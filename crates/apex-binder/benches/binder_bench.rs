@@ -23,7 +23,9 @@
 //! never reach. `"corpus"` (real NPSP, ~1070 files) is where
 //! parallelization's actual payoff shows up.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 fn corpus_root() -> PathBuf {
@@ -60,6 +62,61 @@ fn bench_corpus(c: &mut Criterion) {
                 &root,
             )))
         });
+    });
+    group.finish();
+}
+
+/// Isolates `BACKLOG.md` §2 Step 2's payoff: `ParseCache` is warmed once
+/// (outside the timed loop, matching a just-opened project before the
+/// user's first keystroke), then each timed iteration simulates one more
+/// single-file edit -- every *other* file's content is still exactly
+/// what's cached, so `from_files_cached` should skip re-lexing/
+/// re-parsing them, paying only for the one changed file's parse plus a
+/// full project-wide Pass 1/1.5/2 rebind (rebind itself is *not* yet
+/// incremental -- that's `BACKLOG.md` §2's still-open "incremental
+/// rebind" item -- so this number is today's real baseline, not the
+/// eventual best case, which is exactly what Step 3's decision needs).
+/// Each iteration edits with a unique suffix (via `iter_batched`'s
+/// untimed setup) so the cache never coincidentally already matches --
+/// a real edit every time, not a no-op after the first sample.
+fn bench_warm_single_edit(c: &mut Criterion) {
+    let root = corpus_root();
+    assert!(
+        root.exists(),
+        "no NPSP corpus found at {}; is the submodule checked out? (git submodule update --init --recursive)",
+        root.display()
+    );
+    let target = apex_discover::find_apex_files(&root)
+        .into_iter()
+        .next()
+        .expect("corpus has at least one file to simulate editing");
+    let original = std::fs::read_to_string(&target).unwrap();
+
+    let cache = RefCell::new(apex_binder::ParseCache::default());
+    apex_binder::BoundProgram::from_files_cached(&root, &HashMap::new(), &mut cache.borrow_mut());
+
+    let mut group = c.benchmark_group("corpus");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(1));
+    let edit_counter = Cell::new(0u32);
+    group.bench_function("warm_rebind_after_one_file_edit", |b| {
+        b.iter_batched(
+            || {
+                let n = edit_counter.get();
+                edit_counter.set(n + 1);
+                let mut overrides = HashMap::new();
+                overrides.insert(target.clone(), format!("{original}\n// edit {n}"));
+                overrides
+            },
+            |overrides| {
+                std::hint::black_box(apex_binder::BoundProgram::from_files_cached(
+                    std::hint::black_box(&root),
+                    std::hint::black_box(&overrides),
+                    &mut cache.borrow_mut(),
+                ))
+            },
+            BatchSize::SmallInput,
+        );
     });
     group.finish();
 }
@@ -219,5 +276,10 @@ fn bench_constructs(c: &mut Criterion) {
     let _ = std::fs::remove_dir_all(deep_extends_dir);
 }
 
-criterion_group!(benches, bench_corpus, bench_constructs);
+criterion_group!(
+    benches,
+    bench_corpus,
+    bench_warm_single_edit,
+    bench_constructs
+);
 criterion_main!(benches);

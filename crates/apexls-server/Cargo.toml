@@ -9,6 +9,7 @@ name = "apexls-server"
 path = "src/main.rs"
 
 [dependencies]
+apex-binder.workspace = true
 async-lsp = { version = "0.2.4", features = ["client-monitor", "omni-trait", "stdio", "tracing", "tokio"] }
 lsp-types = "0.95.0"
 futures = "0.3.28"

@@ -35,14 +35,26 @@
 //! become naturally testable once a real (potentially slow,
 //! binder-backed) request exists.
 //!
-//! Deliberately **not** yet wired, each a separate tracked `BACKLOG.md`
-//! item rather than silently dropped: any real language feature at all
-//! (hover/goto-definition/etc, or anything touching `apex-binder`) --
-//! this pass only proves the protocol loop itself works.
+//! **`apex-binder` integration (`BACKLOG.md` §2 Step 1).** `Backend`
+//! keeps a background-rebuilt `apex_binder::BoundProgram` (`Backend::bind`,
+//! `Backend::schedule_rebuild`) in sync with `self.root`/`self.documents`,
+//! naively -- every `didOpen`/`didChange`/`didClose` triggers a full
+//! project rebuild on a `spawn_blocking` task, so the main loop never
+//! blocks on it, but there's no debouncing or cancellation of a
+//! rebuild a newer edit has already superseded yet (see
+//! `Backend::schedule_rebuild`'s doc comment). Unchanged files' parses
+//! are still reused across rebuilds via `ParseCache`. Deliberately **not**
+//! yet wired, each a separate tracked `BACKLOG.md` §3 item rather than
+//! silently dropped: any real language feature that would *consume* the
+//! bind (hover/goto-definition/etc) -- this pass only proves a bind
+//! happens and can be measured.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 
+use apex_binder::{BoundProgram, ParseCache};
 use async_lsp::client_monitor::ClientProcessMonitorLayer;
 use async_lsp::concurrency::ConcurrencyLayer;
 use async_lsp::panic::CatchUnwindLayer;
@@ -93,6 +105,70 @@ struct Backend {
     /// see `BACKLOG.md` §4 for what those settings will eventually be.
     config: Option<serde_json::Value>,
     documents: HashMap<Url, String>,
+    /// The current `apex-binder` bind, rebuilt in the background (see
+    /// `Backend::schedule_rebuild`) after `initialized` and every
+    /// document-sync notification. Naive v1 (`BACKLOG.md` §2 Step 1):
+    /// every edit triggers a full project rebuild, just with unchanged
+    /// files' parses reused via `bind.cache` -- no debouncing, no
+    /// cancelling a still-running rebuild that a newer edit has already
+    /// superseded. `None` until the first rebuild completes. Not
+    /// consumed by any capability yet (that's `BACKLOG.md` §3) -- this
+    /// wiring exists so a real single-edit rebuild latency can finally
+    /// be measured instead of guessed.
+    bind: Arc<BindState>,
+}
+
+/// The mutable state a background rebuild task needs, shared via `Arc`
+/// so `Backend::schedule_rebuild` can hand a clone to
+/// `tokio::task::spawn_blocking` without borrowing `Backend` itself
+/// across an async boundary. `std::sync::Mutex`/`RwLock`, not `tokio`'s --
+/// every access happens either on a blocking-pool thread (the rebuild
+/// itself) or held only long enough to swap a value (never held across
+/// an `.await`), so there's no blocking-executor hazard to avoid.
+#[derive(Default)]
+struct BindState {
+    program: RwLock<Option<BoundProgram>>,
+    cache: Mutex<ParseCache>,
+}
+
+impl Backend {
+    /// Kicks off a background rebuild of `self.bind` against the current
+    /// `self.root` and `self.documents` (each open buffer's in-memory
+    /// text overriding its on-disk content -- see
+    /// `BoundProgram::from_files_with_overrides`'s doc comment for why
+    /// that matters). A no-op if there's no root yet (single-file mode,
+    /// or a request that raced ahead of `initialize`).
+    ///
+    /// Fire-and-forget by design for this first pass (`BACKLOG.md` §2
+    /// Step 1): the returned `JoinHandle` is dropped, not awaited, so
+    /// the rebuild keeps running on `spawn_blocking`'s pool even though
+    /// nothing here waits on it, and a burst of rapid edits schedules a
+    /// burst of overlapping rebuilds with no cancellation between them
+    /// -- whichever finishes last wins (`self.bind.program`'s
+    /// `RwLock::write` is the only synchronization). Debouncing and
+    /// superseded-rebuild cancellation are exactly the kind of
+    /// refinement `BACKLOG.md` §2 Step 3's real latency measurement
+    /// should justify (or not) rather than building speculatively now.
+    fn schedule_rebuild(&self) {
+        let Some(root) = self.root.as_ref().and_then(|url| url.to_file_path().ok()) else {
+            return;
+        };
+        let overrides: HashMap<PathBuf, String> = self
+            .documents
+            .iter()
+            .filter_map(|(uri, text)| uri.to_file_path().ok().map(|path| (path, text.clone())))
+            .collect();
+        let bind = Arc::clone(&self.bind);
+        tokio::task::spawn_blocking(move || {
+            let program = {
+                let mut cache = bind.cache.lock().unwrap();
+                BoundProgram::from_files_cached(&root, &overrides, &mut cache)
+            };
+            let file_count = program.file_count();
+            *bind.program.write().unwrap() = Some(program);
+            info!(file_count, "rebuild complete");
+        });
+    }
 }
 
 impl LanguageServer for Backend {
@@ -177,6 +253,7 @@ impl LanguageServer for Backend {
 
     fn initialized(&mut self, _: InitializedParams) -> Self::NotifyResult {
         info!("initialized");
+        self.schedule_rebuild();
         ControlFlow::Continue(())
     }
 
@@ -189,6 +266,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         info!(%uri, "did_open");
         self.documents.insert(uri, params.text_document.text);
+        self.schedule_rebuild();
         ControlFlow::Continue(())
     }
 
@@ -203,6 +281,7 @@ impl LanguageServer for Backend {
         };
         info!(%uri, len = change.text.len(), "did_change");
         self.documents.insert(uri, change.text);
+        self.schedule_rebuild();
         ControlFlow::Continue(())
     }
 
@@ -210,6 +289,7 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         info!(%uri, "did_close");
         self.documents.remove(&uri);
+        self.schedule_rebuild();
         ControlFlow::Continue(())
     }
 
@@ -237,6 +317,7 @@ async fn main() {
             position_encoding: PositionEncoding::Utf16,
             config: None,
             documents: HashMap::new(),
+            bind: Arc::new(BindState::default()),
         });
 
         ServiceBuilder::new()

@@ -15,9 +15,12 @@ reference resolution, cross-referenced against local SFDX metadata,
 parallelized across passes. `apexls-cli` is still a pre-binder debug tool
 (parses a single file with `parse_statement`, doesn't call into
 `apex-binder` at all). `apexls-server` is a complete, real LSP protocol
-shell (§1 is fully checked off) -- it doesn't call into `apex-binder`
-yet, though, so it can't answer a single real language question. That's
-squarely §2/§3 territory next.
+shell (§1 is fully checked off) that now background-rebuilds a real
+`apex_binder::BoundProgram` on every edit (§2 Step 1) -- but nothing
+consumes that bind through the protocol yet, so it still can't answer a
+single real language question over the wire. That's squarely the rest of
+§2 (incremental rebind is now a measured, confirmed bottleneck, not a
+guess) and §3 next.
 
 ## 1. Protocol / server layer
 
@@ -100,26 +103,65 @@ This is the single biggest gap between what exists and a server that
 feels good to type in. `BoundProgram::from_files` is a full-project
 batch rebuild; nothing about it is incremental.
 
-- [ ] Incremental reparse: `apex-parser`/rowan trees support this in
-      principle (structural sharing), but nothing wires an edit-delta
-      into a reparse that reuses unaffected subtrees -- today every
-      change means re-lexing and re-parsing the whole file from scratch.
+Step 1 (prerequisite, not itself a checklist item): `apexls-server`'s
+`Backend` now actually calls into `apex-binder` -- a background
+`spawn_blocking` task rebuilds a `BoundProgram` on `initialized` and every
+`didOpen`/`didChange`/`didClose`, naively (no debouncing, no cancelling a
+rebuild a newer edit already superseded). Nothing consumes the bind
+through the protocol yet (that's §3) -- this exists purely so the items
+below could be measured against something real instead of guessed at.
+
+- [x] Incremental reparse -- **coarse-grained (file-level) slice done,
+      not true sub-file incremental reparse.** `apex-binder::ParseCache`
+      (`BoundProgram::from_files_cached`) skips re-lexing/re-parsing any
+      file whose content is byte-for-byte identical to the previous
+      rebuild. True sub-file incremental reparse (edit-delta into a
+      single file's tree, reusing unaffected subtrees via rowan's
+      structural sharing) is a real `apex-parser`-level feature this
+      crate has no hooks for yet (only whole-string `parse_*` entry
+      points exist) -- deliberately not built, since the measurement
+      below shows it wouldn't be this server's bottleneck yet even if it
+      existed (see "Step 3 measurement" below).
 - [ ] Incremental rebind: re-bind only a changed file's declarations
       plus whatever referenced them, instead of the whole project.
       Needs real dependency tracking (which symbols/scopes/references
       become stale when file X's declarations change) -- meaningfully
-      harder than anything built so far in `apex-binder`.
+      harder than anything built so far in `apex-binder`, and, per the
+      measurement below, now confirmed to be **the real bottleneck**,
+      not a hypothetical one.
 - [ ] A caching/memoization strategy to hang the above off of --
       possibly salsa-style incremental query architecture (what
       rust-analyzer uses), possibly something simpler given this
       project's smaller surface area. Worth a deliberate design pass,
-      not an ad hoc bolt-on.
-- [ ] Warm background indexing: avoid paying full-project cold-start
-      cost synchronously on `initialize` for large orgs/repos.
-- [ ] Once a server exists (§1), profile *real* single-edit request
-      latency -- bulk throughput numbers already measured (whole-corpus
-      bind ~460ms) don't tell us what a single keystroke's round trip
-      would cost without incremental rebind.
+      not an ad hoc bolt-on. Still not designed in detail -- the
+      measurement below justifies doing this next, but doesn't by
+      itself dictate its shape.
+- [ ] Warm background indexing: partially covered by Step 1's
+      background-task rebuild (the main loop never blocks on a bind).
+      Not yet covered: answering a request that arrives before the
+      *first* bind completes (there's no request that consumes the bind
+      yet -- §3 -- so this has nothing real to be tested against until
+      one exists).
+- [x] Profile *real* single-edit request latency. **Measured** via
+      `apex-binder/benches/binder_bench.rs`'s `corpus/warm_rebind_after_one_file_edit`
+      case (warms `ParseCache` once, then times a full `from_files_cached`
+      call per simulated single-file edit, real NPSP corpus, criterion
+      `--save-baseline incremental-step1`):
+      - `corpus/bind_npsp_full` (cold, no cache): **~677ms** median.
+      - `corpus/warm_rebind_after_one_file_edit` (parse-skip warm, one
+        file edited): **~438ms** median -- only ~35% faster than cold,
+        not the order-of-magnitude drop "feels good to type in" needs.
+      - **Honest conclusion:** file-level parse-skip alone is nowhere
+        near enough. Nearly all of the ~438ms warm figure is Pass
+        1/1.5/2 re-running project-wide over already-parsed trees, which
+        this step deliberately left untouched (see Context in the design
+        plan this work followed). This is the real evidence, not a
+        guess, that **incremental rebind is the next necessary step**,
+        not an optional refinement -- and that a salsa-style/memoized
+        query layer is worth designing next specifically to make
+        Pass 1.5/Pass 2 skip whatever a single file's edit didn't
+        actually affect, rather than being a speculative architecture
+        choice made ahead of any evidence it was needed.
 
 ## 3. Feature surface
 

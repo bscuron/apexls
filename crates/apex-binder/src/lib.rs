@@ -35,6 +35,7 @@
 mod collect;
 mod file_id;
 mod inherit;
+mod parse_cache;
 mod ptr;
 mod reference_table;
 mod resolve;
@@ -45,6 +46,7 @@ mod symbol;
 mod symbol_table;
 
 pub use file_id::FileId;
+pub use parse_cache::ParseCache;
 pub use ptr::{AstPtr, SyntaxPtr};
 pub use reference_table::{ReferenceTable, Resolution};
 pub use schema_index::SchemaIndex;
@@ -104,34 +106,81 @@ fn ensure_large_worker_stacks() {
 
 impl BoundProgram {
     /// Discovers, parses, and binds every `.cls`/`.trigger` file under
-    /// `root`, plus its SFDX object/field metadata.
+    /// `root`, plus its SFDX object/field metadata. Always reads every
+    /// file fresh from disk and re-parses it -- see
+    /// [`Self::from_files_cached`] for a version that skips re-parsing
+    /// files whose content hasn't changed since a previous call.
     pub fn from_files(root: impl AsRef<Path>) -> Self {
+        Self::from_files_with_overrides(root, &HashMap::new())
+    }
+
+    /// Like [`Self::from_files`], but `overrides` (keyed by the same
+    /// paths `apex_discover::discover` would report) supplies a file's
+    /// content directly instead of reading it from disk -- the hook an
+    /// editor-backed caller (`apexls-server`) needs so an *unsaved*
+    /// buffer's content participates in binding instead of stale
+    /// on-disk content. A path with no entry in `overrides` is read from
+    /// disk as normal.
+    pub fn from_files_with_overrides(
+        root: impl AsRef<Path>,
+        overrides: &HashMap<PathBuf, String>,
+    ) -> Self {
+        let mut cache = ParseCache::default();
+        Self::from_files_cached(root, overrides, &mut cache)
+    }
+
+    /// Like [`Self::from_files_with_overrides`], but reuses `cache`'s
+    /// previous `(content, Parse)` for any file whose content is
+    /// byte-for-byte identical to last time, skipping that file's
+    /// lex/parse entirely -- and updates `cache` to reflect this call's
+    /// results before returning, so the next call benefits too. See
+    /// `BACKLOG.md` §2 and [`ParseCache`]'s module doc comment. Binding
+    /// itself (Pass 1/1.5/2 below) still runs project-wide on every
+    /// call regardless of what was cached -- this cache only ever saves
+    /// parse work, not bind work; see `BACKLOG.md` §2's "incremental
+    /// rebind" item for the (deliberately not-yet-built) next step that
+    /// would also skip unaffected binding.
+    pub fn from_files_cached(
+        root: impl AsRef<Path>,
+        overrides: &HashMap<PathBuf, String>,
+        cache: &mut ParseCache,
+    ) -> Self {
         ensure_large_worker_stacks();
         let root = root.as_ref();
         let discovery = apex_discover::discover(root);
         let schema = SchemaIndex::build(root);
 
-        // Stage 1a (parallel): read + parse every file independently.
-        // `par_iter().filter_map(...).collect::<Vec<_>>()` preserves
-        // `discovery.apex_files`'s original order (rayon's indexed
-        // collection always does), so a file's final position in this
-        // `Vec` -- and thus its `FileId` below -- stays deterministic
-        // across runs regardless of which thread actually processed it.
-        let parsed: Vec<(PathBuf, bool, Parse)> = discovery
+        // Stage 1a (parallel): read (or reuse an override's in-memory
+        // content) and parse (or reuse a cache hit's already-built tree)
+        // every file independently. `par_iter().filter_map(...).collect::<Vec<_>>()`
+        // preserves `discovery.apex_files`'s original order (rayon's
+        // indexed collection always does), so a file's final position in
+        // this `Vec` -- and thus its `FileId` below -- stays
+        // deterministic across runs regardless of which thread actually
+        // processed it.
+        let parsed: Vec<(PathBuf, bool, String, Parse)> = discovery
             .apex_files
             .par_iter()
             .filter_map(|path| {
-                let src = std::fs::read_to_string(path).ok()?;
+                let src = match overrides.get(path) {
+                    Some(src) => src.clone(),
+                    None => std::fs::read_to_string(path).ok()?,
+                };
                 let trigger = path
                     .extension()
                     .and_then(|e| e.to_str())
                     .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
+                if let Some((cached_src, cached_parse)) = cache.by_path.get(path) {
+                    if cached_src == &src {
+                        return Some((path.clone(), trigger, src, cached_parse.clone()));
+                    }
+                }
                 let parse = if trigger {
                     apex_parser::parse_trigger_unit(&src)
                 } else {
                     apex_parser::parse_compilation_unit(&src)
                 };
-                Some((path.clone(), trigger, parse))
+                Some((path.clone(), trigger, src, parse))
             })
             .collect();
 
@@ -143,7 +192,7 @@ impl BoundProgram {
         let collections: Vec<collect::FileCollection> = parsed
             .par_iter()
             .enumerate()
-            .map(|(i, (_, trigger, parse))| {
+            .map(|(i, (_, trigger, _, parse))| {
                 let file = FileId(i as u32);
                 let root_node = parse.syntax();
                 if *trigger {
@@ -157,8 +206,19 @@ impl BoundProgram {
             })
             .collect();
 
-        let files: Vec<PathBuf> = parsed.iter().map(|(p, _, _)| p.clone()).collect();
-        let parses: Vec<Parse> = parsed.into_iter().map(|(_, _, parse)| parse).collect();
+        let files: Vec<PathBuf> = parsed.iter().map(|(p, _, _, _)| p.clone()).collect();
+
+        // Refresh the cache with this call's own results before moving
+        // `parsed`'s `Parse`s out below -- a file no longer present in
+        // `parsed` (deleted, or failed to read) is naturally dropped
+        // from the cache here too, since this replaces the whole map
+        // rather than merging into it.
+        cache.by_path = parsed
+            .iter()
+            .map(|(path, _, src, parse)| (path.clone(), (src.clone(), parse.clone())))
+            .collect();
+
+        let parses: Vec<Parse> = parsed.into_iter().map(|(_, _, _, parse)| parse).collect();
 
         // Sequential merge: fold each file's locally-numbered symbols
         // into the shared arena, remapping `container` ids by that

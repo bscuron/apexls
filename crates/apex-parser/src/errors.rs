@@ -16,7 +16,12 @@ pub struct ParseError {
 
 /// The result of any `apex-parser` entry point: a lossless green tree
 /// (round-trips to the exact input even in the presence of errors) plus
-/// whatever diagnostics were collected along the way.
+/// whatever diagnostics were collected along the way. `Clone` is cheap --
+/// `GreenNode` is `Arc`-based, so cloning a `Parse` is an `Arc` bump plus a
+/// `Vec<ParseError>` copy, not a deep tree copy -- which is what makes it
+/// safe to reuse a cached `Parse` across rebuilds (see `apex-binder`'s
+/// `ParseCache`) instead of re-parsing unchanged files from scratch.
+#[derive(Clone)]
 pub struct Parse {
     pub(crate) green: GreenNode,
     pub errors: Vec<ParseError>,
