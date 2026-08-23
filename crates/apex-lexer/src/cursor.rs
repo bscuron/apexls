@@ -107,18 +107,6 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// Advance while `pred` holds on the current byte, with no ASCII
-    /// cutoff. Safe to use whenever the predicate only ever needs to
-    /// recognize specific ASCII delimiter bytes (e.g. "stop at `\r`/`\n`"),
-    /// since UTF-8 continuation/lead bytes (`>= 0x80`) can never equal an
-    /// ASCII byte value and so can never be mistaken for one.
-    #[inline]
-    pub(crate) fn eat_while_raw(&mut self, mut pred: impl FnMut(u8) -> bool) {
-        while !self.is_eof() && pred(self.first()) {
-            self.pos += 1;
-        }
-    }
-
     /// Bytes remaining in the source from the cursor's current position.
     #[inline]
     pub(crate) fn remaining(&self) -> usize {
@@ -139,5 +127,32 @@ impl<'a> Cursor<'a> {
     #[inline]
     pub(crate) fn slice(&self, start: u32, end: u32) -> &'a [u8] {
         &self.bytes[start as usize..end as usize]
+    }
+
+    /// The unconsumed remainder of the source, as bytes. The natural
+    /// haystack for `memchr`-based scanning (comments, string literals):
+    /// callers search this for the next delimiter byte(s), then
+    /// [`Self::advance`] by the returned index rather than looping
+    /// byte-by-byte themselves.
+    #[inline]
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        &self.bytes[self.pos as usize..]
+    }
+
+    /// Advance the cursor by `n` bytes without inspecting them. Callers
+    /// are responsible for `n` landing on a valid boundary -- safe
+    /// whenever `n` came from a `memchr` search over [`Self::rest`],
+    /// since every needle byte searched for in this lexer is ASCII and an
+    /// ASCII byte value can never occur as a UTF-8 continuation byte.
+    #[inline]
+    pub(crate) fn advance(&mut self, n: usize) {
+        self.pos += n as u32;
+    }
+
+    /// Advance the cursor to EOF (an unterminated comment/string: nothing
+    /// left to do but consume the rest of the source).
+    #[inline]
+    pub(crate) fn advance_to_end(&mut self) {
+        self.pos = self.bytes.len() as u32;
     }
 }

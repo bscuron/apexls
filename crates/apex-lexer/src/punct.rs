@@ -164,11 +164,16 @@ pub(crate) fn scan_whitespace(cur: &mut Cursor) -> TokenKind {
 }
 
 /// `LINE_COMMENT: '//' ~[\r\n]* -> channel(COMMENT_CHANNEL);`
-/// Must be called with the cursor at `//`.
+/// Must be called with the cursor at `//`. SIMD-accelerated via `memchr`:
+/// jumps straight to the next `\r`/`\n` instead of a byte-by-byte loop,
+/// which matters for long comments (license headers, commented-out code).
 pub(crate) fn scan_line_comment(cur: &mut Cursor) -> TokenKind {
     cur.bump_byte();
     cur.bump_byte();
-    cur.eat_while_raw(|b| b != b'\r' && b != b'\n');
+    match memchr::memchr2(b'\r', b'\n', cur.rest()) {
+        Some(idx) => cur.advance(idx),
+        None => cur.advance_to_end(),
+    }
     TokenKind::LineComment
 }
 
@@ -196,14 +201,11 @@ pub(crate) fn scan_slash_star_comment(cur: &mut Cursor) -> TokenKind {
 
 /// First offset `i >= start` (relative to the cursor) where bytes `i` and
 /// `i+1` are `*` and `/`, or `None` if no such pair exists before EOF.
+/// SIMD-accelerated substring search via `memchr::memmem`, rather than
+/// checking each byte pair by hand -- this is the biggest single win in
+/// the module, since block/doc comments are often long (license headers,
+/// javadoc-style method docs).
 fn find_star_slash(cur: &Cursor, start: usize) -> Option<usize> {
-    let rem = cur.remaining();
-    let mut i = start;
-    while i + 1 < rem {
-        if cur.peek_at(i) == b'*' && cur.peek_at(i + 1) == b'/' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+    let haystack = cur.rest().get(start..)?;
+    memchr::memmem::find(haystack, b"*/").map(|i| i + start)
 }

@@ -192,28 +192,53 @@ pub(crate) fn scan_string(cur: &mut Cursor) -> TokenKind {
     }
 
     cur.bump_byte(); // opening '
+    scan_quoted_body(cur, false);
+    TokenKind::StringLiteral
+}
+
+/// Shared scanning loop for both string forms: SIMD-jump (via
+/// `memchr::memchr2`) to the next `'` or `\`, since everything in between
+/// -- including non-ASCII content, which never equals either ASCII byte
+/// value -- is uninteresting and can be skipped as a single block instead
+/// of decoded/inspected byte-by-byte or char-by-char.
+///
+/// A `'` closes a plain string immediately. For a multiline string it
+/// only closes if two more `'` immediately follow (the grammar's `'''`
+/// terminator); otherwise it's just a lone-quote content character, per
+/// `MultilineStringLiteral`'s body alternative `'\''`.
+fn scan_quoted_body(cur: &mut Cursor, multiline: bool) {
     loop {
-        match cur.first() {
-            0 if cur.is_eof() => break, // unterminated; stop at EOF
-            b'\'' => {
-                cur.bump_byte();
+        match memchr::memchr2(b'\'', b'\\', cur.rest()) {
+            None => {
+                cur.advance_to_end(); // unterminated; stop at EOF
                 break;
             }
-            b'\\' => {
-                cur.bump_byte();
-                if !cur.is_eof() {
-                    cur.bump_byte();
+            Some(idx) => {
+                cur.advance(idx);
+                match cur.first() {
+                    b'\\' => {
+                        cur.bump_byte();
+                        if !cur.is_eof() {
+                            cur.bump_byte();
+                        }
+                    }
+                    _ if !multiline => {
+                        cur.bump_byte(); // closing '
+                        break;
+                    }
+                    _ if cur.starts_with("'''") => {
+                        cur.bump_byte();
+                        cur.bump_byte();
+                        cur.bump_byte(); // closing '''
+                        break;
+                    }
+                    _ => {
+                        cur.bump_byte(); // lone ' is just content
+                    }
                 }
-            }
-            b if b < 0x80 => {
-                cur.bump_byte();
-            }
-            _ => {
-                cur.bump_char();
             }
         }
     }
-    TokenKind::StringLiteral
 }
 
 /// Length of a run of `WS` charset bytes (` \t\r\n` + form feed) starting
@@ -293,30 +318,6 @@ fn scan_multiline_string(cur: &mut Cursor) -> TokenKind {
     cur.bump_byte(); // opening '''
     cur.bump_byte(); // the mandatory \r or \n right after it
 
-    loop {
-        if cur.is_eof() {
-            break;
-        }
-        if cur.starts_with("'''") {
-            cur.bump_byte();
-            cur.bump_byte();
-            cur.bump_byte();
-            break;
-        }
-        match cur.first() {
-            b'\\' => {
-                cur.bump_byte();
-                if !cur.is_eof() {
-                    cur.bump_byte();
-                }
-            }
-            b if b < 0x80 => {
-                cur.bump_byte();
-            }
-            _ => {
-                cur.bump_char();
-            }
-        }
-    }
+    scan_quoted_body(cur, true);
     TokenKind::MultilineStringLiteral
 }

@@ -162,5 +162,20 @@ fn bench_constructs(c: &mut Criterion) {
     bench_construct(c, "constructs", "operators", &operators);
 }
 
-criterion_group!(benches, bench_corpus, bench_constructs);
+/// Single long, contiguous spans (as opposed to `constructs`' many short
+/// ones) -- this is where a SIMD "find the next interesting byte" win
+/// actually shows up, since the scalar byte-by-byte loop it replaces pays
+/// its per-byte cost across the whole run instead of being dominated by
+/// fixed per-token overhead.
+fn bench_long_runs(c: &mut Criterion) {
+    let long_line_comment = format!("// {}\n", "x".repeat(4000));
+    let long_block_comment = format!("/* {} */\n", "x".repeat(4000));
+    let long_string_literal = format!("'{}'\n", "x".repeat(4000));
+
+    bench_construct(c, "long_runs", "long_line_comment", &long_line_comment);
+    bench_construct(c, "long_runs", "long_block_comment", &long_block_comment);
+    bench_construct(c, "long_runs", "long_string_literal", &long_string_literal);
+}
+
+criterion_group!(benches, bench_corpus, bench_constructs, bench_long_runs);
 criterion_main!(benches);
