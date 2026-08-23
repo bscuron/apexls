@@ -21,6 +21,7 @@
 //!   git checkout mybranch && cargo bench -p apex-lexer -- --baseline main
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use rayon::prelude::*;
 use std::hint::black_box;
 
 fn corpus_root() -> std::path::PathBuf {
@@ -53,6 +54,18 @@ fn bench_corpus(c: &mut Criterion) {
                     black_box(token);
                 }
             }
+        });
+    });
+    // Every file's tokenization is 100% independent of every other's, so
+    // this is the "how much is left on the table by not using every core"
+    // number -- contrast directly against tokenize_npsp above.
+    group.bench_function("tokenize_npsp_parallel", |b| {
+        b.iter(|| {
+            sources.par_iter().for_each(|src| {
+                for token in apex_lexer::tokenize(black_box(src)) {
+                    black_box(token);
+                }
+            });
         });
     });
     group.finish();

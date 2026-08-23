@@ -7,6 +7,7 @@
 
 use apex_lexer::{Token, TokenKind};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use rayon::prelude::*;
 use std::hint::black_box;
 
 fn corpus_root() -> std::path::PathBuf {
@@ -105,6 +106,15 @@ fn bench_corpus(c: &mut Criterion) {
             for fragment in &fragments {
                 black_box(apex_parser::parse_statement(black_box(fragment)));
             }
+        });
+    });
+    // Every fragment parses independently, so this is the "how much is
+    // left on the table by not using every core" number.
+    group.bench_function("parse_npsp_fragments_parallel", |b| {
+        b.iter(|| {
+            fragments.par_iter().for_each(|fragment| {
+                black_box(apex_parser::parse_statement(black_box(fragment)));
+            });
         });
     });
     group.finish();

@@ -49,6 +49,7 @@ dependencies = [
  "criterion",
  "memchr",
  "phf",
+ "rayon",
 ]
 
 [[package]]
@@ -62,6 +63,7 @@ dependencies = [
  "criterion",
  "insta",
  "proptest",
+ "rayon",
 ]
 
 [[package]]
