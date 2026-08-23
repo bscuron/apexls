@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/apex-discover",
     "crates/apex-lexer",
     "crates/apex-syntax",
     "crates/apex-parser",
