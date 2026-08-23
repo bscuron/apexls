@@ -36,11 +36,20 @@ shell (see §1) -- it doesn't call into `apex-binder` either yet.
       is really a facet of the incremental-reparse/-rebind work in §2,
       not a standalone protocol-layer task, so it's tracked there
       instead of here.
-- [ ] Workspace folder handling (multi-root support, or an honest
-      single-root-only limitation stated up front). Not started --
-      `initialize` logs the workspace-folder count and warns on >1, but
-      nothing yet actually resolves or uses a project root at all
-      (there's no binder integration yet for it to feed into).
+- [x] Workspace folder handling. **Decided: single-root only, by
+      design, not just an unimplemented gap.** An SFDX org is one flat
+      Apex namespace (`SymbolTable::top_level` is already project-wide,
+      not per-file, for exactly this reason), so merging two *unrelated*
+      workspace folders into one `BoundProgram` would be actively
+      wrong -- colliding names, references falsely resolving across
+      projects with nothing to do with each other -- and LSP gives no
+      signal to tell "these are the same org" apart from "these just
+      happen to be open together." `Backend::initialize` resolves the
+      first `workspaceFolders` entry (falling back to the deprecated
+      `rootUri` for older clients) and ignores the rest, with a logged
+      warning. No binder integration consumes the resolved root yet
+      (there's no binder integration wired into the server at all
+      yet), but the *policy* is settled, not deferred.
 - [ ] Configuration: `workspace/didChangeConfiguration`,
       `initializationOptions` (e.g. where to find SFDX metadata, whether
       to bundle standard-library stubs -- see §4).

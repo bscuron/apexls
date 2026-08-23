@@ -10,9 +10,23 @@
 //! `textDocument/didOpen`/`didChange`/`didClose`/`didSave` document
 //! sync (full-document sync, not incremental -- see `Backend::initialize`'s
 //! doc comment for why that's a deliberate, tracked choice, not an
-//! oversight). Deliberately **not** yet wired, each a separate tracked
-//! `BACKLOG.md` item rather than silently dropped:
-//! - workspace folders beyond a single root (no multi-root support),
+//! oversight).
+//!
+//! **Single-root only, by design, not by omission.** LSP lets a client
+//! offer several `workspaceFolders` at once (VS Code's "multi-root
+//! workspace" feature -- e.g. two unrelated repos opened together in
+//! one window). apexls doesn't support that: an SFDX org is one flat
+//! Apex namespace (`apex_binder::SymbolTable::top_level` is
+//! project-wide, not per-file, on purpose), so merging two *unrelated*
+//! projects' symbols into one `BoundProgram` would be actively wrong
+//! (colliding names, references falsely resolving across projects that
+//! have nothing to do with each other) -- and LSP gives no signal to
+//! tell "these folders are the same org" apart from "these just happen
+//! to be open together." Rather than guess, `Backend::initialize` takes
+//! only the first workspace folder and ignores the rest.
+//!
+//! Deliberately **not** yet wired, each a separate tracked `BACKLOG.md`
+//! item rather than silently dropped:
 //! - `workspace/didChangeConfiguration`,
 //! - position-encoding negotiation (`positionEncodingKind`),
 //! - request cancellation,
@@ -39,8 +53,9 @@ use lsp_types::{
 use tower::ServiceBuilder;
 use tracing::{info, warn, Level};
 
-/// The server's whole mutable state: for now, just an in-memory
-/// document store (URI -> current full text, kept in sync via
+/// The server's whole mutable state: the single resolved project root
+/// (see the module doc comment's "single-root only" section) and an
+/// in-memory document store (URI -> current full text, kept in sync via
 /// full-document `didChange` notifications). Will grow to hold an
 /// `apex_binder::BoundProgram` once a real language feature is wired
 /// in -- deliberately not yet, to keep this first pass scoped to the
@@ -48,6 +63,12 @@ use tracing::{info, warn, Level};
 struct Backend {
     #[allow(dead_code)] // not sent anything yet -- kept for the features this scaffolds toward
     client: ClientSocket,
+    /// Resolved once in `initialize` from the first `workspaceFolders`
+    /// entry (falling back to the deprecated `rootUri` for older
+    /// clients that don't send `workspaceFolders` at all). `None` if
+    /// the client offered neither -- a request without any open folder,
+    /// which every LSP client allows for single-file editing.
+    root: Option<Url>,
     documents: HashMap<Url, String>,
 }
 
@@ -59,22 +80,24 @@ impl LanguageServer for Backend {
         &mut self,
         params: InitializeParams,
     ) -> BoxFuture<'static, Result<InitializeResult, Self::Error>> {
-        info!(
-            workspace_folder_count = params.workspace_folders.as_ref().map(Vec::len),
-            "initialize",
-        );
-        // Only the first workspace folder / root_uri is ever honored --
-        // multi-root support is a separate, tracked `BACKLOG.md` item.
-        if params
-            .workspace_folders
-            .as_deref()
-            .is_some_and(|f| f.len() > 1)
-        {
+        let folders = params.workspace_folders.as_deref().unwrap_or(&[]);
+        let root = folders
+            .first()
+            .map(|folder| folder.uri.clone())
+            .or_else(|| {
+                #[allow(deprecated)] // the fallback this deprecation exists for
+                params.root_uri.clone()
+            });
+
+        info!(?root, workspace_folder_count = folders.len(), "initialize");
+        if folders.len() > 1 {
             warn!(
-                "multiple workspace folders were offered; only a single root is supported \
-                 (multi-root support is not implemented yet)"
+                extra_folders = folders.len() - 1,
+                "apexls supports a single project root; additional workspace folders are ignored \
+                 (see main.rs's module doc comment for why this is by design)"
             );
         }
+        self.root = root;
 
         Box::pin(async move {
             Ok(InitializeResult {
@@ -156,6 +179,7 @@ async fn main() {
     let (server, _) = async_lsp::MainLoop::new_server(|client| {
         let router = Router::from_language_server(Backend {
             client: client.clone(),
+            root: None,
             documents: HashMap::new(),
         });
 
