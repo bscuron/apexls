@@ -1,0 +1,22 @@
+[package]
+name = "apexls-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "apexls-server"
+path = "src/main.rs"
+
+[dependencies]
+async-lsp = { version = "0.2.4", features = ["client-monitor", "omni-trait", "stdio", "tracing", "tokio"] }
+lsp-types = "0.95.0"
+futures = "0.3.28"
+tower = "0.5"
+tokio = { version = "1.27.0", features = ["io-std", "io-util", "macros", "process", "rt", "time"] }
+tokio-util = { version = "0.7.8", features = ["compat"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.16"
+
+[dev-dependencies]
+serde_json = "1.0.95"

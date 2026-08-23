@@ -9,6 +9,7 @@ members = [
     "crates/apex-parser",
     "crates/apex-printer",
     "crates/apexls-cli",
+    "crates/apexls-server",
 ]
 
 [workspace.package]
