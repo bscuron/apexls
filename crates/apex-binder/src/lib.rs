@@ -90,7 +90,12 @@ pub struct BoundProgram {
     files: HashMap<FileId, PathBuf>,
     parses: HashMap<FileId, Parse>,
     pub symbols: SymbolTable,
-    pub schema: SchemaIndex,
+    /// `Arc`-wrapped for the same reason `symbols`/`bodies` are cheap to
+    /// clone into each call's snapshot: `cache.schema` is only ever
+    /// rebuilt when the directory walk itself is redone (see
+    /// `Self::from_files_cached`), so the common case is a pointer clone,
+    /// not re-parsing every SFDX metadata XML file.
+    pub schema: Arc<SchemaIndex>,
     bodies: HashMap<FileId, Arc<FileBodies>>,
 }
 
@@ -179,43 +184,56 @@ impl BoundProgram {
     ) -> Self {
         ensure_large_worker_stacks();
         let root = root.as_ref();
-        let discovery = apex_discover::discover(root);
-        let schema = SchemaIndex::build(root);
 
-        // Stage 0: resolve every discovered path to a stable `FileId`,
-        // and prune anything the cache still remembers that no longer
-        // exists (a file deleted or renamed since the last call) -- a
-        // removal changes the project-wide namespace just as much as an
-        // addition does, so it also forces the conservative "declarations
-        // changed" path below.
-        let current_files: Vec<(PathBuf, FileId)> = discovery
+        // Stage -1: reuse the cached directory walk (`Discovery`) and
+        // `SchemaIndex` unless something suggests they're stale, rather
+        // than re-walking the whole tree (and re-parsing every SFDX
+        // metadata XML file) unconditionally on every call. There's no
+        // way to detect "a file appeared/disappeared on disk" short of
+        // watching the filesystem (not wired up yet -- an honest,
+        // separate gap, not something this check papers over), but a
+        // *newly created and already-open* file has a real signal: it
+        // shows up in `overrides` before the cached walk has ever heard
+        // of it. That, or no cached walk existing yet, are the only
+        // triggers for redoing it.
+        let need_fresh_discovery = match &cache.discovery {
+            None => true,
+            Some(discovery) => {
+                let known: HashSet<&Path> =
+                    discovery.apex_files.iter().map(PathBuf::as_path).collect();
+                overrides.keys().any(|p| !known.contains(p.as_path()))
+            }
+        };
+        if need_fresh_discovery {
+            let discovery = apex_discover::discover(root);
+            let schema = Arc::new(SchemaIndex::from_discovery(&discovery));
+            cache.discovery = Some(discovery);
+            cache.schema = Some(schema);
+        }
+        let discovery = cache.discovery.as_ref().unwrap();
+        let schema = Arc::clone(cache.schema.as_ref().unwrap());
+
+        // Stage 0: resolve every discovered path to a stable `FileId`.
+        // This is only a *candidate* list -- Stage 1a below is what
+        // actually determines which of these still exist and are
+        // readable, since `discovery` can itself be stale (reused from
+        // an earlier call, per the above) even when it wasn't worth a
+        // fresh walk.
+        let candidates: Vec<(PathBuf, FileId)> = discovery
             .apex_files
             .iter()
             .map(|path| (path.clone(), cache.files.id_for(path)))
             .collect();
-        let current_ids: HashSet<FileId> = current_files.iter().map(|(_, id)| *id).collect();
-        let current_paths: HashSet<&Path> =
-            current_files.iter().map(|(p, _)| p.as_path()).collect();
-
-        let removed: Vec<FileId> = cache
-            .table
-            .known_files()
-            .filter(|id| !current_ids.contains(id))
-            .collect();
-        let mut declarations_changed = !removed.is_empty();
-        for file in removed {
-            cache.table.remove_file(file);
-            cache.raw_extends.remove(&file);
-            cache.raw_super.remove(&file);
-            cache.bodies.remove(&file);
-        }
-        cache
-            .parses
-            .retain(|path, _| current_paths.contains(path.as_path()));
 
         // Stage 1a (parallel): read (or reuse an override's in-memory
         // content) and parse (or reuse a byte-identical cache hit's
-        // already-built tree) every file independently.
+        // already-built tree) every candidate file independently. A
+        // candidate that fails to read (deleted since the walk that
+        // produced it, a permissions race, ...) is silently dropped
+        // here, exactly as it always was -- and that silent drop is
+        // *also* this function's only signal that a file was removed
+        // (see `current_ids` below), so a deletion self-corrects without
+        // ever needing a fresh walk, only a genuinely new file does.
         struct ParsedFile {
             path: PathBuf,
             file: FileId,
@@ -224,7 +242,7 @@ impl BoundProgram {
             content: String,
             parse: Parse,
         }
-        let parsed: Vec<ParsedFile> = current_files
+        let parsed: Vec<ParsedFile> = candidates
             .par_iter()
             .filter_map(|(path, file)| {
                 let content = match overrides.get(path) {
@@ -270,6 +288,32 @@ impl BoundProgram {
                 .parses
                 .insert(p.path.clone(), (p.content.clone(), p.parse.clone()));
         }
+
+        // The *actual* current file set is whatever was just
+        // successfully read above, not `discovery`'s candidate list --
+        // this is what makes a deleted file self-correct even when
+        // `discovery` itself is stale (reused from an earlier call): it
+        // simply isn't in `parsed`. A removal changes the project-wide
+        // namespace just as much as an addition does, so it also forces
+        // the conservative "declarations changed" path below.
+        let current_ids: HashSet<FileId> = parsed.iter().map(|p| p.file).collect();
+        let current_paths: HashSet<&Path> = parsed.iter().map(|p| p.path.as_path()).collect();
+
+        let removed: Vec<FileId> = cache
+            .table
+            .known_files()
+            .filter(|id| !current_ids.contains(id))
+            .collect();
+        let mut declarations_changed = !removed.is_empty();
+        for file in removed {
+            cache.table.remove_file(file);
+            cache.raw_extends.remove(&file);
+            cache.raw_super.remove(&file);
+            cache.bodies.remove(&file);
+        }
+        cache
+            .parses
+            .retain(|path, _| current_paths.contains(path.as_path()));
 
         // Stage 1b (parallel): Pass 1 declaration collection, but only
         // for dirty files -- an unchanged file's declarations are still
@@ -401,10 +445,12 @@ impl BoundProgram {
         // `bodies` (`Arc`-shared per file) are both cheap here regardless
         // of project size -- an *unaffected* file only costs a pointer
         // clone, not a deep copy of its `Symbol`s/references/scopes.
-        let files: HashMap<FileId, PathBuf> =
-            current_files.into_iter().map(|(p, f)| (f, p)).collect();
-        let parses: HashMap<FileId, Parse> =
-            parsed.into_iter().map(|p| (p.file, p.parse)).collect();
+        let mut files = HashMap::with_capacity(parsed.len());
+        let mut parses = HashMap::with_capacity(parsed.len());
+        for p in parsed {
+            files.insert(p.file, p.path);
+            parses.insert(p.file, p.parse);
+        }
         let bodies: HashMap<FileId, Arc<FileBodies>> = current_ids
             .iter()
             .filter_map(|&file| cache.bodies.get(&file).map(|fb| (file, Arc::clone(fb))))

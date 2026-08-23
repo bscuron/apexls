@@ -23,9 +23,18 @@ struct ObjectEntry {
 impl SchemaIndex {
     /// Walks `root` for SFDX metadata and builds the index from it --
     /// see `apex_metadata::discover_sobjects`'s own doc comment for the
-    /// standard-object gap this inherits.
+    /// standard-object gap this inherits. Prefer [`Self::from_discovery`]
+    /// if the caller already has an `apex_discover::Discovery` in hand
+    /// (e.g. `crate::BoundProgram::from_files_cached`, which also needs
+    /// it for `apex_files`), so the directory tree isn't walked twice.
     pub fn build(root: impl AsRef<Path>) -> Self {
         Self::from_sobjects(apex_metadata::discover_sobjects(root))
+    }
+
+    /// Like [`Self::build`], but parses an already-computed
+    /// `apex_discover::Discovery` instead of walking `root` itself.
+    pub fn from_discovery(discovery: &apex_discover::Discovery) -> Self {
+        Self::from_sobjects(apex_metadata::sobjects_from_discovery(discovery))
     }
 
     pub fn from_sobjects(sobjects: Vec<SObjectSchema>) -> Self {

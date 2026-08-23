@@ -17,7 +17,7 @@ parallelized across passes. `apexls-cli` is still a pre-binder debug tool
 `apex-binder` at all). `apexls-server` is a complete, real LSP protocol
 shell (§1 is fully checked off) that now background-rebuilds a real
 `apex_binder::BoundProgram` on every edit, incrementally (§2, fully
-checked off -- a warm single-file-edit rebind measures ~78ms on the real
+checked off -- a warm single-file-edit rebind measures ~17ms on the real
 NPSP corpus, down from ~677ms cold) -- but nothing consumes that bind
 through the protocol yet, so it still can't answer a single real language
 question over the wire. That's squarely §3 next.
@@ -160,43 +160,78 @@ below could be measured against something real instead of guessed at.
       `apex-binder/benches/binder_bench.rs`'s `corpus/warm_rebind_after_one_file_edit`
       case (warms the cache once, then times a full `from_files_cached`
       call per simulated single-file edit, real NPSP corpus, criterion):
-      - `corpus/bind_npsp_full` (cold, no cache): **~427ms** median (was
-        ~677ms before this step -- `Arc`-backed `SymbolTable`/`FileBodies`
-        also cut allocation overhead on the cold path incidentally).
+      - `corpus/bind_npsp_full` (cold, no cache): **~431ms** median (was
+        ~677ms originally -- `Arc`-backed `SymbolTable`/`FileBodies`, and
+        no longer walking the directory tree twice per call -- see
+        below -- both cut real overhead on the cold path too).
       - `corpus/warm_rebind_after_one_file_edit` (warm cache, one file's
-        body-only edit): **~78ms** median -- an **~82% reduction** from
-        the prior step's ~438ms, and a ~5.6x speedup overall from the
-        original ~677ms cold baseline.
-      - **A real regression caught and fixed along the way:** the first
-        implementation of incremental rebind made this benchmark
-        *worse* (~700ms) than the previous step, not better --
-        `BoundProgram::from_files_cached` was skipping recomputation but
-        still deep-cloning the *entire* `SymbolTable` and every file's
-        cached references/scopes into each call's independent snapshot,
-        which turned out to cost more than the work it replaced. Fixing
-        it required `Arc`-wrapping `SymbolTable`'s per-file data and
-        derived-index bundle, and `apex-binder`'s Pass 2 output per file,
-        so assembling a snapshot is a handful of pointer clones for an
-        unaffected file, not a deep copy -- this is exactly the kind of
-        thing only a real measurement catches; it looked correct and
-        reasonable in the design and would have shipped as a silent
-        regression without benchmarking the actual change, not just the
-        feature it was meant to enable.
-      - **Honest scope note:** this is not full per-reference dependency
-        tracking (the original wording: "which symbols/scopes/references
-        become stale when file X's declarations change"). It's one
-        conservative, provably-safe rule -- if *any* file's declarations
-        changed, rebind the whole project (identical cost to before);
-        otherwise, rebind only the changed files. That rule is sized to
-        the dominant real editing pattern (typing inside a method body),
-        not the general case, and is honest about not being faster yet
-        for a signature-changing edit.
-      - **Still not "instantaneous" in an absolute sense, and here's
-        what's left in the ~78ms:** `apex_discover::discover` and
-        `apex_metadata`'s SFDX object/field walk both still re-walk the
-        whole directory tree on *every* call, unconditionally -- neither
-        is cached at all yet. That's the next concrete, measured lever if
-        warm-edit latency needs to drop further, not a new guess.
+        body-only edit): **~17ms** median -- a **~96% reduction** from
+        the ~438ms baseline once incremental rebind existed but before
+        the discovery/schema-caching fix below, and a **~40x** speedup
+        from the original ~677ms fully-cold baseline.
+      - **Two real regressions caught and fixed along the way, both by
+        the same discipline -- benchmark the actual change, not just the
+        feature it's meant to enable:**
+        1. The first implementation of incremental rebind made this
+           benchmark *worse* (~700ms) than the step before it, not
+           better -- `from_files_cached` was skipping recomputation but
+           still deep-cloning the *entire* `SymbolTable` and every
+           file's cached references/scopes into each call's independent
+           snapshot. Fixed by `Arc`-wrapping `SymbolTable`'s per-file
+           data/derived-index bundle and Pass 2's per-file output, so
+           assembling a snapshot is a handful of pointer clones for an
+           unaffected file, not a deep copy -- this got warm-edit
+           latency to ~78ms.
+        2. `apex_discover::discover` and `apex_metadata`'s SFDX
+           object/field walk were still re-walking (and, for metadata,
+           re-parsing every XML file in) the whole directory tree on
+           *every* call, unconditionally, uncached, and -- a separate,
+           real bug this surfaced -- `apex-binder` was doing that walk
+           **twice** per call (`apex_metadata::discover_sobjects`
+           re-walked internally instead of reusing the walk
+           `apex-binder` had just done). Fixed by caching the
+           `Discovery`/`SchemaIndex` pair in `BindCache`, only redone
+           when there's no cached walk yet or an `overrides` path names
+           a file the cached walk has never heard of (a newly created,
+           already-open file) -- and by adding
+           `apex_metadata::sobjects_from_discovery`/`SchemaIndex::from_discovery`
+           so the two walks collapse into one whenever a fresh one is
+           actually needed. Fixing this required also fixing a related
+           latent bug the caching made load-bearing rather than a rare
+           race: a file deleted between calls used to leave stale
+           symbols behind forever if `discovery` itself wasn't
+           re-walked (it's cached now, so it almost never is) --
+           `current_ids`/`current_files` are now derived from which
+           candidate files *actually* parsed successfully this call
+           (`parsed`), not from the raw candidate list, so a deletion
+           self-corrects (the file just fails to read) without needing a
+           fresh walk at all. This dropped warm-edit latency from ~78ms
+           to ~17ms.
+      - **A measurement red herring, for the record:** an intermediate
+        reading during work on the discovery-caching fix showed warm-edit
+        latency at ~645ms -- direct `Instant`-based timing placed *inside*
+        the exact same benchmark run showed the real per-call cost was
+        still ~17ms the whole time, so the ~645ms figure was criterion/
+        machine-level measurement noise (this project has hit this exact
+        false-regression pattern before, from background-process CPU
+        contention), not a real regression -- confirmed by re-running
+        clean and getting ~17ms consistently across repeated runs.
+      - **Honest scope note (still applies):** this is not full
+        per-reference dependency tracking (the original wording: "which
+        symbols/scopes/references become stale when file X's declarations
+        change"). It's one conservative, provably-safe rule -- if *any*
+        file's declarations changed, rebind the whole project (identical
+        cost to before); otherwise, rebind only the changed files. That
+        rule is sized to the dominant real editing pattern (typing inside
+        a method body), not the general case, and is honest about not
+        being faster yet for a signature-changing edit.
+      - **What's left in the ~17ms, honestly:** a file added to disk but
+        never opened in the editor (e.g. `git pull`, a build tool) still
+        won't be picked up until something else triggers a rediscovery --
+        there's no filesystem-watcher integration yet (`workspace/didChangeWatchedFiles`
+        isn't wired up), a real, separate, and already-tracked gap, not
+        papered over by this fix. Metadata XML edited with no
+        corresponding Apex-file signal has the same limit.
 
 ## 3. Feature surface
 

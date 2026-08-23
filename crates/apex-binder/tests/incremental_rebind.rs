@@ -168,3 +168,93 @@ fn declaration_changing_edit_via_incremental_cache_matches_a_cold_rebuild() {
          disagreed with a cold rebuild"
     );
 }
+
+/// `BindCache`'s directory walk (`discovery`) is only ever redone when
+/// something suggests it's stale (see `BoundProgram::from_files_cached`'s
+/// doc comment) -- so a file deleted between two calls has to
+/// self-correct a different way: it just fails to read this call, and
+/// that failure alone is what prunes its stale symbols out of the
+/// persistent `SymbolTable`. This proves that actually happens, rather
+/// than a deleted file's declarations lingering forever because the
+/// cached walk still lists it.
+#[test]
+fn deleting_a_file_leaves_no_stale_symbols_even_with_a_stale_cached_walk() {
+    let dir = write_fixture_dir(
+        "incremental-delete",
+        &[
+            ("Alpha.cls", "public class Alpha { }"),
+            ("Beta.cls", "public class Beta { }"),
+        ],
+    );
+
+    let mut cache = BindCache::default();
+    let first = BoundProgram::from_files_cached(&dir, &HashMap::new(), &mut cache);
+    assert!(
+        first
+            .symbols
+            .iter()
+            .any(|(_, s)| s.kind == SymbolKind::Class && s.name == "Beta"),
+        "Beta should have been collected on the first call"
+    );
+
+    std::fs::remove_file(dir.join("Beta.cls")).unwrap();
+    let second = BoundProgram::from_files_cached(&dir, &HashMap::new(), &mut cache);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        !second
+            .symbols
+            .iter()
+            .any(|(_, s)| s.kind == SymbolKind::Class && s.name == "Beta"),
+        "Beta.cls was deleted -- its symbols should be gone, not stale"
+    );
+    assert!(
+        second
+            .symbols
+            .iter()
+            .any(|(_, s)| s.kind == SymbolKind::Class && s.name == "Alpha"),
+        "Alpha.cls was untouched and should still be present"
+    );
+    assert_eq!(
+        second.file_count(),
+        1,
+        "the deleted file should no longer be counted"
+    );
+}
+
+/// The inverse case: a file created *and opened* after the first call
+/// (its content arrives only via `overrides`, exactly like a real
+/// editor's `didOpen` for a brand-new file) must still get bound on the
+/// very next call, without needing a fresh `BindCache` -- proving the
+/// `overrides`-vs-cached-walk staleness check actually triggers a
+/// rediscovery rather than only ever trusting the first walk.
+#[test]
+fn a_newly_created_and_opened_file_is_picked_up_without_resetting_the_cache() {
+    let dir = write_fixture_dir(
+        "incremental-create",
+        &[("Alpha.cls", "public class Alpha { }")],
+    );
+
+    let mut cache = BindCache::default();
+    let _first = BoundProgram::from_files_cached(&dir, &HashMap::new(), &mut cache);
+
+    // Simulate the editor creating (and writing to disk) a brand-new
+    // file, then sending `didOpen` for it -- its content shows up in
+    // `overrides` for a path the cached walk has never heard of.
+    let gamma_path = dir.join("Gamma.cls");
+    std::fs::write(&gamma_path, "public class Gamma { }").unwrap();
+    let mut overrides = HashMap::new();
+    overrides.insert(gamma_path, "public class Gamma { }".to_string());
+
+    let second = BoundProgram::from_files_cached(&dir, &overrides, &mut cache);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        second
+            .symbols
+            .iter()
+            .any(|(_, s)| s.kind == SymbolKind::Class && s.name == "Gamma"),
+        "a newly created, already-open file should be bound on the very next call"
+    );
+    assert_eq!(second.file_count(), 2);
+}

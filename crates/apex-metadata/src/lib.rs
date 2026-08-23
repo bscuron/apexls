@@ -28,7 +28,7 @@
 mod discover;
 mod xml;
 
-pub use discover::discover_sobjects;
+pub use discover::{discover_sobjects, sobjects_from_discovery};
 
 /// One SObject's schema, as reconstructed from local repo metadata only
 /// -- see the module doc comment for the standard-object gap this

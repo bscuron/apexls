@@ -12,9 +12,11 @@ use crate::file_id::FileId;
 use crate::file_table::FileTable;
 use crate::ptr::SyntaxPtr;
 use crate::reference_table::ReferenceTable;
+use crate::schema_index::SchemaIndex;
 use crate::scope::ScopeTree;
 use crate::symbol::SymbolId;
 use crate::symbol_table::SymbolTable;
+use apex_discover::Discovery;
 use apex_parser::Parse;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,6 +39,17 @@ pub(crate) struct FileBodies {
 #[derive(Default)]
 pub struct BindCache {
     pub(crate) files: FileTable,
+    /// The last directory walk (`apex_files`/`object_meta_files`/
+    /// `field_meta_files`) and the `SchemaIndex` built from it, reused
+    /// across calls instead of re-walking the whole tree (and re-parsing
+    /// every SFDX metadata XML file) unconditionally on every edit.
+    /// `None` only before the first call. See
+    /// `BoundProgram::from_files_cached`'s doc comment for exactly when
+    /// this gets refreshed, and what staleness it accepts as an honest
+    /// v1 limit (a file added on disk but never opened in the editor, or
+    /// metadata XML edited with no corresponding Apex-file signal).
+    pub(crate) discovery: Option<Discovery>,
+    pub(crate) schema: Option<Arc<SchemaIndex>>,
     /// Each path's last-seen `(content, Parse)` -- a parse is reused
     /// as-is whenever a file's content is byte-for-byte identical to
     /// last time, skipping that file's lex/parse entirely.

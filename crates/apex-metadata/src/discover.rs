@@ -16,9 +16,18 @@ use std::path::Path;
 /// [`SObjectSchema`] per distinct `<ApiName>`. Unreadable files and
 /// malformed XML are silently skipped rather than failing the whole
 /// discovery, matching `apex_discover::discover`'s error-tolerance.
+///
+/// Walks fresh every call -- prefer [`sobjects_from_discovery`] if the
+/// caller already has a [`apex_discover::Discovery`] in hand (e.g. it
+/// also needs `apex_files`, or is deciding whether to reuse a cached
+/// walk at all), so the tree isn't read twice.
 pub fn discover_sobjects(root: impl AsRef<Path>) -> Vec<SObjectSchema> {
-    let found = apex_discover::discover(root);
+    sobjects_from_discovery(&apex_discover::discover(root))
+}
 
+/// Like [`discover_sobjects`], but parses an already-computed
+/// [`apex_discover::Discovery`] instead of walking `root` itself.
+pub fn sobjects_from_discovery(found: &apex_discover::Discovery) -> Vec<SObjectSchema> {
     let mut objects: HashMap<String, (bool, Vec<FieldSchema>)> = HashMap::new();
 
     for path in &found.object_meta_files {
