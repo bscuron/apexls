@@ -1,0 +1,19 @@
+[package]
+name = "apex-binder"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apex-syntax.workspace = true
+apex-parser.workspace = true
+apex-metadata.workspace = true
+apex-discover.workspace = true
+rowan = "0.17.0"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "binder_bench"
+harness = false

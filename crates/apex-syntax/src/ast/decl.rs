@@ -6,8 +6,8 @@
 //! here is read-only, structural access over the tree, no semantics.
 
 use super::{
-    ast_node, clean_doc_comment, dispatch_enum, doc_comment_token, first_non_trivia_token,
-    token_after, Block, Expr, Name, Type,
+    ast_node, clean_doc_comment, direct_tokens, dispatch_enum, doc_comment_token,
+    first_non_trivia_token, last_non_trivia_token, token_after, Block, Expr, Name, Type,
 };
 use crate::{ApexLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::ast::{support, AstChildren, AstNode};
@@ -58,6 +58,7 @@ ast_node!(PropertyAccessor, PropertyAccessor);
 ast_node!(FormalParamList, FormalParamList);
 ast_node!(FormalParam, FormalParam);
 ast_node!(VarDeclarator, VarDeclarator);
+ast_node!(TypeArgList, TypeArgList);
 
 /// Shared by every declaration that can carry `modifier*` (classes,
 /// interfaces, enums, methods, constructors, fields, properties,
@@ -353,6 +354,53 @@ impl Annotation {
     /// node since an annotation reference isn't a declaration.
     pub fn name(&self) -> Option<SyntaxToken> {
         token_after(self.syntax(), SyntaxKind::AtSign)
+    }
+}
+
+impl Type {
+    /// The dotted path's identifier-shaped tokens (`Outer`, `Inner` for
+    /// `Outer.Inner[]`), in source order. Per-segment `TypeArgList`
+    /// children and the trailing `[` `]` array-suffix tokens are excluded
+    /// -- `direct_tokens` already skips into `TypeArgList` (a node, not a
+    /// token), so only the brackets need filtering out explicitly. Built
+    /// the same way as `SoqlFieldName::segments()`.
+    pub fn base_name_tokens(&self) -> Vec<SyntaxToken> {
+        direct_tokens(self.syntax())
+            .filter(|t| !matches!(t.kind(), SyntaxKind::LBrack | SyntaxKind::RBrack))
+            .collect()
+    }
+
+    /// The dotted path as plain text (`Outer.Inner`), excluding any type
+    /// arguments or array suffix -- built from `base_name_tokens()`
+    /// rather than `self.syntax().text()` so it can't pick up trivia or
+    /// generic-argument text.
+    pub fn text(&self) -> String {
+        self.base_name_tokens()
+            .iter()
+            .map(|t| t.text())
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// The first segment's `<...>` type arguments, if any. Per the
+    /// grammar each dotted segment can carry its own `TypeArgList`
+    /// (`Outer<T>.Inner<U>` is legal), but this only ever returns the
+    /// first one -- exactly matching what today's callers (a binder
+    /// resolving a declared type's generic arguments) need; a caller
+    /// after a later segment's arguments would need its own tree walk.
+    pub fn type_args(&self) -> Option<TypeArgList> {
+        support::child(self.syntax())
+    }
+
+    /// Whether the type ends in a `[]` array suffix.
+    pub fn is_array(&self) -> bool {
+        last_non_trivia_token(self.syntax()).is_some_and(|t| t.kind() == SyntaxKind::RBrack)
+    }
+}
+
+impl TypeArgList {
+    pub fn args(&self) -> AstChildren<Type> {
+        support::children(self.syntax())
     }
 }
 

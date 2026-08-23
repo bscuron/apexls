@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/apex-binder",
     "crates/apex-discover",
     "crates/apex-lexer",
     "crates/apex-metadata",
@@ -16,6 +17,7 @@ version = "0.1.0"
 license = "MIT"
 
 [workspace.dependencies]
+apex-binder = { path = "crates/apex-binder" }
 apex-discover = { path = "crates/apex-discover" }
 apex-lexer = { path = "crates/apex-lexer" }
 apex-metadata = { path = "crates/apex-metadata" }
