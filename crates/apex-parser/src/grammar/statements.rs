@@ -39,7 +39,12 @@ pub(crate) fn statement(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         SyntaxKind::SystemRunAs => runas_stmt(p),
         SyntaxKind::List | SyntaxKind::Map | SyntaxKind::Set => local_var_decl_stmt(p),
         SyntaxKind::Final | SyntaxKind::Transient => local_var_decl_stmt(p),
-        SyntaxKind::Identifier => local_var_decl_or_expr_stmt(p),
+        // Exact keyword arms above always win ties (e.g. `Insert`/`Try`/
+        // `For` are also `id`-shaped per the reference grammar, but Rust
+        // match already resolved those via the earlier exact arms), so
+        // this only ever catches identifiers plus the many SOQL/SOSL/DML
+        // keywords that double as ordinary names (`System`, `Name`, ...).
+        k if super::ids::is_id_kind(k) => local_var_decl_or_expr_stmt(p),
         _ => expr_stmt(p),
     };
     Some(s)
@@ -116,9 +121,9 @@ fn when_value(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     if p.at(SyntaxKind::Else) {
         p.bump();
-    } else if super::types::at_type_start(p) && p.nth(1) == SyntaxKind::Identifier {
+    } else if super::types::at_type_start(p) && super::ids::is_id_kind(p.nth(1)) {
         super::types::type_ref(p);
-        p.expect(SyntaxKind::Identifier);
+        super::ids::expect_id(p);
     } else {
         when_literal(p);
         while p.at(SyntaxKind::Comma) {
@@ -150,7 +155,7 @@ fn when_literal(p: &mut Parser<'_>) -> CompletedMarker {
         | SyntaxKind::Null => {
             p.bump();
         }
-        SyntaxKind::Identifier => {
+        k if super::ids::is_id_kind(k) => {
             super::types::qualified_name(p);
         }
         _ => p.error(format!("expected when-literal, found {:?}", p.current())),
@@ -193,7 +198,7 @@ fn try_enhanced_for_control(p: &mut Parser<'_>) -> bool {
     if !super::types::type_ref(p) {
         return false;
     }
-    if !p.at(SyntaxKind::Identifier) {
+    if !super::ids::at_id(p) {
         return false;
     }
     p.bump(); // id
@@ -304,7 +309,7 @@ fn catch_clause(p: &mut Parser<'_>) -> CompletedMarker {
     if !super::types::qualified_name(p) {
         p.error("expected exception type");
     }
-    p.expect(SyntaxKind::Identifier);
+    super::ids::expect_id(p);
     p.expect(SyntaxKind::RParen);
     block(p);
     m.complete(p, SyntaxKind::CatchClause)
@@ -450,14 +455,16 @@ fn try_local_var_decl_core(p: &mut Parser<'_>) -> bool {
     if !super::types::type_ref(p) {
         return false;
     }
-    if !p.at(SyntaxKind::Identifier) {
+    if !super::ids::at_id(p) {
         return false;
     }
     var_declarators(p);
     true
 }
 
-fn var_declarators(p: &mut Parser<'_>) {
+/// Shared with `grammar::declarations`' field declarations, which have
+/// the exact same `id (',' id ('=' expr)?)*` shape.
+pub(crate) fn var_declarators(p: &mut Parser<'_>) {
     var_declarator(p);
     while p.at(SyntaxKind::Comma) {
         p.bump();
@@ -467,7 +474,7 @@ fn var_declarators(p: &mut Parser<'_>) {
 
 fn var_declarator(p: &mut Parser<'_>) {
     let m = p.start();
-    p.expect(SyntaxKind::Identifier);
+    super::ids::expect_id(p);
     if p.at(SyntaxKind::Assign) {
         p.bump();
         super::expressions::expr(p);

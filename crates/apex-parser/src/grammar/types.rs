@@ -26,10 +26,8 @@ pub(crate) fn at_type_start(p: &Parser<'_>) -> bool {
 }
 
 fn at_type_name_start(p: &Parser<'_>, n: usize) -> bool {
-    matches!(
-        p.nth(n),
-        SyntaxKind::Identifier | SyntaxKind::List | SyntaxKind::Map | SyntaxKind::Set
-    )
+    let k = p.nth(n);
+    matches!(k, SyntaxKind::List | SyntaxKind::Map | SyntaxKind::Set) || super::ids::is_id_kind(k)
 }
 
 /// Parses a `Type` if one starts here; leaves the cursor untouched and
@@ -92,12 +90,12 @@ fn expect_close_angle(p: &mut Parser<'_>) {
 /// clause exception types, `whenValue`'s bare-enum-constant form, and
 /// `upsert`'s optional external-ID field reference.
 pub(crate) fn qualified_name(p: &mut Parser<'_>) -> bool {
-    if !p.at(SyntaxKind::Identifier) {
+    if !super::ids::at_id(p) {
         return false;
     }
     let m = p.start();
     p.bump();
-    while p.at(SyntaxKind::Dot) && p.nth(1) == SyntaxKind::Identifier {
+    while p.at(SyntaxKind::Dot) && super::ids::is_id_kind(p.nth(1)) {
         p.bump();
         p.bump();
     }

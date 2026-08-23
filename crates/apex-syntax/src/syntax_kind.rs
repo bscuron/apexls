@@ -133,6 +133,28 @@ syntax_kind! {
         BreakStmt, ContinueStmt, AccessLevelClause, InsertStmt,
         UpdateStmt, DeleteStmt, UndeleteStmt, UpsertStmt, MergeStmt,
         RunAsStmt, LocalVarDeclStmt, VarDeclarator, ExprStmt,
+
+        // ---- Declarations (Phase 3) ----
+        CompilationUnit, TriggerUnit, TriggerCase, TriggerBlock,
+        ClassDecl, InterfaceDecl, EnumDecl, EnumConstantList,
+        ClassBody, InterfaceBody, TypeRefList,
+        Modifier, Annotation, AnnotationArgList, AnnotationArg,
+        MethodDecl, ConstructorDecl, FieldDecl, PropertyDecl,
+        PropertyAccessor, FormalParamList, FormalParam,
+
+        // ---- SOQL (Phase 4) ----
+        SoqlExpr, SoqlSelectList, SoqlSelectEntry, SoqlFieldName,
+        SoqlFromList, SoqlUsingScope, SoqlWhereClause, SoqlLogicalExpr,
+        SoqlComparison, SoqlValue, SoqlValueList, SoqlWithClause,
+        SoqlFilteringExpr, SoqlDataCategorySelection, SoqlGroupBy,
+        SoqlOrderBy, SoqlFieldOrder, SoqlLimit, SoqlOffset, SoqlForClause,
+        SoqlUpdateList, SoqlBoundExpr, SoqlFunction, SoqlTypeOf,
+        SoqlWhenClause, SoqlElseClause, SoqlFieldNameList, SoqlSubQuery,
+
+        // ---- SOSL (Phase 4) ----
+        SoslExpr, SoslClauses, SoslSearchGroup, SoslFieldSpecList,
+        SoslFieldSpec, SoslWithClause, SoslFieldList, SoslUpdateList,
+        SoslNetworkList,
     }
 }
 

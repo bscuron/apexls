@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc afc740c793573a65bb931b7ce39af22191cbf9b7e6882e223f15fe152a5f44c6 # shrinks to fragment_idx = 241603635920828371, node_choice = 1336351753
 cc a550d98a0140a0089218b9acf1dc8ae1781b4484fa76cc46d19bc062bb1d4efc # shrinks to fragment_idx = 10794874182057163532, node_choice = 600476163
+cc 66f67d1215ed2345bc00056034bb1dd4f22d6827cbf9ae00ce5a5eadfbbdec07 # shrinks to fragment_idx = 335979068780813755, node_choice = 3693387253

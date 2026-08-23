@@ -44,6 +44,31 @@ pub fn parse_block(src: &str) -> Parse {
     })
 }
 
+/// Parse `src` as a whole `.cls` compilation unit: `modifier* (class |
+/// interface | enum)` declaration, EOF (Phase 3).
+pub fn parse_compilation_unit(src: &str) -> Parse {
+    parse_root(src, grammar::declarations::compilation_unit)
+}
+
+/// Parse `src` as a whole `.trigger` file: `trigger Name on Object
+/// (before insert, ...) { ... }` (Phase 3).
+pub fn parse_trigger_unit(src: &str) -> Parse {
+    parse_root(src, grammar::declarations::trigger_unit)
+}
+
+/// Like `parse_with`, but for entry points whose grammar function always
+/// produces a real node (never `Option::None`) and opens/completes its
+/// *own* root marker as the very first parser action -- no extra
+/// generic-root wrapping needed on top.
+fn parse_root(src: &str, f: impl FnOnce(&mut Parser<'_>) -> parser::CompletedMarker) -> Parse {
+    let input = Input::new(src);
+    let mut p = Parser::new(&input);
+    f(&mut p);
+    let (events, errors) = p.finish();
+    let green = event::build(src, &input, events);
+    Parse { green, errors }
+}
+
 fn parse_with(
     src: &str,
     root_kind: apex_syntax::SyntaxKind,

@@ -199,17 +199,25 @@ fn expr_primary_chain(p: &mut Parser<'_>) -> Option<CompletedMarker> {
             SyntaxKind::Dot | SyntaxKind::QuestionDot => {
                 let m = e.precede(p);
                 p.bump();
-                if at_member_name(p) {
-                    p.bump();
-                } else {
-                    p.error("expected member name");
-                }
+                super::ids::expect_any_id(p);
                 if p.at(SyntaxKind::LParen) {
                     arg_list(p);
                     m.complete(p, SyntaxKind::MethodCallExpr)
                 } else {
                     m.complete(p, SyntaxKind::FieldExpr)
                 }
+            }
+            // `[expr]` indexing, or -- when empty -- the array-type-suffix
+            // half of the `Foo[].class` reflection idiom (`Type[].class`
+            // for a non-generic type; `List<Foo>.class` is handled
+            // separately in `primary`, since `List`/`Map`/`Set` aren't
+            // `id`-shaped). An empty `[]` can never be a real index
+            // expression, so this can't misfire on genuine indexing.
+            SyntaxKind::LBrack if p.nth(1) == SyntaxKind::RBrack => {
+                let m = e.precede(p);
+                p.bump();
+                p.bump();
+                m.complete(p, SyntaxKind::IndexExpr)
             }
             SyntaxKind::LBrack => {
                 let m = e.precede(p);
@@ -222,15 +230,6 @@ fn expr_primary_chain(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         };
     }
     Some(e)
-}
-
-/// Phase 2's minimal member-name set: a plain `Identifier`. The reference
-/// grammar's `anyId` accepts a much wider set of contextual keywords here
-/// (`obj.when`, `obj.get`, ...); real-world uses of that are expected to
-/// show up as filtered-out, not-yet-supported fragments in the corpus
-/// round-trip test rather than as a regression.
-fn at_member_name(p: &Parser<'_>) -> bool {
-    p.at(SyntaxKind::Identifier)
 }
 
 fn is_literal_kind(k: SyntaxKind) -> bool {
@@ -272,21 +271,37 @@ fn primary(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         }
         SyntaxKind::New => Some(new_expr(p)),
         SyntaxKind::LParen => Some(paren_or_cast_expr(p)),
-        SyntaxKind::Identifier if p.nth(1) == SyntaxKind::LParen => {
+        // `List<Foo>.class`/`Map<K, V>.class` -- the reflection idiom for
+        // getting an Apex `Type` token for a generic collection type.
+        // `List`/`Map`/`Set` aren't `id`-shaped (they're reserved
+        // collection-type keywords, excluded from `id` in `grammar::ids`),
+        // so this can't fall through the generic name-expression arm
+        // below; parse the `Type` itself and let `expr_primary_chain`'s
+        // `.` handling attach the `class` member access as usual.
+        SyntaxKind::List | SyntaxKind::Map | SyntaxKind::Set if p.nth(1) == SyntaxKind::Lt => {
+            let m = p.start();
+            super::types::type_ref(p);
+            Some(m.complete(p, SyntaxKind::NameExpr))
+        }
+        _ if super::soql::at_sosl_start(p) => Some(super::soql::sosl_expr(p)),
+        _ if super::soql::at_soql_start(p) => Some(super::soql::soql_expr(p)),
+        k if is_literal_kind(k) => {
+            let m = p.start();
+            p.bump();
+            Some(m.complete(p, SyntaxKind::LiteralExpr))
+        }
+        // `primary: ... | id | ...` -- id, not anyId (a bare expression
+        // can't be named e.g. `new` or `class`, only accessed as `.new`).
+        k if super::ids::is_id_kind(k) && p.nth(1) == SyntaxKind::LParen => {
             let m = p.start();
             p.bump();
             arg_list(p);
             Some(m.complete(p, SyntaxKind::CallExpr))
         }
-        SyntaxKind::Identifier => {
+        k if super::ids::is_id_kind(k) => {
             let m = p.start();
             p.bump();
             Some(m.complete(p, SyntaxKind::NameExpr))
-        }
-        k if is_literal_kind(k) => {
-            let m = p.start();
-            p.bump();
-            Some(m.complete(p, SyntaxKind::LiteralExpr))
         }
         _ => {
             p.error(format!("expected expression, found {:?}", p.current()));
@@ -459,9 +474,18 @@ fn paren_expr_body(p: &mut Parser<'_>) -> CompletedMarker {
 /// documented simplifications versus ANTLR's full adaptive lookahead,
 /// matching how this construct is actually used in practice -- a cast of
 /// a pre-incremented value is vanishingly rare real-world Apex.
+///
+/// Also excludes `Instanceof`, even though it's `id`-shaped per the
+/// reference grammar (`Integer instanceof = 5;` legally declares a
+/// variable named `instanceof`): `(a) instanceof Foo` must parse as
+/// `InstanceofExpr(ParenExpr(a), Foo)`, not as a cast of type `a` applied
+/// to an operand literally named `instanceof` (which would then strand
+/// `Foo`) -- same real-world-frequency rationale as the arithmetic
+/// exclusions above, caught by the same metamorphic proptest.
 fn at_cast_operand_start(p: &Parser<'_>, n: usize) -> bool {
     let k = p.nth(n);
     is_literal_kind(k)
+        || (super::ids::is_id_kind(k) && k != SyntaxKind::Instanceof)
         || matches!(
             k,
             SyntaxKind::Bang
@@ -470,7 +494,6 @@ fn at_cast_operand_start(p: &Parser<'_>, n: usize) -> bool {
                 | SyntaxKind::Super
                 | SyntaxKind::New
                 | SyntaxKind::LParen
-                | SyntaxKind::Identifier
                 | SyntaxKind::List
                 | SyntaxKind::Map
                 | SyntaxKind::Set
