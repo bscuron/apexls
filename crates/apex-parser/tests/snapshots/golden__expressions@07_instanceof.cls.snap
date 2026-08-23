@@ -1,0 +1,18 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/expressions/07_instanceof.cls
+---
+# source
+a instanceof Foo
+
+# tree
+ExprRoot@0..16
+  InstanceofExpr@0..16
+    NameExpr@0..2
+      Identifier@0..1 "a"
+      Whitespace@1..2 " "
+    Instanceof@2..12 "instanceof"
+    Whitespace@12..13 " "
+    Type@13..16
+      Identifier@13..16 "Foo"

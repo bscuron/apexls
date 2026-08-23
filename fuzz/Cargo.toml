@@ -1,0 +1,25 @@
+[package]
+name = "apexls-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Deliberately its own workspace, not a member of the root one: fuzz
+# targets commonly need dependency versions (or nightly-only features)
+# pinned differently from the main crates, and cargo-fuzz itself expects
+# this layout.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+apex-parser = { path = "../crates/apex-parser" }
+
+[[bin]]
+name = "parser_no_panic"
+path = "fuzz_targets/parser_no_panic.rs"
+test = false
+doc = false
+bench = false

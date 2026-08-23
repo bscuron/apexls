@@ -1,0 +1,18 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/expressions/13_cast.cls
+---
+# source
+(Foo) x
+
+# tree
+ExprRoot@0..7
+  CastExpr@0..7
+    LParen@0..1 "("
+    Type@1..4
+      Identifier@1..4 "Foo"
+    RParen@4..5 ")"
+    Whitespace@5..6 " "
+    NameExpr@6..7
+      Identifier@6..7 "x"

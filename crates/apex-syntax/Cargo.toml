@@ -5,3 +5,11 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+apex-lexer.workspace = true
+# Safe, derive-based u16 -> SyntaxKind conversion for rowan::Language,
+# instead of a hand-written unsafe transmute (the usual pattern for this).
+num_enum = "0.7.6"
+# Lossless green/red syntax tree (the same library rust-analyzer uses):
+# O(1)-clone, structurally-shared immutable trees, a natural fit for a
+# language server reparsing on every keystroke.
+rowan = "0.17.0"

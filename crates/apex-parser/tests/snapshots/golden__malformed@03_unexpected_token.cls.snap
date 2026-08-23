@@ -1,0 +1,21 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/malformed/03_unexpected_token.cls
+---
+# source
+a = ;
+
+# tree
+StmtRoot@0..5
+  ExprStmt@0..5
+    BinExpr@0..4
+      NameExpr@0..2
+        Identifier@0..1 "a"
+        Whitespace@1..2 " "
+      Assign@2..3 "="
+      Whitespace@3..4 " "
+    Semi@4..5 ";"
+
+# errors
+ParseError { message: "expected expression, found Semi", offset: 4 }

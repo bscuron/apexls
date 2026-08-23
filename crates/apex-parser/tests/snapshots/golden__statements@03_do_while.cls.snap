@@ -1,0 +1,33 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/statements/03_do_while.cls
+---
+# source
+do { a(); } while (b);
+
+# tree
+StmtRoot@0..22
+  DoWhileStmt@0..22
+    Do@0..2 "do"
+    Whitespace@2..3 " "
+    Block@3..12
+      LBrace@3..4 "{"
+      Whitespace@4..5 " "
+      ExprStmt@5..10
+        CallExpr@5..8
+          Identifier@5..6 "a"
+          ArgList@6..8
+            LParen@6..7 "("
+            RParen@7..8 ")"
+        Semi@8..9 ";"
+        Whitespace@9..10 " "
+      RBrace@10..11 "}"
+      Whitespace@11..12 " "
+    While@12..17 "while"
+    Whitespace@17..18 " "
+    LParen@18..19 "("
+    NameExpr@19..20
+      Identifier@19..20 "b"
+    RParen@20..21 ")"
+    Semi@21..22 ";"

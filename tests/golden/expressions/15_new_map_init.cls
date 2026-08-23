@@ -1,0 +1,1 @@
+new Map<String, Integer>{'a' => 1, 'b' => 2}

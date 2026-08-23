@@ -1,0 +1,1 @@
+switch on x { when 1, 2 { a(); } when Account acc { b(); } when else { c(); } }

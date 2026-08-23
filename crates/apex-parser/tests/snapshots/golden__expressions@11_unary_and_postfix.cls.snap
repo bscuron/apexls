@@ -1,0 +1,24 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/expressions/11_unary_and_postfix.cls
+---
+# source
+-a++ + !b
+
+# tree
+ExprRoot@0..9
+  BinExpr@0..9
+    UnaryExpr@0..5
+      Sub@0..1 "-"
+      PostfixExpr@1..5
+        NameExpr@1..2
+          Identifier@1..2 "a"
+        Inc@2..4 "++"
+        Whitespace@4..5 " "
+    Add@5..6 "+"
+    Whitespace@6..7 " "
+    UnaryExpr@7..9
+      Bang@7..8 "!"
+      NameExpr@8..9
+        Identifier@8..9 "b"

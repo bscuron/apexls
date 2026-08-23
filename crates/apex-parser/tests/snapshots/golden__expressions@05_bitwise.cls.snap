@@ -1,0 +1,30 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/expressions/05_bitwise.cls
+---
+# source
+a | b ^ c & d
+
+# tree
+ExprRoot@0..13
+  BinExpr@0..13
+    NameExpr@0..2
+      Identifier@0..1 "a"
+      Whitespace@1..2 " "
+    BitOr@2..3 "|"
+    Whitespace@3..4 " "
+    BinExpr@4..13
+      NameExpr@4..6
+        Identifier@4..5 "b"
+        Whitespace@5..6 " "
+      Caret@6..7 "^"
+      Whitespace@7..8 " "
+      BinExpr@8..13
+        NameExpr@8..10
+          Identifier@8..9 "c"
+          Whitespace@9..10 " "
+        BitAnd@10..11 "&"
+        Whitespace@11..12 " "
+        NameExpr@12..13
+          Identifier@12..13 "d"

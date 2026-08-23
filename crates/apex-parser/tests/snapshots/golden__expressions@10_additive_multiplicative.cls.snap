@@ -1,0 +1,24 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/expressions/10_additive_multiplicative.cls
+---
+# source
+a + b * c
+
+# tree
+ExprRoot@0..9
+  BinExpr@0..9
+    NameExpr@0..2
+      Identifier@0..1 "a"
+      Whitespace@1..2 " "
+    Add@2..3 "+"
+    Whitespace@3..4 " "
+    BinExpr@4..9
+      NameExpr@4..6
+        Identifier@4..5 "b"
+        Whitespace@5..6 " "
+      Mul@6..7 "*"
+      Whitespace@7..8 " "
+      NameExpr@8..9
+        Identifier@8..9 "c"

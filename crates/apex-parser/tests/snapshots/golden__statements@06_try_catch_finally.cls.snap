@@ -1,0 +1,64 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/statements/06_try_catch_finally.cls
+---
+# source
+try { a(); } catch (Exception e) { b(); } finally { c(); }
+
+# tree
+StmtRoot@0..58
+  TryStmt@0..58
+    Try@0..3 "try"
+    Whitespace@3..4 " "
+    Block@4..13
+      LBrace@4..5 "{"
+      Whitespace@5..6 " "
+      ExprStmt@6..11
+        CallExpr@6..9
+          Identifier@6..7 "a"
+          ArgList@7..9
+            LParen@7..8 "("
+            RParen@8..9 ")"
+        Semi@9..10 ";"
+        Whitespace@10..11 " "
+      RBrace@11..12 "}"
+      Whitespace@12..13 " "
+    CatchClause@13..42
+      Catch@13..18 "catch"
+      Whitespace@18..19 " "
+      LParen@19..20 "("
+      QualifiedName@20..30
+        Identifier@20..29 "Exception"
+        Whitespace@29..30 " "
+      Identifier@30..31 "e"
+      RParen@31..32 ")"
+      Whitespace@32..33 " "
+      Block@33..42
+        LBrace@33..34 "{"
+        Whitespace@34..35 " "
+        ExprStmt@35..40
+          CallExpr@35..38
+            Identifier@35..36 "b"
+            ArgList@36..38
+              LParen@36..37 "("
+              RParen@37..38 ")"
+          Semi@38..39 ";"
+          Whitespace@39..40 " "
+        RBrace@40..41 "}"
+        Whitespace@41..42 " "
+    FinallyClause@42..58
+      Finally@42..49 "finally"
+      Whitespace@49..50 " "
+      Block@50..58
+        LBrace@50..51 "{"
+        Whitespace@51..52 " "
+        ExprStmt@52..57
+          CallExpr@52..55
+            Identifier@52..53 "c"
+            ArgList@53..55
+              LParen@53..54 "("
+              RParen@54..55 ")"
+          Semi@55..56 ";"
+          Whitespace@56..57 " "
+        RBrace@57..58 "}"

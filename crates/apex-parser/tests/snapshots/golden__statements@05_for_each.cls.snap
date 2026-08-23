@@ -1,0 +1,37 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/statements/05_for_each.cls
+---
+# source
+for (Account acc : accounts) { b(); }
+
+# tree
+StmtRoot@0..37
+  ForEachStmt@0..37
+    For@0..3 "for"
+    Whitespace@3..4 " "
+    LParen@4..5 "("
+    Type@5..13
+      Identifier@5..12 "Account"
+      Whitespace@12..13 " "
+    Identifier@13..16 "acc"
+    Whitespace@16..17 " "
+    Colon@17..18 ":"
+    Whitespace@18..19 " "
+    NameExpr@19..27
+      Identifier@19..27 "accounts"
+    RParen@27..28 ")"
+    Whitespace@28..29 " "
+    Block@29..37
+      LBrace@29..30 "{"
+      Whitespace@30..31 " "
+      ExprStmt@31..36
+        CallExpr@31..34
+          Identifier@31..32 "b"
+          ArgList@32..34
+            LParen@32..33 "("
+            RParen@33..34 ")"
+        Semi@34..35 ";"
+        Whitespace@35..36 " "
+      RBrace@36..37 "}"

@@ -1,0 +1,22 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/malformed/01_missing_semicolon.cls
+---
+# source
+a = b
+
+# tree
+StmtRoot@0..5
+  ExprStmt@0..5
+    BinExpr@0..5
+      NameExpr@0..2
+        Identifier@0..1 "a"
+        Whitespace@1..2 " "
+      Assign@2..3 "="
+      Whitespace@3..4 " "
+      NameExpr@4..5
+        Identifier@4..5 "b"
+
+# errors
+ParseError { message: "expected Semi, found Eof", offset: 5 }

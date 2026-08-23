@@ -1,0 +1,56 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/statements/10_local_var_decl.cls
+---
+# source
+List<Map<String, Integer>> x = new List<Map<String, Integer>>();
+
+# tree
+StmtRoot@0..64
+  LocalVarDeclStmt@0..64
+    Type@0..27
+      List@0..4 "List"
+      TypeArgList@4..27
+        Lt@4..5 "<"
+        Type@5..25
+          Map@5..8 "Map"
+          TypeArgList@8..25
+            Lt@8..9 "<"
+            Type@9..15
+              Identifier@9..15 "String"
+            Comma@15..16 ","
+            Whitespace@16..17 " "
+            Type@17..24
+              Identifier@17..24 "Integer"
+            Gt@24..25 ">"
+        Gt@25..26 ">"
+        Whitespace@26..27 " "
+    VarDeclarator@27..63
+      Identifier@27..28 "x"
+      Whitespace@28..29 " "
+      Assign@29..30 "="
+      Whitespace@30..31 " "
+      NewExpr@31..63
+        New@31..34 "new"
+        Whitespace@34..35 " "
+        Type@35..61
+          List@35..39 "List"
+          TypeArgList@39..61
+            Lt@39..40 "<"
+            Type@40..60
+              Map@40..43 "Map"
+              TypeArgList@43..60
+                Lt@43..44 "<"
+                Type@44..50
+                  Identifier@44..50 "String"
+                Comma@50..51 ","
+                Whitespace@51..52 " "
+                Type@52..59
+                  Identifier@52..59 "Integer"
+                Gt@59..60 ">"
+            Gt@60..61 ">"
+        ArgList@61..63
+          LParen@61..62 "("
+          RParen@62..63 ")"
+    Semi@63..64 ";"

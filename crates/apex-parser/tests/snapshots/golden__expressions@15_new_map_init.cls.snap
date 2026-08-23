@@ -1,0 +1,45 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/expressions/15_new_map_init.cls
+---
+# source
+new Map<String, Integer>{'a' => 1, 'b' => 2}
+
+# tree
+ExprRoot@0..44
+  NewExpr@0..44
+    New@0..3 "new"
+    Whitespace@3..4 " "
+    Type@4..24
+      Map@4..7 "Map"
+      TypeArgList@7..24
+        Lt@7..8 "<"
+        Type@8..14
+          Identifier@8..14 "String"
+        Comma@14..15 ","
+        Whitespace@15..16 " "
+        Type@16..23
+          Identifier@16..23 "Integer"
+        Gt@23..24 ">"
+    MapInitializer@24..44
+      LBrace@24..25 "{"
+      MapEntry@25..33
+        LiteralExpr@25..29
+          StringLiteral@25..28 "'a'"
+          Whitespace@28..29 " "
+        MapTo@29..31 "=>"
+        Whitespace@31..32 " "
+        LiteralExpr@32..33
+          IntegerLiteral@32..33 "1"
+      Comma@33..34 ","
+      Whitespace@34..35 " "
+      MapEntry@35..43
+        LiteralExpr@35..39
+          StringLiteral@35..38 "'b'"
+          Whitespace@38..39 " "
+        MapTo@39..41 "=>"
+        Whitespace@41..42 " "
+        LiteralExpr@42..43
+          IntegerLiteral@42..43 "2"
+      RBrace@43..44 "}"

@@ -1,0 +1,29 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/statements/09_runas.cls
+---
+# source
+System.runAs(u) { a(); }
+
+# tree
+StmtRoot@0..24
+  RunAsStmt@0..24
+    SystemRunAs@0..12 "System.runAs"
+    LParen@12..13 "("
+    NameExpr@13..14
+      Identifier@13..14 "u"
+    RParen@14..15 ")"
+    Whitespace@15..16 " "
+    Block@16..24
+      LBrace@16..17 "{"
+      Whitespace@17..18 " "
+      ExprStmt@18..23
+        CallExpr@18..21
+          Identifier@18..19 "a"
+          ArgList@19..21
+            LParen@19..20 "("
+            RParen@20..21 ")"
+        Semi@21..22 ";"
+        Whitespace@22..23 " "
+      RBrace@23..24 "}"

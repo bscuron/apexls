@@ -1,0 +1,56 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/statements/04_for_classic.cls
+---
+# source
+for (Integer i = 0; i < 10; i++) { a(); }
+
+# tree
+StmtRoot@0..41
+  ForStmt@0..41
+    For@0..3 "for"
+    Whitespace@3..4 " "
+    LParen@4..5 "("
+    ForInit@5..18
+      Type@5..13
+        Identifier@5..12 "Integer"
+        Whitespace@12..13 " "
+      VarDeclarator@13..18
+        Identifier@13..14 "i"
+        Whitespace@14..15 " "
+        Assign@15..16 "="
+        Whitespace@16..17 " "
+        LiteralExpr@17..18
+          IntegerLiteral@17..18 "0"
+    Semi@18..19 ";"
+    Whitespace@19..20 " "
+    BinExpr@20..26
+      NameExpr@20..22
+        Identifier@20..21 "i"
+        Whitespace@21..22 " "
+      Lt@22..23 "<"
+      Whitespace@23..24 " "
+      LiteralExpr@24..26
+        IntegerLiteral@24..26 "10"
+    Semi@26..27 ";"
+    Whitespace@27..28 " "
+    ForUpdate@28..31
+      PostfixExpr@28..31
+        NameExpr@28..29
+          Identifier@28..29 "i"
+        Inc@29..31 "++"
+    RParen@31..32 ")"
+    Whitespace@32..33 " "
+    Block@33..41
+      LBrace@33..34 "{"
+      Whitespace@34..35 " "
+      ExprStmt@35..40
+        CallExpr@35..38
+          Identifier@35..36 "a"
+          ArgList@36..38
+            LParen@36..37 "("
+            RParen@37..38 ")"
+        Semi@38..39 ";"
+        Whitespace@39..40 " "
+      RBrace@40..41 "}"

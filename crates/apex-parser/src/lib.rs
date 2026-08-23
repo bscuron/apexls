@@ -3,3 +3,286 @@
 //! Error recovery is a first-class design goal: on a syntax error the
 //! parser should resynchronize at a statement/member boundary and keep
 //! producing a best-effort tree for the rest of the file.
+
+mod errors;
+mod event;
+mod grammar;
+mod input;
+mod parser;
+
+pub use errors::{Parse, ParseError};
+
+use input::Input;
+use parser::Parser;
+
+/// Parse `src` as a single expression (Phase 2's `<=`/`>=`/shift merges,
+/// the full corrected precedence table, and the cast-vs-paren
+/// disambiguation all apply). Trailing content after the expression is
+/// left unconsumed in the token stream but does not appear in the
+/// returned tree -- callers wanting "this whole string must be exactly
+/// one expression" should check `Parse::errors` is empty and that the
+/// tree's text covers all of `src`.
+pub fn parse_expression(src: &str) -> Parse {
+    parse_with(src, apex_syntax::SyntaxKind::ExprRoot, |p| {
+        grammar::expressions::expr(p);
+    })
+}
+
+/// Parse `src` as a single statement (any of the 19 forms in
+/// `grammar::statements`, including the six DML statements, `switch on`,
+/// and `System.runAs`).
+pub fn parse_statement(src: &str) -> Parse {
+    parse_with(src, apex_syntax::SyntaxKind::StmtRoot, |p| {
+        grammar::statements::statement(p);
+    })
+}
+
+/// Parse `src` as a brace-delimited block (`{ stmt* }`).
+pub fn parse_block(src: &str) -> Parse {
+    parse_with(src, apex_syntax::SyntaxKind::BlockRoot, |p| {
+        grammar::statements::block(p);
+    })
+}
+
+fn parse_with(
+    src: &str,
+    root_kind: apex_syntax::SyntaxKind,
+    f: impl FnOnce(&mut Parser<'_>),
+) -> Parse {
+    let input = Input::new(src);
+    let mut p = Parser::new(&input);
+    let m = p.start();
+    f(&mut p);
+    m.complete(&mut p, root_kind);
+    let (events, errors) = p.finish();
+    let green = event::build(src, &input, events);
+    Parse { green, errors }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::Input;
+    use crate::parser::Parser;
+    use apex_syntax::SyntaxKind;
+
+    /// Smoke test for the core machinery (input -> parser -> events ->
+    /// sink), independent of any real grammar: parse a single identifier
+    /// token wrapped in a root node and check the tree round-trips.
+    #[test]
+    fn core_pipeline_round_trips_a_single_token() {
+        let src = "  foo  ";
+        let input = Input::new(src);
+        let mut p = Parser::new(&input);
+        let m = p.start();
+        p.bump();
+        m.complete(&mut p, SyntaxKind::ExprRoot);
+        let (events, errors) = p.finish();
+        assert!(errors.is_empty());
+
+        let green = event::build(src, &input, events);
+        let parse = Parse {
+            green,
+            errors: Vec::new(),
+        };
+        assert_eq!(parse.syntax().text().to_string(), src);
+    }
+
+    /// Exercises the newline-split trivia rule and a nested-node wrap via
+    /// `precede`: `a; // trailing\nb` parsed as two child nodes under one
+    /// root. `// trailing` must stay glued to `a`'s statement as trailing
+    /// trivia (no newline before it truncates that run), while the
+    /// newline itself is the split point, so `\n` also ends up trailing
+    /// on `a`'s side (up to *and including* the first newline) and `b`
+    /// gets no leading trivia at all.
+    #[test]
+    fn trivia_split_and_precede_round_trip() {
+        let src = "a; // trailing\nb";
+        let input = Input::new(src);
+        let mut p = Parser::new(&input);
+        let root = p.start();
+
+        // First statement: `a` wrapped in a node, then retroactively
+        // preceded to include the following `;` too.
+        let a = p.start();
+        p.bump(); // a
+        let a = a.complete(&mut p, SyntaxKind::NameExpr);
+        let stmt1 = a.precede(&mut p);
+        p.bump(); // ;
+        stmt1.complete(&mut p, SyntaxKind::ExprStmt);
+
+        // Second statement: bare `b`.
+        let stmt2 = p.start();
+        p.bump(); // b
+        stmt2.complete(&mut p, SyntaxKind::ExprStmt);
+
+        root.complete(&mut p, SyntaxKind::BlockRoot);
+        let (events, errors) = p.finish();
+        assert!(errors.is_empty());
+
+        let green = event::build(src, &input, events);
+        let parse = Parse {
+            green,
+            errors: Vec::new(),
+        };
+        let tree = parse.syntax();
+        assert_eq!(tree.text().to_string(), src);
+
+        let children: Vec<_> = tree.children().collect();
+        assert_eq!(
+            children.len(),
+            2,
+            "expected two ExprStmt children, got {children:?}"
+        );
+        assert_eq!(children[0].kind(), SyntaxKind::ExprStmt);
+        assert_eq!(children[0].text().to_string(), "a; // trailing\n");
+        assert_eq!(children[1].kind(), SyntaxKind::ExprStmt);
+        assert_eq!(children[1].text().to_string(), "b");
+    }
+
+    fn assert_expr_round_trips(src: &str) {
+        let parse = parse_expression(src);
+        assert!(
+            parse.errors.is_empty(),
+            "{src:?}: unexpected errors: {:?}",
+            parse.errors
+        );
+        assert_eq!(
+            parse.syntax().text().to_string(),
+            src,
+            "{src:?} did not round-trip"
+        );
+    }
+
+    fn assert_stmt_round_trips(src: &str) {
+        let parse = parse_statement(src);
+        assert!(
+            parse.errors.is_empty(),
+            "{src:?}: unexpected errors: {:?}",
+            parse.errors
+        );
+        assert_eq!(
+            parse.syntax().text().to_string(),
+            src,
+            "{src:?} did not round-trip"
+        );
+    }
+
+    /// Broad smoke coverage across the whole precedence table, the two
+    /// backtracking cases, and every statement form -- not a substitute
+    /// for the structural (insta) golden suite, just a fast "does the
+    /// foundation actually work" check before building on top of it.
+    #[test]
+    fn expressions_round_trip() {
+        for src in [
+            "a",
+            "1",
+            "'hello'",
+            "true",
+            "null",
+            "this",
+            "super",
+            "a = b",
+            "a = b = c",
+            "a ? b : c",
+            "a ? b ? c : d : e",
+            "a ?? b ?? c",
+            "a || b && c",
+            "a | b ^ c & d",
+            "a == b != c === d !== e",
+            "a instanceof Foo",
+            "a < b",
+            "a > b",
+            "a <= b",
+            "a >= b",
+            "a << b",
+            "a >> b",
+            "a >>> b",
+            "a + b * c",
+            "(a + b) * c",
+            "-a + +b",
+            "!a && ~b",
+            "a++ + ++b",
+            "-a++",
+            "!a++",
+            "a.b.c",
+            "a?.b",
+            "a[0]",
+            "a.b()",
+            "a.b(1, 2)",
+            "foo()",
+            "foo(1, 2)",
+            "this(1)",
+            "super(1)",
+            "(Foo) x",
+            "(Foo.Bar) x",
+            "(a + b)",
+            "(a)",
+            "new Foo()",
+            "new Foo(1, 2)",
+            "new List<Integer>()",
+            "new List<List<Integer>>()",
+            "new Integer[5]",
+            "new Integer[]{1, 2, 3}",
+            "new List<Integer>{1, 2, 3}",
+            "new Map<String, Integer>{'a' => 1, 'b' => 2}",
+            "new Foo.Bar()",
+        ] {
+            assert_expr_round_trips(src);
+        }
+    }
+
+    #[test]
+    fn statements_round_trip() {
+        for src in [
+            "foo();",
+            "a = b;",
+            "Integer x = 5;",
+            "Integer x = 5, y = 6;",
+            "final Integer x = 5;",
+            "List<Integer> xs = new List<Integer>();",
+            "foo.bar();",
+            "if (a) { b(); }",
+            "if (a) { b(); } else { c(); }",
+            "if (a) b(); else c();",
+            "while (a) { b(); }",
+            "while (a) ;",
+            "do { a(); } while (b);",
+            "for (Integer i = 0; i < 10; i++) { a(); }",
+            "for (Account a : accounts) { b(); }",
+            "for (;;) { a(); }",
+            "return;",
+            "return a;",
+            "throw new MyException();",
+            "break;",
+            "continue;",
+            "try { a(); } catch (Exception e) { b(); }",
+            "try { a(); } catch (Exception e) { b(); } finally { c(); }",
+            "try { a(); } finally { c(); }",
+            "insert a;",
+            "insert as system a;",
+            "update a;",
+            "delete a;",
+            "undelete a;",
+            "upsert a;",
+            "upsert a Some__c;",
+            "merge a b;",
+            "System.runAs(u) { a(); }",
+            "switch on x { when 1, 2 { a(); } when Account acc { b(); } when else { c(); } }",
+        ] {
+            assert_stmt_round_trips(src);
+        }
+    }
+
+    #[test]
+    fn block_round_trips() {
+        let src = "{ Integer x = 1; if (x > 0) { return x; } return -x; }";
+        let parse = parse_block(src);
+        assert!(
+            parse.errors.is_empty(),
+            "unexpected errors: {:?}",
+            parse.errors
+        );
+        assert_eq!(parse.syntax().text().to_string(), src);
+    }
+}

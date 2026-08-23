@@ -1,0 +1,23 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/statements/11_local_var_decl_vs_expr_stmt.cls
+---
+# source
+foo.bar.baz();
+
+# tree
+StmtRoot@0..14
+  ExprStmt@0..14
+    MethodCallExpr@0..13
+      FieldExpr@0..7
+        NameExpr@0..3
+          Identifier@0..3 "foo"
+        Dot@3..4 "."
+        Identifier@4..7 "bar"
+      Dot@7..8 "."
+      Identifier@8..11 "baz"
+      ArgList@11..13
+        LParen@11..12 "("
+        RParen@12..13 ")"
+    Semi@13..14 ";"

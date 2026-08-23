@@ -1,0 +1,26 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/expressions/14_method_chain.cls
+---
+# source
+a.b().c[0]
+
+# tree
+ExprRoot@0..10
+  IndexExpr@0..10
+    FieldExpr@0..7
+      MethodCallExpr@0..5
+        NameExpr@0..1
+          Identifier@0..1 "a"
+        Dot@1..2 "."
+        Identifier@2..3 "b"
+        ArgList@3..5
+          LParen@3..4 "("
+          RParen@4..5 ")"
+      Dot@5..6 "."
+      Identifier@6..7 "c"
+    LBrack@7..8 "["
+    LiteralExpr@8..9
+      IntegerLiteral@8..9 "0"
+    RBrack@9..10 "]"

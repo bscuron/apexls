@@ -1,0 +1,24 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/statements/08_dml.cls
+---
+# source
+upsert as system records Some_External_Id__c;
+
+# tree
+StmtRoot@0..45
+  UpsertStmt@0..45
+    Upsert@0..6 "upsert"
+    Whitespace@6..7 " "
+    AccessLevelClause@7..17
+      As@7..9 "as"
+      Whitespace@9..10 " "
+      System@10..16 "system"
+      Whitespace@16..17 " "
+    NameExpr@17..25
+      Identifier@17..24 "records"
+      Whitespace@24..25 " "
+    QualifiedName@25..44
+      Identifier@25..44 "Some_External_Id__c"
+    Semi@44..45 ";"

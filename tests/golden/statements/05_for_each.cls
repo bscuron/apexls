@@ -1,0 +1,1 @@
+for (Account acc : accounts) { b(); }
