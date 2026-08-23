@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/apex-discover",
     "crates/apex-lexer",
+    "crates/apex-metadata",
     "crates/apex-syntax",
     "crates/apex-parser",
     "crates/apex-printer",
@@ -17,6 +18,7 @@ license = "MIT"
 [workspace.dependencies]
 apex-discover = { path = "crates/apex-discover" }
 apex-lexer = { path = "crates/apex-lexer" }
+apex-metadata = { path = "crates/apex-metadata" }
 apex-syntax = { path = "crates/apex-syntax" }
 apex-parser = { path = "crates/apex-parser" }
 apex-printer = { path = "crates/apex-printer" }

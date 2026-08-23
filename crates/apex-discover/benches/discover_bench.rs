@@ -62,6 +62,15 @@ fn bench_walk(c: &mut Criterion) {
             black_box(out)
         });
     });
+    // The unified walk (source + object/field metadata) can't prune
+    // `objects`/`fields` the way `find_apex_files` does -- that's exactly
+    // where metadata lives -- so it's expected to cost more than
+    // `pruned_parallel` alone. What this tracks is *how much* more, so a
+    // regression in that gap (as opposed to the gap that's inherent to
+    // walking a directory tree `find_apex_files` gets to skip) is visible.
+    group.bench_function("discover_parallel", |b| {
+        b.iter(|| black_box(apex_discover::discover(black_box(&root))));
+    });
     group.finish();
 }
 

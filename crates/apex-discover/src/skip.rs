@@ -1,5 +1,8 @@
 //! Directory names that can be pruned outright when searching a
-//! Salesforce repo for `.cls`/`.trigger` files.
+//! Salesforce repo for `.cls`/`.trigger` files -- or, via
+//! [`should_skip_dir_keep_metadata_dirs`], the same list minus
+//! `objects`/`fields`, for callers that also want
+//! `.object-meta.xml`/`.field-meta.xml` files out of the same walk.
 //!
 //! Two categories:
 //!
@@ -98,10 +101,29 @@ static SKIP: phf::Set<&'static str> = phf_set! {
 /// rather than recursed into? True for every hidden (dot-prefixed)
 /// directory, plus anything in [`SKIP`].
 pub(crate) fn should_skip_dir(name: &str) -> bool {
-    if name.starts_with('.') {
+    is_hidden(name) || in_skip_set(name)
+}
+
+/// Same as [`should_skip_dir`], except `objects`/`fields` are never
+/// pruned -- for callers that also need `.object-meta.xml`/
+/// `.field-meta.xml` files, which is the entire reason those two
+/// directories are in [`SKIP`] in the first place (Apex source can never
+/// live there, but SObject/field metadata only ever lives there).
+pub(crate) fn should_skip_dir_keep_metadata_dirs(name: &str) -> bool {
+    if is_hidden(name) {
         return true;
     }
+    if name.eq_ignore_ascii_case("objects") || name.eq_ignore_ascii_case("fields") {
+        return false;
+    }
+    in_skip_set(name)
+}
 
+fn is_hidden(name: &str) -> bool {
+    name.starts_with('.')
+}
+
+fn in_skip_set(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > MAX_NAME_LEN || !bytes.is_ascii() {
         return false;

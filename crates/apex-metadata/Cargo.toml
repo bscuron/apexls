@@ -1,0 +1,9 @@
+[package]
+name = "apex-metadata"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apex-discover.workspace = true
+roxmltree = "0.20"
