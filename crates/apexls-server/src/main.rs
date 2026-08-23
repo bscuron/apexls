@@ -42,8 +42,9 @@
 //! project rebuild on a `spawn_blocking` task, so the main loop never
 //! blocks on it, but there's no debouncing or cancellation of a
 //! rebuild a newer edit has already superseded yet (see
-//! `Backend::schedule_rebuild`'s doc comment). Unchanged files' parses
-//! are still reused across rebuilds via `ParseCache`. Deliberately **not**
+//! `Backend::schedule_rebuild`'s doc comment). Unaffected files' parses
+//! and binder output are reused across rebuilds via `apex_binder::BindCache`
+//! (`BACKLOG.md` §2's incremental rebind). Deliberately **not**
 //! yet wired, each a separate tracked `BACKLOG.md` §3 item rather than
 //! silently dropped: any real language feature that would *consume* the
 //! bind (hover/goto-definition/etc) -- this pass only proves a bind
@@ -54,7 +55,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use apex_binder::{BoundProgram, ParseCache};
+use apex_binder::{BindCache, BoundProgram};
 use async_lsp::client_monitor::ClientProcessMonitorLayer;
 use async_lsp::concurrency::ConcurrencyLayer;
 use async_lsp::panic::CatchUnwindLayer;
@@ -107,14 +108,17 @@ struct Backend {
     documents: HashMap<Url, String>,
     /// The current `apex-binder` bind, rebuilt in the background (see
     /// `Backend::schedule_rebuild`) after `initialized` and every
-    /// document-sync notification. Naive v1 (`BACKLOG.md` §2 Step 1):
-    /// every edit triggers a full project rebuild, just with unchanged
-    /// files' parses reused via `bind.cache` -- no debouncing, no
-    /// cancelling a still-running rebuild that a newer edit has already
+    /// document-sync notification. Every edit schedules a rebuild, but
+    /// `bind.cache` (`apex_binder::BindCache`) makes each one
+    /// incremental -- unaffected files' parses *and* declarations/
+    /// references are reused, not just reparsed -- so in the common case
+    /// (an edit that doesn't change any declaration) only the edited
+    /// file's own bodies actually get re-resolved. Still no debouncing or
+    /// cancellation of a still-running rebuild a newer edit has already
     /// superseded. `None` until the first rebuild completes. Not
     /// consumed by any capability yet (that's `BACKLOG.md` §3) -- this
-    /// wiring exists so a real single-edit rebuild latency can finally
-    /// be measured instead of guessed.
+    /// wiring exists so real single-edit rebuild latency can be measured
+    /// instead of guessed.
     bind: Arc<BindState>,
 }
 
@@ -128,7 +132,7 @@ struct Backend {
 #[derive(Default)]
 struct BindState {
     program: RwLock<Option<BoundProgram>>,
-    cache: Mutex<ParseCache>,
+    cache: Mutex<BindCache>,
 }
 
 impl Backend {

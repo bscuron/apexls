@@ -54,7 +54,7 @@ fn resolve_field_path(
     field_name: &SoqlFieldName,
     object: Option<&str>,
 ) {
-    let ptr = SyntaxPtr::new(field_name.syntax());
+    let ptr = SyntaxPtr::new(binder.file, field_name.syntax());
     let segments = field_name.segments();
     let Some(mut current_object) = object.map(str::to_string) else {
         binder.refs.set(ptr, Resolution::Unresolved);
@@ -208,9 +208,10 @@ fn bind_type_of(binder: &mut BodyBinder<'_>, type_of: &SoqlTypeOf, object: Optio
         // grammar, not a field on `object`, so it's resolved as an
         // object reference directly rather than hopped through
         // `object`'s schema.
+        let file = binder.file;
         let when_object = when.field_name().map(|f| {
             let name = f.text();
-            resolve_object_ptr(binder, SyntaxPtr::new(f.syntax()), &name);
+            resolve_object_ptr(binder, SyntaxPtr::new(file, f.syntax()), &name);
             name
         });
         if let Some(then_fields) = when.then_fields() {
@@ -225,9 +226,8 @@ fn bind_type_of(binder: &mut BodyBinder<'_>, type_of: &SoqlTypeOf, object: Optio
                 // Applies across every non-matched type, so there's no
                 // single object to resolve against -- walked for corpus
                 // coverage, always `Unresolved`.
-                binder
-                    .refs
-                    .set(SyntaxPtr::new(f.syntax()), Resolution::Unresolved);
+                let ptr = SyntaxPtr::new(binder.file, f.syntax());
+                binder.refs.set(ptr, Resolution::Unresolved);
             }
         }
     }
@@ -238,7 +238,8 @@ fn bind_from_list(binder: &mut BodyBinder<'_>, from: Option<SoqlFromList>) -> Op
     let mut first = None;
     for entry in from.entries() {
         let name = entry.text();
-        resolve_object_ptr(binder, SyntaxPtr::new(entry.syntax()), &name);
+        let ptr = SyntaxPtr::new(binder.file, entry.syntax());
+        resolve_object_ptr(binder, ptr, &name);
         if first.is_none() {
             first = Some(name);
         }
@@ -321,9 +322,10 @@ pub(crate) fn bind_soql(binder: &mut BodyBinder<'_>, scope: ScopeId, sq: &SoqlEx
 }
 
 fn bind_sosl_field_spec(binder: &mut BodyBinder<'_>, scope: ScopeId, spec: &SoslFieldSpec) {
+    let file = binder.file;
     let object = spec.object().map(|o| {
         let name = o.text();
-        resolve_object_ptr(binder, SyntaxPtr::new(o.syntax()), &name);
+        resolve_object_ptr(binder, SyntaxPtr::new(file, o.syntax()), &name);
         name
     });
     if let Some(fields) = spec.field_list() {

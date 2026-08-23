@@ -33,7 +33,11 @@ fn name_expr_resolutions(
     root.descendants()
         .filter_map(NameExpr::cast)
         .filter(|n| n.name_token().is_some_and(|t| t.text() == name))
-        .map(|n| program.refs.get(SyntaxPtr::new(n.syntax())).cloned())
+        .map(|n| {
+            program
+                .resolution(SyntaxPtr::new(file, n.syntax()))
+                .cloned()
+        })
         .collect()
 }
 
@@ -103,10 +107,10 @@ fn inherited_field_and_method_resolve_across_extends_but_not_between_unrelated_s
     let call_ptr = root
         .descendants()
         .find_map(apex_syntax::ast::expr::CallExpr::cast)
-        .map(|c| SyntaxPtr::new(c.syntax()))
+        .map(|c| SyntaxPtr::new(derived_file, c.syntax()))
         .expect("Derived.n() should contain one CallExpr (`m()`)");
     assert_eq!(
-        program.refs.get(call_ptr).cloned(),
+        program.resolution(call_ptr).cloned(),
         Some(Resolution::Resolved(base_method_id))
     );
 
@@ -129,7 +133,11 @@ fn call_resolutions(program: &BoundProgram, file: apex_binder::FileId) -> Vec<Op
     let root = program.syntax(file);
     root.descendants()
         .filter_map(apex_syntax::ast::expr::CallExpr::cast)
-        .map(|c| program.refs.get(SyntaxPtr::new(c.syntax())).cloned())
+        .map(|c| {
+            program
+                .resolution(SyntaxPtr::new(file, c.syntax()))
+                .cloned()
+        })
         .collect()
 }
 

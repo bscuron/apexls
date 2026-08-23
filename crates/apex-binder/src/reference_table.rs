@@ -56,7 +56,7 @@ impl Resolution {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ReferenceTable {
     resolutions: HashMap<SyntaxPtr, Resolution>,
 }

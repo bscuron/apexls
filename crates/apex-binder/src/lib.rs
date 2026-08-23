@@ -34,8 +34,9 @@
 
 mod collect;
 mod file_id;
+mod file_table;
+mod incremental;
 mod inherit;
-mod parse_cache;
 mod ptr;
 mod reference_table;
 mod resolve;
@@ -46,7 +47,7 @@ mod symbol;
 mod symbol_table;
 
 pub use file_id::FileId;
-pub use parse_cache::ParseCache;
+pub use incremental::BindCache;
 pub use ptr::{AstPtr, SyntaxPtr};
 pub use reference_table::{ReferenceTable, Resolution};
 pub use schema_index::SchemaIndex;
@@ -59,24 +60,38 @@ use apex_syntax::ast::decl::{
     CompilationUnit, ConstructorDecl, MethodDecl, PropertyDecl, TriggerUnit, VarDeclarator,
 };
 use apex_syntax::SyntaxNode;
+use incremental::FileBodies;
 use rayon::prelude::*;
 use rowan::ast::AstNode;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// A whole bound project: every file's parse tree, the project-wide
 /// symbol table, every reference's resolution, the Salesforce object/
 /// field schema index consulted along the way, and every body's scope
-/// tree (keyed by that body's own `Block`/`TriggerBlock`
-/// [`SyntaxPtr`] -- not by symbol, since a property's two accessors
-/// share one symbol but have two independent bodies).
+/// tree (via [`Self::scope_tree`], keyed by that body's own
+/// `Block`/`TriggerBlock` [`SyntaxPtr`] -- not by symbol, since a
+/// property's two accessors share one symbol but have two independent
+/// bodies). An independent, owned snapshot -- it doesn't borrow from
+/// whatever [`BindCache`] produced it, so a caller (`apexls-server`) can
+/// hold one `BoundProgram` while a background rebuild computes the next
+/// one.
+///
+/// `bodies` is keyed and `Arc`-shared per file (rather than one flat
+/// merged `ReferenceTable`/scope map, which this type exposed in an
+/// earlier revision) specifically so assembling this snapshot in
+/// `Self::from_files_cached` only costs a pointer clone per *unaffected*
+/// file, not a deep copy of every reference/scope in the whole project
+/// -- see `crate::symbol_table`'s module doc comment for the same
+/// reasoning applied to `symbols`, and the measured regression that
+/// motivated both.
 pub struct BoundProgram {
-    files: Vec<PathBuf>,
-    parses: Vec<Parse>,
+    files: HashMap<FileId, PathBuf>,
+    parses: HashMap<FileId, Parse>,
     pub symbols: SymbolTable,
-    pub refs: ReferenceTable,
     pub schema: SchemaIndex,
-    scopes: HashMap<SyntaxPtr, ScopeTree>,
+    bodies: HashMap<FileId, Arc<FileBodies>>,
 }
 
 /// Rayon lazily builds its global thread pool (default stack size, ~1
@@ -106,10 +121,12 @@ fn ensure_large_worker_stacks() {
 
 impl BoundProgram {
     /// Discovers, parses, and binds every `.cls`/`.trigger` file under
-    /// `root`, plus its SFDX object/field metadata. Always reads every
-    /// file fresh from disk and re-parses it -- see
-    /// [`Self::from_files_cached`] for a version that skips re-parsing
-    /// files whose content hasn't changed since a previous call.
+    /// `root`, plus its SFDX object/field metadata. Always starts from a
+    /// cold [`BindCache`] -- see [`Self::from_files_cached`] for a
+    /// version that reuses a persistent cache across repeated calls
+    /// (what an editor-backed caller wants; `from_files` itself exists
+    /// mainly for one-shot batch tools like `apexls-cli` and tests/
+    /// benches that don't need incrementality).
     pub fn from_files(root: impl AsRef<Path>) -> Self {
         Self::from_files_with_overrides(root, &HashMap::new())
     }
@@ -125,191 +142,337 @@ impl BoundProgram {
         root: impl AsRef<Path>,
         overrides: &HashMap<PathBuf, String>,
     ) -> Self {
-        let mut cache = ParseCache::default();
+        let mut cache = BindCache::default();
         Self::from_files_cached(root, overrides, &mut cache)
     }
 
-    /// Like [`Self::from_files_with_overrides`], but reuses `cache`'s
-    /// previous `(content, Parse)` for any file whose content is
-    /// byte-for-byte identical to last time, skipping that file's
-    /// lex/parse entirely -- and updates `cache` to reflect this call's
-    /// results before returning, so the next call benefits too. See
-    /// `BACKLOG.md` §2 and [`ParseCache`]'s module doc comment. Binding
-    /// itself (Pass 1/1.5/2 below) still runs project-wide on every
-    /// call regardless of what was cached -- this cache only ever saves
-    /// parse work, not bind work; see `BACKLOG.md` §2's "incremental
-    /// rebind" item for the (deliberately not-yet-built) next step that
-    /// would also skip unaffected binding.
+    /// Like [`Self::from_files_with_overrides`], but reuses and patches
+    /// `cache` (a [`BindCache`]) instead of recomputing the whole
+    /// project from nothing. Three things get skipped when they safely
+    /// can, each cheaper than the last to check:
+    ///
+    /// 1. **Reparsing**: a file whose content is byte-for-byte identical
+    ///    to `cache`'s last-seen copy reuses that `Parse` outright.
+    /// 2. **Rebuilding `SymbolTable`'s derived indices and `crate::inherit`'s
+    ///    inheritance chains**: skipped entirely unless some file's
+    ///    *declared shape* actually changed this call (a dirty file's
+    ///    new declarations are compared against its previous ones by
+    ///    `declarations_equivalent` -- kind/name/container/type/
+    ///    modifiers only, deliberately ignoring byte ranges, which shift
+    ///    on *any* edit earlier in the file even when nothing declared
+    ///    did).
+    /// 3. **Pass 2 (body resolution)**: reruns for *every* file if any
+    ///    file's declarations changed (conservative but safe -- v1
+    ///    doesn't track fine-grained per-reference dependencies, see
+    ///    `BACKLOG.md` §2's honest scope note), but reruns for *only the
+    ///    dirty files* otherwise -- the common "typing inside a method
+    ///    body" case, which never touches declarations at all.
+    ///
+    /// `SymbolId`/`FileId` stability (`crate::symbol::SymbolId`,
+    /// `crate::file_table::FileTable`) is what makes patching file-by-
+    /// file sound instead of stale: an unrelated file's ids never shift
+    /// just because another file's declaration count changed.
     pub fn from_files_cached(
         root: impl AsRef<Path>,
         overrides: &HashMap<PathBuf, String>,
-        cache: &mut ParseCache,
+        cache: &mut BindCache,
     ) -> Self {
         ensure_large_worker_stacks();
         let root = root.as_ref();
         let discovery = apex_discover::discover(root);
         let schema = SchemaIndex::build(root);
 
-        // Stage 1a (parallel): read (or reuse an override's in-memory
-        // content) and parse (or reuse a cache hit's already-built tree)
-        // every file independently. `par_iter().filter_map(...).collect::<Vec<_>>()`
-        // preserves `discovery.apex_files`'s original order (rayon's
-        // indexed collection always does), so a file's final position in
-        // this `Vec` -- and thus its `FileId` below -- stays
-        // deterministic across runs regardless of which thread actually
-        // processed it.
-        let parsed: Vec<(PathBuf, bool, String, Parse)> = discovery
+        // Stage 0: resolve every discovered path to a stable `FileId`,
+        // and prune anything the cache still remembers that no longer
+        // exists (a file deleted or renamed since the last call) -- a
+        // removal changes the project-wide namespace just as much as an
+        // addition does, so it also forces the conservative "declarations
+        // changed" path below.
+        let current_files: Vec<(PathBuf, FileId)> = discovery
             .apex_files
+            .iter()
+            .map(|path| (path.clone(), cache.files.id_for(path)))
+            .collect();
+        let current_ids: HashSet<FileId> = current_files.iter().map(|(_, id)| *id).collect();
+        let current_paths: HashSet<&Path> =
+            current_files.iter().map(|(p, _)| p.as_path()).collect();
+
+        let removed: Vec<FileId> = cache
+            .table
+            .known_files()
+            .filter(|id| !current_ids.contains(id))
+            .collect();
+        let mut declarations_changed = !removed.is_empty();
+        for file in removed {
+            cache.table.remove_file(file);
+            cache.raw_extends.remove(&file);
+            cache.raw_super.remove(&file);
+            cache.bodies.remove(&file);
+        }
+        cache
+            .parses
+            .retain(|path, _| current_paths.contains(path.as_path()));
+
+        // Stage 1a (parallel): read (or reuse an override's in-memory
+        // content) and parse (or reuse a byte-identical cache hit's
+        // already-built tree) every file independently.
+        struct ParsedFile {
+            path: PathBuf,
+            file: FileId,
+            trigger: bool,
+            dirty: bool,
+            content: String,
+            parse: Parse,
+        }
+        let parsed: Vec<ParsedFile> = current_files
             .par_iter()
-            .filter_map(|path| {
-                let src = match overrides.get(path) {
-                    Some(src) => src.clone(),
+            .filter_map(|(path, file)| {
+                let content = match overrides.get(path) {
+                    Some(c) => c.clone(),
                     None => std::fs::read_to_string(path).ok()?,
                 };
                 let trigger = path
                     .extension()
                     .and_then(|e| e.to_str())
                     .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
-                if let Some((cached_src, cached_parse)) = cache.by_path.get(path) {
-                    if cached_src == &src {
-                        return Some((path.clone(), trigger, src, cached_parse.clone()));
+                if let Some((cached_content, cached_parse)) = cache.parses.get(path) {
+                    if cached_content == &content {
+                        return Some(ParsedFile {
+                            path: path.clone(),
+                            file: *file,
+                            trigger,
+                            dirty: false,
+                            content,
+                            parse: cached_parse.clone(),
+                        });
                     }
                 }
                 let parse = if trigger {
-                    apex_parser::parse_trigger_unit(&src)
+                    apex_parser::parse_trigger_unit(&content)
                 } else {
-                    apex_parser::parse_compilation_unit(&src)
+                    apex_parser::parse_compilation_unit(&content)
                 };
-                Some((path.clone(), trigger, src, parse))
+                Some(ParsedFile {
+                    path: path.clone(),
+                    file: *file,
+                    trigger,
+                    dirty: true,
+                    content,
+                    parse,
+                })
             })
             .collect();
 
-        // Stage 1b (parallel): Pass 1 declaration collection, one file
-        // at a time -- a pure function of that file's already-parsed
-        // tree with no cross-file lookups (see `collect`'s module doc
-        // comment), safe to run fully independently now that every
-        // file has a final `FileId` (its index here).
-        let collections: Vec<collect::FileCollection> = parsed
+        // Refresh the parse cache for dirty files only -- an unchanged
+        // file's entry is already correct.
+        for p in parsed.iter().filter(|p| p.dirty) {
+            cache
+                .parses
+                .insert(p.path.clone(), (p.content.clone(), p.parse.clone()));
+        }
+
+        // Stage 1b (parallel): Pass 1 declaration collection, but only
+        // for dirty files -- an unchanged file's declarations are still
+        // exactly what `cache.table`/`cache.raw_extends`/`cache.raw_super`
+        // already hold.
+        let fresh: Vec<(FileId, collect::FileCollection)> = parsed
             .par_iter()
-            .enumerate()
-            .map(|(i, (_, trigger, _, parse))| {
-                let file = FileId(i as u32);
-                let root_node = parse.syntax();
-                if *trigger {
+            .filter(|p| p.dirty)
+            .map(|p| {
+                let root_node = p.parse.syntax();
+                let collection = if p.trigger {
                     TriggerUnit::cast(root_node.clone())
-                        .map(|tu| collect::collect_trigger_unit(file, &tu))
+                        .map(|tu| collect::collect_trigger_unit(p.file, &tu))
                 } else {
                     CompilationUnit::cast(root_node.clone())
-                        .map(|cu| collect::collect_compilation_unit(file, &cu))
+                        .map(|cu| collect::collect_compilation_unit(p.file, &cu))
                 }
-                .unwrap_or_default()
+                .unwrap_or_default();
+                (p.file, collection)
             })
             .collect();
 
-        let files: Vec<PathBuf> = parsed.iter().map(|(p, _, _, _)| p.clone()).collect();
-
-        // Refresh the cache with this call's own results before moving
-        // `parsed`'s `Parse`s out below -- a file no longer present in
-        // `parsed` (deleted, or failed to read) is naturally dropped
-        // from the cache here too, since this replaces the whole map
-        // rather than merging into it.
-        cache.by_path = parsed
-            .iter()
-            .map(|(path, _, src, parse)| (path.clone(), (src.clone(), parse.clone())))
-            .collect();
-
-        let parses: Vec<Parse> = parsed.into_iter().map(|(_, _, _, parse)| parse).collect();
-
-        // Sequential merge: fold each file's locally-numbered symbols
-        // into the shared arena, remapping `container` ids by that
-        // file's base offset. Cheap (no parsing/tree-walking left to
-        // do here, just `Vec` extends and integer arithmetic), so this
-        // doesn't need to be parallel itself.
-        let mut table = SymbolTable::default();
-        let mut raw_extends: Vec<(SymbolId, Vec<String>)> = Vec::new();
-        let mut raw_super: Vec<(SymbolId, String)> = Vec::new();
-        for collection in collections {
-            let base = table.len() as u32;
-            for mut symbol in collection.symbols {
-                symbol.container = symbol
-                    .container
-                    .map(|SymbolId(local)| SymbolId(base + local));
-                table.alloc(symbol);
+        // Sequential merge: patch each dirty file's slice of the
+        // persistent `SymbolTable`/Pass-1.5 inputs, tracking whether any
+        // file's *declared shape* actually changed. Cheap (no parsing/
+        // tree-walking left to do here, just moving already-built
+        // `Symbol`s and a same-length field-by-field comparison).
+        for (file, collection) in fresh {
+            let is_new = !cache.table.has_file(file);
+            if is_new
+                || !declarations_equivalent(cache.table.symbols_of_file(file), &collection.symbols)
+            {
+                declarations_changed = true;
             }
-            for (local, names) in collection.raw_extends {
-                raw_extends.push((SymbolId(base + local), names));
-            }
-            for (local, name) in collection.raw_super {
-                raw_super.push((SymbolId(base + local), name));
-            }
+            cache.table.set_file_symbols(file, collection.symbols);
+            cache.raw_extends.insert(file, collection.raw_extends);
+            cache.raw_super.insert(file, collection.raw_super);
         }
 
-        // Pass 1.5 (parallel where it counts): resolves every type's
-        // `extends`/`implements` chain -- see `inherit`'s module doc
-        // comment for the parallel/sequential split within it.
-        inherit::resolve_inheritance(&mut table, &raw_extends, &raw_super);
+        // Pass 1.5 + derived-index rebuild only when something actually
+        // declared changed project-wide -- otherwise every index and
+        // `inherited_chain`/`direct_super` entry is still exactly
+        // correct from the previous call (see `SymbolTable::rebuild_indices`'s
+        // doc comment for why skipping this is sound, not just fast).
+        if declarations_changed {
+            cache.table.rebuild_indices();
+            let all_raw_extends: Vec<(SymbolId, Vec<String>)> =
+                cache.raw_extends.values().flatten().cloned().collect();
+            let all_raw_super: Vec<(SymbolId, String)> =
+                cache.raw_super.values().flatten().cloned().collect();
+            inherit::resolve_inheritance(&mut cache.table, &all_raw_extends, &all_raw_super);
+        }
 
-        // Pass 2 (parallel): bind every declared symbol's body/
-        // initializer independently against the now-final, read-only
-        // `table` -- see `resolve`'s module doc comment for how a
-        // body's own newly-declared locals stay out of `table` until
-        // the sequential merge below (`rayon`-safe concurrent binding
-        // needs a single shared mutable arena avoided, not locked).
-        let declared: Vec<(SymbolId, Symbol)> =
-            table.iter().map(|(id, s)| (id, s.clone())).collect();
-        let bound: Vec<(Option<SyntaxPtr>, resolve::BoundBody)> = declared
+        // Pass 2 (parallel): rebind every current file if declarations
+        // changed anywhere (conservative fallback, identical cost to a
+        // full rebuild), or just the dirty files otherwise -- see this
+        // method's doc comment.
+        // Keyed by `&Parse` (`Sync`, safe to share across threads), not
+        // by an already-built `SyntaxNode` (rowan's tree is `Rc`-based,
+        // so `SyntaxNode` itself is neither `Send` nor `Sync`) -- each
+        // parallel closure below calls `.syntax()` itself to build its
+        // own thread-local node from the shared `Parse`.
+        let parse_by_file: HashMap<FileId, &Parse> =
+            parsed.iter().map(|p| (p.file, &p.parse)).collect();
+        let files_to_rebind: Vec<FileId> = if declarations_changed {
+            current_ids.iter().copied().collect()
+        } else {
+            parsed.iter().filter(|p| p.dirty).map(|p| p.file).collect()
+        };
+        let to_bind: Vec<(FileId, SymbolId, Symbol)> =
+            files_to_rebind
+                .iter()
+                .flat_map(|&file| {
+                    cache.table.symbols_of_file(file).iter().enumerate().map(
+                        move |(local, symbol)| {
+                            (file, SymbolId::new(file, local as u32), symbol.clone())
+                        },
+                    )
+                })
+                .collect();
+        let bound: Vec<(FileId, Option<SyntaxPtr>, resolve::BoundBody)> = to_bind
             .par_iter()
-            .flat_map(|(id, symbol)| {
-                let root_node = parses[symbol.file.index()].syntax();
-                bind_symbol_body(&table, &schema, &root_node, *id, symbol)
+            .flat_map(|(file, id, symbol)| {
+                let root_node = parse_by_file[file].syntax();
+                bind_symbol_body(&cache.table, &schema, &root_node, *id, symbol)
+                    .into_iter()
+                    .map(move |(key, body)| (*file, key, body))
+                    .collect::<Vec<_>>()
             })
             .collect();
 
-        // Sequential merge, mirroring Pass 1's: allocate each body's
-        // pending locals into the shared table, remap that body's
-        // sentinel ids to the resulting real global ids, and fold its
-        // reference/scope-tree output into the project-wide result.
-        let mut refs = ReferenceTable::default();
-        let mut scope_trees = HashMap::new();
-        for (key, body) in bound {
-            let base = table.len() as u32;
-            for local in body.pending_locals {
-                table.alloc(local);
-            }
-            let remap = |id: SymbolId| resolve::remap_local_id(id, base);
-            let mut scopes = body.scopes;
-            scopes.remap_symbol_ids(&remap);
-            body.refs.map_ids(&remap).merge_into(&mut refs);
-            if let Some(key) = key {
-                scope_trees.insert(key, scopes);
-            }
+        // Sequential merge, mirroring Pass 1's: group each file's bound
+        // bodies together, then -- one file at a time -- allocate its
+        // bodies' pending locals onto the end of *that file's own*
+        // declared symbols (not the whole project's), remapping each
+        // body's sentinel ids to the resulting real ids as it goes (a
+        // running per-file base, so sibling bodies bound concurrently in
+        // the same file don't collide over the same local-id range).
+        // Every file in `files_to_rebind` gets a fresh `FileBodies`
+        // entry even if it produced zero bound bodies (e.g. every method
+        // in it was just deleted) -- otherwise a stale fragment from
+        // before that edit would silently survive in `cache.bodies`.
+        let mut by_file: HashMap<FileId, Vec<(Option<SyntaxPtr>, resolve::BoundBody)>> =
+            files_to_rebind.iter().map(|&f| (f, Vec::new())).collect();
+        for (file, key, body) in bound {
+            by_file.entry(file).or_default().push((key, body));
         }
+        for (file, bodies) in by_file {
+            let mut base = cache.table.symbols_of_file(file).len() as u32;
+            let mut extra_symbols = Vec::new();
+            let mut file_bodies = incremental::FileBodies::default();
+            for (key, body) in bodies {
+                let remap = |id: SymbolId| resolve::remap_local_id(id, base);
+                let mut scopes = body.scopes;
+                scopes.remap_symbol_ids(&remap);
+                body.refs.map_ids(&remap).merge_into(&mut file_bodies.refs);
+                if let Some(key) = key {
+                    file_bodies.scopes.insert(key, scopes);
+                }
+                base += body.pending_locals.len() as u32;
+                extra_symbols.extend(body.pending_locals);
+            }
+            cache.table.append_file_symbols(file, extra_symbols);
+            cache.bodies.insert(file, Arc::new(file_bodies));
+        }
+
+        // Assemble this call's independent, owned snapshot. `symbols`
+        // (`Arc`-backed, see `symbol_table`'s module doc comment) and
+        // `bodies` (`Arc`-shared per file) are both cheap here regardless
+        // of project size -- an *unaffected* file only costs a pointer
+        // clone, not a deep copy of its `Symbol`s/references/scopes.
+        let files: HashMap<FileId, PathBuf> =
+            current_files.into_iter().map(|(p, f)| (f, p)).collect();
+        let parses: HashMap<FileId, Parse> =
+            parsed.into_iter().map(|p| (p.file, p.parse)).collect();
+        let bodies: HashMap<FileId, Arc<FileBodies>> = current_ids
+            .iter()
+            .filter_map(|&file| cache.bodies.get(&file).map(|fb| (file, Arc::clone(fb))))
+            .collect();
 
         BoundProgram {
             files,
             parses,
-            symbols: table,
-            refs,
+            symbols: cache.table.clone(),
             schema,
-            scopes: scope_trees,
+            bodies,
         }
     }
 
     pub fn file_path(&self, file: FileId) -> &Path {
-        &self.files[file.index()]
+        &self.files[&file]
     }
 
     pub fn syntax(&self, file: FileId) -> SyntaxNode {
-        self.parses[file.index()].syntax()
+        self.parses[&file].syntax()
     }
 
     pub fn file_count(&self) -> usize {
         self.files.len()
     }
 
-    pub fn scope_tree(&self, block: SyntaxPtr) -> Option<&ScopeTree> {
-        self.scopes.get(&block)
+    /// What `ptr` (a reference `SyntaxPtr` -- a `NameExpr`, `FieldExpr`,
+    /// SOQL field name, ...) resolved to during Pass 2, if anything was
+    /// ever recorded for it.
+    pub fn resolution(&self, ptr: SyntaxPtr) -> Option<&Resolution> {
+        self.bodies.get(&ptr.file())?.refs.get(ptr)
     }
+
+    /// Every reference's `SyntaxPtr` and its `Resolution`, across every
+    /// file -- the whole-project view `Self::resolution` doesn't give
+    /// one lookup at a time. Costs time proportional to the whole
+    /// project to iterate in full, same as it always did; unlike
+    /// `Self::resolution`, there's no way to avoid that for a query that
+    /// is, by definition, asking for everything.
+    pub fn all_resolutions(&self) -> impl Iterator<Item = (&SyntaxPtr, &Resolution)> {
+        self.bodies.values().flat_map(|fb| fb.refs.iter())
+    }
+
+    pub fn scope_tree(&self, block: SyntaxPtr) -> Option<&ScopeTree> {
+        self.bodies.get(&block.file())?.scopes.get(&block)
+    }
+}
+
+/// Compares two versions of one file's Pass 1 output by declared
+/// *shape* only (`kind`/`name`/`container`/`type_name`/`modifiers`),
+/// deliberately ignoring `ptr`/`name_range`/`type_ref` -- all three are
+/// byte-range-based, and *any* edit earlier in a file shifts every later
+/// declaration's range even when nothing about what's declared actually
+/// changed. Comparing those too would make `BoundProgram::from_files_cached`'s
+/// fast Pass 2 path fire only for edits at the very end of a file,
+/// defeating the point. `container`'s `SymbolId` is safe to compare
+/// directly despite embedding no range itself: it only depends on
+/// declaration order/count within the file, which Pass 1 never looks at
+/// body content to determine.
+fn declarations_equivalent(old: &[Symbol], new: &[Symbol]) -> bool {
+    old.len() == new.len()
+        && old.iter().zip(new).all(|(a, b)| {
+            a.kind == b.kind
+                && a.name == b.name
+                && a.container == b.container
+                && a.type_name == b.type_name
+                && a.modifiers == b.modifiers
+        })
 }
 
 /// Binds one declared symbol's body/initializer, if it has one --
@@ -336,7 +499,7 @@ fn bind_symbol_body(
                 return Vec::new();
             };
             let params = table.params(id);
-            let key = SyntaxPtr::new(body.syntax());
+            let key = SyntaxPtr::new(symbol.file, body.syntax());
             let bound = resolve::bind_body(
                 table,
                 schema,
@@ -356,7 +519,7 @@ fn bind_symbol_body(
                 return Vec::new();
             };
             let params = table.params(id);
-            let key = SyntaxPtr::new(body.syntax());
+            let key = SyntaxPtr::new(symbol.file, body.syntax());
             let bound = resolve::bind_body(
                 table,
                 schema,
@@ -375,7 +538,7 @@ fn bind_symbol_body(
             p.accessors()
                 .filter_map(|accessor| {
                     let body = accessor.body()?;
-                    let key = SyntaxPtr::new(body.syntax());
+                    let key = SyntaxPtr::new(symbol.file, body.syntax());
                     let bound = resolve::bind_body(
                         table,
                         schema,
@@ -407,13 +570,16 @@ fn bind_symbol_body(
             let mut out = Vec::new();
             if let Some(obj_tok) = tu.object_ref() {
                 if let Some(parent) = obj_tok.parent() {
-                    let bound =
-                        resolve::bind_object_ref(schema, SyntaxPtr::new(&parent), obj_tok.text());
+                    let bound = resolve::bind_object_ref(
+                        schema,
+                        SyntaxPtr::new(symbol.file, &parent),
+                        obj_tok.text(),
+                    );
                     out.push((None, bound));
                 }
             }
             if let Some(block) = tu.block() {
-                let key = SyntaxPtr::new(block.syntax());
+                let key = SyntaxPtr::new(symbol.file, block.syntax());
                 let bound =
                     resolve::bind_trigger_body(table, schema, symbol.file, Some(id), &block);
                 out.push((Some(key), bound));

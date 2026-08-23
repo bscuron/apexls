@@ -157,9 +157,14 @@ fn is_argument_type_compatible(
 /// applied uniformly without needing to track which ids came from where.
 pub(crate) const LOCAL_SENTINEL_BASE: u32 = u32::MAX / 2;
 
+/// `base` is the *file's own* declared-symbol count (`FileCollection::symbols.len()`
+/// for the file this sentinel id's `id.file` names) -- not a project-wide
+/// count. Since a body's sentinel ids already carry the correct `file`
+/// (set once at `declare_local` time), remapping only ever needs to
+/// translate `local`, never `file`.
 pub(crate) fn remap_local_id(id: SymbolId, base: u32) -> SymbolId {
-    if id.0 >= LOCAL_SENTINEL_BASE {
-        SymbolId(base + (id.0 - LOCAL_SENTINEL_BASE))
+    if id.local >= LOCAL_SENTINEL_BASE {
+        SymbolId::new(id.file, base + (id.local - LOCAL_SENTINEL_BASE))
     } else {
         id
     }
@@ -189,7 +194,7 @@ pub(crate) struct BodyBinder<'a> {
     pub(crate) refs: ReferenceTable,
     pub(crate) scopes: ScopeTree,
     pending_locals: Vec<Symbol>,
-    file: FileId,
+    pub(crate) file: FileId,
     /// The enclosing type, for `this`/`super`/unqualified member lookup
     /// fallthrough once local-scope lookup misses. `None` when binding a
     /// trigger's top-level body (a `TriggerUnit` isn't itself a type
@@ -324,21 +329,24 @@ impl<'a> BodyBinder<'a> {
         type_ref: Option<&Type>,
     ) -> SymbolId {
         let (type_ptr, type_name) = match type_ref {
-            Some(ty) => (Some(AstPtr::new(ty)), Some(ty.text())),
+            Some(ty) => (Some(AstPtr::new(self.file, ty)), Some(ty.text())),
             None => (None, None),
         };
         let symbol = Symbol {
             kind,
             name: name.text().unwrap_or_default(),
             file: self.file,
-            ptr: SyntaxPtr::new(name.syntax()),
+            ptr: SyntaxPtr::new(self.file, name.syntax()),
             name_range: name.syntax().text_range(),
             container: self.enclosing_member,
             type_ref: type_ptr,
             type_name,
             modifiers: ModifierSet::default(),
         };
-        let id = SymbolId(LOCAL_SENTINEL_BASE + self.pending_locals.len() as u32);
+        let id = SymbolId::new(
+            self.file,
+            LOCAL_SENTINEL_BASE + self.pending_locals.len() as u32,
+        );
         self.pending_locals.push(symbol);
         id
     }
@@ -350,8 +358,8 @@ impl<'a> BodyBinder<'a> {
     /// pre-existing project symbol) need this indirection since the
     /// shared table doesn't contain this body's locals yet.
     fn get_symbol(&self, id: SymbolId) -> &Symbol {
-        if id.0 >= LOCAL_SENTINEL_BASE {
-            &self.pending_locals[(id.0 - LOCAL_SENTINEL_BASE) as usize]
+        if id.local >= LOCAL_SENTINEL_BASE {
+            &self.pending_locals[(id.local - LOCAL_SENTINEL_BASE) as usize]
         } else {
             self.table.get(id)
         }
@@ -375,7 +383,7 @@ impl<'a> BodyBinder<'a> {
     /// "one hop" other resolvers chain through.
     pub(crate) fn resolve_type_ref(&mut self, ty: &Type) -> Option<SymbolId> {
         let name = ty.text();
-        let ptr = SyntaxPtr::new(ty.syntax());
+        let ptr = SyntaxPtr::new(self.file, ty.syntax());
         if let Some(id) = self.table.top_level(&name) {
             self.refs.set(ptr, Resolution::Resolved(id));
             return Some(id);
@@ -536,7 +544,7 @@ impl<'a> BodyBinder<'a> {
                 }
                 for catch in s.catch_clauses() {
                     if let Some(ty) = catch.exception_type() {
-                        let ptr = SyntaxPtr::new(ty.syntax());
+                        let ptr = SyntaxPtr::new(self.file, ty.syntax());
                         // `QualifiedName` (not `Type`) -- resolve by its
                         // whole-text base name against project types
                         // only; unlike `resolve_type_ref`, exception
@@ -745,7 +753,7 @@ impl<'a> BodyBinder<'a> {
         }
         let tok = n.name_token()?;
         let name = tok.text();
-        let ptr = SyntaxPtr::new(n.syntax());
+        let ptr = SyntaxPtr::new(self.file, n.syntax());
 
         if let Some(local) = self.scopes.resolve_local(scope, name) {
             self.refs.set(ptr, Resolution::Resolved(local));
@@ -793,7 +801,7 @@ impl<'a> BodyBinder<'a> {
         let target_type = f.target().and_then(|t| self.bind_expr(scope, &t));
         let tok = f.member_token()?;
         let name = tok.text();
-        let ptr = SyntaxPtr::new(f.syntax());
+        let ptr = SyntaxPtr::new(self.file, f.syntax());
 
         let Some(container) = target_type else {
             self.refs.set(ptr, Resolution::Unresolved);
@@ -836,7 +844,7 @@ impl<'a> BodyBinder<'a> {
         }
         let tok = mc.method_name_token()?;
         let name = tok.text();
-        let ptr = SyntaxPtr::new(mc.syntax());
+        let ptr = SyntaxPtr::new(self.file, mc.syntax());
 
         let Some(container) = target_type else {
             self.refs.set(ptr, Resolution::Unresolved);
@@ -865,7 +873,7 @@ impl<'a> BodyBinder<'a> {
             }
         }
         let tok = c.callee_token()?;
-        let ptr = SyntaxPtr::new(c.syntax());
+        let ptr = SyntaxPtr::new(self.file, c.syntax());
 
         let (target_type, want_ctor) = match tok.kind() {
             SyntaxKind::This => (self.enclosing_type, true),
@@ -930,7 +938,8 @@ impl<'a> BodyBinder<'a> {
                     .collect();
                 if !ctors.is_empty() {
                     let resolution = narrow_by_overload(self.table, ctors, &arg_types);
-                    self.refs.set(SyntaxPtr::new(ne.syntax()), resolution);
+                    self.refs
+                        .set(SyntaxPtr::new(self.file, ne.syntax()), resolution);
                 }
             }
         }

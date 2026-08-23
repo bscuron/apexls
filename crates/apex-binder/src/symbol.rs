@@ -11,12 +11,27 @@ use apex_syntax::ast::Type;
 use apex_syntax::SyntaxKind;
 use rowan::TextRange;
 
+/// A symbol's identity: which file declared it, plus its position among
+/// that file's own declarations. Deliberately **not** a flat project-wide
+/// index -- see `crate::file_table::FileTable`'s doc comment for why a
+/// flat index can't stay stable across incremental rebuilds. Because
+/// `local` only depends on *this file's own* declaration order/count, an
+/// unrelated file changing elsewhere in the project can never change an
+/// unchanged file's symbols' ids, which is exactly the property
+/// `crate::BindCache`'s per-file caching needs to be sound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SymbolId(pub(crate) u32);
+pub struct SymbolId {
+    pub(crate) file: FileId,
+    pub(crate) local: u32,
+}
 
 impl SymbolId {
-    pub(crate) fn index(self) -> usize {
-        self.0 as usize
+    pub(crate) fn new(file: FileId, local: u32) -> Self {
+        SymbolId { file, local }
+    }
+
+    pub fn file(self) -> FileId {
+        self.file
     }
 }
 

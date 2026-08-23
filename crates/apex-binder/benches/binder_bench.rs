@@ -92,7 +92,7 @@ fn bench_warm_single_edit(c: &mut Criterion) {
         .expect("corpus has at least one file to simulate editing");
     let original = std::fs::read_to_string(&target).unwrap();
 
-    let cache = RefCell::new(apex_binder::ParseCache::default());
+    let cache = RefCell::new(apex_binder::BindCache::default());
     apex_binder::BoundProgram::from_files_cached(&root, &HashMap::new(), &mut cache.borrow_mut());
 
     let mut group = c.benchmark_group("corpus");

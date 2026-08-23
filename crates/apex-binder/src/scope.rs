@@ -73,7 +73,7 @@ impl Scope {
 /// innermost scope at this position" queries -- useful beyond Pass 2's
 /// own resolution (which always knows its current scope directly while
 /// walking) for later position-driven LSP requests like completion.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ScopeTree {
     scopes: Vec<Scope>,
     /// Each scope's own defining range (the `Block`/loop-body/catch-

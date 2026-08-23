@@ -13,29 +13,47 @@
 //! `Parse::syntax()` call against the same `Parse` produces a
 //! structurally-identical tree, since the underlying green node is
 //! reused).
+//!
+//! Every pointer also carries the [`FileId`] of the file it points into.
+//! Without it, two *different* files that happen to produce an
+//! identically-shaped node at the same byte range (easy with a shared
+//! boilerplate prefix, e.g. `public class Foo {`) would collide as
+//! `HashMap` keys in `ReferenceTable`/`crate::BoundProgram`'s scope-tree
+//! map, silently corrupting one file's result with another's. Carrying
+//! `FileId` closes that (kind, range) alone can't disambiguate, and is
+//! also exactly the granularity `crate::BindCache`'s per-file caching
+//! needs to invalidate/replace one file's pointers without touching any
+//! other file's.
 
+use crate::file_id::FileId;
 use apex_syntax::{ApexLanguage, SyntaxKind, SyntaxNode};
 use rowan::ast::AstNode;
 use rowan::{NodeOrToken, TextRange};
 use std::marker::PhantomData;
 
-/// An untyped node pointer: kind + range, no static guarantee about what
-/// kind of declaration/expression/statement it names. Used for `Symbol`s,
-/// which point at heterogeneous declaration node kinds (`ClassDecl`,
-/// `MethodDecl`, `FieldDecl`, ...) with no single common `AstNode` type
-/// to parameterize an `AstPtr` over.
+/// An untyped node pointer: file + kind + range, no static guarantee
+/// about what kind of declaration/expression/statement it names. Used
+/// for `Symbol`s, which point at heterogeneous declaration node kinds
+/// (`ClassDecl`, `MethodDecl`, `FieldDecl`, ...) with no single common
+/// `AstNode` type to parameterize an `AstPtr` over.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SyntaxPtr {
+    file: FileId,
     kind: SyntaxKind,
     range: TextRange,
 }
 
 impl SyntaxPtr {
-    pub fn new(node: &SyntaxNode) -> Self {
+    pub fn new(file: FileId, node: &SyntaxNode) -> Self {
         SyntaxPtr {
+            file,
             kind: node.kind(),
             range: node.text_range(),
         }
+    }
+
+    pub fn file(&self) -> FileId {
+        self.file
     }
 
     pub fn kind(&self) -> SyntaxKind {
@@ -101,9 +119,9 @@ impl<N> std::fmt::Debug for AstPtr<N> {
 }
 
 impl<N: AstNode<Language = ApexLanguage>> AstPtr<N> {
-    pub fn new(node: &N) -> Self {
+    pub fn new(file: FileId, node: &N) -> Self {
         AstPtr {
-            raw: SyntaxPtr::new(node.syntax()),
+            raw: SyntaxPtr::new(file, node.syntax()),
             _marker: PhantomData,
         }
     }
@@ -131,7 +149,7 @@ mod tests {
         let TypeDecl::Class(class) = cu.type_decl().unwrap() else {
             panic!("expected a ClassDecl");
         };
-        let ptr = AstPtr::<ClassDecl>::new(&class);
+        let ptr = AstPtr::<ClassDecl>::new(FileId(0), &class);
 
         // A second, independently-fetched `SyntaxNode` root for the same
         // `Parse` -- structurally identical, but not the same handle.
@@ -154,7 +172,7 @@ mod tests {
             panic!("expected a ClassDecl");
         };
         let name = class.name().unwrap();
-        let ptr = SyntaxPtr::new(name.syntax());
+        let ptr = SyntaxPtr::new(FileId(0), name.syntax());
 
         let root2 = parse.syntax();
         let resolved = ptr.to_node(&root2).expect("ptr should resolve");

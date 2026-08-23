@@ -16,11 +16,11 @@ parallelized across passes. `apexls-cli` is still a pre-binder debug tool
 (parses a single file with `parse_statement`, doesn't call into
 `apex-binder` at all). `apexls-server` is a complete, real LSP protocol
 shell (§1 is fully checked off) that now background-rebuilds a real
-`apex_binder::BoundProgram` on every edit (§2 Step 1) -- but nothing
-consumes that bind through the protocol yet, so it still can't answer a
-single real language question over the wire. That's squarely the rest of
-§2 (incremental rebind is now a measured, confirmed bottleneck, not a
-guess) and §3 next.
+`apex_binder::BoundProgram` on every edit, incrementally (§2, fully
+checked off -- a warm single-file-edit rebind measures ~78ms on the real
+NPSP corpus, down from ~677ms cold) -- but nothing consumes that bind
+through the protocol yet, so it still can't answer a single real language
+question over the wire. That's squarely §3 next.
 
 ## 1. Protocol / server layer
 
@@ -112,7 +112,7 @@ through the protocol yet (that's §3) -- this exists purely so the items
 below could be measured against something real instead of guessed at.
 
 - [x] Incremental reparse -- **coarse-grained (file-level) slice done,
-      not true sub-file incremental reparse.** `apex-binder::ParseCache`
+      not true sub-file incremental reparse.** `apex_binder::BindCache`
       (`BoundProgram::from_files_cached`) skips re-lexing/re-parsing any
       file whose content is byte-for-byte identical to the previous
       rebuild. True sub-file incremental reparse (edit-delta into a
@@ -120,48 +120,83 @@ below could be measured against something real instead of guessed at.
       structural sharing) is a real `apex-parser`-level feature this
       crate has no hooks for yet (only whole-string `parse_*` entry
       points exist) -- deliberately not built, since the measurement
-      below shows it wouldn't be this server's bottleneck yet even if it
-      existed (see "Step 3 measurement" below).
-- [ ] Incremental rebind: re-bind only a changed file's declarations
-      plus whatever referenced them, instead of the whole project.
-      Needs real dependency tracking (which symbols/scopes/references
-      become stale when file X's declarations change) -- meaningfully
-      harder than anything built so far in `apex-binder`, and, per the
-      measurement below, now confirmed to be **the real bottleneck**,
-      not a hypothetical one.
-- [ ] A caching/memoization strategy to hang the above off of --
-      possibly salsa-style incremental query architecture (what
-      rust-analyzer uses), possibly something simpler given this
-      project's smaller surface area. Worth a deliberate design pass,
-      not an ad hoc bolt-on. Still not designed in detail -- the
-      measurement below justifies doing this next, but doesn't by
-      itself dictate its shape.
-- [ ] Warm background indexing: partially covered by Step 1's
-      background-task rebuild (the main loop never blocks on a bind).
-      Not yet covered: answering a request that arrives before the
-      *first* bind completes (there's no request that consumes the bind
-      yet -- §3 -- so this has nothing real to be tested against until
-      one exists).
+      below shows it isn't this server's bottleneck even without it.
+- [x] Incremental rebind. **Done for the dominant case.** `SymbolId`
+      became a stable `{file, local}` identity (not a flat project-wide
+      index) and `FileId` became a persistent, session-long identity
+      (`FileTable`), instead of "a file's position in this call's
+      directory walk" -- together these make it sound to patch
+      `SymbolTable`/Pass 2 output file-by-file across calls instead of
+      recomputing everything, since an unrelated file's ids never shift.
+      `BoundProgram::from_files_cached` now: reruns Pass 1 (collect) only
+      for files whose content actually changed; compares each changed
+      file's new declarations against its old ones by *shape*
+      (kind/name/container/type/modifiers, deliberately not byte ranges,
+      which shift on any earlier edit) to decide whether anything
+      project-wide could have changed; skips Pass 1.5 (inherit) and every
+      `SymbolTable` derived index rebuild entirely when nothing did; and
+      reruns Pass 2 (body resolution) only for the changed files in that
+      case -- the common "typing inside a method body" edit, which never
+      touches a declaration. A signature/field/class-shape change still
+      falls back to a full project-wide rebind, identical cost to before
+      -- correct, just not sped up (see the honest scope note below).
+- [x] A caching/memoization strategy. **Built, not salsa -- a hand-rolled
+      per-file cache (`BindCache`) sized to this project's actual shape**
+      rather than a general incremental-query engine: `FileTable` (stable
+      `FileId`s), a persisted `SymbolTable` patched file-by-file, and
+      per-file Pass 2 output (`FileBodies`), all `Arc`-shared per file so
+      that assembling one call's independent `BoundProgram` snapshot only
+      costs an `Arc` clone per *unaffected* file, not a deep copy of its
+      data -- catching a real regression along the way (see the
+      measurement below).
+- [x] Warm background indexing: covered by Step 1's background-task
+      rebuild (the main loop never blocks on a bind) plus this step's
+      incremental patching (a rebuild after the first one is now cheap in
+      the common case, not just non-blocking). Answering a request that
+      arrives before the *first* bind completes is still untested --
+      there's no request that consumes the bind yet (§3), so there's
+      nothing real to test that against until one exists.
 - [x] Profile *real* single-edit request latency. **Measured** via
       `apex-binder/benches/binder_bench.rs`'s `corpus/warm_rebind_after_one_file_edit`
-      case (warms `ParseCache` once, then times a full `from_files_cached`
-      call per simulated single-file edit, real NPSP corpus, criterion
-      `--save-baseline incremental-step1`):
-      - `corpus/bind_npsp_full` (cold, no cache): **~677ms** median.
-      - `corpus/warm_rebind_after_one_file_edit` (parse-skip warm, one
-        file edited): **~438ms** median -- only ~35% faster than cold,
-        not the order-of-magnitude drop "feels good to type in" needs.
-      - **Honest conclusion:** file-level parse-skip alone is nowhere
-        near enough. Nearly all of the ~438ms warm figure is Pass
-        1/1.5/2 re-running project-wide over already-parsed trees, which
-        this step deliberately left untouched (see Context in the design
-        plan this work followed). This is the real evidence, not a
-        guess, that **incremental rebind is the next necessary step**,
-        not an optional refinement -- and that a salsa-style/memoized
-        query layer is worth designing next specifically to make
-        Pass 1.5/Pass 2 skip whatever a single file's edit didn't
-        actually affect, rather than being a speculative architecture
-        choice made ahead of any evidence it was needed.
+      case (warms the cache once, then times a full `from_files_cached`
+      call per simulated single-file edit, real NPSP corpus, criterion):
+      - `corpus/bind_npsp_full` (cold, no cache): **~427ms** median (was
+        ~677ms before this step -- `Arc`-backed `SymbolTable`/`FileBodies`
+        also cut allocation overhead on the cold path incidentally).
+      - `corpus/warm_rebind_after_one_file_edit` (warm cache, one file's
+        body-only edit): **~78ms** median -- an **~82% reduction** from
+        the prior step's ~438ms, and a ~5.6x speedup overall from the
+        original ~677ms cold baseline.
+      - **A real regression caught and fixed along the way:** the first
+        implementation of incremental rebind made this benchmark
+        *worse* (~700ms) than the previous step, not better --
+        `BoundProgram::from_files_cached` was skipping recomputation but
+        still deep-cloning the *entire* `SymbolTable` and every file's
+        cached references/scopes into each call's independent snapshot,
+        which turned out to cost more than the work it replaced. Fixing
+        it required `Arc`-wrapping `SymbolTable`'s per-file data and
+        derived-index bundle, and `apex-binder`'s Pass 2 output per file,
+        so assembling a snapshot is a handful of pointer clones for an
+        unaffected file, not a deep copy -- this is exactly the kind of
+        thing only a real measurement catches; it looked correct and
+        reasonable in the design and would have shipped as a silent
+        regression without benchmarking the actual change, not just the
+        feature it was meant to enable.
+      - **Honest scope note:** this is not full per-reference dependency
+        tracking (the original wording: "which symbols/scopes/references
+        become stale when file X's declarations change"). It's one
+        conservative, provably-safe rule -- if *any* file's declarations
+        changed, rebind the whole project (identical cost to before);
+        otherwise, rebind only the changed files. That rule is sized to
+        the dominant real editing pattern (typing inside a method body),
+        not the general case, and is honest about not being faster yet
+        for a signature-changing edit.
+      - **Still not "instantaneous" in an absolute sense, and here's
+        what's left in the ~78ms:** `apex_discover::discover` and
+        `apex_metadata`'s SFDX object/field walk both still re-walk the
+        whole directory tree on *every* call, unconditionally -- neither
+        is cached at all yet. That's the next concrete, measured lever if
+        warm-edit latency needs to drop further, not a new guess.
 
 ## 3. Feature surface
 

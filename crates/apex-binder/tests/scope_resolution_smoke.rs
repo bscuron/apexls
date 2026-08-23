@@ -35,7 +35,7 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
     let program = BoundProgram::from_files(&root);
 
     let mut counts = Counts::default();
-    for (_, resolution) in program.refs.iter() {
+    for (_, resolution) in program.all_resolutions() {
         match resolution {
             Resolution::Resolved(_) => counts.resolved += 1,
             Resolution::Candidates(_) => counts.candidates += 1,

@@ -32,7 +32,7 @@ fn custom_object_references_resolve_against_independently_discovered_metadata() 
 
     let mut resolved_custom_objects = 0usize;
     let mut unknown_custom_objects = 0usize;
-    for (_, resolution) in program.refs.iter() {
+    for (_, resolution) in program.all_resolutions() {
         match resolution {
             Resolution::SchemaObject {
                 object,
