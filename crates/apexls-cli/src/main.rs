@@ -16,7 +16,24 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let src = match std::fs::read_to_string(&path) {
+    // Run on a thread with a generously large stack, then join it, rather
+    // than doing the work directly on `main`'s (typically ~1 MiB on
+    // Windows) default stack -- see `apex_parser`'s module doc comment's
+    // "deep-tree stack safety caveat": a pathologically long chain
+    // expression can overflow the stack purely on *dropping* the parsed
+    // tree, unrelated to how large the input file itself is. A one-shot
+    // CLI invocation like this one can easily afford the thread-spawn
+    // cost to be safe against that, unlike a hot per-file loop.
+    std::thread::Builder::new()
+        .stack_size(apex_parser::RECOMMENDED_MIN_STACK_SIZE)
+        .spawn(move || run(&path))
+        .expect("failed to spawn worker thread")
+        .join()
+        .expect("worker thread panicked")
+}
+
+fn run(path: &str) -> ExitCode {
+    let src = match std::fs::read_to_string(path) {
         Ok(src) => src,
         Err(e) => {
             eprintln!("error reading {path}: {e}");

@@ -10,6 +10,18 @@ use std::collections::HashMap;
 pub struct SymbolTable {
     symbols: Vec<Symbol>,
     members_of: HashMap<SymbolId, Vec<SymbolId>>,
+    /// `(container, lowercase member name) -> every member of `container`
+    /// with that name`. Exists purely so `lookup_member` -- called once
+    /// per name reference anywhere in the program, the single hottest
+    /// path in Pass 2 -- is an O(1)-average hash lookup per type in the
+    /// inheritance chain instead of an O(members-of-that-type) linear
+    /// string-comparison scan. Without this index, a large class whose
+    /// methods reference each other extensively (its reference count
+    /// scaling with its own member count M) would cost O(M) per lookup
+    /// times O(M) lookups, i.e. trend toward O(M^2) in aggregate for
+    /// that one class -- exactly the kind of accidental quadratic
+    /// behavior a hash-indexed lookup avoids.
+    members_by_name: HashMap<(SymbolId, String), Vec<SymbolId>>,
     /// Lowercase declared type name -> its `SymbolId`, project-wide (not
     /// per-file): unlike most languages this binder targets, Apex has no
     /// import/package system -- every top-level class/interface/enum in
@@ -47,10 +59,14 @@ impl SymbolTable {
 
         self.by_name_ci.entry(lower.clone()).or_default().push(id);
         if symbol.container.is_none() && symbol.kind.is_type() {
-            self.top_level.entry(lower).or_insert(id);
+            self.top_level.entry(lower.clone()).or_insert(id);
         }
         if let Some(container) = symbol.container {
             self.members_of.entry(container).or_default().push(id);
+            self.members_by_name
+                .entry((container, lower))
+                .or_default()
+                .push(id);
         }
 
         self.symbols.push(symbol);
@@ -125,16 +141,19 @@ impl SymbolTable {
     /// `type_id` or anywhere in its resolved `extends`/`implements`
     /// chain -- the candidate set an unqualified member reference
     /// resolves against. Declaration order is preserved within each
-    /// type visited, self before ancestors.
+    /// type visited, self before ancestors. An O(1)-average hash lookup
+    /// per type in the chain (via `members_by_name`), not a linear scan
+    /// over that type's members -- see `members_by_name`'s doc comment
+    /// for why that distinction matters (this is Pass 2's single hottest
+    /// path, called once per name reference in the whole program).
     pub fn lookup_member(&self, type_id: SymbolId, name: &str) -> Vec<SymbolId> {
+        let lower = name.to_ascii_lowercase();
         let mut found = Vec::new();
         for chain_id in
             std::iter::once(type_id).chain(self.inherited_chain(type_id).iter().copied())
         {
-            for &member in self.members_of(chain_id) {
-                if self.get(member).name.eq_ignore_ascii_case(name) {
-                    found.push(member);
-                }
+            if let Some(members) = self.members_by_name.get(&(chain_id, lower.clone())) {
+                found.extend(members.iter().copied());
             }
         }
         found

@@ -3,6 +3,31 @@
 //! Error recovery is a first-class design goal: on a syntax error the
 //! parser should resynchronize at a statement/member boundary and keep
 //! producing a best-effort tree for the rest of the file.
+//!
+//! **Deep-tree stack safety caveat.** Parsing itself (`grammar::expressions`'
+//! left-associative binary levels, in particular) is iterative, not
+//! recursive -- a long same-precedence chain like `a + b + c + ...`
+//! costs O(1) parser stack depth regardless of chain length. But the
+//! *tree* it produces is still a left-nested `BinExpr` chain exactly as
+//! long, and `rowan::GreenNode` (an `Arc`-based recursive structure) is
+//! torn down via ordinary generated `Drop` glue, which recurses one
+//! frame per tree level. On this project's Windows dev machine a
+//! left-nested chain around ~6,500-7,000 terms overflows a default
+//! (~1 MiB) thread stack purely on *drop* -- confirmed by isolating each
+//! stage (`parse_expression` returning, `Parse::syntax()`, dropping the
+//! `SyntaxNode`, then dropping `Parse` itself) and finding only the
+//! final drop crashes. This is a `rowan`-level characteristic, not a bug
+//! in this crate's own grammar code, and it can't be fixed by changing
+//! how events are parsed/built -- only by giving whichever thread
+//! eventually drops the tree enough stack headroom. A long chain this
+//! long is very rare in hand-written Apex but realistic from generated
+//! code (a large dynamic SOQL condition, a big rules-engine-emitted
+//! boolean expression, ...), so any caller whose input isn't guaranteed
+//! small/hand-written should parse (and, critically, later drop the
+//! result) on a thread built with at least [`RECOMMENDED_MIN_STACK_SIZE`]
+//! bytes of stack -- see `apex-binder`'s `BoundProgram::from_files` and
+//! `apexls-cli`'s `main` for the two call sites in this workspace that
+//! do.
 
 mod errors;
 mod event;
@@ -14,6 +39,17 @@ pub use errors::{Parse, ParseError};
 
 use input::Input;
 use parser::Parser;
+
+/// The minimum stack size (bytes) a thread should be built with before
+/// parsing input that isn't guaranteed small/hand-written, and -- this
+/// is the part that actually matters -- before dropping the resulting
+/// `Parse`/`SyntaxNode` tree. See the module doc comment's "deep-tree
+/// stack safety caveat" for why. 64 MiB comfortably covers even
+/// pathological generated chains hundreds of thousands of terms long;
+/// actual physical memory use stays near zero for ordinary input, since
+/// OS thread stacks are reserved virtual address space, committed
+/// page-by-page only as they're actually touched.
+pub const RECOMMENDED_MIN_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Parse `src` as a single expression (Phase 2's `<=`/`>=`/shift merges,
 /// the full corrected precedence table, and the cast-vs-paren

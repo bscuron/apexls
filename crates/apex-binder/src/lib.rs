@@ -77,10 +77,36 @@ pub struct BoundProgram {
     scopes: HashMap<SyntaxPtr, ScopeTree>,
 }
 
+/// Rayon lazily builds its global thread pool (default stack size, ~1
+/// MiB on this project's Windows dev machine) on first use unless
+/// something builds it explicitly first -- called once, before any
+/// `par_iter()` below, to give every worker thread enough stack to
+/// safely *drop* a deeply left-nested expression tree (see
+/// `apex_parser`'s module doc comment's "deep-tree stack safety
+/// caveat"; every parsed file's tree is ultimately dropped on one of
+/// these workers, whether immediately or much later as part of
+/// `BoundProgram` itself being dropped).
+static ENSURE_LARGE_WORKER_STACKS: std::sync::Once = std::sync::Once::new();
+
+fn ensure_large_worker_stacks() {
+    ENSURE_LARGE_WORKER_STACKS.call_once(|| {
+        // Ignore failure: it only means the global pool was already
+        // built by something else (an earlier call in this process, or
+        // a host application's own rayon use) before we got here --
+        // that pool's stack size is then outside this crate's control,
+        // a broader application-level concern rather than something to
+        // panic over.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .stack_size(apex_parser::RECOMMENDED_MIN_STACK_SIZE)
+            .build_global();
+    });
+}
+
 impl BoundProgram {
     /// Discovers, parses, and binds every `.cls`/`.trigger` file under
     /// `root`, plus its SFDX object/field metadata.
     pub fn from_files(root: impl AsRef<Path>) -> Self {
+        ensure_large_worker_stacks();
         let root = root.as_ref();
         let discovery = apex_discover::discover(root);
         let schema = SchemaIndex::build(root);
