@@ -17,8 +17,9 @@ StmtRoot@0..41
         Identifier@5..12 "Integer"
         Whitespace@12..13 " "
       VarDeclarator@13..18
-        Identifier@13..14 "i"
-        Whitespace@14..15 " "
+        DeclName@13..15
+          Identifier@13..14 "i"
+          Whitespace@14..15 " "
         Assign@15..16 "="
         Whitespace@16..17 " "
         LiteralExpr@17..18

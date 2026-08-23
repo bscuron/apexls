@@ -31,7 +31,8 @@ StmtRoot@0..58
       QualifiedName@20..30
         Identifier@20..29 "Exception"
         Whitespace@29..30 " "
-      Identifier@30..31 "e"
+      DeclName@30..31
+        Identifier@30..31 "e"
       RParen@31..32 ")"
       Whitespace@32..33 " "
       Block@33..42

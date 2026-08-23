@@ -201,7 +201,7 @@ fn try_enhanced_for_control(p: &mut Parser<'_>) -> bool {
     if !super::ids::at_id(p) {
         return false;
     }
-    p.bump(); // id
+    super::ids::expect_name(p);
     if !p.at(SyntaxKind::Colon) {
         return false;
     }
@@ -315,7 +315,7 @@ fn catch_clause(p: &mut Parser<'_>) -> CompletedMarker {
     if !super::types::qualified_name(p) {
         p.error("expected exception type");
     }
-    super::ids::expect_id(p);
+    super::ids::expect_name(p);
     p.expect(SyntaxKind::RParen);
     block(p);
     m.complete(p, SyntaxKind::CatchClause)
@@ -480,7 +480,7 @@ pub(crate) fn var_declarators(p: &mut Parser<'_>) {
 
 fn var_declarator(p: &mut Parser<'_>) {
     let m = p.start();
-    super::ids::expect_id(p);
+    super::ids::expect_name(p);
     if p.at(SyntaxKind::Assign) {
         p.bump();
         super::expressions::expr(p);

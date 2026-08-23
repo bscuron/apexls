@@ -163,7 +163,7 @@ fn literal_value(p: &mut Parser<'_>) {
 
 fn class_decl_rest(p: &mut Parser<'_>) {
     p.bump(); // class
-    super::ids::expect_id(p);
+    super::ids::expect_name(p);
     if p.at(SyntaxKind::Extends) {
         p.bump();
         if !super::types::type_ref(p) {
@@ -251,7 +251,7 @@ fn member_decl(p: &mut Parser<'_>) {
 fn member_decl_rest(p: &mut Parser<'_>) -> SyntaxKind {
     if p.at(SyntaxKind::Void) {
         p.bump();
-        super::ids::expect_id(p);
+        super::ids::expect_name(p);
         formal_parameters(p);
         method_body_or_semi(p);
         return SyntaxKind::MethodDecl;
@@ -275,13 +275,17 @@ fn member_decl_rest(p: &mut Parser<'_>) -> SyntaxKind {
 
     match p.nth(1) {
         SyntaxKind::LParen => {
+            let name = p.start();
             p.bump(); // method name
+            name.complete(p, SyntaxKind::DeclName);
             formal_parameters(p);
             method_body_or_semi(p);
             SyntaxKind::MethodDecl
         }
         SyntaxKind::LBrace => {
+            let name = p.start();
             p.bump(); // property name
+            name.complete(p, SyntaxKind::DeclName);
             property_body(p);
             SyntaxKind::PropertyDecl
         }
@@ -321,7 +325,7 @@ fn formal_parameter(p: &mut Parser<'_>) {
     if !super::types::type_ref(p) {
         p.error("expected a parameter type");
     }
-    super::ids::expect_id(p);
+    super::ids::expect_name(p);
     m.complete(p, SyntaxKind::FormalParam);
 }
 
@@ -353,7 +357,7 @@ fn property_block(p: &mut Parser<'_>) {
 
 fn interface_decl_rest(p: &mut Parser<'_>) {
     p.bump(); // interface
-    super::ids::expect_id(p);
+    super::ids::expect_name(p);
     if p.at(SyntaxKind::Extends) {
         p.bump();
         type_ref_list(p);
@@ -379,7 +383,7 @@ fn interface_method_decl(p: &mut Parser<'_>) {
     } else if !super::types::type_ref(p) {
         p.error("expected a return type");
     }
-    super::ids::expect_id(p);
+    super::ids::expect_name(p);
     formal_parameters(p);
     p.expect(SyntaxKind::Semi);
     m.complete(p, SyntaxKind::MethodDecl);
@@ -389,14 +393,14 @@ fn interface_method_decl(p: &mut Parser<'_>) {
 
 fn enum_decl_rest(p: &mut Parser<'_>) {
     p.bump(); // enum
-    super::ids::expect_id(p);
+    super::ids::expect_name(p);
     p.expect(SyntaxKind::LBrace);
     if !p.at(SyntaxKind::RBrace) {
         let m = p.start();
-        super::ids::expect_id(p);
+        super::ids::expect_name(p);
         while p.at(SyntaxKind::Comma) {
             p.bump();
-            super::ids::expect_id(p);
+            super::ids::expect_name(p);
         }
         m.complete(p, SyntaxKind::EnumConstantList);
     }
@@ -410,9 +414,9 @@ fn enum_decl_rest(p: &mut Parser<'_>) {
 pub(crate) fn trigger_unit(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // trigger
-    super::ids::expect_id(p);
+    super::ids::expect_name(p);
     p.expect(SyntaxKind::On);
-    super::ids::expect_id(p);
+    super::ids::expect_id(p); // SObject reference, not a declared name
     p.expect(SyntaxKind::LParen);
     trigger_case(p);
     while p.at(SyntaxKind::Comma) {

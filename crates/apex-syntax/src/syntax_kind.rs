@@ -120,6 +120,19 @@ syntax_kind! {
         // ---- Types (expression/statement-scoped subset only) ----
         Type, TypeArgList, QualifiedName,
 
+        // ---- Names ----
+        // A declared-name position (class/interface/enum/method/field/
+        // property/parameter/enum-constant/local-variable/catch-variable
+        // name), wrapped in its own node so the typed AST layer can find
+        // it without scanning for "the token after the introducing
+        // keyword/type" -- unlike `NameExpr` (a name used as a value) or
+        // `QualifiedName` (a dotted reference chain), `DeclName` never has
+        // children of its own, just the one identifier-shaped token.
+        // Named `DeclName` rather than `Name` because `Name` is already a
+        // token kind (the SOSL `NAME` keyword) and rowan needs one flat
+        // kind space shared by tokens and nodes.
+        DeclName,
+
         // ---- Expressions ----
         LiteralExpr, NameExpr, ThisExpr, SuperExpr, ParenExpr, CastExpr,
         BinExpr, UnaryExpr, PostfixExpr, TernaryExpr, InstanceofExpr,

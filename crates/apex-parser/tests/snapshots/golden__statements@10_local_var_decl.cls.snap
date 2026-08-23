@@ -27,8 +27,9 @@ StmtRoot@0..64
         Gt@25..26 ">"
         Whitespace@26..27 " "
     VarDeclarator@27..63
-      Identifier@27..28 "x"
-      Whitespace@28..29 " "
+      DeclName@27..29
+        Identifier@27..28 "x"
+        Whitespace@28..29 " "
       Assign@29..30 "="
       Whitespace@30..31 " "
       NewExpr@31..63

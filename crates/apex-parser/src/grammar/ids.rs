@@ -46,6 +46,22 @@ pub(crate) fn expect_any_id(p: &mut Parser<'_>) -> bool {
     }
 }
 
+/// Like [`expect_id`], but wraps the consumed token (or the empty hole
+/// left by a failed `expect_id`) in a `Name` node -- used at *declared*-
+/// name positions (class/method/field/parameter/local-variable/... names)
+/// so the typed AST layer and, eventually, symbol-table binding can find
+/// a declaration's name without scanning for "the token after whatever
+/// happens to precede it here" (a keyword, a return `Type`, ...), which
+/// differs per declaration kind. Not used for *reference* positions
+/// (`QualifiedName`, SOQL field names, the trigger's `ON <object>`) --
+/// those aren't declaring anything.
+pub(crate) fn expect_name(p: &mut Parser<'_>) -> bool {
+    let m = p.start();
+    let ok = expect_id(p);
+    m.complete(p, SyntaxKind::DeclName);
+    ok
+}
+
 /// `anyId` minus the "Apex Keywords" block that would be ambiguous or
 /// nonsensical as a *declared* name (`class`, `new`, `return`, ...) --
 /// still fine to *access* via `.new`, which is why `anyId` allows it and

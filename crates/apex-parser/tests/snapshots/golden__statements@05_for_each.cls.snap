@@ -15,8 +15,9 @@ StmtRoot@0..37
     Type@5..13
       Identifier@5..12 "Account"
       Whitespace@12..13 " "
-    Identifier@13..16 "acc"
-    Whitespace@16..17 " "
+    DeclName@13..17
+      Identifier@13..16 "acc"
+      Whitespace@16..17 " "
     Colon@17..18 ":"
     Whitespace@18..19 " "
     NameExpr@19..27
