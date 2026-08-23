@@ -47,7 +47,9 @@ fn full_handshake_over_real_stdio() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-    // 1. initialize
+    // 1. initialize -- offers both UTF-8 and UTF-16 position encodings
+    // (negotiation should prefer UTF-8) plus an initializationOptions
+    // blob, to exercise both alongside the handshake itself.
     send(
         &mut stdin,
         &serde_json::json!({
@@ -57,7 +59,10 @@ fn full_handshake_over_real_stdio() {
             "params": {
                 "processId": null,
                 "rootUri": null,
-                "capabilities": {},
+                "capabilities": {
+                    "general": { "positionEncodings": ["utf-8", "utf-16"] }
+                },
+                "initializationOptions": { "someSetting": true },
             }
         }),
     );
@@ -71,6 +76,10 @@ fn full_handshake_over_real_stdio() {
         response["result"]["capabilities"]["textDocumentSync"],
         serde_json::json!(1),
         "expected TextDocumentSyncKind::FULL (1), got: {response:?}"
+    );
+    assert_eq!(
+        response["result"]["capabilities"]["positionEncoding"], "utf-8",
+        "expected UTF-8 to be negotiated since it was offered, got: {response:?}"
     );
     assert_eq!(response["result"]["serverInfo"]["name"], "apexls");
 
@@ -114,9 +123,20 @@ fn full_handshake_over_real_stdio() {
         }),
     );
 
+    // 3b. workspace/didChangeConfiguration (notification, no response
+    // expected) -- just proving the server accepts it without erroring.
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "workspace/didChangeConfiguration",
+            "params": { "settings": { "someSetting": false } }
+        }),
+    );
+
     // A request sent right after those notifications should still get
     // a well-formed response -- proves the server didn't wedge or drop
-    // sync after processing document-sync notifications.
+    // sync after processing document-sync/configuration notifications.
     send(
         &mut stdin,
         &serde_json::json!({

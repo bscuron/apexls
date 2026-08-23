@@ -25,14 +25,20 @@
 //! to be open together." Rather than guess, `Backend::initialize` takes
 //! only the first workspace folder and ignores the rest.
 //!
+//! Request **cancellation** (`$/cancelRequest`) needs no code here at
+//! all: `ConcurrencyLayer`, wired into the middleware stack below,
+//! already intercepts that notification and aborts the matching
+//! in-flight request's future automatically (confirmed by reading
+//! `async-lsp`'s own source -- see `BACKLOG.md` §1). There's no
+//! end-to-end test of it *actually cancelling something* yet, since
+//! every request handler so far completes near-instantly; that'll
+//! become naturally testable once a real (potentially slow,
+//! binder-backed) request exists.
+//!
 //! Deliberately **not** yet wired, each a separate tracked `BACKLOG.md`
-//! item rather than silently dropped:
-//! - `workspace/didChangeConfiguration`,
-//! - position-encoding negotiation (`positionEncodingKind`),
-//! - request cancellation,
-//! - any real language feature at all (hover/goto-definition/etc, or
-//!   anything touching `apex-binder`) -- this pass only proves the
-//!   protocol loop itself works.
+//! item rather than silently dropped: any real language feature at all
+//! (hover/goto-definition/etc, or anything touching `apex-binder`) --
+//! this pass only proves the protocol loop itself works.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -46,12 +52,17 @@ use async_lsp::tracing::TracingLayer;
 use async_lsp::{ClientSocket, LanguageServer, ResponseError};
 use futures::future::BoxFuture;
 use lsp_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, InitializeParams, InitializeResult, InitializedParams,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, InitializeParams, InitializeResult,
+    InitializedParams, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Url,
 };
 use tower::ServiceBuilder;
 use tracing::{info, warn, Level};
+
+mod line_index;
+
+use line_index::PositionEncoding;
 
 /// The server's whole mutable state: the single resolved project root
 /// (see the module doc comment's "single-root only" section) and an
@@ -69,6 +80,18 @@ struct Backend {
     /// the client offered neither -- a request without any open folder,
     /// which every LSP client allows for single-file editing.
     root: Option<Url>,
+    /// Negotiated once in `initialize` (see `line_index::PositionEncoding::negotiate`).
+    /// `Utf16` until then, matching the LSP-mandated default -- never
+    /// actually observed pre-negotiation, since nothing sends a
+    /// position-bearing request before `initialize` completes.
+    position_encoding: PositionEncoding,
+    /// The raw `initializationOptions` blob from `initialize`, updated
+    /// wholesale by any later `workspace/didChangeConfiguration`
+    /// notification. Kept as opaque JSON rather than a typed config
+    /// struct since nothing consumes specific settings yet (no
+    /// standard-library-stub toggle, no metadata-root override) --
+    /// see `BACKLOG.md` §4 for what those settings will eventually be.
+    config: Option<serde_json::Value>,
     documents: HashMap<Url, String>,
 }
 
@@ -89,7 +112,20 @@ impl LanguageServer for Backend {
                 params.root_uri.clone()
             });
 
-        info!(?root, workspace_folder_count = folders.len(), "initialize");
+        let client_encodings = params
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|g| g.position_encodings.as_deref());
+        let position_encoding = PositionEncoding::negotiate(client_encodings);
+
+        info!(
+            ?root,
+            workspace_folder_count = folders.len(),
+            ?position_encoding,
+            has_initialization_options = params.initialization_options.is_some(),
+            "initialize",
+        );
         if folders.len() > 1 {
             warn!(
                 extra_folders = folders.len() - 1,
@@ -98,6 +134,8 @@ impl LanguageServer for Backend {
             );
         }
         self.root = root;
+        self.position_encoding = position_encoding;
+        self.config = params.initialization_options;
 
         Box::pin(async move {
             Ok(InitializeResult {
@@ -111,6 +149,13 @@ impl LanguageServer for Backend {
                     text_document_sync: Some(TextDocumentSyncCapability::Kind(
                         TextDocumentSyncKind::FULL,
                     )),
+                    // Always stated explicitly rather than omitted:
+                    // omitting `position_encoding` means both sides must
+                    // assume UTF-16 per spec, which is exactly what we'd
+                    // pick anyway when the client doesn't offer UTF-8 --
+                    // but being explicit means a client inspecting the
+                    // response never has to know that default by heart.
+                    position_encoding: Some(position_encoding.into()),
                     ..ServerCapabilities::default()
                 },
                 server_info: Some(ServerInfo {
@@ -119,6 +164,15 @@ impl LanguageServer for Backend {
                 }),
             })
         })
+    }
+
+    fn did_change_configuration(
+        &mut self,
+        params: DidChangeConfigurationParams,
+    ) -> Self::NotifyResult {
+        info!("did_change_configuration");
+        self.config = Some(params.settings);
+        ControlFlow::Continue(())
     }
 
     fn initialized(&mut self, _: InitializedParams) -> Self::NotifyResult {
@@ -180,6 +234,8 @@ async fn main() {
         let router = Router::from_language_server(Backend {
             client: client.clone(),
             root: None,
+            position_encoding: PositionEncoding::Utf16,
+            config: None,
             documents: HashMap::new(),
         });
 

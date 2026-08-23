@@ -14,8 +14,10 @@ project-wide symbol table with scope-aware, arity-and-type-narrowed
 reference resolution, cross-referenced against local SFDX metadata,
 parallelized across passes. `apexls-cli` is still a pre-binder debug tool
 (parses a single file with `parse_statement`, doesn't call into
-`apex-binder` at all). `apexls-server` is a minimal but real LSP protocol
-shell (see §1) -- it doesn't call into `apex-binder` either yet.
+`apex-binder` at all). `apexls-server` is a complete, real LSP protocol
+shell (§1 is fully checked off) -- it doesn't call into `apex-binder`
+yet, though, so it can't answer a single real language question. That's
+squarely §2/§3 territory next.
 
 ## 1. Protocol / server layer
 
@@ -50,20 +52,40 @@ shell (see §1) -- it doesn't call into `apex-binder` either yet.
       warning. No binder integration consumes the resolved root yet
       (there's no binder integration wired into the server at all
       yet), but the *policy* is settled, not deferred.
-- [ ] Configuration: `workspace/didChangeConfiguration`,
-      `initializationOptions` (e.g. where to find SFDX metadata, whether
-      to bundle standard-library stubs -- see §4).
-- [ ] Position encoding: LSP positions are UTF-16 line/character by
-      default; our `TextRange`/`TextSize` are byte offsets. Need a
-      line-index + UTF-16 conversion layer, or negotiate a different
-      `positionEncodingKind` if the client supports it (most do now).
-      Not started -- no capability implemented yet actually consumes a
-      position, so there's nothing to convert for yet either.
-- [ ] Cancellation: long-running requests (a whole-project rebind) need
-      to be cancellable when a newer request supersedes them, or the
-      server will feel unresponsive under real editing load. `async-lsp`
-      has the plumbing for this (its `ConcurrencyLayer`); not yet wired
-      to anything, since there's no long-running request to cancel yet.
+- [x] Configuration: `workspace/didChangeConfiguration`,
+      `initializationOptions`. **Done** as plumbing -- `Backend` captures
+      `initializationOptions` at `initialize` and overwrites it wholesale
+      on any later `didChangeConfiguration`, kept as opaque
+      `serde_json::Value` (no typed schema yet, since nothing consumes
+      specific settings -- e.g. where to find SFDX metadata, whether to
+      bundle standard-library stubs, both still §4 gaps with nothing to
+      configure). Verified via the protocol test accepting a
+      `didChangeConfiguration` notification without erroring or wedging
+      the server.
+- [x] Position encoding. **Done** -- `crates/apexls-server/src/line_index.rs`
+      negotiates `positionEncodingKind` in `initialize` (`ClientCapabilities.general.positionEncodings`,
+      preferring UTF-8 whenever offered -- zero conversion needed
+      against our own UTF-8 byte-offset `TextRange`/`TextSize` -- else
+      falling back to UTF-16, the LSP-mandated default) and always
+      states the choice explicitly in `ServerCapabilities.positionEncoding`
+      rather than relying on the implicit default. Also built a real,
+      unit-tested `LineIndex` (byte offset <-> `Position`, correct for
+      UTF-8/UTF-16/UTF-32 including surrogate-pair characters) --
+      genuinely useful infrastructure even with no consuming capability
+      yet, the same way `apex-binder`'s `AstPtr`/`SyntaxPtr` were built
+      ahead of goto-definition. (Caught a real shadowing bug in its
+      `\r`/`\n`-stripping logic via its own test suite before it shipped.)
+- [x] Cancellation. **Turned out to already be done**, not a gap: read
+      `async-lsp`'s own source and confirmed `ConcurrencyLayer` (already
+      in our middleware stack since the very first scaffolding)
+      intercepts `$/cancelRequest` directly and aborts the matching
+      in-flight request's future automatically -- no code needed from
+      this project at all. Honest caveat: there's no end-to-end test
+      proving it *actually cancels something*, since every request
+      handler so far (`initialize`, `shutdown`) completes near-instantly
+      and there's nothing slow to meaningfully cancel yet; that becomes
+      naturally testable once a real (potentially slow, binder-backed)
+      request exists.
 - [x] Protocol-level integration test harness: spin up the server,
       drive it over stdio with real LSP JSON-RPC messages, assert
       responses. **Done** --
