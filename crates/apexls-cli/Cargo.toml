@@ -1,0 +1,9 @@
+[package]
+name = "apexls-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apex-parser.workspace = true
+apex-printer.workspace = true

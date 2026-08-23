@@ -1,0 +1,9 @@
+[package]
+name = "apex-parser"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+apex-lexer.workspace = true
+apex-syntax.workspace = true

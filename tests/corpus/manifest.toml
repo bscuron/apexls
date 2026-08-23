@@ -1,0 +1,20 @@
+# Provenance ledger for vendored real-world Apex source used as test
+# fixtures. Every entry must record where the code came from, at what
+# commit, and under what license, so corpus vendoring stays auditable.
+#
+# Example:
+# [[entry]]
+# name = "apex-recipes"
+# repo = "https://github.com/trailheadapps/apex-recipes"
+# commit = "<pinned-sha>"
+# license = "BSD-3-Clause"
+# retrieved = "2026-08-22"
+
+[[entry]]
+name = "npsp"
+repo = "https://github.com/SalesforceFoundation/NPSP.git"
+commit = "3dc817c94e3f2d41d461f6a79dd9e83c279ded9c"
+license = "BSD-3-Clause-style (see tests/corpus/npsp/LICENSE)"
+retrieved = "2026-08-23"
+vendored-as = "git submodule (shallow, --depth 1) at tests/corpus/npsp"
+note = "~1070 .cls/.trigger files; used by crates/apex-lexer/tests/roundtrip.rs"

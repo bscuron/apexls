@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/apex-lexer",
+    "crates/apex-syntax",
+    "crates/apex-parser",
+    "crates/apex-printer",
+    "crates/apexls-cli",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+apex-lexer = { path = "crates/apex-lexer" }
+apex-syntax = { path = "crates/apex-syntax" }
+apex-parser = { path = "crates/apex-parser" }
+apex-printer = { path = "crates/apex-printer" }

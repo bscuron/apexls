@@ -1,0 +1,17 @@
+(* apexls grammar-of-record.
+ *
+ * This is a hand-maintained EBNF description of the Apex grammar as
+ * implemented by apex-parser/apex-lexer. Salesforce publishes no formal
+ * Apex spec, so this document is *our* source of truth for what apexls
+ * intends to accept — kept in sync with the parser code by convention
+ * (each rule here should correspond to a parser function and at least one
+ * tests/golden/ entry).
+ *
+ * Cross-referenced against, but not derived from:
+ *   - https://github.com/apex-dev-tools/apex-parser (ANTLR4)
+ *   - https://github.com/antlr/grammars-v4/blob/master/apex/apex.g4
+ *   - https://github.com/aheber/tree-sitter-sfapex
+ *
+ * Empty for now — Phase 1 (lexer) has not started. Add productions here as
+ * each grammar rule is implemented, not before.
+ *)

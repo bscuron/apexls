@@ -1,0 +1,3 @@
+[submodule "tests/corpus/npsp"]
+	path = tests/corpus/npsp
+	url = https://github.com/SalesforceFoundation/NPSP.git
