@@ -49,8 +49,9 @@ StmtRoot@0..79
         Type@38..46
           Identifier@38..45 "Account"
           Whitespace@45..46 " "
-        Identifier@46..49 "acc"
-        Whitespace@49..50 " "
+        DeclName@46..50
+          Identifier@46..49 "acc"
+          Whitespace@49..50 " "
       Block@50..59
         LBrace@50..51 "{"
         Whitespace@51..52 " "

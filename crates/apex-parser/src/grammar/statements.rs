@@ -123,7 +123,7 @@ fn when_value(p: &mut Parser<'_>) -> CompletedMarker {
         p.bump();
     } else if super::types::at_type_start(p) && super::ids::is_id_kind(p.nth(1)) {
         super::types::type_ref(p);
-        super::ids::expect_id(p);
+        super::ids::expect_name(p);
     } else {
         when_literal(p);
         while p.at(SyntaxKind::Comma) {

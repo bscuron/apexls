@@ -13,9 +13,9 @@ use rowan::ast::{support, AstChildren, AstNode};
 
 dispatch_enum! {
     TypeDecl {
-        Class => ClassDecl,
-        Interface => InterfaceDecl,
-        Enum => EnumDecl,
+        Class(ClassDecl) => ClassDecl,
+        Interface(InterfaceDecl) => InterfaceDecl,
+        Enum(EnumDecl) => EnumDecl,
     }
 }
 
@@ -26,13 +26,13 @@ dispatch_enum! {
 // wants).
 dispatch_enum! {
     Member {
-        Method => MethodDecl,
-        Constructor => ConstructorDecl,
-        Field => FieldDecl,
-        Property => PropertyDecl,
-        NestedClass => ClassDecl,
-        NestedInterface => InterfaceDecl,
-        NestedEnum => EnumDecl,
+        Method(MethodDecl) => MethodDecl,
+        Constructor(ConstructorDecl) => ConstructorDecl,
+        Field(FieldDecl) => FieldDecl,
+        Property(PropertyDecl) => PropertyDecl,
+        NestedClass(ClassDecl) => ClassDecl,
+        NestedInterface(InterfaceDecl) => InterfaceDecl,
+        NestedEnum(EnumDecl) => EnumDecl,
     }
 }
 
@@ -358,10 +358,9 @@ mod tests {
 
         let root = SyntaxNode::new_root(b.finish());
         let cu = CompilationUnit::cast(root).unwrap();
-        let TypeDecl::Class(class_node) = cu.type_decl().unwrap() else {
+        let TypeDecl::Class(class) = cu.type_decl().unwrap() else {
             panic!("expected a ClassDecl");
         };
-        let class = ClassDecl::cast(class_node).unwrap();
         assert_eq!(class.name().unwrap().text().unwrap(), "Foo");
         assert!(class.body().unwrap().members().next().is_none());
     }

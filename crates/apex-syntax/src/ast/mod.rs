@@ -1,29 +1,35 @@
 //! Typed AST layer over the raw [`crate::SyntaxNode`] tree: thin
 //! `rowan::ast::AstNode` wrappers, one dispatch enum per grammar
-//! category. Built out incrementally alongside whatever actually needs
-//! typed access -- per-variant field accessors (e.g. `BinExpr::lhs()`)
-//! can be added the same way as they become needed. `decl` (declarations:
-//! classes/interfaces/enums/triggers/members) is the first grammar area
-//! built out beyond `Expr`, since a symbol-table binder needs typed
-//! access to walk declarations before it can do anything else.
+//! category. `decl` (declarations: classes/interfaces/enums/triggers/
+//! members), `expr` (expressions), and `stmt` (statements) are built out
+//! with real per-node accessors (`BinExpr::lhs()`, `IfStmt::condition()`,
+//! ...) rather than just `AstNode` casting, since a symbol-table binder
+//! and an LSP built on top of it both need to walk into real operands
+//! and sub-statements, not just identify a node's kind.
 
 use crate::{ApexLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::ast::AstNode;
 
 pub mod decl;
+pub mod expr;
+pub mod stmt;
 
-/// Each variant holds the raw `SyntaxNode`, not the more specific typed
-/// wrapper its name suggests (`Member::NestedClass` holds a `SyntaxNode`,
-/// not a `ClassDecl`) -- callers that need that variant's own accessors
-/// re-cast it (`ClassDecl::cast(node)`), same as rust-analyzer's
-/// equivalent macro. Kept this way rather than holding typed payloads so
-/// this macro doesn't require every dispatch target to already have its
-/// own `ast_node!`/`dispatch_enum!` wrapper defined first.
+pub use expr::Expr;
+pub use stmt::{Block, Stmt};
+
+/// Each variant holds the specific typed wrapper its name suggests
+/// (`Member::NestedClass` holds a `ClassDecl`, not a raw `SyntaxNode`),
+/// matching rust-analyzer's equivalent macro -- callers get that
+/// variant's own accessors immediately after a `match`, no re-cast
+/// needed. Every `$ty` must already have its own `ast_node!`/
+/// `dispatch_enum!`-generated `AstNode` impl; Rust's item-order
+/// independence within a module means the two macro invocations for a
+/// type and the dispatch enum that names it can appear in either order.
 macro_rules! dispatch_enum {
-    ($enum_name:ident { $($variant:ident => $kind:ident),* $(,)? }) => {
+    ($enum_name:ident { $($variant:ident($ty:ty) => $kind:ident),* $(,)? }) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         pub enum $enum_name {
-            $($variant(SyntaxNode),)*
+            $($variant($ty),)*
         }
 
         impl AstNode for $enum_name {
@@ -35,14 +41,14 @@ macro_rules! dispatch_enum {
 
             fn cast(node: SyntaxNode) -> Option<Self> {
                 match node.kind() {
-                    $(SyntaxKind::$kind => Some($enum_name::$variant(node)),)*
+                    $(SyntaxKind::$kind => Some($enum_name::$variant(<$ty>::cast(node)?)),)*
                     _ => None,
                 }
             }
 
             fn syntax(&self) -> &SyntaxNode {
                 match self {
-                    $($enum_name::$variant(node) => node,)*
+                    $($enum_name::$variant(inner) => inner.syntax(),)*
                 }
             }
         }
@@ -83,33 +89,9 @@ macro_rules! ast_node {
 pub(crate) use ast_node;
 pub(crate) use dispatch_enum;
 
-dispatch_enum! {
-    Expr {
-        Literal => LiteralExpr,
-        Name => NameExpr,
-        This => ThisExpr,
-        Super => SuperExpr,
-        Paren => ParenExpr,
-        Cast => CastExpr,
-        Bin => BinExpr,
-        Unary => UnaryExpr,
-        Postfix => PostfixExpr,
-        Ternary => TernaryExpr,
-        Instanceof => InstanceofExpr,
-        Field => FieldExpr,
-        Index => IndexExpr,
-        Call => CallExpr,
-        MethodCall => MethodCallExpr,
-        New => NewExpr,
-        Soql => SoqlExpr,
-        Sosl => SoslExpr,
-    }
-}
-
 ast_node!(Name, DeclName);
 ast_node!(Type, Type);
 ast_node!(QualifiedName, QualifiedName);
-ast_node!(Block, Block);
 
 impl Name {
     /// The single identifier-shaped token a `Name` node wraps -- may be
@@ -125,13 +107,34 @@ impl Name {
     }
 }
 
-/// The first non-trivia token directly under `node` -- the general-
-/// purpose accessor for nodes (like `Name`) that are known to wrap
-/// exactly one significant token, whichever kind it happens to be.
-pub(crate) fn first_non_trivia_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+/// All direct non-trivia token children of `node`, in source order --
+/// the general-purpose accessor behind [`first_non_trivia_token`]/
+/// [`last_non_trivia_token`], and used directly wherever a node can hold
+/// more than one significant token with no children of its own between
+/// them (e.g. `BinExpr`'s operator, which is 1-3 tokens: `=`, `<=`
+/// merged from `Lt`+`Assign`, `>>>` merged from three `Gt`s, ...). Child
+/// *nodes* (an expression's operands, a statement's sub-block, ...) are
+/// never tokens, so they're transparently skipped without needing to
+/// know where they are positionally.
+pub(crate) fn direct_tokens(node: &SyntaxNode) -> impl Iterator<Item = SyntaxToken> + '_ {
     node.children_with_tokens()
         .filter_map(|it| it.into_token())
-        .find(|t| !t.kind().is_trivia())
+        .filter(|t| !t.kind().is_trivia())
+}
+
+/// The first non-trivia token directly under `node` -- for nodes (like
+/// `Name`, or a prefix `UnaryExpr`'s operator) known to lead with exactly
+/// one significant token.
+pub(crate) fn first_non_trivia_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+    direct_tokens(node).next()
+}
+
+/// The last non-trivia token directly under `node` -- for nodes (like a
+/// `FieldExpr`/`MethodCallExpr`'s member name, always the last direct
+/// token after the target expression and the `.`/`?.`) known to trail
+/// with exactly one significant token.
+pub(crate) fn last_non_trivia_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+    direct_tokens(node).last()
 }
 
 /// The first non-trivia token strictly after the first occurrence of a
@@ -153,43 +156,4 @@ pub(crate) fn token_after(node: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxT
         }
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::GreenNodeBuilder;
-
-    /// Builds `1 + 2` as a `BinExpr(LiteralExpr, Add, LiteralExpr)` by
-    /// hand (no parser involved) and checks the `Expr` dispatch enum
-    /// casts/rejects correctly -- `apex-parser`'s tests exercise this
-    /// against real parsed trees; this just checks the macro-generated
-    /// `AstNode` impl itself is wired up right.
-    #[test]
-    fn expr_cast_dispatches_by_kind() {
-        let mut b = GreenNodeBuilder::new();
-        b.start_node(SyntaxKind::BinExpr.into());
-        b.start_node(SyntaxKind::LiteralExpr.into());
-        b.token(SyntaxKind::IntegerLiteral.into(), "1");
-        b.finish_node();
-        b.token(SyntaxKind::Add.into(), "+");
-        b.start_node(SyntaxKind::LiteralExpr.into());
-        b.token(SyntaxKind::IntegerLiteral.into(), "2");
-        b.finish_node();
-        b.finish_node();
-
-        let root = SyntaxNode::new_root(b.finish());
-        assert_eq!(root.text().to_string(), "1+2");
-
-        let bin = Expr::cast(root.clone()).expect("BinExpr should cast to Expr");
-        assert!(matches!(bin, Expr::Bin(_)));
-
-        let lit_node = root.first_child().unwrap();
-        let lit = Expr::cast(lit_node).expect("LiteralExpr should cast to Expr");
-        assert!(matches!(lit, Expr::Literal(_)));
-
-        // A token (not a node) can't cast at all -- can_cast only ever
-        // sees node kinds coming from `SyntaxNode::kind()`.
-        assert!(!Expr::can_cast(SyntaxKind::Add));
-    }
 }
