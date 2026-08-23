@@ -9,9 +9,18 @@
 //! `SymbolTable::lookup_member` walks for member-lookup fallthrough --
 //! plus, separately, each class's direct `extends` target alone
 //! (`direct_super`), for `super`/`super(...)` resolution.
+//!
+//! Every per-type computation here (resolving one type's direct
+//! `extends`/`implements` names, flattening one type's chain) only ever
+//! reads `table`, never writes it, so each is safe to run in parallel
+//! (`rayon`) against a shared `&SymbolTable`; only the final
+//! `set_inherited_chain`/`set_direct_super` calls need `&mut
+//! SymbolTable`, so those stay a fast sequential pass over the
+//! already-computed results.
 
 use crate::symbol::SymbolId;
 use crate::symbol_table::SymbolTable;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 /// `raw_extends`: for each type symbol that declared at least one
@@ -23,10 +32,12 @@ pub(crate) fn resolve_inheritance(
     raw_extends: &[(SymbolId, Vec<String>)],
     raw_super: &[(SymbolId, String)],
 ) {
-    for (type_id, super_name) in raw_super {
-        if let Some(super_id) = table.top_level(super_name) {
-            table.set_direct_super(*type_id, super_id);
-        }
+    let direct_super: Vec<(SymbolId, SymbolId)> = raw_super
+        .par_iter()
+        .filter_map(|(type_id, name)| table.top_level(name).map(|super_id| (*type_id, super_id)))
+        .collect();
+    for (type_id, super_id) in direct_super {
+        table.set_direct_super(type_id, super_id);
     }
 
     // Resolve each type's *direct* supertype names to `SymbolId`s first,
@@ -37,15 +48,19 @@ pub(crate) fn resolve_inheritance(
     // is simply dropped: an unresolvable supertype contributes nothing
     // to the chain, it doesn't abort collection.
     let direct: HashMap<SymbolId, Vec<SymbolId>> = raw_extends
-        .iter()
+        .par_iter()
         .map(|(type_id, names)| {
             let resolved = names.iter().filter_map(|n| table.top_level(n)).collect();
             (*type_id, resolved)
         })
         .collect();
 
-    for (type_id, _) in raw_extends {
-        table.set_inherited_chain(*type_id, flatten(&direct, *type_id));
+    let chains: Vec<(SymbolId, Vec<SymbolId>)> = raw_extends
+        .par_iter()
+        .map(|(type_id, _)| (*type_id, flatten(&direct, *type_id)))
+        .collect();
+    for (type_id, chain) in chains {
+        table.set_inherited_chain(type_id, chain);
     }
 }
 

@@ -109,6 +109,18 @@ impl SymbolTable {
         self.direct_super.get(&id).copied()
     }
 
+    /// Every `Parameter` symbol directly contained by `container` (a
+    /// `Method`/`Constructor`), in declaration order -- used both to
+    /// seed a body's root scope (`crate::resolve`) and to check a call's
+    /// arity against a candidate during overload resolution.
+    pub fn params(&self, container: SymbolId) -> Vec<SymbolId> {
+        self.members_of(container)
+            .iter()
+            .copied()
+            .filter(|&id| self.get(id).kind == crate::symbol::SymbolKind::Parameter)
+            .collect()
+    }
+
     /// Every member named `name` (case-insensitive) directly on
     /// `type_id` or anywhere in its resolved `extends`/`implements`
     /// chain -- the candidate set an unqualified member reference

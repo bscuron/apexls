@@ -14,7 +14,14 @@
 //! hand-written fixture projects (deep SOQL relationship-field chains,
 //! a class with many overloaded same-name methods, a deep `extends`
 //! chain) -- written to a temp dir once per bench function, outside the
-//! timed closure, and cleaned up afterward.
+//! timed closure, and cleaned up afterward. Since `BoundProgram::from_files`
+//! parallelizes internally (`rayon`), these 2-3-file fixtures are
+//! expected to run measurably *slower* than they did before
+//! parallelization was added: thread-pool scheduling overhead is a
+//! roughly fixed per-call cost that only pays for itself past a real
+//! project's file/symbol count, which these deliberately tiny fixtures
+//! never reach. `"corpus"` (real NPSP, ~1070 files) is where
+//! parallelization's actual payoff shows up.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::path::{Path, PathBuf};

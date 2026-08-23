@@ -6,7 +6,7 @@
 //! 10%, but 10% is still nonzero so the floor still passes." A fixed,
 //! narrow numeric target would be too brittle (any grammar/AST change
 //! shifts these counts), so the ceiling is set well above the current
-//! observed ratio (~55%) rather than pinned to it.
+//! observed ratio (~54%) rather than pinned to it.
 
 use apex_binder::{BoundProgram, Resolution};
 use std::path::{Path, PathBuf};
@@ -55,14 +55,22 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
         "expected >200,000 total reference resolutions across NPSP, got {total}"
     );
 
+    // `resolved`'s floor sits well above `candidates`' now that call
+    // expressions go through arity-then-type overload narrowing
+    // (`crate::resolve::narrow_by_overload`): most real overload sets in
+    // NPSP are same-name-different-arity, which arity alone resolves,
+    // so the bulk of what used to land in `Candidates` moved to
+    // `Resolved`. `candidates` still has a real floor -- genuinely
+    // ambiguous same-arity overloads (most often disambiguated only by
+    // argument types v1 doesn't model, like `Integer`/`String`) remain.
     assert!(
-        counts.resolved > 50_000,
-        "expected >50,000 Resolved references, got {}: {counts:?}",
+        counts.resolved > 100_000,
+        "expected >100,000 Resolved references, got {}: {counts:?}",
         counts.resolved
     );
     assert!(
-        counts.candidates > 5_000,
-        "expected >5,000 Candidates references, got {}: {counts:?}",
+        counts.candidates > 1_000,
+        "expected >1,000 Candidates references, got {}: {counts:?}",
         counts.candidates
     );
     assert!(

@@ -41,6 +41,7 @@ dependencies = [
  "apex-parser",
  "apex-syntax",
  "criterion",
+ "rayon",
  "rowan",
 ]
 

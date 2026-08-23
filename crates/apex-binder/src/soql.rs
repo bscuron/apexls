@@ -39,7 +39,7 @@ fn relationship_field_api_name(segment: &str) -> String {
 }
 
 fn resolve_object_ptr(binder: &mut BodyBinder<'_>, ptr: SyntaxPtr, name: &str) {
-    crate::schema_index::resolve_object(binder.schema, binder.refs, ptr, name);
+    crate::schema_index::resolve_object(binder.schema, &mut binder.refs, ptr, name);
 }
 
 /// Resolves a dotted `SoqlFieldName` (`Owner.Name`, a bare `AccountId`,

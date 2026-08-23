@@ -4,13 +4,17 @@
 //! [`Stmt`]/[`Expr`] walk, resolving references as they're encountered.
 //!
 //! Runs only after Pass 1.5 (`crate::inherit`) has finished, so member/
-//! inherited-chain lookups against the whole project are always safe --
-//! unlike Pass 1, this isn't embarrassingly parallel across bodies in
-//! this version, since [`BodyBinder`] allocates new [`SymbolId`]s for
-//! locals directly into the shared [`SymbolTable`] as it walks (the same
-//! arena Pass 1 populated), rather than a separate local-then-remap
-//! step. Parallelizing this later would need that same local-collect-
-//! then-merge trick Pass 1 already uses for symbols.
+//! inherited-chain lookups against the whole project are always safe.
+//! Like Pass 1, each body is bound independently against a read-only
+//! `&SymbolTable` and is safe to run in parallel (`crate::BoundProgram::from_files`
+//! does, via `rayon`) -- a body's newly-declared locals (`LocalVar`/
+//! `CatchVar`/`ForEachVar`/`SwitchBindingVar`) are allocated into a
+//! body-local arena (`BodyBinder::pending_locals`) tagged with a
+//! sentinel `SymbolId` (see [`LOCAL_SENTINEL_BASE`]) rather than the
+//! shared table directly, and merged in afterward by a fast sequential
+//! pass -- the same local-collect-then-merge trick Pass 1 uses for
+//! symbols, applied here to keep concurrent bodies from needing to
+//! coordinate a single shared mutable arena.
 //!
 //! Scope of what gets resolved, and how -- see the project's design
 //! plan for the full rationale, summarized here:
@@ -28,10 +32,17 @@
 //!   declared type is itself a project-local class. Anything requiring
 //!   real type inference (the result of an arbitrary method call, a
 //!   binary expression, ...) stays `Unresolved` rather than guessing.
-//! - Method calls (qualified or not) never resolve to a single
-//!   `SymbolId`, even when only one same-name method exists -- v1 does
-//!   no argument-type/arity overload resolution, so every method-call
-//!   reference is `Candidates` or `Unresolved`, never `Resolved`.
+//! - Method/constructor calls (qualified or not, including `new`/
+//!   `this(...)`/`super(...)`) go through [`narrow_by_overload`]: an
+//!   exact arity filter (real Apex semantics -- there's no varargs or
+//!   default parameter values for user-defined methods, so arity alone
+//!   is authoritative, not a heuristic), then a best-effort narrowing by
+//!   known project-local argument types among same-arity candidates. A
+//!   call resolves to a single `Resolved` symbol when exactly one
+//!   candidate survives; otherwise it's `Candidates` (genuinely
+//!   ambiguous, or argument types v1 can't check -- system/library
+//!   types have no model to compare against) or `Unresolved` (no
+//!   same-name member at all).
 
 use crate::file_id::FileId;
 use crate::ptr::{AstPtr, SyntaxPtr};
@@ -47,17 +58,137 @@ use apex_syntax::ast::{Expr, Name, Stmt, Type};
 use apex_syntax::SyntaxKind;
 use rowan::ast::AstNode;
 
-/// One method/constructor/property-accessor body's binding context:
-/// shared read-only project state (`table`* is `&mut` only because
-/// locals get allocated into it as they're discovered; every *lookup*
-/// against already-collected symbols is logically read-only),
-/// write-only output (`refs`), and the scope chain being built as the
-/// walk descends.
-pub(crate) struct BodyBinder<'a> {
-    pub(crate) table: &'a mut SymbolTable,
-    pub(crate) schema: &'a SchemaIndex,
-    pub(crate) refs: &'a mut ReferenceTable,
+/// Narrows a same-name candidate set (methods, or constructors for a
+/// `new`/`this(...)`/`super(...)` call) using real Apex overload-
+/// resolution rules where they're checkable without a full type system.
+///
+/// First, an exact arity filter: Apex has no varargs or default
+/// parameter values for user-defined methods/constructors, so a
+/// candidate whose parameter count doesn't equal `arg_types.len()`
+/// genuinely cannot be the one called -- this is exact, not a
+/// heuristic. If nothing survives arity filtering at all (a real
+/// compile error, or a gap in this binder's own counting), the original
+/// full candidate set is reported rather than claiming nothing matched.
+///
+/// Second, among same-arity survivors, elimination by known project-
+/// local argument types: a candidate is ruled out only when some
+/// argument's inferred type is *positively* incompatible with the
+/// corresponding parameter's declared type (neither an exact match nor
+/// a subtype via `extends`/`implements`). An argument whose type isn't
+/// known (a literal, a system-typed value, an uninferred call result,
+/// ...) or a parameter whose declared type isn't itself project-local
+/// (`String`, `List<T>`, ... -- v1 has no model of these to check
+/// against) can never rule a candidate out: "can't prove wrong" always
+/// wins over "assume wrong."
+fn narrow_by_overload(
+    table: &SymbolTable,
+    candidates: Vec<SymbolId>,
+    arg_types: &[Option<SymbolId>],
+) -> Resolution {
+    if candidates.is_empty() {
+        return Resolution::Unresolved;
+    }
+
+    let by_arity: Vec<SymbolId> = candidates
+        .iter()
+        .copied()
+        .filter(|&id| table.params(id).len() == arg_types.len())
+        .collect();
+    let pool = if by_arity.is_empty() {
+        candidates
+    } else {
+        by_arity
+    };
+    if pool.len() == 1 {
+        return Resolution::Resolved(pool[0]);
+    }
+
+    let by_type: Vec<SymbolId> = pool
+        .iter()
+        .copied()
+        .filter(|&id| is_argument_type_compatible(table, id, arg_types))
+        .collect();
+    match by_type.len() {
+        1 => Resolution::Resolved(by_type[0]),
+        // Over-eliminated (every candidate ruled itself out, which given
+        // the conservative rule above should only happen if `pool`
+        // itself was already empty -- defensive, not expected) or still
+        // ambiguous: report the honest pre-type-filter pool either way.
+        0 => Resolution::Candidates(pool),
+        _ => Resolution::Candidates(by_type),
+    }
+}
+
+fn is_argument_type_compatible(
+    table: &SymbolTable,
+    candidate: SymbolId,
+    arg_types: &[Option<SymbolId>],
+) -> bool {
+    for (param, arg_type) in table.params(candidate).iter().zip(arg_types.iter()) {
+        let Some(arg_type_id) = arg_type else {
+            continue;
+        };
+        let Some(param_type_name) = table.get(*param).type_name.as_deref() else {
+            continue;
+        };
+        let Some(param_type_id) = table.top_level(param_type_name) else {
+            continue;
+        };
+        if *arg_type_id == param_type_id {
+            continue;
+        }
+        if table.inherited_chain(*arg_type_id).contains(&param_type_id) {
+            continue; // the argument's type extends/implements the parameter's type -- a valid upcast
+        }
+        return false;
+    }
+    true
+}
+
+/// The reserved `SymbolId` range `declare_local` allocates from during
+/// one body's binding pass, disjoint from any real project `SymbolId`
+/// (no real Apex org has ~2 billion top-level declarations). A
+/// placeholder, remapped to a real global id once every body's local
+/// batch has been merged into the shared `SymbolTable`
+/// (`crate::BoundProgram::from_files`). Using a disjoint numbering range
+/// -- rather than an `enum` wrapper around every `SymbolId`-typed field
+/// -- keeps `Resolution`/`Scope` unchanged: the remap step is a single
+/// `SymbolId -> SymbolId` function, a no-op below this threshold,
+/// applied uniformly without needing to track which ids came from where.
+pub(crate) const LOCAL_SENTINEL_BASE: u32 = u32::MAX / 2;
+
+pub(crate) fn remap_local_id(id: SymbolId, base: u32) -> SymbolId {
+    if id.0 >= LOCAL_SENTINEL_BASE {
+        SymbolId(base + (id.0 - LOCAL_SENTINEL_BASE))
+    } else {
+        id
+    }
+}
+
+/// One body's complete Pass 2 output, still containing sentinel ids
+/// (see [`LOCAL_SENTINEL_BASE`]) for any symbol it locally declared.
+/// `crate::BoundProgram::from_files` merges `pending_locals` into the
+/// shared `SymbolTable` and remaps `scopes`/`refs` accordingly, once per
+/// body -- safe to do for many bodies' outputs in any order, including
+/// interleaved from multiple threads, since each body's own remap only
+/// touches its own data.
+pub(crate) struct BoundBody {
     pub(crate) scopes: ScopeTree,
+    pub(crate) pending_locals: Vec<Symbol>,
+    pub(crate) refs: ReferenceTable,
+}
+
+/// One method/constructor/property-accessor body's binding context:
+/// shared read-only project state (`table`, `schema`), this body's own
+/// local write targets (`refs`, `scopes`, `pending_locals`), all owned
+/// so binding never needs to coordinate with any other body running
+/// concurrently.
+pub(crate) struct BodyBinder<'a> {
+    pub(crate) table: &'a SymbolTable,
+    pub(crate) schema: &'a SchemaIndex,
+    pub(crate) refs: ReferenceTable,
+    pub(crate) scopes: ScopeTree,
+    pending_locals: Vec<Symbol>,
     file: FileId,
     /// The enclosing type, for `this`/`super`/unqualified member lookup
     /// fallthrough once local-scope lookup misses. `None` when binding a
@@ -74,24 +205,24 @@ pub(crate) struct BodyBinder<'a> {
 
 /// Binds one method/constructor/property-accessor `Block` body: builds
 /// its `ScopeTree` seeded with `params` in the root scope, walks every
-/// statement/expression, and returns the finished tree.
+/// statement/expression, and returns the (still sentinel-tagged) result.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bind_body(
-    table: &mut SymbolTable,
+    table: &SymbolTable,
     schema: &SchemaIndex,
-    refs: &mut ReferenceTable,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     enclosing_member: Option<SymbolId>,
     params: &[SymbolId],
     block: &Block,
-) -> ScopeTree {
+) -> BoundBody {
     let (scopes, root_scope) = ScopeTree::new_root(ScopeKind::Body, block.syntax().text_range());
     let mut binder = BodyBinder {
         table,
         schema,
-        refs,
+        refs: ReferenceTable::default(),
         scopes,
+        pending_locals: Vec::new(),
         file,
         enclosing_type,
         enclosing_member,
@@ -101,7 +232,7 @@ pub(crate) fn bind_body(
         binder.scopes.bind(root_scope, name, p);
     }
     binder.bind_block_stmts(root_scope, block);
-    binder.scopes
+    binder.into_bound_body()
 }
 
 /// Binds a `TriggerBlock`'s bare top-level statements -- the trigger's
@@ -110,19 +241,19 @@ pub(crate) fn bind_body(
 /// alongside (interleaved with, in source order) the `Member`
 /// declarations Pass 1 already collected separately.
 pub(crate) fn bind_trigger_body(
-    table: &mut SymbolTable,
+    table: &SymbolTable,
     schema: &SchemaIndex,
-    refs: &mut ReferenceTable,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     block: &TriggerBlock,
-) -> ScopeTree {
+) -> BoundBody {
     let (scopes, root_scope) = ScopeTree::new_root(ScopeKind::Body, block.syntax().text_range());
     let mut binder = BodyBinder {
         table,
         schema,
-        refs,
+        refs: ReferenceTable::default(),
         scopes,
+        pending_locals: Vec::new(),
         file,
         enclosing_type,
         enclosing_member: None,
@@ -132,34 +263,60 @@ pub(crate) fn bind_trigger_body(
             binder.bind_stmt(root_scope, &stmt);
         }
     }
-    binder.scopes
+    binder.into_bound_body()
 }
 
 /// Binds a bare expression with no enclosing statement context (a
 /// field/property initializer) -- member lookup only, no locals, no
 /// `ScopeTree` worth keeping around afterward.
 pub(crate) fn bind_initializer(
-    table: &mut SymbolTable,
+    table: &SymbolTable,
     schema: &SchemaIndex,
-    refs: &mut ReferenceTable,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     expr: &Expr,
-) {
+) -> BoundBody {
     let (scopes, root_scope) = ScopeTree::new_root(ScopeKind::Body, expr.syntax().text_range());
     let mut binder = BodyBinder {
         table,
         schema,
-        refs,
+        refs: ReferenceTable::default(),
         scopes,
+        pending_locals: Vec::new(),
         file,
         enclosing_type,
         enclosing_member: None,
     };
     binder.bind_expr(root_scope, expr);
+    binder.into_bound_body()
+}
+
+/// Resolves a single bare object-name reference (a trigger's `ON
+/// <object>`) against `schema`, wrapped as a `BoundBody` purely so it
+/// merges through the same sequential path as every other Pass 2
+/// result -- there's no body/scope involved, so `scopes`/`pending_locals`
+/// are empty and this entry is never inserted into
+/// `BoundProgram`'s scope-tree map (its caller passes `key: None`).
+pub(crate) fn bind_object_ref(schema: &SchemaIndex, ptr: SyntaxPtr, name: &str) -> BoundBody {
+    let mut refs = ReferenceTable::default();
+    crate::schema_index::resolve_object(schema, &mut refs, ptr, name);
+    let (scopes, _) = ScopeTree::new_root(ScopeKind::Body, rowan::TextRange::empty(0.into()));
+    BoundBody {
+        scopes,
+        pending_locals: Vec::new(),
+        refs,
+    }
 }
 
 impl<'a> BodyBinder<'a> {
+    fn into_bound_body(self) -> BoundBody {
+        BoundBody {
+            scopes: self.scopes,
+            pending_locals: self.pending_locals,
+            refs: self.refs,
+        }
+    }
+
     fn declare_local(
         &mut self,
         kind: SymbolKind,
@@ -181,7 +338,23 @@ impl<'a> BodyBinder<'a> {
             type_name,
             modifiers: ModifierSet::default(),
         };
-        self.table.alloc(symbol)
+        let id = SymbolId(LOCAL_SENTINEL_BASE + self.pending_locals.len() as u32);
+        self.pending_locals.push(symbol);
+        id
+    }
+
+    /// `id` resolved against this body's own pending local arena if it's
+    /// a sentinel id (see [`LOCAL_SENTINEL_BASE`]), otherwise against the
+    /// shared, already-final `SymbolTable` -- the two id spaces a body
+    /// can encounter (a symbol it just locally declared, vs. any
+    /// pre-existing project symbol) need this indirection since the
+    /// shared table doesn't contain this body's locals yet.
+    fn get_symbol(&self, id: SymbolId) -> &Symbol {
+        if id.0 >= LOCAL_SENTINEL_BASE {
+            &self.pending_locals[(id.0 - LOCAL_SENTINEL_BASE) as usize]
+        } else {
+            self.table.get(id)
+        }
     }
 
     /// The project-local type symbol `symbol`'s declared type resolves
@@ -190,7 +363,7 @@ impl<'a> BodyBinder<'a> {
     /// a symbol with no type, or whose type isn't a project-local class/
     /// interface/enum (a schema-object-typed or unmodeled system type).
     fn type_of_symbol(&self, id: SymbolId) -> Option<SymbolId> {
-        let type_name = self.table.get(id).type_name.as_deref()?;
+        let type_name = self.get_symbol(id).type_name.as_deref()?;
         self.table.top_level(type_name)
     }
 
@@ -480,8 +653,10 @@ impl<'a> BodyBinder<'a> {
     /// Walks `expr` and every subexpression, resolving references along
     /// the way. Returns the project-local type symbol `expr`'s static
     /// type resolves to, when that's known without inference (see the
-    /// module doc comment) -- `None` otherwise, including for every
-    /// method-call expression (v1 never infers a call's return type).
+    /// module doc comment) -- `None` otherwise. A call expression's
+    /// "type" is its resolved method/constructor's declared return type
+    /// (only available when overload resolution narrowed to exactly one
+    /// candidate with a project-local return type).
     pub(crate) fn bind_expr(&mut self, scope: ScopeId, expr: &Expr) -> Option<SymbolId> {
         match expr {
             Expr::Literal(_) => None,
@@ -548,10 +723,7 @@ impl<'a> BodyBinder<'a> {
                 // always unknown.
                 None
             }
-            Expr::Call(c) => {
-                self.bind_call_expr(scope, c);
-                None
-            }
+            Expr::Call(c) => self.bind_call_expr(scope, c),
             Expr::MethodCall(mc) => self.bind_method_call_expr(scope, mc),
             Expr::New(ne) => self.bind_new_expr(scope, ne),
             Expr::Soql(sq) => {
@@ -656,9 +828,10 @@ impl<'a> BodyBinder<'a> {
 
     fn bind_method_call_expr(&mut self, scope: ScopeId, mc: &MethodCallExpr) -> Option<SymbolId> {
         let target_type = mc.target().and_then(|t| self.bind_expr(scope, &t));
+        let mut arg_types = Vec::new();
         if let Some(args) = mc.args() {
             for a in args.args() {
-                self.bind_expr(scope, &a);
+                arg_types.push(self.bind_expr(scope, &a));
             }
         }
         let tok = mc.method_name_token()?;
@@ -675,26 +848,23 @@ impl<'a> BodyBinder<'a> {
             .into_iter()
             .filter(|&id| self.table.get(id).kind == SymbolKind::Method)
             .collect();
-        if methods.is_empty() {
-            self.refs.set(ptr, Resolution::Unresolved);
-        } else {
-            // Never `Resolved`, even for a single same-name match -- v1
-            // doesn't attempt argument-type/arity overload resolution
-            // (see the module doc comment).
-            self.refs.set(ptr, Resolution::Candidates(methods));
-        }
-        None
+        let resolution = narrow_by_overload(self.table, methods, &arg_types);
+        let result_type = match &resolution {
+            Resolution::Resolved(id) => self.type_of_symbol(*id),
+            _ => None,
+        };
+        self.refs.set(ptr, resolution);
+        result_type
     }
 
-    fn bind_call_expr(&mut self, scope: ScopeId, c: &CallExpr) {
+    fn bind_call_expr(&mut self, scope: ScopeId, c: &CallExpr) -> Option<SymbolId> {
+        let mut arg_types = Vec::new();
         if let Some(args) = c.args() {
             for a in args.args() {
-                self.bind_expr(scope, &a);
+                arg_types.push(self.bind_expr(scope, &a));
             }
         }
-        let Some(tok) = c.callee_token() else {
-            return;
-        };
+        let tok = c.callee_token()?;
         let ptr = SyntaxPtr::new(c.syntax());
 
         let (target_type, want_ctor) = match tok.kind() {
@@ -707,7 +877,7 @@ impl<'a> BodyBinder<'a> {
         };
         let Some(container) = target_type else {
             self.refs.set(ptr, Resolution::Unresolved);
-            return;
+            return None;
         };
 
         let candidates: Vec<SymbolId> = if want_ctor {
@@ -730,18 +900,25 @@ impl<'a> BodyBinder<'a> {
                 .collect()
         };
 
-        if candidates.is_empty() {
-            self.refs.set(ptr, Resolution::Unresolved);
-        } else {
-            self.refs.set(ptr, Resolution::Candidates(candidates));
-        }
+        let resolution = narrow_by_overload(self.table, candidates, &arg_types);
+        // Constructor symbols never carry a `type_name` (see
+        // `collect::collect_constructor`), so `type_of_symbol` is `None`
+        // for the `this(...)`/`super(...)` case without needing a
+        // separate `want_ctor` guard here.
+        let result_type = match &resolution {
+            Resolution::Resolved(id) => self.type_of_symbol(*id),
+            _ => None,
+        };
+        self.refs.set(ptr, resolution);
+        result_type
     }
 
     fn bind_new_expr(&mut self, scope: ScopeId, ne: &NewExpr) -> Option<SymbolId> {
         let resolved_type = ne.type_ref().and_then(|t| self.resolve_type_ref(&t));
         if let Some(args) = ne.args() {
+            let mut arg_types = Vec::new();
             for a in args.args() {
-                self.bind_expr(scope, &a);
+                arg_types.push(self.bind_expr(scope, &a));
             }
             if let Some(container) = resolved_type {
                 let ctors: Vec<SymbolId> = self
@@ -752,8 +929,8 @@ impl<'a> BodyBinder<'a> {
                     .filter(|&id| self.table.get(id).kind == SymbolKind::Constructor)
                     .collect();
                 if !ctors.is_empty() {
-                    self.refs
-                        .set(SyntaxPtr::new(ne.syntax()), Resolution::Candidates(ctors));
+                    let resolution = narrow_by_overload(self.table, ctors, &arg_types);
+                    self.refs.set(SyntaxPtr::new(ne.syntax()), resolution);
                 }
             }
         }

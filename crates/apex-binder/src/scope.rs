@@ -60,6 +60,12 @@ impl Scope {
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, id)| *id)
     }
+
+    fn remap_symbol_ids(&mut self, f: &impl Fn(SymbolId) -> SymbolId) {
+        for (_, id) in &mut self.bindings {
+            *id = f(*id);
+        }
+    }
 }
 
 /// One method/constructor/accessor/initializer body's scope chain, plus
@@ -96,6 +102,15 @@ impl ScopeTree {
 
     pub(crate) fn bind(&mut self, scope: ScopeId, name: String, symbol: SymbolId) {
         self.scopes[scope.0 as usize].bindings.push((name, symbol));
+    }
+
+    /// Applies `f` to every `SymbolId` bound in this tree -- see
+    /// `Resolution::map_ids`'s doc comment for why (translating a Pass-2
+    /// body's local sentinel ids to real global ids after merge).
+    pub(crate) fn remap_symbol_ids(&mut self, f: &impl Fn(SymbolId) -> SymbolId) {
+        for scope in &mut self.scopes {
+            scope.remap_symbol_ids(f);
+        }
     }
 
     pub fn scope(&self, id: ScopeId) -> &Scope {

@@ -1,6 +1,10 @@
 //! The symbol-table binder: turns "we can parse and walk Apex" into "we
 //! can answer real LSP questions." [`BoundProgram::from_files`] walks a
-//! whole project (via `apex_discover::discover`) through three passes:
+//! whole project (via `apex_discover::discover`) through three passes,
+//! each one run in parallel (`rayon`) wherever the work is genuinely
+//! per-item independent, with a fast sequential pass merging the
+//! results back into shared state where it isn't (see each stage's
+//! comments below for exactly where and why):
 //!
 //! 1. **Collect** (`collect`): every file's declarations
 //!    (`apex_syntax::ast::decl`) become [`symbol::Symbol`]s in one
@@ -18,9 +22,15 @@
 //! declaration-site binding is unconditionally precise; reference-site
 //! resolution is precise for unqualified names (locals/params/fields/
 //! types, which Apex guarantees resolve unambiguously by simple name)
-//! and honestly imprecise everywhere real type inference or overload
-//! resolution would be required (`Resolution::Candidates`/`Unresolved`
-//! rather than a guessed single answer).
+//! and calls go through real (arity-exact, best-effort type-narrowed)
+//! overload resolution (`crate::resolve::narrow_by_overload`). What's
+//! left honestly imprecise is exactly what would require a full
+//! expression-type-inference engine v1 doesn't have: an argument whose
+//! type is a literal or an unmodeled system/library type can't be used
+//! to disambiguate an overload, and a qualified access only chains past
+//! `Unresolved` when its target's type is already known one hop away
+//! (`Resolution::Candidates`/`Unresolved` rather than a guessed single
+//! answer in those cases).
 
 mod collect;
 mod file_id;
@@ -47,6 +57,7 @@ use apex_syntax::ast::decl::{
     CompilationUnit, ConstructorDecl, MethodDecl, PropertyDecl, TriggerUnit, VarDeclarator,
 };
 use apex_syntax::SyntaxNode;
+use rayon::prelude::*;
 use rowan::ast::AstNode;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -74,45 +85,64 @@ impl BoundProgram {
         let discovery = apex_discover::discover(root);
         let schema = SchemaIndex::build(root);
 
-        let mut files = Vec::new();
-        let mut parses = Vec::new();
-        let mut is_trigger = Vec::new();
-        for path in &discovery.apex_files {
-            let Ok(src) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            let trigger = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
-            let parse = if trigger {
-                apex_parser::parse_trigger_unit(&src)
-            } else {
-                apex_parser::parse_compilation_unit(&src)
-            };
-            files.push(path.clone());
-            is_trigger.push(trigger);
-            parses.push(parse);
-        }
+        // Stage 1a (parallel): read + parse every file independently.
+        // `par_iter().filter_map(...).collect::<Vec<_>>()` preserves
+        // `discovery.apex_files`'s original order (rayon's indexed
+        // collection always does), so a file's final position in this
+        // `Vec` -- and thus its `FileId` below -- stays deterministic
+        // across runs regardless of which thread actually processed it.
+        let parsed: Vec<(PathBuf, bool, Parse)> = discovery
+            .apex_files
+            .par_iter()
+            .filter_map(|path| {
+                let src = std::fs::read_to_string(path).ok()?;
+                let trigger = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
+                let parse = if trigger {
+                    apex_parser::parse_trigger_unit(&src)
+                } else {
+                    apex_parser::parse_compilation_unit(&src)
+                };
+                Some((path.clone(), trigger, parse))
+            })
+            .collect();
 
+        // Stage 1b (parallel): Pass 1 declaration collection, one file
+        // at a time -- a pure function of that file's already-parsed
+        // tree with no cross-file lookups (see `collect`'s module doc
+        // comment), safe to run fully independently now that every
+        // file has a final `FileId` (its index here).
+        let collections: Vec<collect::FileCollection> = parsed
+            .par_iter()
+            .enumerate()
+            .map(|(i, (_, trigger, parse))| {
+                let file = FileId(i as u32);
+                let root_node = parse.syntax();
+                if *trigger {
+                    TriggerUnit::cast(root_node.clone())
+                        .map(|tu| collect::collect_trigger_unit(file, &tu))
+                } else {
+                    CompilationUnit::cast(root_node.clone())
+                        .map(|cu| collect::collect_compilation_unit(file, &cu))
+                }
+                .unwrap_or_default()
+            })
+            .collect();
+
+        let files: Vec<PathBuf> = parsed.iter().map(|(p, _, _)| p.clone()).collect();
+        let parses: Vec<Parse> = parsed.into_iter().map(|(_, _, parse)| parse).collect();
+
+        // Sequential merge: fold each file's locally-numbered symbols
+        // into the shared arena, remapping `container` ids by that
+        // file's base offset. Cheap (no parsing/tree-walking left to
+        // do here, just `Vec` extends and integer arithmetic), so this
+        // doesn't need to be parallel itself.
         let mut table = SymbolTable::default();
         let mut raw_extends: Vec<(SymbolId, Vec<String>)> = Vec::new();
         let mut raw_super: Vec<(SymbolId, String)> = Vec::new();
-
-        for (i, parse) in parses.iter().enumerate() {
-            let file = FileId(i as u32);
-            let root_node = parse.syntax();
-            let collection = if is_trigger[i] {
-                TriggerUnit::cast(root_node.clone())
-                    .map(|tu| collect::collect_trigger_unit(file, &tu))
-            } else {
-                CompilationUnit::cast(root_node.clone())
-                    .map(|cu| collect::collect_compilation_unit(file, &cu))
-            };
-            let Some(collection) = collection else {
-                continue;
-            };
-
+        for collection in collections {
             let base = table.len() as u32;
             for mut symbol in collection.symbols {
                 symbol.container = symbol
@@ -128,30 +158,45 @@ impl BoundProgram {
             }
         }
 
+        // Pass 1.5 (parallel where it counts): resolves every type's
+        // `extends`/`implements` chain -- see `inherit`'s module doc
+        // comment for the parallel/sequential split within it.
         inherit::resolve_inheritance(&mut table, &raw_extends, &raw_super);
 
-        let mut refs = ReferenceTable::default();
-        let mut scope_trees = HashMap::new();
-
-        // Snapshotted before Pass 2, which allocates new local symbols
-        // into `table` as it walks -- iterating `table.iter()` live
-        // while also mutating it isn't possible in safe Rust, and isn't
-        // what's wanted anyway (Pass 2 shouldn't try to bind bodies for
-        // the locals it itself just declared).
+        // Pass 2 (parallel): bind every declared symbol's body/
+        // initializer independently against the now-final, read-only
+        // `table` -- see `resolve`'s module doc comment for how a
+        // body's own newly-declared locals stay out of `table` until
+        // the sequential merge below (`rayon`-safe concurrent binding
+        // needs a single shared mutable arena avoided, not locked).
         let declared: Vec<(SymbolId, Symbol)> =
             table.iter().map(|(id, s)| (id, s.clone())).collect();
+        let bound: Vec<(Option<SyntaxPtr>, resolve::BoundBody)> = declared
+            .par_iter()
+            .flat_map(|(id, symbol)| {
+                let root_node = parses[symbol.file.index()].syntax();
+                bind_symbol_body(&table, &schema, &root_node, *id, symbol)
+            })
+            .collect();
 
-        for (id, symbol) in &declared {
-            let root_node = parses[symbol.file.index()].syntax();
-            bind_symbol_body(
-                &mut table,
-                &schema,
-                &mut refs,
-                &mut scope_trees,
-                &root_node,
-                *id,
-                symbol,
-            );
+        // Sequential merge, mirroring Pass 1's: allocate each body's
+        // pending locals into the shared table, remap that body's
+        // sentinel ids to the resulting real global ids, and fold its
+        // reference/scope-tree output into the project-wide result.
+        let mut refs = ReferenceTable::default();
+        let mut scope_trees = HashMap::new();
+        for (key, body) in bound {
+            let base = table.len() as u32;
+            for local in body.pending_locals {
+                table.alloc(local);
+            }
+            let remap = |id: SymbolId| resolve::remap_local_id(id, base);
+            let mut scopes = body.scopes;
+            scopes.remap_symbol_ids(&remap);
+            body.refs.map_ids(&remap).merge_into(&mut refs);
+            if let Some(key) = key {
+                scope_trees.insert(key, scopes);
+            }
         }
 
         BoundProgram {
@@ -181,111 +226,113 @@ impl BoundProgram {
     }
 }
 
+/// Binds one declared symbol's body/initializer, if it has one --
+/// almost always zero or one result, except a `Property` (0-2, one per
+/// accessor with a real body) and a `Trigger` (0-2: its `ON <object>`
+/// reference and its executable top-level block are two independent
+/// `BoundBody`s). The `Option<SyntaxPtr>` is `Some` only for a result
+/// that's a real body worth keeping a `ScopeTree` for (`None` for the
+/// trigger's bare object-name resolution, which has no scope of its
+/// own).
 fn bind_symbol_body(
-    table: &mut SymbolTable,
+    table: &SymbolTable,
     schema: &SchemaIndex,
-    refs: &mut ReferenceTable,
-    scope_trees: &mut HashMap<SyntaxPtr, ScopeTree>,
     root: &SyntaxNode,
     id: SymbolId,
     symbol: &Symbol,
-) {
+) -> Vec<(Option<SyntaxPtr>, resolve::BoundBody)> {
     match symbol.kind {
         SymbolKind::Method => {
             let Some(m) = symbol.ptr.to_node(root).and_then(MethodDecl::cast) else {
-                return;
+                return Vec::new();
             };
-            let Some(body) = m.body() else { return };
-            let params = params_of(table, id);
+            let Some(body) = m.body() else {
+                return Vec::new();
+            };
+            let params = table.params(id);
             let key = SyntaxPtr::new(body.syntax());
-            let tree = resolve::bind_body(
+            let bound = resolve::bind_body(
                 table,
                 schema,
-                refs,
                 symbol.file,
                 symbol.container,
                 Some(id),
                 &params,
                 &body,
             );
-            scope_trees.insert(key, tree);
+            vec![(Some(key), bound)]
         }
         SymbolKind::Constructor => {
             let Some(c) = symbol.ptr.to_node(root).and_then(ConstructorDecl::cast) else {
-                return;
+                return Vec::new();
             };
-            let Some(body) = c.body() else { return };
-            let params = params_of(table, id);
+            let Some(body) = c.body() else {
+                return Vec::new();
+            };
+            let params = table.params(id);
             let key = SyntaxPtr::new(body.syntax());
-            let tree = resolve::bind_body(
+            let bound = resolve::bind_body(
                 table,
                 schema,
-                refs,
                 symbol.file,
                 symbol.container,
                 Some(id),
                 &params,
                 &body,
             );
-            scope_trees.insert(key, tree);
+            vec![(Some(key), bound)]
         }
         SymbolKind::Property => {
             let Some(p) = symbol.ptr.to_node(root).and_then(PropertyDecl::cast) else {
-                return;
+                return Vec::new();
             };
-            for accessor in p.accessors() {
-                let Some(body) = accessor.body() else {
-                    continue;
-                };
-                let key = SyntaxPtr::new(body.syntax());
-                let tree = resolve::bind_body(
-                    table,
-                    schema,
-                    refs,
-                    symbol.file,
-                    symbol.container,
-                    None,
-                    &[],
-                    &body,
-                );
-                scope_trees.insert(key, tree);
-            }
+            p.accessors()
+                .filter_map(|accessor| {
+                    let body = accessor.body()?;
+                    let key = SyntaxPtr::new(body.syntax());
+                    let bound = resolve::bind_body(
+                        table,
+                        schema,
+                        symbol.file,
+                        symbol.container,
+                        None,
+                        &[],
+                        &body,
+                    );
+                    Some((Some(key), bound))
+                })
+                .collect()
         }
         SymbolKind::Field => {
             let Some(decl) = symbol.ptr.to_node(root).and_then(VarDeclarator::cast) else {
-                return;
+                return Vec::new();
             };
-            if let Some(init) = decl.init() {
-                resolve::bind_initializer(
-                    table,
-                    schema,
-                    refs,
-                    symbol.file,
-                    symbol.container,
-                    &init,
-                );
-            }
+            let Some(init) = decl.init() else {
+                return Vec::new();
+            };
+            let bound =
+                resolve::bind_initializer(table, schema, symbol.file, symbol.container, &init);
+            vec![(None, bound)]
         }
         SymbolKind::Trigger => {
             let Some(tu) = symbol.ptr.to_node(root).and_then(TriggerUnit::cast) else {
-                return;
+                return Vec::new();
             };
+            let mut out = Vec::new();
             if let Some(obj_tok) = tu.object_ref() {
                 if let Some(parent) = obj_tok.parent() {
-                    schema_index::resolve_object(
-                        schema,
-                        refs,
-                        SyntaxPtr::new(&parent),
-                        obj_tok.text(),
-                    );
+                    let bound =
+                        resolve::bind_object_ref(schema, SyntaxPtr::new(&parent), obj_tok.text());
+                    out.push((None, bound));
                 }
             }
             if let Some(block) = tu.block() {
                 let key = SyntaxPtr::new(block.syntax());
-                let tree =
-                    resolve::bind_trigger_body(table, schema, refs, symbol.file, Some(id), &block);
-                scope_trees.insert(key, tree);
+                let bound =
+                    resolve::bind_trigger_body(table, schema, symbol.file, Some(id), &block);
+                out.push((Some(key), bound));
             }
+            out
         }
         SymbolKind::Interface
         | SymbolKind::Class
@@ -295,15 +342,6 @@ fn bind_symbol_body(
         | SymbolKind::LocalVar
         | SymbolKind::CatchVar
         | SymbolKind::ForEachVar
-        | SymbolKind::SwitchBindingVar => {}
+        | SymbolKind::SwitchBindingVar => Vec::new(),
     }
-}
-
-fn params_of(table: &SymbolTable, container: SymbolId) -> Vec<SymbolId> {
-    table
-        .members_of(container)
-        .iter()
-        .copied()
-        .filter(|&id| table.get(id).kind == SymbolKind::Parameter)
-        .collect()
 }

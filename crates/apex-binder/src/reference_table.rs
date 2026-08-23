@@ -40,6 +40,22 @@ pub enum Resolution {
     Unresolved,
 }
 
+impl Resolution {
+    /// Applies `f` to every `SymbolId` this resolution references --
+    /// used to translate a Pass-2 body's local sentinel ids
+    /// (`crate::resolve::LOCAL_SENTINEL_BASE`) into real global ids once
+    /// that body's newly-declared locals have been merged into the
+    /// shared `SymbolTable` (`f` is the identity for any id that was
+    /// already global).
+    pub(crate) fn map_ids(self, f: &impl Fn(SymbolId) -> SymbolId) -> Resolution {
+        match self {
+            Resolution::Resolved(id) => Resolution::Resolved(f(id)),
+            Resolution::Candidates(ids) => Resolution::Candidates(ids.into_iter().map(f).collect()),
+            other => other,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ReferenceTable {
     resolutions: HashMap<SyntaxPtr, Resolution>,
@@ -64,5 +80,24 @@ impl ReferenceTable {
 
     pub fn is_empty(&self) -> bool {
         self.resolutions.is_empty()
+    }
+
+    /// Consumes this table, applying `f` to every `SymbolId` any entry
+    /// references -- the whole-table counterpart to `Resolution::map_ids`.
+    pub(crate) fn map_ids(self, f: &impl Fn(SymbolId) -> SymbolId) -> ReferenceTable {
+        ReferenceTable {
+            resolutions: self
+                .resolutions
+                .into_iter()
+                .map(|(ptr, res)| (ptr, res.map_ids(f)))
+                .collect(),
+        }
+    }
+
+    /// Merges `self` into `target`, consuming `self` -- used to fold one
+    /// Pass-2 body's (already id-remapped) reference fragment into the
+    /// project-wide table.
+    pub(crate) fn merge_into(self, target: &mut ReferenceTable) {
+        target.resolutions.extend(self.resolutions);
     }
 }
