@@ -15,6 +15,7 @@ version = "0.1.0"
 license = "MIT"
 
 [workspace.dependencies]
+apex-discover = { path = "crates/apex-discover" }
 apex-lexer = { path = "crates/apex-lexer" }
 apex-syntax = { path = "crates/apex-syntax" }
 apex-parser = { path = "crates/apex-parser" }

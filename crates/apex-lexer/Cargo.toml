@@ -8,3 +8,11 @@ license.workspace = true
 # Compile-time perfect hash map for O(1), zero-allocation, collision-free
 # keyword lookup (no runtime hashing/build step required).
 phf = { version = "0.11", features = ["macros"] }
+
+[dev-dependencies]
+apex-discover.workspace = true
+criterion = { version = "0.8.2", features = ["html_reports"] }
+
+[[bench]]
+name = "lexer_bench"
+harness = false
