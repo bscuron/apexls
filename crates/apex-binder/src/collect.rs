@@ -54,10 +54,32 @@ impl FileCollection {
     }
 }
 
-fn type_ptr_and_name(file: FileId, ty: Option<Type>) -> (Option<AstPtr<Type>>, Option<String>) {
+/// `(pointer, base name, type argument names)` for a declared type
+/// reference, e.g. `List<Account>` -> `(ptr, "List", ["Account"])`. Type
+/// argument *names* are cached eagerly here, the same reason `type_name`
+/// itself is: a symbol declared in one file can be referenced while
+/// binding a different file, which only has *that* file's `SyntaxNode`
+/// root in hand, not the declaring file's -- re-deriving type arguments
+/// from `type_ref.to_node(root)` later wouldn't work in general. Only
+/// one level deep (an argument's *own* type arguments, e.g. the inner
+/// `Account` of a hypothetical `List<List<Account>>`, aren't captured) --
+/// the only shape Apex generics actually have is one level (`List<T>`/
+/// `Map<K, V>`/`Set<T>`, never user-defined, never nested more than a
+/// project actually chooses to nest collections), so going deeper here
+/// wouldn't pay for its own complexity.
+fn type_ptr_and_name(
+    file: FileId,
+    ty: Option<Type>,
+) -> (Option<AstPtr<Type>>, Option<String>, Vec<String>) {
     match ty {
-        Some(ty) => (Some(AstPtr::new(file, &ty)), Some(ty.text())),
-        None => (None, None),
+        Some(ty) => {
+            let args = ty
+                .type_args()
+                .map(|list| list.args().map(|a| a.text()).collect())
+                .unwrap_or_default();
+            (Some(AstPtr::new(file, &ty)), Some(ty.text()), args)
+        }
+        None => (None, None, Vec::new()),
     }
 }
 
@@ -92,6 +114,7 @@ pub(crate) fn collect_trigger_unit(file: FileId, tu: &TriggerUnit) -> FileCollec
             container: None,
             type_ref: None,
             type_name: None,
+            type_args: Vec::new(),
             modifiers: ModifierSet::default(),
         },
     );
@@ -140,6 +163,7 @@ fn collect_class(
             container,
             type_ref: None,
             type_name: None,
+            type_args: Vec::new(),
             modifiers: ModifierSet::from_modifiers(class.modifiers()),
         },
     );
@@ -186,6 +210,7 @@ fn collect_interface(
             container,
             type_ref: None,
             type_name: None,
+            type_args: Vec::new(),
             modifiers: ModifierSet::from_modifiers(iface.modifiers()),
         },
     );
@@ -227,6 +252,7 @@ fn collect_enum(
             container,
             type_ref: None,
             type_name: None,
+            type_args: Vec::new(),
             modifiers: ModifierSet::from_modifiers(en.modifiers()),
         },
     );
@@ -247,6 +273,7 @@ fn collect_enum(
                     container: Some(enum_id),
                     type_ref: None,
                     type_name: None,
+                    type_args: Vec::new(),
                     modifiers: ModifierSet::default(),
                 },
             );
@@ -273,7 +300,7 @@ fn collect_method(out: &mut FileCollection, file: FileId, m: &MethodDecl, contai
     let Some(name_text) = name.text() else {
         return;
     };
-    let (type_ref, type_name) = type_ptr_and_name(file, m.return_type());
+    let (type_ref, type_name, type_args) = type_ptr_and_name(file, m.return_type());
     let method_id = out.push(
         file,
         Symbol {
@@ -285,6 +312,7 @@ fn collect_method(out: &mut FileCollection, file: FileId, m: &MethodDecl, contai
             container: Some(container),
             type_ref,
             type_name,
+            type_args,
             modifiers: ModifierSet::from_modifiers(m.modifiers()),
         },
     );
@@ -316,6 +344,7 @@ fn collect_constructor(
             container: Some(container),
             type_ref: None,
             type_name: None,
+            type_args: Vec::new(),
             modifiers: ModifierSet::from_modifiers(c.modifiers()),
         },
     );
@@ -326,7 +355,7 @@ fn collect_constructor(
 }
 
 fn collect_field(out: &mut FileCollection, file: FileId, f: &FieldDecl, container: SymbolId) {
-    let (type_ref, type_name) = type_ptr_and_name(file, f.type_ref());
+    let (type_ref, type_name, type_args) = type_ptr_and_name(file, f.type_ref());
     for declarator in f.declarators() {
         let Some(name) = declarator.name() else {
             continue;
@@ -345,6 +374,7 @@ fn collect_field(out: &mut FileCollection, file: FileId, f: &FieldDecl, containe
                 container: Some(container),
                 type_ref,
                 type_name: type_name.clone(),
+                type_args: type_args.clone(),
                 modifiers: ModifierSet::from_modifiers(f.modifiers()),
             },
         );
@@ -358,7 +388,7 @@ fn collect_property(out: &mut FileCollection, file: FileId, p: &PropertyDecl, co
     let Some(name_text) = name.text() else {
         return;
     };
-    let (type_ref, type_name) = type_ptr_and_name(file, p.type_ref());
+    let (type_ref, type_name, type_args) = type_ptr_and_name(file, p.type_ref());
     out.push(
         file,
         Symbol {
@@ -370,6 +400,7 @@ fn collect_property(out: &mut FileCollection, file: FileId, p: &PropertyDecl, co
             container: Some(container),
             type_ref,
             type_name,
+            type_args,
             modifiers: ModifierSet::from_modifiers(p.modifiers()),
         },
     );
@@ -388,7 +419,7 @@ fn collect_params(
         let Some(name_text) = name.text() else {
             continue;
         };
-        let (type_ref, type_name) = type_ptr_and_name(file, param.type_ref());
+        let (type_ref, type_name, type_args) = type_ptr_and_name(file, param.type_ref());
         out.push(
             file,
             Symbol {
@@ -400,6 +431,7 @@ fn collect_params(
                 container: Some(container),
                 type_ref,
                 type_name,
+                type_args,
                 modifiers: ModifierSet::default(),
             },
         );

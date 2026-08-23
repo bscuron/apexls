@@ -314,21 +314,110 @@ precision" -- they directly block shipping certain features honestly.
       this project). This is the more tractable of the two "unmodeled
       Salesforce surface" gaps, since describe calls are a solved,
       already-integrated pattern for this project.
-- [ ] **No real type inference** beyond one-hop chaining (a name's
-      *declared* type, not the inferred result of an arbitrary
-      subexpression). Limits hover accuracy and overload-resolution
-      precision for anything past the simplest expressions.
-- [ ] **No generics-aware resolution** -- `List<T>`/`Map<K,V>` type
-      argument substitution isn't modeled; flagged as deferred in the
-      original binder design.
-- [ ] **No override-matching semantics** beyond simple inherited-chain
-      member lookup (`virtual`/`override` compatibility isn't checked).
-- [ ] **No cross-file visibility enforcement** -- `ModifierSet` captures
-      `private`/`protected`/`public`/`global` but `lookup_member` doesn't
-      filter by accessibility from the reference site, so a private
-      member of another class can still appear as a resolution
-      candidate. Not urgent for hover, but relevant before completion
-      or quick-fixes should suggest only what's actually callable.
+- [x] **Real type inference beyond one-hop chaining -- done, honestly
+      bounded.** A new `Ty` value (`crates/apex-binder/src/ty.rs`,
+      walker-internal only, never stored on `BoundProgram`/`Resolution`)
+      replaces `Option<SymbolId>` as `BodyBinder::bind_expr`'s return
+      type: `Ty::Project(SymbolId)` is exactly what `Option<SymbolId>`
+      already meant; `Ty::System { name, args }` names a system/library
+      type or schema SObject even without a member model for it, so a
+      literal, an operator result, or a generic collection's element type
+      no longer silently disappears at the first hop the way it used to.
+      Literal kinds (`Integer`/`Long`/`Decimal`/`String`/`Boolean`) get
+      their real system type; comparison/logical operators always produce
+      `Boolean`; arithmetic/bitwise/shift/assignment operators propagate
+      an operand's type. **What this doesn't do:** cover the rest of the
+      standard library's real method surface (still the separate,
+      still-unmodeled stdlib-model gap below) or attempt common-supertype
+      inference for a ternary's two branches beyond exact `Ty` equality.
+- [x] **Generics-aware resolution for `List`/`Map`/`Set` -- done.** Apex
+      has no user-defined generics at all, so a small, hand-written,
+      case-insensitive table (`crates/apex-binder/src/generics.rs`)
+      genuinely *is* Apex's whole generics story: `List.get`/`size`/
+      `isEmpty`/`contains`, `Map.get`/`size`/`isEmpty`/`containsKey`/
+      `containsValue`/`keySet`/`values`, `Set.size`/`isEmpty`/`contains`,
+      each substituting the collection's own type argument(s) (captured
+      at Pass 1 collection time as a new `Symbol.type_args: Vec<String>`
+      field, one level deep -- the only shape Apex generics actually
+      have). `List<Account> l; l.get(0).Name` now resolves `Name` when
+      `Account` is project-local, even though `l.get(0)` itself has no
+      real declaration to resolve to (stays `Resolution::Unresolved`,
+      correctly -- only the *type* flows onward, not a fabricated
+      resolution). Not exhaustive: `sort`/`addAll`/`retainAll`/`clone`/
+      `iterator`/... fall through to today's `Unresolved`, same as any
+      other unmodeled system method, no regression.
+- [x] **Override-matching semantics -- done.** `SymbolTable::lookup_member`
+      now tracks which arities an `override` candidate has already
+      claimed at a more-derived level of the `extends`/`implements` chain
+      and excludes any same-arity candidate at a more-ancestral level,
+      instead of reporting both as separate overload candidates. Exact,
+      not a heuristic: Apex requires an `override` method's signature
+      (arity included) to exactly match what it overrides, a compile
+      error otherwise -- the same guarantee `narrow_by_overload` already
+      relies on for arity-based narrowing.
+- [x] **Cross-file visibility enforcement -- done.** New
+      `SymbolTable::is_visible_from(candidate, from)`: `public`/`global`
+      are always visible (v1 still has no namespace model); `private`
+      requires the same *top-level* declaring type (Apex nested classes
+      share their outer class's private access, so this walks `container`
+      to the root, not just one level); `protected` additionally allows
+      any type that is, extends, or implements the member's declaring
+      type. Every `lookup_member` call site in `resolve.rs`, plus the
+      constructor-lookup branches, now filters through it, so a private
+      member of an unrelated class can no longer surface as a resolution
+      candidate from outside its own type.
+- [ ] **No standard-library type model** carries forward unchanged (see
+      above) -- `Ty::System` can *name* an unmodeled type now, but still
+      can't resolve members of one beyond the `List`/`Map`/`Set` table
+      just added.
+
+**Performance, measured (`cargo bench -p apex-binder`, real NPSP corpus,
+~1070 files):** `corpus/bind_npsp_full` (cold): ~440-459ms across two
+consecutive clean runs, within this machine's already-established noise
+band for this benchmark (384-487ms observed across earlier, unrelated
+baselines with no code changes between them -- see §2's own noise-caveat
+precedent). `corpus/warm_rebind_after_one_file_edit`: **~15.2ms**,
+stable across three consecutive runs -- consistent with the ~13.3ms
+baseline from just before this work, i.e. no real regression from
+threading `Ty` through the hottest path in the crate. Getting there took
+two real fixes, not just measurement:
+1. `Ty::System`'s `name` field was originally a plain `String`, which
+   heap-allocates on every literal `bind_expr` walks -- literals are the
+   single most common thing typed in the whole corpus, so this showed up
+   as a real, uniform ~13-18% regression across *every* benchmark in the
+   suite (not noise -- noise hits one benchmark disproportionately, this
+   hit all of them evenly). Fixed by making it `Cow<'static, str>`:
+   `Ty::system`/`Ty::system_with_args` (literals, and every hand-written
+   name in `crate::generics`) construct a zero-allocation `Cow::Borrowed`
+   from a compile-time-known `&'static str`; only a type name captured
+   from real, dynamic source text (`Ty::system_owned`, used by
+   `type_of_symbol`/`resolve_type_ref`) pays for an owned `String`.
+2. A genuine, pre-existing `BindCache` correctness *and* performance bug,
+   unrelated to this work but surfaced while benchmarking it:
+   `BoundProgram::from_files_cached`'s conservative "some file's
+   declarations changed, rebind every file's bodies" fallback calls
+   `SymbolTable::append_file_symbols` (which appends each rebind's freshly
+   re-collected local-variable symbols onto a file's declared symbols) for
+   *every* file being rebound, but only Pass-1-dirty files had their
+   declared portion freshly reset first via `set_file_symbols`. For every
+   other file swept up by the conservative fallback, each call's locals
+   landed on top of the *previous* call's locals instead of replacing
+   them -- an unbounded, monotonically growing `SymbolTable` across
+   repeated calls. Worse, this was self-sustaining: comparing a fresh
+   Pass 1 declared-only count against the now-inflated (declared+stale-
+   locals) cached count for the edited file itself always looked like a
+   declaration change, which is exactly what triggers the "rebind every
+   file" fallback in the first place. Confirmed real (not noise) via a
+   standalone `Instant`-timed loop with no criterion involved at all,
+   showing per-call cost climbing from ~265ms to ~730ms over 24 calls
+   editing the same file, and root-caused by diffing the stuck-`true`
+   `declarations_changed` file's before/after symbol counts directly.
+   Fixed by giving `SymbolTable` a `declared_len` per file (set whenever
+   `set_file_symbols` runs) so `append_file_symbols` can truncate away any
+   stale tail before appending regardless of which files were Pass-1-dirty
+   this call, and by comparing a fresh Pass 1 collection against
+   `declared_symbols_of_file` (declared-only) rather than the full
+   declared+locals slice.
 
 ## 5. Smaller, concrete loose ends
 

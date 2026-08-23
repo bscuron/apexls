@@ -223,3 +223,50 @@ fn overload_resolution_narrows_by_arity_then_by_known_argument_types() {
     };
     assert_eq!(remaining.len(), 2);
 }
+
+#[test]
+fn an_override_shadows_its_base_declaration_instead_of_adding_a_spurious_candidate() {
+    let dir = write_fixture_dir(
+        "override",
+        &[
+            (
+                "Base.cls",
+                "public virtual class Base { public virtual void greet() { } }",
+            ),
+            (
+                "Derived.cls",
+                "public class Derived extends Base { \
+                 public override void greet() { } \
+                 public void run() { greet(); } \
+             }",
+            ),
+        ],
+    );
+
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let derived_greet = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Method && s.name == "greet" && s.modifiers.is_override)
+        .map(|(id, _)| id)
+        .expect("Derived.greet (the override) should have been collected");
+
+    let derived_file = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Class && s.name == "Derived")
+        .map(|(_, s)| s.file)
+        .expect("Derived should have been collected");
+
+    let calls = call_resolutions(&program, derived_file);
+    assert_eq!(calls.len(), 1, "expected one CallExpr in Derived.run()");
+    assert_eq!(
+        calls[0],
+        Some(Resolution::Resolved(derived_greet)),
+        "an unqualified call to an overridden method should resolve unambiguously to the \
+         override, not report both declarations as separate Candidates: {:?}",
+        calls[0]
+    );
+}

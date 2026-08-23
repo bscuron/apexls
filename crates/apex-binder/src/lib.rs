@@ -35,6 +35,7 @@
 mod collect;
 mod file_id;
 mod file_table;
+mod generics;
 mod incremental;
 mod inherit;
 mod ptr;
@@ -45,6 +46,7 @@ mod scope;
 mod soql;
 mod symbol;
 mod symbol_table;
+mod ty;
 
 pub use file_id::FileId;
 pub use incremental::BindCache;
@@ -344,7 +346,10 @@ impl BoundProgram {
         for (file, collection) in fresh {
             let is_new = !cache.table.has_file(file);
             if is_new
-                || !declarations_equivalent(cache.table.symbols_of_file(file), &collection.symbols)
+                || !declarations_equivalent(
+                    cache.table.declared_symbols_of_file(file),
+                    &collection.symbols,
+                )
             {
                 declarations_changed = true;
             }
@@ -422,7 +427,7 @@ impl BoundProgram {
             by_file.entry(file).or_default().push((key, body));
         }
         for (file, bodies) in by_file {
-            let mut base = cache.table.symbols_of_file(file).len() as u32;
+            let mut base = cache.table.declared_len(file) as u32;
             let mut extra_symbols = Vec::new();
             let mut file_bodies = incremental::FileBodies::default();
             for (key, body) in bodies {

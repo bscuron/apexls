@@ -51,6 +51,7 @@ use crate::schema_index::SchemaIndex;
 use crate::scope::{ScopeId, ScopeKind, ScopeTree};
 use crate::symbol::{ModifierSet, Symbol, SymbolId, SymbolKind};
 use crate::symbol_table::SymbolTable;
+use crate::ty::Ty;
 use apex_syntax::ast::decl::TriggerBlock;
 use apex_syntax::ast::expr::{CallExpr, FieldExpr, Initializer, MethodCallExpr, NameExpr, NewExpr};
 use apex_syntax::ast::stmt::Block;
@@ -75,15 +76,21 @@ use rowan::ast::AstNode;
 /// argument's inferred type is *positively* incompatible with the
 /// corresponding parameter's declared type (neither an exact match nor
 /// a subtype via `extends`/`implements`). An argument whose type isn't
-/// known (a literal, a system-typed value, an uninferred call result,
-/// ...) or a parameter whose declared type isn't itself project-local
-/// (`String`, `List<T>`, ... -- v1 has no model of these to check
-/// against) can never rule a candidate out: "can't prove wrong" always
-/// wins over "assume wrong."
+/// known at all, or is only known as a *system* type (`Ty::System` --
+/// a literal, a `List<T>`, an uninferred call result, ...), or a
+/// parameter whose declared type isn't itself project-local (`String`,
+/// `List<T>`, ...) can never rule a candidate out: "can't prove wrong"
+/// always wins over "assume wrong." System-vs-system comparisons are
+/// deliberately never attempted either, even when both names are known
+/// (an `Integer` argument against a `Long` parameter, say) -- Apex's
+/// real implicit-numeric-widening rules aren't modeled, and a wrong
+/// elimination is a real correctness bug, not just a missed narrowing;
+/// only project-local-vs-project-local comparisons are exact enough to
+/// eliminate on.
 fn narrow_by_overload(
     table: &SymbolTable,
     candidates: Vec<SymbolId>,
-    arg_types: &[Option<SymbolId>],
+    arg_types: &[Option<Ty>],
 ) -> Resolution {
     if candidates.is_empty() {
         return Resolution::Unresolved;
@@ -122,10 +129,13 @@ fn narrow_by_overload(
 fn is_argument_type_compatible(
     table: &SymbolTable,
     candidate: SymbolId,
-    arg_types: &[Option<SymbolId>],
+    arg_types: &[Option<Ty>],
 ) -> bool {
     for (param, arg_type) in table.params(candidate).iter().zip(arg_types.iter()) {
-        let Some(arg_type_id) = arg_type else {
+        // Only a project-local argument type is exact enough to compare
+        // -- see this function's caller's doc comment for why a `Ty::System`
+        // argument (or an entirely unknown one) never eliminates.
+        let Some(Ty::Project(arg_type_id)) = arg_type else {
             continue;
         };
         let Some(param_type_name) = table.get(*param).type_name.as_deref() else {
@@ -328,9 +338,15 @@ impl<'a> BodyBinder<'a> {
         name: &Name,
         type_ref: Option<&Type>,
     ) -> SymbolId {
-        let (type_ptr, type_name) = match type_ref {
-            Some(ty) => (Some(AstPtr::new(self.file, ty)), Some(ty.text())),
-            None => (None, None),
+        let (type_ptr, type_name, type_args) = match type_ref {
+            Some(ty) => {
+                let args = ty
+                    .type_args()
+                    .map(|list| list.args().map(|a| a.text()).collect())
+                    .unwrap_or_default();
+                (Some(AstPtr::new(self.file, ty)), Some(ty.text()), args)
+            }
+            None => (None, None, Vec::new()),
         };
         let symbol = Symbol {
             kind,
@@ -341,6 +357,7 @@ impl<'a> BodyBinder<'a> {
             container: self.enclosing_member,
             type_ref: type_ptr,
             type_name,
+            type_args,
             modifiers: ModifierSet::default(),
         };
         let id = SymbolId::new(
@@ -365,38 +382,68 @@ impl<'a> BodyBinder<'a> {
         }
     }
 
-    /// The project-local type symbol `symbol`'s declared type resolves
-    /// to, if any -- the one-hop "type of this expression" chaining
-    /// `FieldExpr`/`MethodCallExpr` target resolution needs. `None` for
-    /// a symbol with no type, or whose type isn't a project-local class/
-    /// interface/enum (a schema-object-typed or unmodeled system type).
-    fn type_of_symbol(&self, id: SymbolId) -> Option<SymbolId> {
-        let type_name = self.get_symbol(id).type_name.as_deref()?;
-        self.table.top_level(type_name)
+    /// `symbol`'s declared type, as a [`Ty`] -- the "type of this
+    /// expression" chaining `FieldExpr`/`MethodCallExpr` target
+    /// resolution needs. `Ty::Project` when the declared type is a
+    /// project-local class/interface/enum; otherwise `Ty::System` naming
+    /// whatever was declared (a schema object, an unmodeled system type,
+    /// a generic collection with its type argument(s) substituted in --
+    /// see `Symbol::type_args`), never lost to `None` just because it
+    /// isn't project-local. `None` only when the symbol has no type of
+    /// its own at all (a type itself, an enum constant, a `void` method,
+    /// a constructor).
+    fn type_of_symbol(&self, id: SymbolId) -> Option<Ty> {
+        let symbol = self.get_symbol(id);
+        let type_name = symbol.type_name.as_deref()?;
+        if let Some(project_id) = self.table.top_level(type_name) {
+            return Some(Ty::Project(project_id));
+        }
+        let args = symbol
+            .type_args
+            .iter()
+            .map(|name| match self.table.top_level(name) {
+                Some(id) => Ty::Project(id),
+                None => Ty::system_owned(name.clone(), Vec::new()),
+            })
+            .collect();
+        Some(Ty::system_owned(type_name.to_string(), args))
     }
 
     /// Resolves a plain Apex `Type` reference (a field/param/local/
     /// return type, a `new`/`instanceof`/cast target, ...) against
     /// project-local types first, then `apex-metadata`'s schema (an
-    /// SObject-typed declaration, e.g. `Account a;`). Returns the
-    /// project-local type symbol, if that's what it resolved to -- the
-    /// "one hop" other resolvers chain through.
-    pub(crate) fn resolve_type_ref(&mut self, ty: &Type) -> Option<SymbolId> {
+    /// SObject-typed declaration, e.g. `Account a;`) -- recursively
+    /// resolving (and registering `self.refs` resolutions for) any type
+    /// arguments along the way regardless of which case the base name
+    /// itself falls into, since `List<Account>`'s `Account` is a real,
+    /// independently-resolvable reference in its own right. Returns the
+    /// resulting [`Ty`] either way -- the "one hop" other resolvers chain
+    /// through, now never losing the type entirely just because it isn't
+    /// project-local (see [`Ty`]'s own doc comment).
+    pub(crate) fn resolve_type_ref(&mut self, ty: &Type) -> Option<Ty> {
         let name = ty.text();
         let ptr = SyntaxPtr::new(self.file, ty.syntax());
         if let Some(id) = self.table.top_level(&name) {
             self.refs.set(ptr, Resolution::Resolved(id));
-            return Some(id);
+            return Some(Ty::Project(id));
         }
+        let args: Vec<Ty> = ty
+            .type_args()
+            .map(|list| {
+                list.args()
+                    .filter_map(|arg| self.resolve_type_ref(&arg))
+                    .collect()
+            })
+            .unwrap_or_default();
         if self.schema.object(&name).is_some() {
             self.refs.set(
                 ptr,
                 Resolution::SchemaObject {
-                    object: name,
+                    object: name.clone(),
                     field: None,
                 },
             );
-            return None;
+            return Some(Ty::system_owned(name, args));
         }
         // Could be a standard object this repo never locally extended
         // (indistinguishable, using `apex-metadata` alone, from a
@@ -404,8 +451,9 @@ impl<'a> BodyBinder<'a> {
         // type (`String`, `List`, an `Exception` subtype, ...) -- v1
         // can't tell these apart, so both land here as `Unresolved`
         // rather than one of them being misreported as `UnknownSchema`.
+        // The name is still real, though, so the returned `Ty` keeps it.
         self.refs.set(ptr, Resolution::Unresolved);
-        None
+        Some(Ty::system_owned(name, args))
     }
 
     fn bind_block_stmts(&mut self, scope: ScopeId, block: &Block) {
@@ -659,18 +707,21 @@ impl<'a> BodyBinder<'a> {
     }
 
     /// Walks `expr` and every subexpression, resolving references along
-    /// the way. Returns the project-local type symbol `expr`'s static
-    /// type resolves to, when that's known without inference (see the
-    /// module doc comment) -- `None` otherwise. A call expression's
-    /// "type" is its resolved method/constructor's declared return type
-    /// (only available when overload resolution narrowed to exactly one
-    /// candidate with a project-local return type).
-    pub(crate) fn bind_expr(&mut self, scope: ScopeId, expr: &Expr) -> Option<SymbolId> {
+    /// the way. Returns `expr`'s inferred [`Ty`], when known -- `None`
+    /// otherwise (an expression this binder genuinely can't type at all,
+    /// e.g. the result of an unresolved call). A call expression's type
+    /// is its resolved method/constructor's declared return type (only
+    /// available when overload resolution narrowed to exactly one
+    /// candidate).
+    pub(crate) fn bind_expr(&mut self, scope: ScopeId, expr: &Expr) -> Option<Ty> {
         match expr {
-            Expr::Literal(_) => None,
+            Expr::Literal(lit) => lit.token().and_then(|t| Ty::for_literal(t.kind())),
             Expr::Name(n) => self.bind_name_expr(scope, n),
-            Expr::This(_) => self.enclosing_type,
-            Expr::Super(_) => self.enclosing_type.and_then(|t| self.table.direct_super(t)),
+            Expr::This(_) => self.enclosing_type.map(Ty::Project),
+            Expr::Super(_) => self
+                .enclosing_type
+                .and_then(|t| self.table.direct_super(t))
+                .map(Ty::Project),
             Expr::Paren(p) => p.inner().and_then(|inner| self.bind_expr(scope, &inner)),
             Expr::Cast(c) => {
                 if let Some(op) = c.operand() {
@@ -679,35 +730,41 @@ impl<'a> BodyBinder<'a> {
                 c.type_ref().and_then(|t| self.resolve_type_ref(&t))
             }
             Expr::Bin(b) => {
-                if let Some(l) = b.lhs() {
-                    self.bind_expr(scope, &l);
-                }
-                if let Some(r) = b.rhs() {
-                    self.bind_expr(scope, &r);
-                }
-                None
+                let lhs_ty = b.lhs().and_then(|l| self.bind_expr(scope, &l));
+                let rhs_ty = b.rhs().and_then(|r| self.bind_expr(scope, &r));
+                let op_text: String = b
+                    .operator_tokens()
+                    .iter()
+                    .map(|t| t.text())
+                    .collect::<Vec<_>>()
+                    .join("");
+                Ty::for_bin_op(&op_text, lhs_ty, rhs_ty)
             }
             Expr::Unary(u) => {
-                if let Some(o) = u.operand() {
-                    self.bind_expr(scope, &o);
+                let operand_ty = u.operand().and_then(|o| self.bind_expr(scope, &o));
+                match u.operator().map(|t| t.text().to_string()).as_deref() {
+                    Some("!") => Some(Ty::boolean()),
+                    // `~`/unary `+`/`-`/prefix `++`/`--` all preserve the
+                    // operand's own type.
+                    _ => operand_ty,
                 }
-                None
             }
             Expr::Postfix(p) => {
-                if let Some(o) = p.operand() {
-                    self.bind_expr(scope, &o);
-                }
-                None
+                // `++`/`--` only -- always preserves the operand's type.
+                p.operand().and_then(|o| self.bind_expr(scope, &o))
             }
             Expr::Ternary(t) => {
                 if let Some(c) = t.condition() {
                     self.bind_expr(scope, &c);
                 }
                 let then_ty = t.then_branch().and_then(|e| self.bind_expr(scope, &e));
-                if let Some(e) = t.else_branch() {
-                    self.bind_expr(scope, &e);
-                }
-                then_ty
+                let else_ty = t.else_branch().and_then(|e| self.bind_expr(scope, &e));
+                // No common-supertype inference when both branches are
+                // known but disagree (that needs the same generics/
+                // stdlib depth this step deliberately isn't building) --
+                // just prefer `then`, falling back to `else` only when
+                // `then`'s own type isn't known at all.
+                then_ty.or(else_ty)
             }
             Expr::Instanceof(i) => {
                 if let Some(o) = i.operand() {
@@ -716,7 +773,7 @@ impl<'a> BodyBinder<'a> {
                 if let Some(t) = i.type_ref() {
                     self.resolve_type_ref(&t);
                 }
-                None
+                Some(Ty::boolean())
             }
             Expr::Field(f) => self.bind_field_expr(scope, f),
             Expr::Index(idx) => {
@@ -727,7 +784,9 @@ impl<'a> BodyBinder<'a> {
                     self.bind_expr(scope, &i);
                 }
                 // v1 doesn't model List<T>/Map<K,V> element-type
-                // inference, so an indexing expression's own type is
+                // inference for indexing syntax (only for the
+                // `crate::generics` method-call table `[...]` doesn't go
+                // through), so an indexing expression's own type is
                 // always unknown.
                 None
             }
@@ -745,7 +804,7 @@ impl<'a> BodyBinder<'a> {
         }
     }
 
-    fn bind_name_expr(&mut self, scope: ScopeId, n: &NameExpr) -> Option<SymbolId> {
+    fn bind_name_expr(&mut self, scope: ScopeId, n: &NameExpr) -> Option<Ty> {
         if let Some(ty) = n.type_ref() {
             // The `List<Foo>.class` reflection form -- a type reference,
             // not a name lookup.
@@ -778,7 +837,7 @@ impl<'a> BodyBinder<'a> {
                 !matches!(
                     self.table.get(id).kind,
                     SymbolKind::Method | SymbolKind::Constructor
-                )
+                ) && self.table.is_visible_from(id, self.enclosing_type)
             })
             .collect();
         match members.as_slice() {
@@ -797,13 +856,17 @@ impl<'a> BodyBinder<'a> {
         }
     }
 
-    fn bind_field_expr(&mut self, scope: ScopeId, f: &FieldExpr) -> Option<SymbolId> {
+    fn bind_field_expr(&mut self, scope: ScopeId, f: &FieldExpr) -> Option<Ty> {
         let target_type = f.target().and_then(|t| self.bind_expr(scope, &t));
         let tok = f.member_token()?;
         let name = tok.text();
         let ptr = SyntaxPtr::new(self.file, f.syntax());
 
-        let Some(container) = target_type else {
+        let Some(Ty::Project(container)) = target_type else {
+            // `target_type` is either entirely unknown or a `Ty::System`
+            // -- a system/schema type this binder has no member model
+            // for (see `Ty`'s doc comment) -- either way, honestly
+            // `Unresolved` rather than a guess.
             self.refs.set(ptr, Resolution::Unresolved);
             return None;
         };
@@ -815,7 +878,7 @@ impl<'a> BodyBinder<'a> {
                 !matches!(
                     self.table.get(id).kind,
                     SymbolKind::Method | SymbolKind::Constructor
-                )
+                ) && self.table.is_visible_from(id, self.enclosing_type)
             })
             .collect();
         match members.as_slice() {
@@ -834,7 +897,7 @@ impl<'a> BodyBinder<'a> {
         }
     }
 
-    fn bind_method_call_expr(&mut self, scope: ScopeId, mc: &MethodCallExpr) -> Option<SymbolId> {
+    fn bind_method_call_expr(&mut self, scope: ScopeId, mc: &MethodCallExpr) -> Option<Ty> {
         let target_type = mc.target().and_then(|t| self.bind_expr(scope, &t));
         let mut arg_types = Vec::new();
         if let Some(args) = mc.args() {
@@ -846,26 +909,45 @@ impl<'a> BodyBinder<'a> {
         let name = tok.text();
         let ptr = SyntaxPtr::new(self.file, mc.syntax());
 
-        let Some(container) = target_type else {
-            self.refs.set(ptr, Resolution::Unresolved);
-            return None;
-        };
-        let methods: Vec<SymbolId> = self
-            .table
-            .lookup_member(container, name)
-            .into_iter()
-            .filter(|&id| self.table.get(id).kind == SymbolKind::Method)
-            .collect();
-        let resolution = narrow_by_overload(self.table, methods, &arg_types);
-        let result_type = match &resolution {
-            Resolution::Resolved(id) => self.type_of_symbol(*id),
-            _ => None,
-        };
-        self.refs.set(ptr, resolution);
-        result_type
+        match target_type {
+            Some(Ty::Project(container)) => {
+                let methods: Vec<SymbolId> = self
+                    .table
+                    .lookup_member(container, name)
+                    .into_iter()
+                    .filter(|&id| {
+                        self.table.get(id).kind == SymbolKind::Method
+                            && self.table.is_visible_from(id, self.enclosing_type)
+                    })
+                    .collect();
+                let resolution = narrow_by_overload(self.table, methods, &arg_types);
+                let result_type = match &resolution {
+                    Resolution::Resolved(id) => self.type_of_symbol(*id),
+                    _ => None,
+                };
+                self.refs.set(ptr, resolution);
+                result_type
+            }
+            Some(Ty::System { name: base, args }) => {
+                // No `SymbolId` backs a built-in generic method -- there's
+                // no real declaration for goto-definition to point at --
+                // so the *reference* stays honestly `Unresolved` even
+                // when the *type* it returns is known (see
+                // `crate::generics`'s module doc comment). The returned
+                // `Ty` still flows upward for further chaining, e.g.
+                // `myList.get(0).Name` resolving `Name` when the list's
+                // element type is project-local.
+                self.refs.set(ptr, Resolution::Unresolved);
+                crate::generics::builtin_generic_member_type(&base, &args, name)
+            }
+            None => {
+                self.refs.set(ptr, Resolution::Unresolved);
+                None
+            }
+        }
     }
 
-    fn bind_call_expr(&mut self, scope: ScopeId, c: &CallExpr) -> Option<SymbolId> {
+    fn bind_call_expr(&mut self, scope: ScopeId, c: &CallExpr) -> Option<Ty> {
         let mut arg_types = Vec::new();
         if let Some(args) = c.args() {
             for a in args.args() {
@@ -897,14 +979,20 @@ impl<'a> BodyBinder<'a> {
                 .members_of(container)
                 .iter()
                 .copied()
-                .filter(|&id| self.table.get(id).kind == SymbolKind::Constructor)
+                .filter(|&id| {
+                    self.table.get(id).kind == SymbolKind::Constructor
+                        && self.table.is_visible_from(id, self.enclosing_type)
+                })
                 .collect()
         } else {
             let name = tok.text();
             self.table
                 .lookup_member(container, name)
                 .into_iter()
-                .filter(|&id| self.table.get(id).kind == SymbolKind::Method)
+                .filter(|&id| {
+                    self.table.get(id).kind == SymbolKind::Method
+                        && self.table.is_visible_from(id, self.enclosing_type)
+                })
                 .collect()
         };
 
@@ -921,20 +1009,23 @@ impl<'a> BodyBinder<'a> {
         result_type
     }
 
-    fn bind_new_expr(&mut self, scope: ScopeId, ne: &NewExpr) -> Option<SymbolId> {
+    fn bind_new_expr(&mut self, scope: ScopeId, ne: &NewExpr) -> Option<Ty> {
         let resolved_type = ne.type_ref().and_then(|t| self.resolve_type_ref(&t));
         if let Some(args) = ne.args() {
             let mut arg_types = Vec::new();
             for a in args.args() {
                 arg_types.push(self.bind_expr(scope, &a));
             }
-            if let Some(container) = resolved_type {
+            if let Some(&Ty::Project(container)) = resolved_type.as_ref() {
                 let ctors: Vec<SymbolId> = self
                     .table
                     .members_of(container)
                     .iter()
                     .copied()
-                    .filter(|&id| self.table.get(id).kind == SymbolKind::Constructor)
+                    .filter(|&id| {
+                        self.table.get(id).kind == SymbolKind::Constructor
+                            && self.table.is_visible_from(id, self.enclosing_type)
+                    })
                     .collect();
                 if !ctors.is_empty() {
                     let resolution = narrow_by_overload(self.table, ctors, &arg_types);

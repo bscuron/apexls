@@ -175,5 +175,14 @@ pub struct Symbol {
     /// that *do* have the right root and want the real `Type` node (e.g.
     /// goto-definition on the type reference itself).
     pub type_name: Option<String>,
+    /// `type_name`'s own type argument names (`List<Account>` ->
+    /// `["Account"]`), cached eagerly for the same cross-file reason as
+    /// `type_name` itself -- see `crate::collect`'s `type_ptr_and_name`.
+    /// Empty for a non-generic type or a symbol with no type at all.
+    /// Only one level deep: an argument's *own* type arguments aren't
+    /// captured, matching the only shape Apex generics actually have
+    /// (`List`/`Map`/`Set`, never user-defined, never meaningfully
+    /// nested more than a project chooses to write by hand).
+    pub type_args: Vec<String>,
     pub modifiers: ModifierSet,
 }

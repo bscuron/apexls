@@ -42,8 +42,8 @@
 //! (see `BoundProgram::from_files_cached`).
 
 use crate::file_id::FileId;
-use crate::symbol::{Symbol, SymbolId};
-use std::collections::HashMap;
+use crate::symbol::{Symbol, SymbolId, Visibility};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Default, Clone)]
@@ -95,6 +95,19 @@ struct Indices {
 #[derive(Debug, Default, Clone)]
 pub struct SymbolTable {
     by_file: HashMap<FileId, Arc<Vec<Symbol>>>,
+    /// Each file's declared-symbol count as of its last [`Self::set_file_symbols`]
+    /// call -- i.e. `by_file[file]`'s length *before* any
+    /// [`Self::append_file_symbols`] call added that rebind's locals on
+    /// top. Needed because Pass 2 can rebind a file's bodies (and so call
+    /// `append_file_symbols` for it again) on a call where that file
+    /// *wasn't* Pass-1-dirty (`BoundProgram::from_files_cached`'s
+    /// conservative "some other file's declarations changed, rebind
+    /// every file's bodies" fallback) -- without this, `append_file_symbols`
+    /// would have no way to tell "already has last call's locals on the
+    /// end" from "freshly declared, no locals yet" and would append onto
+    /// the previous call's locals instead of replacing them, growing
+    /// `by_file[file]` without bound over repeated calls.
+    declared_len: HashMap<FileId, usize>,
     indices: Arc<Indices>,
 }
 
@@ -105,6 +118,7 @@ impl SymbolTable {
     /// index; call [`Self::rebuild_indices`] afterward once every dirty
     /// file's symbols have been set for this rebuild.
     pub(crate) fn set_file_symbols(&mut self, file: FileId, symbols: Vec<Symbol>) {
+        self.declared_len.insert(file, symbols.len());
         self.by_file.insert(file, Arc::new(symbols));
     }
 
@@ -114,24 +128,29 @@ impl SymbolTable {
     /// afterward.
     pub(crate) fn remove_file(&mut self, file: FileId) {
         self.by_file.remove(&file);
+        self.declared_len.remove(&file);
     }
 
     /// Appends `extra` (Pass 2's newly-declared locals for bodies in
     /// `file`, already remapped to real `SymbolId`s -- see
-    /// `crate::resolve::remap_local_id`) after `file`'s existing
-    /// declared symbols. Deliberately doesn't touch any derived index --
-    /// unlike Pass 1 declarations, a local variable is never looked up
-    /// through `members_of`/`by_name_ci`/`top_level` (lexical-scope
-    /// lookup via `crate::scope::ScopeTree` handles locals entirely
-    /// separately), so there's nothing for those indices to gain from
-    /// including it. Always called right after [`Self::set_file_symbols`]
-    /// for the same `file` within one `BoundProgram::from_files_cached`
-    /// call, so the `Arc::make_mut` below never actually clones in
-    /// practice -- nothing else has had a chance to clone this file's
-    /// brand-new `Arc` yet.
+    /// `crate::resolve::remap_local_id`) after `file`'s declared symbols,
+    /// first truncating away any locals a *previous* call already
+    /// appended (see [`Self::declared_len`]'s doc comment -- this file
+    /// need not have gone through [`Self::set_file_symbols`] this call
+    /// for that stale tail to exist). Deliberately doesn't touch any
+    /// derived index -- unlike Pass 1 declarations, a local variable is
+    /// never looked up through `members_of`/`by_name_ci`/`top_level`
+    /// (lexical-scope lookup via `crate::scope::ScopeTree` handles locals
+    /// entirely separately), so there's nothing for those indices to gain
+    /// from including it.
     pub(crate) fn append_file_symbols(&mut self, file: FileId, mut extra: Vec<Symbol>) {
+        let declared_len = self.declared_len.get(&file).copied();
         let entry = self.by_file.entry(file).or_default();
-        Arc::make_mut(entry).append(&mut extra);
+        let owned = Arc::make_mut(entry);
+        if let Some(declared_len) = declared_len {
+            owned.truncate(declared_len);
+        }
+        owned.append(&mut extra);
     }
 
     pub(crate) fn has_file(&self, file: FileId) -> bool {
@@ -186,9 +205,32 @@ impl SymbolTable {
 
     /// Every symbol declared in `file`, in declaration order (so a
     /// symbol's position in this slice, cast to `u32`, is exactly its
-    /// `SymbolId::local`).
+    /// `SymbolId::local`). Includes any locals a prior [`Self::append_file_symbols`]
+    /// call appended on top -- use [`Self::declared_symbols_of_file`]/
+    /// [`Self::declared_len`] instead when only the Pass-1 declared
+    /// portion is wanted.
     pub(crate) fn symbols_of_file(&self, file: FileId) -> &[Symbol] {
         self.by_file.get(&file).map_or(&[], |v| v.as_slice())
+    }
+
+    /// `file`'s declared symbols only -- excludes any locals a prior
+    /// [`Self::append_file_symbols`] call appended, unlike
+    /// [`Self::symbols_of_file`]. This is what a fresh Pass 1 collection
+    /// for `file` must be compared against to detect a real declaration
+    /// change; comparing against [`Self::symbols_of_file`] instead would
+    /// spuriously "detect" a change every time purely because that file
+    /// carries locals from its last bind and Pass 1 output never does.
+    pub(crate) fn declared_symbols_of_file(&self, file: FileId) -> &[Symbol] {
+        let len = self.declared_len(file);
+        self.by_file.get(&file).map_or(&[], |v| &v[..len])
+    }
+
+    /// `file`'s declared-symbol count as of its last [`Self::set_file_symbols`]
+    /// call (`0` for a file that's never had one). See the `declared_len`
+    /// field's doc comment for why this must stay separate from
+    /// `by_file[file].len()`.
+    pub(crate) fn declared_len(&self, file: FileId) -> usize {
+        self.declared_len.get(&file).copied().unwrap_or(0)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (SymbolId, &Symbol)> {
@@ -265,6 +307,56 @@ impl SymbolTable {
             .collect()
     }
 
+    /// Walks `container` up to the outermost enclosing type. Apex nested
+    /// classes share their outer class's `private` access (compiling, in
+    /// effect, as one nesting-aware unit) -- `is_visible_from`'s
+    /// `Private` case needs the *top-level* declaring type, not just the
+    /// immediately-enclosing one, to get that right.
+    fn top_level_of(&self, id: SymbolId) -> SymbolId {
+        let mut current = id;
+        while let Some(parent) = self.get(current).container {
+            current = parent;
+        }
+        current
+    }
+
+    /// Whether `candidate` (a member returned by `lookup_member`) is
+    /// visible from `from` -- the reference site's enclosing type, `None`
+    /// for a context with no enclosing type at all (a trigger's top-level
+    /// body). `Public`/`Global` collapse to "always visible": v1 has no
+    /// namespace model, the same simplification this binder already
+    /// makes everywhere else a namespace boundary would otherwise matter.
+    /// `Private` requires the same top-level type (`Self::top_level_of`);
+    /// `Protected` additionally allows any type that *is*, `extends`, or
+    /// `implements` the member's declaring type
+    /// (`self.get(candidate).container`, already that type directly --
+    /// every `lookup_member` candidate's `container` is its immediately-
+    /// enclosing type, never a method/parameter, since only type-owned
+    /// declarations are indexed by `members_by_name` at all).
+    pub fn is_visible_from(&self, candidate: SymbolId, from: Option<SymbolId>) -> bool {
+        match self.get(candidate).modifiers.visibility {
+            Visibility::Public | Visibility::Global => true,
+            Visibility::Private => {
+                let Some(from) = from else {
+                    return false;
+                };
+                self.top_level_of(candidate) == self.top_level_of(from)
+            }
+            Visibility::Protected => {
+                let Some(from) = from else {
+                    return false;
+                };
+                if self.top_level_of(candidate) == self.top_level_of(from) {
+                    return true;
+                }
+                let Some(declaring) = self.get(candidate).container else {
+                    return false;
+                };
+                from == declaring || self.inherited_chain(from).contains(&declaring)
+            }
+        }
+    }
+
     /// Every member named `name` (case-insensitive) directly on
     /// `type_id` or anywhere in its resolved `extends`/`implements`
     /// chain -- the candidate set an unqualified member reference
@@ -274,15 +366,44 @@ impl SymbolTable {
     /// over that type's members -- see `members_by_name`'s doc comment
     /// for why that distinction matters (this is Pass 2's single hottest
     /// path, called once per name reference in the whole program).
+    ///
+    /// An `override` member shadows -- doesn't sit alongside -- the
+    /// ancestor member it overrides: once a more-derived level's
+    /// candidate is marked `is_override`, any later (more-ancestral)
+    /// same-name candidate at the *same arity* is excluded rather than
+    /// reported as a separate overload. This is exact, not a heuristic --
+    /// Apex requires an `override` method's signature (arity included) to
+    /// exactly match what it overrides, a compile error otherwise, the
+    /// same "arity alone is authoritative for user-defined methods"
+    /// guarantee `crate::resolve::narrow_by_overload` already relies on.
+    /// Only ever compares candidates *across* chain levels -- two
+    /// same-arity overloads legitimately declared side by side at the
+    /// *same* level (e.g. `foo(Integer)` and `foo(String)`, arity 1 each,
+    /// on the same class) are never affected by each other, since a
+    /// level's own overrides are only folded into the shadow set after
+    /// that whole level has already been processed.
     pub fn lookup_member(&self, type_id: SymbolId, name: &str) -> Vec<SymbolId> {
         let lower = name.to_ascii_lowercase();
         let mut found = Vec::new();
+        let mut overridden_arities: HashSet<usize> = HashSet::new();
         for chain_id in
             std::iter::once(type_id).chain(self.inherited_chain(type_id).iter().copied())
         {
-            if let Some(members) = self.indices.members_by_name.get(&(chain_id, lower.clone())) {
-                found.extend(members.iter().copied());
+            let Some(members) = self.indices.members_by_name.get(&(chain_id, lower.clone())) else {
+                continue;
+            };
+            let mut newly_overridden = Vec::new();
+            for &id in members {
+                let arity = self.params(id).len();
+                if overridden_arities.contains(&arity) {
+                    continue;
+                }
+                found.push(id);
+                if self.get(id).modifiers.is_override {
+                    newly_overridden.push(arity);
+                }
             }
+            overridden_arities.extend(newly_overridden);
         }
         found
     }
