@@ -302,10 +302,16 @@ fn try_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     m.complete(p, SyntaxKind::TryStmt)
 }
 
+/// `catchClause: CATCH LPAREN modifier* qualifiedName id RPAREN block`.
+/// The `modifier*` (e.g. `catch (final MyException e)`) is genuinely
+/// valid Apex -- confirmed by compiling it against a real org via `sf
+/// apex run`, not just present in the reference grammar -- even though
+/// it's rare enough that it never appears anywhere in the NPSP corpus.
 fn catch_clause(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // catch
     p.expect(SyntaxKind::LParen);
+    super::declarations::modifiers(p);
     if !super::types::qualified_name(p) {
         p.error("expected exception type");
     }

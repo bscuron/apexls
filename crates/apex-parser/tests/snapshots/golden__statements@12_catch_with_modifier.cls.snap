@@ -1,0 +1,53 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/statements/12_catch_with_modifier.cls
+---
+# source
+try { a(); } catch (final MyException e) { b(); }
+
+
+# tree
+StmtRoot@0..50
+  TryStmt@0..50
+    Try@0..3 "try"
+    Whitespace@3..4 " "
+    Block@4..13
+      LBrace@4..5 "{"
+      Whitespace@5..6 " "
+      ExprStmt@6..11
+        CallExpr@6..9
+          Identifier@6..7 "a"
+          ArgList@7..9
+            LParen@7..8 "("
+            RParen@8..9 ")"
+        Semi@9..10 ";"
+        Whitespace@10..11 " "
+      RBrace@11..12 "}"
+      Whitespace@12..13 " "
+    CatchClause@13..50
+      Catch@13..18 "catch"
+      Whitespace@18..19 " "
+      LParen@19..20 "("
+      Modifier@20..26
+        Final@20..25 "final"
+        Whitespace@25..26 " "
+      QualifiedName@26..38
+        Identifier@26..37 "MyException"
+        Whitespace@37..38 " "
+      Identifier@38..39 "e"
+      RParen@39..40 ")"
+      Whitespace@40..41 " "
+      Block@41..50
+        LBrace@41..42 "{"
+        Whitespace@42..43 " "
+        ExprStmt@43..48
+          CallExpr@43..46
+            Identifier@43..44 "b"
+            ArgList@44..46
+              LParen@44..45 "("
+              RParen@45..46 ")"
+          Semi@46..47 ";"
+          Whitespace@47..48 " "
+        RBrace@48..49 "}"
+        Whitespace@49..50 "\n"
