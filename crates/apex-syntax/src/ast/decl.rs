@@ -6,7 +6,8 @@
 //! here is read-only, structural access over the tree, no semantics.
 
 use super::{
-    ast_node, dispatch_enum, first_non_trivia_token, token_after, Block, Expr, Name, Type,
+    ast_node, clean_doc_comment, dispatch_enum, doc_comment_token, first_non_trivia_token,
+    token_after, Block, Expr, Name, Type,
 };
 use crate::{ApexLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::ast::{support, AstChildren, AstNode};
@@ -82,6 +83,34 @@ impl HasModifiers for ConstructorDecl {}
 impl HasModifiers for FieldDecl {}
 impl HasModifiers for PropertyDecl {}
 impl HasModifiers for FormalParam {}
+
+/// Shared by every declaration a `/** ... */` doc comment can precede.
+/// The comment ends up nested inside the declaration's first `Modifier`/
+/// `Annotation` child rather than as the declaration's own direct child
+/// (see `doc_comment_token`'s doc comment for why), so this can't be
+/// folded into `HasModifiers` -- `TriggerUnit` has a doc comment position
+/// but no modifiers at all.
+pub trait HasDocComment: AstNode<Language = ApexLanguage> {
+    fn doc_comment_token(&self) -> Option<SyntaxToken> {
+        doc_comment_token(self.syntax())
+    }
+
+    /// The doc comment with its `/**`/`*/` delimiters, per-line leading
+    /// `*`, and leading/trailing blank lines stripped.
+    fn doc_comment_text(&self) -> Option<String> {
+        self.doc_comment_token()
+            .map(|t| clean_doc_comment(t.text()))
+    }
+}
+
+impl HasDocComment for ClassDecl {}
+impl HasDocComment for InterfaceDecl {}
+impl HasDocComment for EnumDecl {}
+impl HasDocComment for MethodDecl {}
+impl HasDocComment for ConstructorDecl {}
+impl HasDocComment for FieldDecl {}
+impl HasDocComment for PropertyDecl {}
+impl HasDocComment for TriggerUnit {}
 
 impl CompilationUnit {
     pub fn type_decl(&self) -> Option<TypeDecl> {

@@ -158,3 +158,95 @@ pub(crate) fn token_after(node: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxT
     }
     None
 }
+
+/// The `DocComment` token immediately preceding `node`'s real content, if
+/// any. Trivia attaches to whatever token it's leading trivia *for*, and
+/// that token can end up nested a level or two inside `node` (a
+/// declaration's doc comment ends up inside its first `Modifier`/
+/// `Annotation` child, not as a direct child of the declaration itself,
+/// since that's whatever node is open when the sink processes the
+/// trivia run right before the first real token) -- so this walks the
+/// whole subtree in document order via `descendants_with_tokens()`
+/// rather than just direct children, stopping at the first non-trivia
+/// token found anywhere. Only `/** ... */`-style comments count (Apex/
+/// Java convention); an unrelated `//` comment or blank line further
+/// back is walked past, and the *last* `DocComment` immediately before
+/// the real content wins if more than one appears in the run.
+pub(crate) fn doc_comment_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+    let mut found = None;
+    for elem in node.descendants_with_tokens() {
+        let Some(t) = elem.as_token() else {
+            continue; // a node boundary (including `node` itself) -- keep descending
+        };
+        if t.kind() == SyntaxKind::DocComment {
+            found = Some(t.clone());
+        } else if !t.kind().is_trivia() {
+            break; // first real token anywhere in the subtree -- stop
+        }
+    }
+    found
+}
+
+/// Strips a `/** ... */` doc comment down to its content: the `/**`/`*/`
+/// delimiters, each line's leading `*` (Javadoc/ApexDoc convention), and
+/// leading/trailing blank lines. A line that's *entirely* `*` characters
+/// (the `***...***` divider style common in NPSP-style headers) is
+/// treated as blank rather than left as a run of stars in the output.
+pub(crate) fn clean_doc_comment(text: &str) -> String {
+    let inner = text.strip_prefix("/**").unwrap_or(text);
+    let inner = inner.strip_suffix("*/").unwrap_or(inner);
+
+    let lines: Vec<String> = inner
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if !trimmed.is_empty() && trimmed.chars().all(|c| c == '*') {
+                return String::new();
+            }
+            let trimmed = trimmed.strip_prefix('*').unwrap_or(trimmed);
+            let trimmed = trimmed.strip_prefix(' ').unwrap_or(trimmed);
+            trimmed.trim_end().to_string()
+        })
+        .collect();
+
+    let start = lines.iter().position(|l| !l.is_empty()).unwrap_or(0);
+    let end = lines
+        .iter()
+        .rposition(|l| !l.is_empty())
+        .map_or(0, |i| i + 1);
+    lines[start.min(end)..end].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_doc_comment;
+
+    #[test]
+    fn cleans_a_single_line_doc_comment() {
+        assert_eq!(
+            clean_doc_comment("/** Does something. */"),
+            "Does something."
+        );
+    }
+
+    #[test]
+    fn cleans_a_multi_line_javadoc_style_comment() {
+        let raw = "/**\n * Does something.\n * @param x the value\n */";
+        assert_eq!(
+            clean_doc_comment(raw),
+            "Does something.\n@param x the value"
+        );
+    }
+
+    #[test]
+    fn treats_a_star_divider_line_as_blank() {
+        let raw = "/***************\n* @description Blah\n***************/";
+        assert_eq!(clean_doc_comment(raw), "@description Blah");
+    }
+
+    #[test]
+    fn empty_doc_comment_cleans_to_empty_string() {
+        assert_eq!(clean_doc_comment("/**\n *\n */"), "");
+        assert_eq!(clean_doc_comment("/***/"), "");
+    }
+}

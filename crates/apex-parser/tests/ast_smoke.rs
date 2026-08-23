@@ -16,8 +16,8 @@
 //! rather than an assertion that happens to pass today.
 
 use apex_syntax::ast::decl::{
-    CompilationUnit, ConstructorDecl, FieldDecl, Member, MethodDecl, PropertyDecl, TriggerUnit,
-    TypeDecl,
+    CompilationUnit, ConstructorDecl, FieldDecl, HasDocComment, Member, MethodDecl, PropertyDecl,
+    TriggerUnit, TypeDecl,
 };
 use apex_syntax::ast::expr::Expr;
 use apex_syntax::ast::soql::{
@@ -37,6 +37,25 @@ struct Counts {
     exprs: usize,
     soql_queries: usize,
     sosl_queries: usize,
+    doc_comments: usize,
+}
+
+/// Just needs to not panic and (when present) clean to something -- the
+/// per-file assertions elsewhere are about tree-shape correctness, not
+/// about every declaration having documentation, so a missing doc
+/// comment is never a failure here, only a non-empty raw token failing
+/// to produce sensible cleaned text would be.
+fn check_doc_comment(path: &std::path::Path, has_doc: &impl HasDocComment, counts: &mut Counts) {
+    if let Some(token) = has_doc.doc_comment_token() {
+        assert_eq!(
+            token.kind(),
+            apex_syntax::SyntaxKind::DocComment,
+            "{}: doc_comment_token returned a non-DocComment token",
+            path.display()
+        );
+        has_doc.doc_comment_text(); // just must not panic
+        counts.doc_comments += 1;
+    }
 }
 
 #[test]
@@ -80,6 +99,7 @@ fn every_declared_name_and_body_resolves_through_the_ast_layer() {
                 "{}: trigger has no object reference",
                 path.display()
             );
+            check_doc_comment(path, &trigger, &mut counts);
             if let Some(block) = trigger.block() {
                 for member in block.members() {
                     check_member(path, member, &mut counts);
@@ -133,6 +153,11 @@ fn every_declared_name_and_body_resolves_through_the_ast_layer() {
         "expected at least one SOSL query walked, found {}",
         counts.sosl_queries
     );
+    assert!(
+        counts.doc_comments > 1000,
+        "expected over 1000 doc comments found, found {}",
+        counts.doc_comments
+    );
 }
 
 fn check_type_decl(path: &std::path::Path, decl: TypeDecl, counts: &mut Counts) {
@@ -143,6 +168,7 @@ fn check_type_decl(path: &std::path::Path, decl: TypeDecl, counts: &mut Counts) 
                 "{}: class has no name",
                 path.display()
             );
+            check_doc_comment(path, &class, counts);
             if let Some(body) = class.body() {
                 for member in body.members() {
                     check_member(path, member, counts);
@@ -155,6 +181,7 @@ fn check_type_decl(path: &std::path::Path, decl: TypeDecl, counts: &mut Counts) 
                 "{}: interface has no name",
                 path.display()
             );
+            check_doc_comment(path, &iface, counts);
             if let Some(body) = iface.body() {
                 for method in body.methods() {
                     assert!(
@@ -167,6 +194,7 @@ fn check_type_decl(path: &std::path::Path, decl: TypeDecl, counts: &mut Counts) 
         }
         TypeDecl::Enum(en) => {
             assert!(en.name().is_some(), "{}: enum has no name", path.display());
+            check_doc_comment(path, &en, counts);
             for constant in en.constant_list().into_iter().flat_map(|l| l.constants()) {
                 assert!(
                     constant.text().is_some_and(|t| !t.is_empty()),
@@ -182,8 +210,8 @@ fn check_member(path: &std::path::Path, member: Member, counts: &mut Counts) {
     match member {
         Member::Method(method) => check_method(path, &method, counts),
         Member::Constructor(ctor) => check_constructor(path, &ctor, counts),
-        Member::Field(field) => check_field(path, &field),
-        Member::Property(prop) => check_property(path, &prop),
+        Member::Field(field) => check_field(path, &field, counts),
+        Member::Property(prop) => check_property(path, &prop, counts),
         Member::NestedClass(_) | Member::NestedInterface(_) | Member::NestedEnum(_) => {
             let decl = TypeDecl::cast(member.syntax().clone()).unwrap();
             check_type_decl(path, decl, counts);
@@ -197,6 +225,7 @@ fn check_method(path: &std::path::Path, method: &MethodDecl, counts: &mut Counts
         "{}: method has no name",
         path.display()
     );
+    check_doc_comment(path, method, counts);
     for param in method.params().into_iter().flat_map(|l| l.params()) {
         assert!(
             param.name().is_some(),
@@ -215,17 +244,19 @@ fn check_constructor(path: &std::path::Path, ctor: &ConstructorDecl, counts: &mu
         "{}: constructor has no type",
         path.display()
     );
+    check_doc_comment(path, ctor, counts);
     if let Some(body) = ctor.body() {
         walk_stmt(path, Stmt::Block(body), counts);
     }
 }
 
-fn check_field(path: &std::path::Path, field: &FieldDecl) {
+fn check_field(path: &std::path::Path, field: &FieldDecl, counts: &mut Counts) {
     assert!(
         field.type_ref().is_some(),
         "{}: field has no type",
         path.display()
     );
+    check_doc_comment(path, field, counts);
     let mut any = false;
     for decl in field.declarators() {
         any = true;
@@ -238,12 +269,13 @@ fn check_field(path: &std::path::Path, field: &FieldDecl) {
     assert!(any, "{}: field has no declarators", path.display());
 }
 
-fn check_property(path: &std::path::Path, prop: &PropertyDecl) {
+fn check_property(path: &std::path::Path, prop: &PropertyDecl, counts: &mut Counts) {
     assert!(
         prop.name().is_some(),
         "{}: property has no name",
         path.display()
     );
+    check_doc_comment(path, prop, counts);
 }
 
 fn walk_stmt(path: &std::path::Path, stmt: Stmt, counts: &mut Counts) {
