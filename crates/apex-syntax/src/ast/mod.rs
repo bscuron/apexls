@@ -12,6 +12,7 @@ use rowan::ast::AstNode;
 
 pub mod decl;
 pub mod expr;
+pub mod soql;
 pub mod stmt;
 
 pub use expr::Expr;

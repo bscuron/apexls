@@ -20,6 +20,9 @@ use apex_syntax::ast::decl::{
     TypeDecl,
 };
 use apex_syntax::ast::expr::Expr;
+use apex_syntax::ast::soql::{
+    SoqlCondition, SoqlExpr, SoqlLogicalExpr, SoqlSelectEntry, SoqlSubQuery, SoqlValue, SoslExpr,
+};
 use apex_syntax::ast::stmt::Stmt;
 use apex_syntax::AstNode;
 
@@ -32,6 +35,8 @@ fn is_known_non_compilation_unit(path: &std::path::Path) -> bool {
 struct Counts {
     stmts: usize,
     exprs: usize,
+    soql_queries: usize,
+    sosl_queries: usize,
 }
 
 #[test]
@@ -117,6 +122,16 @@ fn every_declared_name_and_body_resolves_through_the_ast_layer() {
         counts.exprs > 50_000,
         "expected over 50k expressions walked, found {}",
         counts.exprs
+    );
+    assert!(
+        counts.soql_queries > 500,
+        "expected over 500 SOQL queries walked, found {}",
+        counts.soql_queries
+    );
+    assert!(
+        counts.sosl_queries > 0,
+        "expected at least one SOSL query walked, found {}",
+        counts.sosl_queries
     );
 }
 
@@ -434,7 +449,9 @@ fn walk_stmt(path: &std::path::Path, stmt: Stmt, counts: &mut Counts) {
 fn walk_expr(path: &std::path::Path, expr: Expr, counts: &mut Counts) {
     counts.exprs += 1;
     match expr {
-        Expr::Literal(_) | Expr::This(_) | Expr::Super(_) | Expr::Soql(_) | Expr::Sosl(_) => {}
+        Expr::Literal(_) | Expr::This(_) | Expr::Super(_) => {}
+        Expr::Soql(e) => walk_soql(path, &e, counts),
+        Expr::Sosl(e) => walk_sosl(path, &e, counts),
         Expr::Name(e) => {
             assert!(
                 e.name_token().is_some() || e.type_ref().is_some(),
@@ -611,6 +628,188 @@ fn walk_initializer(
                     .value()
                     .unwrap_or_else(|| panic!("{}: map entry has no value", path.display()));
                 walk_expr(path, value, counts);
+            }
+        }
+    }
+}
+
+fn walk_soql(path: &std::path::Path, soql: &SoqlExpr, counts: &mut Counts) {
+    counts.soql_queries += 1;
+    let select_list = soql
+        .select_list()
+        .unwrap_or_else(|| panic!("{}: soql query has no select list", path.display()));
+    for entry in select_list.entries() {
+        walk_soql_select_entry(path, entry, counts);
+    }
+    assert!(
+        soql.from_list().is_some(),
+        "{}: soql query has no from list",
+        path.display()
+    );
+    assert!(
+        soql.from_list().unwrap().entries().next().is_some(),
+        "{}: soql query's from list has no entries",
+        path.display()
+    );
+    if let Some(where_clause) = soql.where_clause() {
+        let cond = where_clause
+            .condition()
+            .unwrap_or_else(|| panic!("{}: soql where clause has no condition", path.display()));
+        walk_soql_logical_expr(path, cond, counts);
+    }
+    if let Some(group_by) = soql.group_by() {
+        assert!(
+            group_by.fields().next().is_some(),
+            "{}: soql group by has no fields",
+            path.display()
+        );
+    }
+    if let Some(order_by) = soql.order_by() {
+        for fo in order_by.field_orders() {
+            assert!(
+                fo.target().is_some(),
+                "{}: soql order-by entry has no target",
+                path.display()
+            );
+        }
+    }
+}
+
+fn walk_soql_select_entry(path: &std::path::Path, entry: SoqlSelectEntry, counts: &mut Counts) {
+    if let Some(field) = entry.field_name() {
+        assert!(
+            !field.segments().is_empty(),
+            "{}: soql select field has no segments",
+            path.display()
+        );
+    } else if let Some(func) = entry.function() {
+        assert!(
+            func.name_token().is_some(),
+            "{}: soql select function has no name",
+            path.display()
+        );
+    } else if let Some(sub) = entry.sub_query() {
+        walk_soql_subquery(path, sub, counts);
+    } else if let Some(type_of) = entry.type_of() {
+        assert!(
+            type_of.field_name().is_some(),
+            "{}: soql TYPEOF has no field name",
+            path.display()
+        );
+        for when in type_of.when_clauses() {
+            assert!(
+                when.field_name().is_some(),
+                "{}: soql TYPEOF WHEN has no field name",
+                path.display()
+            );
+            assert!(
+                when.then_fields().is_some(),
+                "{}: soql TYPEOF WHEN has no THEN fields",
+                path.display()
+            );
+        }
+    } else {
+        panic!(
+            "{}: soql select entry has none of field/function/subquery/typeof",
+            path.display()
+        );
+    }
+}
+
+fn walk_soql_subquery(path: &std::path::Path, sub: SoqlSubQuery, counts: &mut Counts) {
+    let select_list = sub
+        .select_list()
+        .unwrap_or_else(|| panic!("{}: soql subquery has no select list", path.display()));
+    for entry in select_list.entries() {
+        walk_soql_select_entry(path, entry, counts);
+    }
+    assert!(
+        sub.from_list().is_some(),
+        "{}: soql subquery has no from list",
+        path.display()
+    );
+    if let Some(where_clause) = sub.where_clause() {
+        let cond = where_clause.condition().unwrap_or_else(|| {
+            panic!(
+                "{}: soql subquery where clause has no condition",
+                path.display()
+            )
+        });
+        walk_soql_logical_expr(path, cond, counts);
+    }
+}
+
+fn walk_soql_logical_expr(path: &std::path::Path, cond: SoqlLogicalExpr, counts: &mut Counts) {
+    let mut any = false;
+    for c in cond.conditions() {
+        any = true;
+        match c {
+            SoqlCondition::Comparison(cmp) => {
+                assert!(
+                    cmp.field_name().is_some() || cmp.function().is_some(),
+                    "{}: soql comparison has neither a field nor a function",
+                    path.display()
+                );
+                assert!(
+                    !cmp.operator_tokens().is_empty(),
+                    "{}: soql comparison has no operator",
+                    path.display()
+                );
+                let value = cmp
+                    .value()
+                    .unwrap_or_else(|| panic!("{}: soql comparison has no value", path.display()));
+                walk_soql_value(path, value, counts);
+            }
+            SoqlCondition::Group(nested) => walk_soql_logical_expr(path, nested, counts),
+        }
+    }
+    assert!(
+        any,
+        "{}: soql logical expr has no conditions",
+        path.display()
+    );
+}
+
+fn walk_soql_value(path: &std::path::Path, value: SoqlValue, counts: &mut Counts) {
+    if let Some(bound) = value.bound_expr() {
+        if let Some(e) = bound.expr() {
+            walk_expr(path, e, counts);
+        }
+    } else if let Some(sub) = value.sub_query() {
+        walk_soql_subquery(path, sub, counts);
+    } else if let Some(list) = value.value_list() {
+        for v in list.values() {
+            walk_soql_value(path, v, counts);
+        }
+    } else {
+        assert!(
+            value.literal_token().is_some(),
+            "{}: soql value has no literal token",
+            path.display()
+        );
+    }
+}
+
+fn walk_sosl(path: &std::path::Path, sosl: &SoslExpr, counts: &mut Counts) {
+    counts.sosl_queries += 1;
+    assert!(
+        sosl.find_literal().is_some() || sosl.bound_expr().is_some(),
+        "{}: sosl expr has neither a find literal nor a bound expression",
+        path.display()
+    );
+    if let Some(bound) = sosl.bound_expr() {
+        if let Some(e) = bound.expr() {
+            walk_expr(path, e, counts);
+        }
+    }
+    if let Some(clauses) = sosl.clauses() {
+        if let Some(spec_list) = clauses.field_spec_list() {
+            for spec in spec_list.specs() {
+                assert!(
+                    spec.object().is_some(),
+                    "{}: sosl field spec has no object",
+                    path.display()
+                );
             }
         }
     }

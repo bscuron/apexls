@@ -12,6 +12,7 @@
 //! like `<=`/shift). Accessors below reflect that directly rather than
 //! inventing an operator node the parser never builds.
 
+use super::soql::{SoqlExpr, SoslExpr};
 use super::{
     ast_node, direct_tokens, dispatch_enum, first_non_trivia_token, last_non_trivia_token, Type,
 };
@@ -74,8 +75,6 @@ ast_node!(ArrayInitializer, ArrayInitializer);
 ast_node!(MapInitializer, MapInitializer);
 ast_node!(MapEntry, MapEntry);
 ast_node!(SetInitializer, SetInitializer);
-ast_node!(SoqlExpr, SoqlExpr);
-ast_node!(SoslExpr, SoslExpr);
 
 impl LiteralExpr {
     pub fn token(&self) -> Option<SyntaxToken> {
