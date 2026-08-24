@@ -18,7 +18,11 @@ fn write_fixture_dir(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     for (file_name, src) in files {
-        std::fs::write(dir.join(file_name), src).unwrap();
+        let path = dir.join(file_name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, src).unwrap();
     }
     dir
 }
@@ -562,5 +566,57 @@ fn a_nested_enum_constant_resolves_through_the_full_qualifier_chain_from_another
         program.resolution_at(file, offset).cloned(),
         Some(Resolution::Resolved(archive_bridge_id)),
         "the full Outer.NestedEnum.CONSTANT chain should resolve to the enum constant"
+    );
+}
+
+/// A custom SObject field accessed through plain dot-notation in a body
+/// expression (`this.dataImport.Status__c`), *not* inside a SOQL query
+/// -- `bind_field_expr` only ever handled `Ty::Project` (a project-local
+/// class/interface/enum) as a chain target; a `Ty::System` target (a
+/// schema SObject value, e.g. `dataImport`'s declared type `DataImport__c`)
+/// fell straight to `Unresolved` without ever consulting `SchemaIndex`,
+/// even though the exact same object/field lookup `crate::soql` already
+/// does for a SOQL query was available and correct here too.
+#[test]
+fn a_custom_sobject_field_accessed_via_dot_notation_resolves() {
+    let dir = write_fixture_dir(
+        "sobject-field-access",
+        &[
+            (
+                "Foo.cls",
+                "public class Foo {\n    DataImport__c dataImport;\n    public String getStatus() {\n        return this.dataImport.Status__c;\n    }\n}\n",
+            ),
+            (
+                "objects/DataImport__c/DataImport__c.object-meta.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomObject xmlns=\"http://soap.sforce.com/2006/04/metadata\"><label>Data Import</label></CustomObject>",
+            ),
+            (
+                "objects/DataImport__c/fields/Status__c.field-meta.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomField xmlns=\"http://soap.sforce.com/2006/04/metadata\"><fullName>Status__c</fullName><type>Picklist</type></CustomField>",
+            ),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let root = program.syntax(file);
+    let chain_range = root
+        .descendants()
+        .filter_map(apex_syntax::ast::expr::FieldExpr::cast)
+        .map(|f| f.syntax().text_range())
+        .max_by_key(|r| r.len())
+        .expect("expected at least one FieldExpr");
+    let offset = chain_range.end() - rowan::TextSize::from(1);
+
+    assert_eq!(
+        program.resolution_at(file, offset).cloned(),
+        Some(Resolution::SchemaObject(Box::new(
+            apex_binder::SchemaObjectRef {
+                object: "DataImport__c".into(),
+                field: Some("Status__c".into()),
+            }
+        ))),
+        "this.dataImport.Status__c should resolve against the schema, not fall to Unresolved"
     );
 }

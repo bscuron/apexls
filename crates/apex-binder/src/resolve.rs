@@ -46,7 +46,7 @@
 
 use crate::file_id::FileId;
 use crate::ptr::{AstPtr, SyntaxPtr};
-use crate::reference_table::{ReferenceTable, Resolution, SchemaObjectRef};
+use crate::reference_table::{ReferenceTable, Resolution, SchemaObjectRef, UnknownSchemaRef};
 use crate::schema_index::SchemaIndex;
 use crate::scope::{ScopeId, ScopeKind, ScopeTree};
 use crate::symbol::{ModifierSet, Symbol, SymbolId, SymbolKind};
@@ -58,6 +58,7 @@ use apex_syntax::ast::stmt::Block;
 use apex_syntax::ast::{Expr, Name, Stmt, Type};
 use apex_syntax::SyntaxKind;
 use rowan::ast::AstNode;
+use smol_str::SmolStr;
 
 /// Narrows a same-name candidate set (methods, or constructors for a
 /// `new`/`this(...)`/`super(...)` call) using real Apex overload-
@@ -1033,13 +1034,43 @@ impl<'a> BodyBinder<'a> {
         let name = tok.text();
         let ptr = SyntaxPtr::new(self.file, f.syntax());
 
-        let Some(Ty::Project(container)) = target_type else {
-            // `target_type` is either entirely unknown or a `Ty::System`
-            // -- a system/schema type this binder has no member model
-            // for (see `Ty`'s doc comment) -- either way, honestly
-            // `Unresolved` rather than a guess.
-            self.refs.set(ptr, Resolution::Unresolved);
-            return None;
+        let container = match target_type {
+            Some(Ty::Project(container)) => container,
+            // A schema SObject value (`this.dataImport` typed as the
+            // custom object `DataImport__c`) -- `.Status__c` is a real
+            // field access this binder *can* answer via `self.schema`,
+            // even outside SOQL, so this isn't the same "no member
+            // model" gap a genuinely unmodeled system type (`String`,
+            // `List`, ...) is. Mirrors `crate::soql`'s own object/field
+            // hop resolution; unlike SOQL, a lookup/master-detail
+            // field's `reference_to` isn't chased any further here --
+            // continuing the chain in real code needs the field's `__r`
+            // relationship alias, a different name than the field's own
+            // API name this resolves against, which is its own separate
+            // gap, not silently guessed at.
+            Some(Ty::System { name: object, .. }) => {
+                let resolution = if self.schema.field(&object, name).is_some() {
+                    Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                        object: object.clone(),
+                        field: Some(SmolStr::new(name)),
+                    }))
+                } else if self.schema.object(&object).is_some() {
+                    Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
+                        object: Some(object.clone()),
+                        field: Some(SmolStr::new(name)),
+                    }))
+                } else {
+                    Resolution::Unresolved
+                };
+                self.refs.set(ptr, resolution);
+                return None;
+            }
+            // `target_type` is entirely unknown -- honestly `Unresolved`
+            // rather than a guess.
+            None => {
+                self.refs.set(ptr, Resolution::Unresolved);
+                return None;
+            }
         };
         let members: Vec<SymbolId> = self
             .table
