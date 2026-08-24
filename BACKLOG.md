@@ -237,7 +237,7 @@ below could be measured against something real instead of guessed at.
         isn't wired up), a real, separate, and already-tracked gap, not
         papered over by this fix. Metadata XML edited with no
         corresponding Apex-file signal has the same limit.
-- [ ] **Function-level breakdown of the cold/warm bind costs, and a
+- [x] **Function-level breakdown of the cold/warm bind costs, and a
       ranked follow-up plan.** The measurements above only ever timed
       `from_files`/`from_files_cached` from the outside; nothing broke
       down where inside the pipeline the ~431ms cold / ~17ms warm totals
@@ -306,6 +306,90 @@ below could be measured against something real instead of guessed at.
            regardless of how many files actually changed
            (`crates/apex-binder/src/lib.rs`, "Assemble this call's
            independent, owned snapshot").
+      - **Ranked follow-up -- all four implemented and re-measured with
+        the same `cpu_profile` harness. Wall-clock totals are noisy
+        run-to-run (this machine has hit that before, see the
+        `warm_rebind_after_one_file_edit` bench's own "measurement red
+        herring" note above) -- allocation totals aren't, and are the
+        more reliable signal below:**
+        1. **Persist `files`/`file_ids`/`parses` in `BindCache`, patched
+           per-file instead of rebuilt from every parsed file.** Done
+           (`cache.paths`/`cache.path_ids`/`cache.file_parses`,
+           `crates/apex-binder/src/incremental.rs`). **Smaller payoff
+           than hoped, honestly**: the owned-snapshot assembly still
+           needs one `.clone()` of each persisted map per call (a
+           `BoundProgram` must stay an independent snapshot -- see its
+           doc comment on why -- and `apexls-server`'s `BindState` keeps
+           the *previous* `BoundProgram` alive for the whole duration of
+           the next rebuild, so an `Arc`-sharing scheme with
+           `Arc::make_mut` was considered and rejected: its zero-copy
+           path only fires when nothing else still holds the old data,
+           which isn't true for that caller's real usage pattern -- it
+           would only have looked like a win in this synthetic harness,
+           which drops its warm-up call's result immediately). What this
+           safely achieves: one fewer redundant `PathBuf` clone per
+           unchanged file per call (3 down to 2 -- see point 2 below for
+           where the third one went). Warm-rebind allocation held flat
+           (~1.1-1.2 MB total, both before and after) rather than
+           shrinking -- an honest negative result, not a regression.
+        2. **Reduce Stage 1a's redundant `PathBuf` clone.** Changed
+           `candidates.par_iter()` to `.into_par_iter()` so each
+           candidate's already-owned `PathBuf` moves into its `ParsedFile`
+           instead of being cloned again (`crates/apex-binder/src/lib.rs`).
+           Safe and unconditional (every file, every call), but small in
+           practice: Stage 1a's cost is dominated by the `std::fs::metadata`
+           stat syscall itself, not this clone. The originally-planned
+           "skip re-stat'ing unchanged files entirely" was **investigated
+           and deliberately not implemented** -- `crates/apex-binder/tests/incremental_rebind.rs`'s
+           `deleting_a_file_leaves_no_stale_symbols_even_with_a_stale_cached_walk`
+           test exists precisely because deletion detection depends on
+           every candidate actually being re-stated/re-read each call;
+           skipping that for cached files would silently break it. Stage
+           1a's ~52-66% share of warm-rebind wall time is therefore
+           mostly irreducible without a real filesystem-watcher signal
+           (an already-tracked, separate gap -- see above), not something
+           this round could safely cut further.
+        3. **Parallelize `SchemaIndex::from_discovery`'s SFDX XML parse
+           with `rayon`.** Done (`apex_metadata::sobjects_from_discovery`,
+           `crates/apex-metadata/src/discover.rs`: the `field_meta_files`
+           read+parse loop is now a `par_iter().filter_map(...).collect()`
+           followed by a cheap sequential grouping merge, the same
+           parallel-map-then-merge shape this pipeline already uses
+           throughout). **Clear, large, reproducible win**: `discover_and_build_schema`
+           dropped from ~79-87ms to a consistent ~21ms across repeated
+           runs (roughly a 73-76% reduction in that stage alone), a
+           guaranteed ~60ms+ cut to every cold bind regardless of
+           machine noise.
+        4. **Reduce `pass2_merge_bodies`'s allocation.** Two changes:
+           (a) `ReferenceTable::map_ids`+`merge_into` (two separate steps
+           -- build a whole new intermediate `ReferenceTable`, then drain
+           it into the target) fused into one `map_ids_into` that remaps
+           and inserts directly into `target` (`crates/apex-binder/src/reference_table.rs`),
+           eliminating one full intermediate `FxHashMap` allocation per
+           body, project-wide; (b) `extra_symbols`/`file_bodies.scopes`
+           now pre-sized per file instead of growing via repeated
+           `.extend()`/`.insert()` calls (`crates/apex-binder/src/lib.rs`).
+           **Clear, large, reproducible win, and noise-free** (allocation
+           totals don't vary run-to-run the way wall-clock does):
+           `pass2_merge_bodies`'s own exclusive allocation dropped from
+           110.0 MB to a consistent 75.6 MB (-31%), and a cold bind's
+           *total* allocation dropped from 544.5 MB to ~501-502 MB (-8%)
+           almost entirely attributable to this one fix.
+        - **Net effect**: a cold bind's total allocation is down ~8%
+          (544.5 MB -> ~502 MB) and wall time is consistently lower than
+          the pre-optimization baseline (373-393ms) across repeated runs
+          (293-337ms observed, noisy but never overlapping the old
+          range), with the metadata-parse parallelization (#3) as the
+          single largest, most confidently-attributable contributor.
+          Warm single-edit rebind's wall time and allocation are within
+          measurement noise of the baseline (~6-7ms, ~1.1-1.2 MB) --
+          honestly, this round's changes mostly targeted cold-bind cost;
+          cutting warm-rebind's dominant cost further needs either a
+          filesystem-watcher signal (to safely narrow Stage 1a's
+          re-stat pass) or a real architectural change to how
+          `BoundProgram` snapshots share data with `BindCache` across
+          calls (rejected this round as described in #1), not a
+          same-shaped incremental tweak.
 
 ## 3. Feature surface
 

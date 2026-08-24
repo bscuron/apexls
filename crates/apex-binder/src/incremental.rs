@@ -105,6 +105,28 @@ pub struct BindCache {
     /// what's compared instead, and the two attempts before it (a stored
     /// `String`, then a content hash) that this superseded.
     pub(crate) parses: FxHashMap<PathBuf, (Freshness, Parse)>,
+    /// Every currently-live file's path, keyed by its stable `FileId` --
+    /// persisted and patched file-by-file (dirty/removed only) across
+    /// calls, same discipline as `table`/`bodies` below, so
+    /// `BoundProgram::from_files_cached` only has to `.clone()` this map
+    /// once per call to assemble its snapshot instead of rebuilding it
+    /// with a fresh `PathBuf` clone per file, every file, every call --
+    /// see the `hotpath`-measured finding in `BACKLOG.md` §2 that
+    /// motivated this (69% of a warm single-edit rebind's allocated
+    /// bytes traced to exactly this rebuild).
+    pub(crate) paths: FxHashMap<FileId, PathBuf>,
+    /// Reverse of `paths`, patched alongside it.
+    pub(crate) path_ids: FxHashMap<PathBuf, FileId>,
+    /// Every currently-live file's last-bound `Parse`, keyed by `FileId`
+    /// -- the `BoundProgram`-facing counterpart to `parses` above (which
+    /// is keyed by `PathBuf` and paired with a `Freshness` purely for
+    /// that field's own staleness check). Kept as a separate map rather
+    /// than merged into `parses` since the two serve different call
+    /// sites with no clean shared shape; duplicating one cheap `Parse`
+    /// clone (`Arc`-backed `GreenNode`, see `apex_parser::Parse`'s doc
+    /// comment) across two maps is a fair trade for not reworking the
+    /// path-keyed freshness check to be `FileId`-keyed instead.
+    pub(crate) file_parses: FxHashMap<FileId, Parse>,
     /// The project's declared symbols, persisted and patched file-by-file
     /// across calls rather than rebuilt from nothing -- see
     /// `SymbolTable`'s module doc comment.

@@ -95,21 +95,27 @@ impl ReferenceTable {
     }
 
     /// Consumes this table, applying `f` to every `SymbolId` any entry
-    /// references -- the whole-table counterpart to `Resolution::map_ids`.
-    pub(crate) fn map_ids(self, f: &impl Fn(SymbolId) -> SymbolId) -> ReferenceTable {
-        ReferenceTable {
-            resolutions: self
-                .resolutions
+    /// references (the whole-table counterpart to `Resolution::map_ids`),
+    /// and folds the result directly into `target` -- used to merge one
+    /// Pass-2 body's reference fragment into the project-wide table
+    /// during `BoundProgram::from_files_cached`'s sequential merge.
+    /// Remaps and inserts in one pass rather than building a whole
+    /// intermediate `ReferenceTable` (a second full `FxHashMap` the same
+    /// size as `self`, immediately drained into `target` and dropped) --
+    /// see the `hotpath`-measured finding in `BACKLOG.md` §2 that
+    /// motivated this: this exact intermediate-then-merge pattern, run
+    /// once per body project-wide, was a real share of a cold bind's
+    /// allocation.
+    pub(crate) fn map_ids_into(
+        self,
+        f: &impl Fn(SymbolId) -> SymbolId,
+        target: &mut ReferenceTable,
+    ) {
+        target.resolutions.reserve(self.resolutions.len());
+        target.resolutions.extend(
+            self.resolutions
                 .into_iter()
-                .map(|(ptr, res)| (ptr, res.map_ids(f)))
-                .collect(),
-        }
-    }
-
-    /// Merges `self` into `target`, consuming `self` -- used to fold one
-    /// Pass-2 body's (already id-remapped) reference fragment into the
-    /// project-wide table.
-    pub(crate) fn merge_into(self, target: &mut ReferenceTable) {
-        target.resolutions.extend(self.resolutions);
+                .map(|(ptr, res)| (ptr, res.map_ids(f))),
+        );
     }
 }

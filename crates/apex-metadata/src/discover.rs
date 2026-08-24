@@ -8,6 +8,7 @@
 
 use crate::xml::parse_field_meta;
 use crate::{FieldSchema, SObjectSchema};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -44,16 +45,25 @@ pub fn sobjects_from_discovery(found: &apex_discover::Discovery) -> Vec<SObjectS
         }
     }
 
-    for path in &found.field_meta_files {
-        let Some(api_name) = field_owner_api_name(path) else {
-            continue;
-        };
-        let Ok(content) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let Some(field) = parse_field_meta(&content, path.clone()) else {
-            continue;
-        };
+    // Parallel (`rayon`): each field-meta file's read + XML parse is
+    // fully independent of every other one -- no shared state touched
+    // until the sequential merge below, the same parallel-map-then-
+    // merge shape `apex-binder`'s own Pass 1/Pass 2 use throughout.
+    // Real payoff on a project like NPSP, which has thousands of these
+    // (one per custom/standard field), and was previously the single
+    // largest un-parallelized stage in a cold bind -- see the `hotpath`-
+    // measured finding in `BACKLOG.md` §2 this targets.
+    let parsed_fields: Vec<(String, FieldSchema)> = found
+        .field_meta_files
+        .par_iter()
+        .filter_map(|path| {
+            let api_name = field_owner_api_name(path)?;
+            let content = std::fs::read_to_string(path).ok()?;
+            let field = parse_field_meta(&content, path.clone())?;
+            Some((api_name, field))
+        })
+        .collect();
+    for (api_name, field) in parsed_fields {
         objects.entry(api_name).or_default().fields.push(field);
     }
 

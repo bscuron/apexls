@@ -97,6 +97,7 @@ name = "apex-metadata"
 version = "0.1.0"
 dependencies = [
  "apex-discover",
+ "rayon",
  "roxmltree",
  "smol_str",
 ]

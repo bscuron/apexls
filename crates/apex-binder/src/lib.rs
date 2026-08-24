@@ -256,7 +256,7 @@ impl BoundProgram {
         }
         let parsed: Vec<ParsedFile> = hotpath::measure_block!("stage_1a_read_and_parse", {
             candidates
-                .par_iter()
+                .into_par_iter()
                 .filter_map(|(path, file)| {
                     let trigger = path
                         .extension()
@@ -269,14 +269,19 @@ impl BoundProgram {
                     // way), so it's compared by content hash, same as
                     // before. In practice this is at most a handful of
                     // files per call (whatever's actually being edited).
-                    if let Some(content) = overrides.get(path) {
+                    // `path` moves into whichever `ParsedFile` this
+                    // invocation actually returns (one `PathBuf` per
+                    // candidate, not the extra clone an owned-vs-borrowed
+                    // mismatch used to force here) -- see the `hotpath`-
+                    // measured finding in `BACKLOG.md` §2 this targets.
+                    if let Some(content) = overrides.get(&path) {
                         let freshness =
                             Freshness::ContentHash(incremental::content_fingerprint(content));
-                        if let Some((cached, cached_parse)) = cache.parses.get(path) {
+                        if let Some((cached, cached_parse)) = cache.parses.get(&path) {
                             if *cached == freshness {
                                 return Some(ParsedFile {
-                                    path: path.clone(),
-                                    file: *file,
+                                    path,
+                                    file,
                                     trigger,
                                     dirty: false,
                                     freshness,
@@ -290,8 +295,8 @@ impl BoundProgram {
                             apex_parser::parse_compilation_unit(content)
                         };
                         return Some(ParsedFile {
-                            path: path.clone(),
-                            file: *file,
+                            path,
+                            file,
                             trigger,
                             dirty: true,
                             freshness,
@@ -306,17 +311,17 @@ impl BoundProgram {
                     // one actually being edited. See `Freshness::Stat`'s
                     // doc comment for the honest staleness caveat this
                     // trades for that.
-                    let metadata = std::fs::metadata(path).ok()?;
+                    let metadata = std::fs::metadata(&path).ok()?;
                     let stat_freshness = metadata.modified().ok().map(|modified| Freshness::Stat {
                         len: metadata.len(),
                         modified,
                     });
                     if let Some(freshness) = &stat_freshness {
-                        if let Some((cached, cached_parse)) = cache.parses.get(path) {
+                        if let Some((cached, cached_parse)) = cache.parses.get(&path) {
                             if cached == freshness {
                                 return Some(ParsedFile {
-                                    path: path.clone(),
-                                    file: *file,
+                                    path,
+                                    file,
                                     trigger,
                                     dirty: false,
                                     freshness: freshness.clone(),
@@ -325,7 +330,7 @@ impl BoundProgram {
                             }
                         }
                     }
-                    let content = std::fs::read_to_string(path).ok()?;
+                    let content = std::fs::read_to_string(&path).ok()?;
                     let parse = if trigger {
                         apex_parser::parse_trigger_unit(&content)
                     } else {
@@ -339,8 +344,8 @@ impl BoundProgram {
                         Freshness::ContentHash(incremental::content_fingerprint(&content))
                     });
                     Some(ParsedFile {
-                        path: path.clone(),
-                        file: *file,
+                        path,
+                        file,
                         trigger,
                         dirty: true,
                         freshness,
@@ -356,6 +361,9 @@ impl BoundProgram {
             cache
                 .parses
                 .insert(p.path.clone(), (p.freshness.clone(), p.parse.clone()));
+            cache.paths.insert(p.file, p.path.clone());
+            cache.path_ids.insert(p.path.clone(), p.file);
+            cache.file_parses.insert(p.file, p.parse.clone());
         }
 
         // The *actual* current file set is whatever was just
@@ -380,6 +388,10 @@ impl BoundProgram {
             cache.raw_super.remove(&file);
             cache.supertype_ptrs.remove(&file);
             cache.bodies.remove(&file);
+            if let Some(path) = cache.paths.remove(&file) {
+                cache.path_ids.remove(&path);
+            }
+            cache.file_parses.remove(&file);
         }
         cache
             .parses
@@ -545,13 +557,29 @@ impl BoundProgram {
             }
             for (file, bodies) in by_file {
                 let mut base = cache.table.declared_len(file) as u32;
-                let mut extra_symbols = Vec::new();
-                let mut file_bodies = incremental::FileBodies::default();
+                // Pre-sized rather than growing via repeated `.extend()`/
+                // `.insert()` calls as each body is folded in below --
+                // `scopes`' bound (`bodies.len()`) is an upper bound, not
+                // exact (not every body has a `Some(key)`), but a small
+                // over-reservation beats the reallocations this file's
+                // bodies would otherwise cause one at a time. See the
+                // `hotpath`-measured finding in `BACKLOG.md` §2 this
+                // targets.
+                let mut extra_symbols = Vec::with_capacity(
+                    bodies
+                        .iter()
+                        .map(|(_, body)| body.pending_locals.len())
+                        .sum(),
+                );
+                let mut file_bodies = incremental::FileBodies {
+                    refs: ReferenceTable::default(),
+                    scopes: FxHashMap::with_capacity_and_hasher(bodies.len(), Default::default()),
+                };
                 for (key, body) in bodies {
                     let remap = |id: SymbolId| resolve::remap_local_id(id, base);
                     let mut scopes = body.scopes;
                     scopes.remap_symbol_ids(&remap);
-                    body.refs.map_ids(&remap).merge_into(&mut file_bodies.refs);
+                    body.refs.map_ids_into(&remap, &mut file_bodies.refs);
                     if let Some(key) = key {
                         file_bodies.scopes.insert(key, scopes);
                     }
@@ -568,14 +596,14 @@ impl BoundProgram {
         // `bodies` (`Arc`-shared per file) are both cheap here regardless
         // of project size -- an *unaffected* file only costs a pointer
         // clone, not a deep copy of its `Symbol`s/references/scopes.
-        let mut files = FxHashMap::with_capacity_and_hasher(parsed.len(), Default::default());
-        let mut file_ids = FxHashMap::with_capacity_and_hasher(parsed.len(), Default::default());
-        let mut parses = FxHashMap::with_capacity_and_hasher(parsed.len(), Default::default());
-        for p in parsed {
-            file_ids.insert(p.path.clone(), p.file);
-            files.insert(p.file, p.path);
-            parses.insert(p.file, p.parse);
-        }
+        // `files`/`file_ids`/`parses` were patched incrementally in
+        // `cache` above (dirty/removed files only, not every file every
+        // call), so assembling them here is one `.clone()` of each
+        // already-correct persisted map, not `parsed.len()` fresh
+        // inserts with a `PathBuf` clone apiece.
+        let files = cache.paths.clone();
+        let file_ids = cache.path_ids.clone();
+        let parses = cache.file_parses.clone();
         let bodies: FxHashMap<FileId, Arc<FileBodies>> = current_ids
             .iter()
             .filter_map(|&file| cache.bodies.get(&file).map(|fb| (file, Arc::clone(fb))))
