@@ -29,13 +29,20 @@
 //! regardless of whether it happens to hit the exact race this run: no
 //! "panicked" line ever appears on stderr, and the server is still fully
 //! responsive afterward (a `textDocument/definition` request resolves
-//! correctly, not `null`). The real confidence in the fix
-//! (`main.rs`'s `spawn_rebuild`, which now captures `overrides` only
-//! after acquiring `bind.cache`'s lock -- so calls can never regress
-//! relative to each other no matter what order they happen to acquire
-//! the lock in -- and debounces/cancels a still-pending rebuild a newer
-//! edit has already superseded) comes from that ordering argument being
-//! unconditional, not from this test managing to hit the race.
+//! correctly, not `null`).
+//!
+//! The fix went through two designs. The first kept one `spawn_blocking`
+//! task per edit but debounced it and captured `overrides` only after
+//! acquiring `bind.cache`'s lock, so calls could never regress relative
+//! to each other regardless of acquisition order. The current design
+//! (`main.rs`'s `spawn_rebuild_worker`) replaces that with a single
+//! persistent worker task woken by a `tokio::sync::Notify` -- with
+//! exactly one task ever calling `from_files_cached`, sequentially,
+//! there is no second rebuild left to race against in the first place,
+//! no debounce delay before an idle worker picks up a single edit, and
+//! no timing constant to tune. The real confidence in the fix comes from
+//! that structural argument, not from this test managing to hit the
+//! race.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};

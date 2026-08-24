@@ -127,16 +127,18 @@ struct Backend {
     /// standard-library-stub toggle, no metadata-root override) --
     /// see `BACKLOG.md` §4 for what those settings will eventually be.
     config: Option<serde_json::Value>,
-    /// The current `apex-binder` bind, rebuilt in the background (see
-    /// `Backend::schedule_rebuild`) after `initialized` and every
-    /// document-sync notification. Every edit schedules a rebuild, but
+    /// The current `apex-binder` bind, rebuilt in the background by a
+    /// single persistent worker task (`spawn_rebuild_worker`) after
+    /// `initialized` and every document-sync notification
+    /// (`Backend::schedule_rebuild`). Every edit requests a rebuild, but
     /// `bind.cache` (`apex_binder::BindCache`) makes each one
     /// incremental -- unaffected files' parses *and* declarations/
     /// references are reused, not just reparsed -- so in the common case
     /// (an edit that doesn't change any declaration) only the edited
-    /// file's own bodies actually get re-resolved. Still no debouncing or
-    /// cancellation of a still-running rebuild a newer edit has already
-    /// superseded. `None` until the first rebuild completes. Not
+    /// file's own bodies actually get re-resolved. A burst of rapid edits
+    /// coalesces into a single rebuild once the worker is free rather
+    /// than running (or racing) one per edit -- see `BindState::rebuild_requested`'s
+    /// doc comment. `None` until the first rebuild completes. Not
     /// consumed by any capability yet (that's `BACKLOG.md` §3) -- this
     /// wiring exists so real single-edit rebuild latency can be measured
     /// instead of guessed.
@@ -169,14 +171,30 @@ struct BindState {
     program: RwLock<Option<BoundProgram>>,
     cache: Mutex<BindCache>,
     documents: Mutex<HashMap<Url, String>>,
-    /// The still-sleeping debounce timer for the most recently scheduled
-    /// rebuild, if its `DEBOUNCE` wait hasn't elapsed yet -- see
-    /// `spawn_rebuild`'s doc comment for why debouncing this way, on top
-    /// of the ordering fix that actually makes overlapping rebuilds safe,
-    /// still matters. `None` once that timer has fired (or been aborted)
-    /// and its rebuild is (or was) actually running -- at that point
-    /// there's nothing left to cancel, only something to wait out.
-    pending_rebuild: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Signals `spawn_rebuild_worker`'s single persistent background
+    /// task that `documents` has changed and there's a rebuild to do --
+    /// set by `Backend::schedule_rebuild` and the filesystem watcher's
+    /// callback, never awaited on by either. `tokio::sync::Notify`
+    /// stores at most one buffered "wake up" permit: any number of
+    /// `notify_one()` calls that land while the worker is still busy
+    /// with a previous rebuild (or hasn't started waiting yet) collapse
+    /// into that single permit rather than queuing one wake-up per call.
+    /// That's exactly the behavior a burst of rapid edits wants -- once
+    /// the worker finishes its current rebuild and loops back to wait
+    /// again, it immediately picks up the one outstanding permit and
+    /// runs exactly one more rebuild covering everything that changed in
+    /// the meantime, rather than replaying every edit in between one at
+    /// a time. Unlike a debounce timer, there's no artificial delay
+    /// before an *idle* worker picks up a single edit (it starts the
+    /// instant `notify_one()` is called) and no tuning constant to pick
+    /// -- "coalesce" only ever means "the worker was still busy," never
+    /// "wait around in case something happens." See
+    /// `spawn_rebuild_worker`'s doc comment for how this also makes the
+    /// worker's own `from_files_cached` calls trivially safe to reason
+    /// about: with exactly one task ever making them, sequentially,
+    /// there is no "two rebuilds raced and one landed out of order"
+    /// scenario left to guard against.
+    rebuild_requested: tokio::sync::Notify,
     /// Kept alive only so the watch stays active -- `Debouncer` stops
     /// watching on drop. `None` until `Backend::start_watcher`'s
     /// `spawn_blocking` task finishes registering it, and permanently
@@ -195,32 +213,18 @@ struct BindState {
 }
 
 impl Backend {
-    /// Kicks off a background rebuild of `self.bind` against the current
-    /// `self.root` and `self.bind.documents` (each open buffer's
-    /// in-memory text overriding its on-disk content -- see
+    /// Requests a background rebuild reflecting the current
+    /// `self.bind.documents` (each open buffer's in-memory text
+    /// overriding its on-disk content -- see
     /// `BoundProgram::from_files_with_overrides`'s doc comment for why
-    /// that matters). A no-op if there's no root yet (single-file mode,
-    /// or a request that raced ahead of `initialize`).
-    ///
-    /// Fire-and-forget by design for this first pass (`BACKLOG.md` §2
-    /// Step 1): the returned `JoinHandle` is dropped, not awaited, so
-    /// the rebuild keeps running on `spawn_blocking`'s pool even though
-    /// nothing here waits on it, and a burst of rapid edits schedules a
-    /// burst of overlapping rebuilds with no cancellation between them
-    /// -- whichever finishes last wins (`self.bind.program`'s
-    /// `RwLock::write` is the only synchronization). Debouncing and
-    /// superseded-rebuild cancellation are exactly the kind of
-    /// refinement `BACKLOG.md` §2 Step 3's real latency measurement
-    /// should justify (or not) rather than building speculatively now.
+    /// that matters). Just sets `self.bind.rebuild_requested`'s permit;
+    /// the actual work happens on `spawn_rebuild_worker`'s persistent
+    /// background task, spawned once from `initialized`. A harmless no-op
+    /// if that worker was never spawned (no resolved root -- single-file
+    /// mode, or a request that raced ahead of `initialized`): the permit
+    /// is simply never consumed.
     fn schedule_rebuild(&self) {
-        let Some(root) = self.root.as_ref().and_then(|url| url.to_file_path().ok()) else {
-            return;
-        };
-        spawn_rebuild(
-            root,
-            Arc::clone(&self.bind),
-            tokio::runtime::Handle::current(),
-        );
+        self.bind.rebuild_requested.notify_one();
     }
 
     /// Spawns a background task that registers a debounced filesystem
@@ -249,9 +253,13 @@ impl Backend {
     /// needs the watch to be live by any particular point, only
     /// *eventually*, matching how relying on it at all already accepts
     /// "not instant" (see the honest race-window note on `BindState::watcher`'s
-    /// doc comment).
+    /// doc comment). The callback below runs on a thread `notify` owns,
+    /// not a `tokio`-managed one, but only ever calls
+    /// `rebuild_requested.notify_one()` -- a plain, synchronous method
+    /// needing no runtime handle at all -- so unlike an earlier version
+    /// of this function, no `tokio::runtime::Handle` needs threading
+    /// through to it.
     fn start_watcher(root: PathBuf, bind: Arc<BindState>) {
-        let handle = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             let watch_root = root.clone();
             let callback_bind = Arc::clone(&bind);
@@ -276,7 +284,7 @@ impl Backend {
                         return;
                     }
                     callback_bind.cache.lock().unwrap().invalidate_discovery();
-                    spawn_rebuild(root.clone(), Arc::clone(&callback_bind), handle.clone());
+                    callback_bind.rebuild_requested.notify_one();
                 },
             ) {
                 Ok(debouncer) => debouncer,
@@ -294,81 +302,57 @@ impl Backend {
     }
 }
 
-/// How long a rebuild waits after being scheduled before actually
-/// running, restarting the wait on every further edit in the meantime --
-/// see `spawn_rebuild`'s doc comment. Short enough to stay imperceptible
-/// against a warm rebind's own ~5-7ms cost (`BACKLOG.md` §2), long enough
-/// to coalesce a burst of same-keystroke-driven `didChange` notifications
-/// (an LSP client can fire one per character) into a single rebuild
-/// rather than one per character.
-const REBUILD_DEBOUNCE: Duration = Duration::from_millis(150);
-
-/// The actual rebuild work `Backend::schedule_rebuild` and the
-/// filesystem watcher's debounced callback both trigger -- factored out
-/// since the watcher's callback runs on a thread `notify` owns, not one
-/// with access to `&Backend`, so it needs a version taking only the
-/// `Arc<BindState>` handle both callers already have, plus an explicit
-/// `Handle` (see `Backend::start_watcher`'s doc comment for why that
-/// can't just be `tokio::task::spawn_blocking`'s ambient-runtime form).
+/// Spawns the single persistent background rebuild worker for the
+/// session, run for as long as the connection lives. Loops forever:
+/// wait for `bind.rebuild_requested`, run exactly one rebuild reflecting
+/// whatever's currently in `bind.documents`, then go back to waiting --
+/// see `BindState::rebuild_requested`'s doc comment for why a `Notify`
+/// makes this coalesce a burst of rapid edits into one rebuild (run the
+/// instant the worker is free, not after some fixed delay) rather than
+/// running -- or racing -- one per edit.
 ///
-/// **Debounced, and the previous pending rebuild is cancelled outright**
-/// (`bind.pending_rebuild`) rather than left to race the new one: a real,
-/// reproduced bug (not a hypothetical) showed why this matters beyond
-/// wasted CPU. `apex_binder::BindCache`'s incremental patching assumes a
-/// file's declared shape only ever moves *forward* in edit order -- a
-/// rebuild fed an *older* snapshot of `bind.documents` that happens to
-/// finish (or even just start) *after* a newer rebuild already patched
-/// shared indices from it can leave `cache.table` internally
-/// inconsistent (a `SymbolId` some other file's already-bound reference
-/// still points at, indexed against a since-shrunk symbol list) --
-/// observed in practice as a `SymbolTable::get` index-out-of-bounds panic
-/// that poisoned `bind.cache`'s `Mutex` and permanently broke every
-/// future rebuild for the rest of the session (nothing recovers a
-/// poisoned `std::sync::Mutex` on its own). Two changes close this,
-/// together: (1) `overrides` is captured only *after* acquiring
-/// `bind.cache`'s lock, immediately before the call that consumes it, not
-/// before -- since `bind.documents` only ever moves forward (a `String`
-/// replaced by a newer one, never reverted), whichever rebuild acquires
-/// the lock *later* is now guaranteed to see content at least as fresh as
-/// any rebuild that acquired it earlier, closing the "ran with stale
-/// content after fresher content already landed" window entirely, no
-/// matter how rebuilds happen to interleave. (2) Debouncing (this
-/// function) then means that safety property rarely has to do real work
-/// in the first place -- during a burst of rapid edits, only the last
-/// one's rebuild actually acquires the lock and runs at all, since each
-/// new edit cancels its predecessor's still-sleeping timer before it
-/// fires. Only the *timer* is cancellable this way -- a rebuild whose
-/// timer has already fired and started the actual (CPU-bound,
-/// `spawn_blocking`) work can't be preempted mid-flight, but (1) above is
-/// exactly what makes letting it run safely to completion, unpreempted,
-/// fine regardless.
-fn spawn_rebuild(root: PathBuf, bind: Arc<BindState>, handle: tokio::runtime::Handle) {
-    if let Some(previous) = bind.pending_rebuild.lock().unwrap().take() {
-        previous.abort();
-    }
-    let timer_bind = Arc::clone(&bind);
-    let task = handle.spawn(async move {
-        tokio::time::sleep(REBUILD_DEBOUNCE).await;
-        tokio::task::spawn_blocking(move || {
-            let mut cache = timer_bind.cache.lock().unwrap();
-            // Captured under `cache`'s lock, not before it -- see this
-            // function's doc comment for why that ordering is load-bearing,
-            // not incidental.
-            let overrides: HashMap<PathBuf, String> = timer_bind
-                .documents
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|(uri, text)| uri.to_file_path().ok().map(|path| (path, text.clone())))
-                .collect();
-            let program = BoundProgram::from_files_cached(&root, &overrides, &mut cache);
-            drop(cache);
-            let file_count = program.file_count();
-            *timer_bind.program.write().unwrap() = Some(program);
-            info!(file_count, "rebuild complete");
-        });
+/// This replaced an earlier design (a fresh `spawn_blocking` task per
+/// edit, debounced by a timer, with the *previous* pending timer
+/// cancelled by each new edit) after that design caused a real,
+/// reproduced bug: `overrides` was captured before acquiring
+/// `bind.cache`'s lock, so a rebuild fed an *older* snapshot of
+/// `bind.documents` could still acquire the lock *after* a newer
+/// rebuild already had, leaving `apex_binder::BindCache` internally
+/// inconsistent -- observed as a `SymbolTable::get` index-out-of-bounds
+/// panic that poisoned `bind.cache`'s `Mutex` and permanently broke
+/// every later rebuild for the rest of the session (a poisoned
+/// `std::sync::Mutex` never recovers on its own). That version's fix
+/// added an explicit "capture `overrides` only after acquiring the
+/// lock" ordering argument on top of the debounce. This design doesn't
+/// need that argument at all: with exactly one task ever calling
+/// `from_files_cached`, sequentially, in a plain loop, there is no
+/// second rebuild for an out-of-order one to race against in the first
+/// place -- correct by construction, not by a debounce timer narrowing
+/// the window enough that the race rarely fires.
+fn spawn_rebuild_worker(root: PathBuf, bind: Arc<BindState>) {
+    tokio::spawn(async move {
+        loop {
+            bind.rebuild_requested.notified().await;
+            let bind = Arc::clone(&bind);
+            let root = root.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut cache = bind.cache.lock().unwrap();
+                let overrides: HashMap<PathBuf, String> = bind
+                    .documents
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|(uri, text)| uri.to_file_path().ok().map(|path| (path, text.clone())))
+                    .collect();
+                let program = BoundProgram::from_files_cached(&root, &overrides, &mut cache);
+                drop(cache);
+                let file_count = program.file_count();
+                *bind.program.write().unwrap() = Some(program);
+                info!(file_count, "rebuild complete");
+            })
+            .await;
+        }
     });
-    *bind.pending_rebuild.lock().unwrap() = Some(task);
 }
 
 impl LanguageServer for Backend {
@@ -461,10 +445,11 @@ impl LanguageServer for Backend {
 
     fn initialized(&mut self, _: InitializedParams) -> Self::NotifyResult {
         info!("initialized");
-        self.schedule_rebuild();
         if let Some(root) = self.root.as_ref().and_then(|url| url.to_file_path().ok()) {
+            spawn_rebuild_worker(root.clone(), Arc::clone(&self.bind));
             Backend::start_watcher(root, Arc::clone(&self.bind));
         }
+        self.schedule_rebuild();
         ControlFlow::Continue(())
     }
 
