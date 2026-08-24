@@ -169,6 +169,14 @@ struct BindState {
     program: RwLock<Option<BoundProgram>>,
     cache: Mutex<BindCache>,
     documents: Mutex<HashMap<Url, String>>,
+    /// The still-sleeping debounce timer for the most recently scheduled
+    /// rebuild, if its `DEBOUNCE` wait hasn't elapsed yet -- see
+    /// `spawn_rebuild`'s doc comment for why debouncing this way, on top
+    /// of the ordering fix that actually makes overlapping rebuilds safe,
+    /// still matters. `None` once that timer has fired (or been aborted)
+    /// and its rebuild is (or was) actually running -- at that point
+    /// there's nothing left to cancel, only something to wait out.
+    pending_rebuild: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Kept alive only so the watch stays active -- `Debouncer` stops
     /// watching on drop. `None` until `Backend::start_watcher`'s
     /// `spawn_blocking` task finishes registering it, and permanently
@@ -286,6 +294,15 @@ impl Backend {
     }
 }
 
+/// How long a rebuild waits after being scheduled before actually
+/// running, restarting the wait on every further edit in the meantime --
+/// see `spawn_rebuild`'s doc comment. Short enough to stay imperceptible
+/// against a warm rebind's own ~5-7ms cost (`BACKLOG.md` §2), long enough
+/// to coalesce a burst of same-keystroke-driven `didChange` notifications
+/// (an LSP client can fire one per character) into a single rebuild
+/// rather than one per character.
+const REBUILD_DEBOUNCE: Duration = Duration::from_millis(150);
+
 /// The actual rebuild work `Backend::schedule_rebuild` and the
 /// filesystem watcher's debounced callback both trigger -- factored out
 /// since the watcher's callback runs on a thread `notify` owns, not one
@@ -293,23 +310,65 @@ impl Backend {
 /// `Arc<BindState>` handle both callers already have, plus an explicit
 /// `Handle` (see `Backend::start_watcher`'s doc comment for why that
 /// can't just be `tokio::task::spawn_blocking`'s ambient-runtime form).
+///
+/// **Debounced, and the previous pending rebuild is cancelled outright**
+/// (`bind.pending_rebuild`) rather than left to race the new one: a real,
+/// reproduced bug (not a hypothetical) showed why this matters beyond
+/// wasted CPU. `apex_binder::BindCache`'s incremental patching assumes a
+/// file's declared shape only ever moves *forward* in edit order -- a
+/// rebuild fed an *older* snapshot of `bind.documents` that happens to
+/// finish (or even just start) *after* a newer rebuild already patched
+/// shared indices from it can leave `cache.table` internally
+/// inconsistent (a `SymbolId` some other file's already-bound reference
+/// still points at, indexed against a since-shrunk symbol list) --
+/// observed in practice as a `SymbolTable::get` index-out-of-bounds panic
+/// that poisoned `bind.cache`'s `Mutex` and permanently broke every
+/// future rebuild for the rest of the session (nothing recovers a
+/// poisoned `std::sync::Mutex` on its own). Two changes close this,
+/// together: (1) `overrides` is captured only *after* acquiring
+/// `bind.cache`'s lock, immediately before the call that consumes it, not
+/// before -- since `bind.documents` only ever moves forward (a `String`
+/// replaced by a newer one, never reverted), whichever rebuild acquires
+/// the lock *later* is now guaranteed to see content at least as fresh as
+/// any rebuild that acquired it earlier, closing the "ran with stale
+/// content after fresher content already landed" window entirely, no
+/// matter how rebuilds happen to interleave. (2) Debouncing (this
+/// function) then means that safety property rarely has to do real work
+/// in the first place -- during a burst of rapid edits, only the last
+/// one's rebuild actually acquires the lock and runs at all, since each
+/// new edit cancels its predecessor's still-sleeping timer before it
+/// fires. Only the *timer* is cancellable this way -- a rebuild whose
+/// timer has already fired and started the actual (CPU-bound,
+/// `spawn_blocking`) work can't be preempted mid-flight, but (1) above is
+/// exactly what makes letting it run safely to completion, unpreempted,
+/// fine regardless.
 fn spawn_rebuild(root: PathBuf, bind: Arc<BindState>, handle: tokio::runtime::Handle) {
-    handle.spawn_blocking(move || {
-        let overrides: HashMap<PathBuf, String> = bind
-            .documents
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|(uri, text)| uri.to_file_path().ok().map(|path| (path, text.clone())))
-            .collect();
-        let program = {
-            let mut cache = bind.cache.lock().unwrap();
-            BoundProgram::from_files_cached(&root, &overrides, &mut cache)
-        };
-        let file_count = program.file_count();
-        *bind.program.write().unwrap() = Some(program);
-        info!(file_count, "rebuild complete");
+    if let Some(previous) = bind.pending_rebuild.lock().unwrap().take() {
+        previous.abort();
+    }
+    let timer_bind = Arc::clone(&bind);
+    let task = handle.spawn(async move {
+        tokio::time::sleep(REBUILD_DEBOUNCE).await;
+        tokio::task::spawn_blocking(move || {
+            let mut cache = timer_bind.cache.lock().unwrap();
+            // Captured under `cache`'s lock, not before it -- see this
+            // function's doc comment for why that ordering is load-bearing,
+            // not incidental.
+            let overrides: HashMap<PathBuf, String> = timer_bind
+                .documents
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(uri, text)| uri.to_file_path().ok().map(|path| (path, text.clone())))
+                .collect();
+            let program = BoundProgram::from_files_cached(&root, &overrides, &mut cache);
+            drop(cache);
+            let file_count = program.file_count();
+            *timer_bind.program.write().unwrap() = Some(program);
+            info!(file_count, "rebuild complete");
+        });
     });
+    *bind.pending_rebuild.lock().unwrap() = Some(task);
 }
 
 impl LanguageServer for Backend {
