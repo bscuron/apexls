@@ -17,12 +17,15 @@ parallelized across passes. `apexls-cli` is still a pre-binder debug tool
 `apex-binder` at all). `apexls-server` is a complete, real LSP protocol
 shell (§1 is fully checked off) that now background-rebuilds a real
 `apex_binder::BoundProgram` on every edit, incrementally (§2, fully
-checked off -- a warm single-file-edit rebind measures ~17ms on the real
-NPSP corpus, down from ~677ms cold). `textDocument/hover` and
-`textDocument/definition` (§3) are the first two capabilities to actually
-consume that bind over the wire -- the rest of §3's "buildable now" list
-(`documentSymbol`, `workspace/symbol`, `foldingRange`/`selectionRange`)
-is next.
+checked off -- a warm single-file-edit rebind now measures ~5-7ms on the
+real NPSP corpus, down from ~677ms cold, after further memory/perf work
+past the original ~17ms). §3's whole "buildable now, no new binder work
+needed" list is checked off: `textDocument/hover`, `textDocument/definition`,
+`textDocument/documentSymbol`, `workspace/symbol`, `textDocument/foldingRange`,
+`textDocument/selectionRange`. Next up is §3's "needs new binder-side
+work first" list (`references`/`documentHighlight`, `rename`, `signatureHelp`,
+`completion`, `semanticTokens`, `callHierarchy`, `inlayHint`), or §4's
+still-open standard-library/schema type-model gap.
 
 ## 1. Protocol / server layer
 
@@ -266,11 +269,33 @@ supports each one.
       silently-picked one). Deliberately *not* wired to `symbol_at` --
       "go to definition" on your own declaration has nowhere useful to
       go, so that stays a no-op rather than a special case.
-- [ ] `textDocument/documentSymbol` -- outline view, from `SymbolTable`
-      filtered to one file.
-- [ ] `workspace/symbol` -- from `SymbolTable::by_name_ci`.
-- [ ] `textDocument/foldingRange`, `textDocument/selectionRange` --
-      directly derivable from the existing CST, no semantic info needed.
+- [x] `textDocument/documentSymbol` -- **done.** `capabilities::document_symbols`
+      filters `SymbolTable::iter()` to one file's declaration-shaped
+      symbols (everything except `Parameter`/`LocalVar`/`CatchVar`/
+      `ForEachVar`/`SwitchBindingVar` -- an outline has no business
+      showing method-local variables) and nests them by `Symbol::container`:
+      a type's members and any nested types become its `children`,
+      top-level types are the roots. `range` is `Symbol::ptr`'s whole-
+      declaration span, `selection_range` is `Symbol::name_range` -- both
+      already exactly what `DocumentSymbol` wants, no new binder data.
+- [x] `workspace/symbol` -- **done**, but not from `SymbolTable::by_name_ci`
+      as originally guessed: that's an *exact* case-insensitive lookup,
+      not the substring match a real "type a few letters" workspace-
+      symbol UX needs, so `capabilities::workspace_symbols` does a plain
+      case-insensitive substring scan over every declaration-shaped
+      symbol project-wide instead (same kind-filter as `documentSymbol`).
+      Simplest correct baseline -- no fuzzy ranking.
+- [x] `textDocument/foldingRange`, `textDocument/selectionRange` --
+      **done**, directly off the CST as expected, no semantic info
+      needed. `foldingRange` folds every multi-line brace-delimited
+      region (`ClassBody`/`InterfaceBody`/`Block`/`TriggerBlock`/collection
+      initializers), line-granular only (no `start_character`/`end_character`,
+      matching how most editors fold anyway). `selectionRange` walks a
+      position's token up through every ancestor node, innermost first,
+      chained via `parent` -- rowan's tree already *is* that nesting;
+      consecutive levels with an identical range (a single-child wrapper
+      node) collapse into one so "expand selection" never appears to do
+      nothing.
 
 **Needs new binder-side work first:**
 - [ ] `textDocument/references` / `textDocument/documentHighlight` --

@@ -1,10 +1,13 @@
-//! Protocol-level verification of `BACKLOG.md` §3's first two real
-//! consumers of the bind: `textDocument/hover` and `textDocument/definition`.
-//! Follows `binder_integration.rs`'s exact pattern (spawn the real
-//! binary, drive it over real stdio, wait for the background rebuild's
-//! "rebuild complete" stderr line before sending a position-based
-//! request -- there's no other externally observable "the bind is
-//! ready" signal yet).
+//! Protocol-level verification of `BACKLOG.md` §3's `textDocument/hover`
+//! and `textDocument/definition` (the bind's first real consumers),
+//! plus the four "buildable now, no new binder work needed" capabilities
+//! that came right after: `textDocument/documentSymbol`, `workspace/symbol`,
+//! `textDocument/foldingRange`, `textDocument/selectionRange`. Follows
+//! `binder_integration.rs`'s exact pattern (spawn the real binary, drive
+//! it over real stdio, wait for the background rebuild's "rebuild
+//! complete" stderr line before sending a position-based request --
+//! there's no other externally observable "the bind is ready" signal
+//! yet).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -261,6 +264,146 @@ fn definition_on_a_field_reference_points_back_at_its_declaration() {
     // Line 1 is `    public Integer value;` -- the field's own
     // declaration line.
     assert_eq!(result["range"]["start"]["line"], 1);
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn document_symbol_returns_the_class_nesting_its_field_and_method() {
+    let dir = write_fixture_dir("document-symbol", &[("Foo.cls", FOO_SRC)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+
+    let mut session = Session::start(&foo_uri, &root_uri);
+
+    let response = session.request(
+        2,
+        "textDocument/documentSymbol",
+        serde_json::json!({ "textDocument": { "uri": foo_uri } }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "documentSymbol returned an error: {response:?}"
+    );
+    let result = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a symbol array, got {response:?}"));
+    assert_eq!(result.len(), 1, "expected one top-level symbol (Foo)");
+    let foo = &result[0];
+    assert_eq!(foo["name"], "Foo");
+    let children = foo["children"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected Foo to have children, got {foo:?}"));
+    let names: Vec<&str> = children
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"value"), "children should include `value`: {names:?}");
+    assert!(names.contains(&"run"), "children should include `run`: {names:?}");
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn workspace_symbol_finds_a_method_by_substring() {
+    let dir = write_fixture_dir("workspace-symbol", &[("Foo.cls", FOO_SRC)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+
+    let mut session = Session::start(&foo_uri, &root_uri);
+
+    let response = session.request(
+        2,
+        "workspace/symbol",
+        serde_json::json!({ "query": "ru" }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "workspace/symbol returned an error: {response:?}"
+    );
+    let result = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a symbol array, got {response:?}"));
+    assert!(
+        result.iter().any(|s| s["name"] == "run"),
+        "expected `run` among workspace/symbol results for query \"ru\": {result:?}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn folding_range_covers_the_class_body_and_the_method_body() {
+    let dir = write_fixture_dir("folding-range", &[("Foo.cls", FOO_SRC)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+
+    let mut session = Session::start(&foo_uri, &root_uri);
+
+    let response = session.request(
+        2,
+        "textDocument/foldingRange",
+        serde_json::json!({ "textDocument": { "uri": foo_uri } }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "foldingRange returned an error: {response:?}"
+    );
+    let result = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a folding range array, got {response:?}"));
+    // The class body (lines 0-5) and `run`'s block (lines 2-4) are both
+    // multi-line braced regions -- both should fold.
+    assert!(
+        result.iter().any(|r| r["startLine"] == 0),
+        "expected a folding range starting at the class body's opening brace: {result:?}"
+    );
+    assert!(
+        result.iter().any(|r| r["startLine"] == 2),
+        "expected a folding range starting at `run`'s opening brace: {result:?}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn selection_range_expands_from_the_reference_outward() {
+    let dir = write_fixture_dir("selection-range", &[("Foo.cls", FOO_SRC)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+
+    let mut session = Session::start(&foo_uri, &root_uri);
+
+    let response = session.request(
+        2,
+        "textDocument/selectionRange",
+        serde_json::json!({
+            "textDocument": { "uri": foo_uri },
+            "positions": [
+                { "line": VALUE_REFERENCE_POSITION.0, "character": VALUE_REFERENCE_POSITION.1 },
+            ],
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "selectionRange returned an error: {response:?}"
+    );
+    let result = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a selection range array, got {response:?}"));
+    assert_eq!(result.len(), 1, "expected one selection range per requested position");
+    // The innermost range (`value`, the NameExpr) must itself expand to
+    // at least one real parent (the statement/block/method/class
+    // ancestry) -- a chain of length 1 would mean nothing but the token
+    // itself was ever returned.
+    assert!(
+        result[0]["parent"].is_object(),
+        "expected the innermost selection range to have a parent: {result:?}"
+    );
 
     session.shutdown();
     let _ = std::fs::remove_dir_all(&dir);

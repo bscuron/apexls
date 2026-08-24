@@ -66,10 +66,13 @@ use async_lsp::{ClientSocket, LanguageServer, ResponseError};
 use futures::future::BoxFuture;
 use lsp_types::{
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, MarkupContent, MarkupKind, OneOf,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
+    DocumentSymbolResponse, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    MarkupContent, MarkupKind, OneOf, SelectionRange, SelectionRangeParams,
+    SelectionRangeProviderCapability, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Url, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use tower::ServiceBuilder;
 use tracing::{info, warn, Level};
@@ -240,6 +243,10 @@ impl LanguageServer for Backend {
                     position_encoding: Some(position_encoding.into()),
                     hover_provider: Some(HoverProviderCapability::Simple(true)),
                     definition_provider: Some(OneOf::Left(true)),
+                    document_symbol_provider: Some(OneOf::Left(true)),
+                    workspace_symbol_provider: Some(OneOf::Left(true)),
+                    folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                    selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                     ..ServerCapabilities::default()
                 },
                 server_info: Some(ServerInfo {
@@ -406,6 +413,113 @@ impl LanguageServer for Backend {
             };
 
             Ok(response)
+        })
+    }
+
+    /// The outline view: `capabilities::document_symbols` nests every
+    /// declaration-shaped symbol in `file` by `Symbol::container`.
+    fn document_symbol(
+        &mut self,
+        params: DocumentSymbolParams,
+    ) -> BoxFuture<'static, Result<Option<DocumentSymbolResponse>, Self::Error>> {
+        let uri = params.text_document.uri;
+        let encoding = self.position_encoding;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some(path) = uri.to_file_path().ok() else {
+                return Ok(None);
+            };
+            let Some(file) = program.file_id(&path) else {
+                return Ok(None);
+            };
+            let symbols = capabilities::document_symbols(program, file, encoding);
+            Ok((!symbols.is_empty()).then_some(DocumentSymbolResponse::Nested(symbols)))
+        })
+    }
+
+    /// Project-wide symbol search: `capabilities::workspace_symbols`'s
+    /// case-insensitive substring match over every declaration-shaped
+    /// symbol in the current bind.
+    fn symbol(
+        &mut self,
+        params: WorkspaceSymbolParams,
+    ) -> BoxFuture<'static, Result<Option<WorkspaceSymbolResponse>, Self::Error>> {
+        let encoding = self.position_encoding;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let results = capabilities::workspace_symbols(program, &params.query, encoding);
+            Ok((!results.is_empty()).then_some(WorkspaceSymbolResponse::Flat(results)))
+        })
+    }
+
+    /// Every brace-delimited region in `file` -- `capabilities::folding_ranges`
+    /// works straight off the CST, no bind needed, so this only ever
+    /// comes back empty for a genuinely unknown file, not a stale one.
+    fn folding_range(
+        &mut self,
+        params: FoldingRangeParams,
+    ) -> BoxFuture<'static, Result<Option<Vec<FoldingRange>>, Self::Error>> {
+        let uri = params.text_document.uri;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some(path) = uri.to_file_path().ok() else {
+                return Ok(None);
+            };
+            let Some(file) = program.file_id(&path) else {
+                return Ok(None);
+            };
+            let ranges = capabilities::folding_ranges(program, file);
+            Ok((!ranges.is_empty()).then_some(ranges))
+        })
+    }
+
+    /// One expanding-selection chain per requested position
+    /// (`capabilities::selection_range_at`) -- a position `resolve_position`
+    /// can't place (outside the known file/text) still gets a trivial
+    /// zero-width range back rather than being dropped, since the
+    /// response array must stay the same length as `params.positions`.
+    fn selection_range(
+        &mut self,
+        params: SelectionRangeParams,
+    ) -> BoxFuture<'static, Result<Option<Vec<SelectionRange>>, Self::Error>> {
+        let uri = params.text_document.uri;
+        let positions = params.positions;
+        let encoding = self.position_encoding;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let ranges: Vec<SelectionRange> = positions
+                .into_iter()
+                .map(|position| {
+                    capabilities::resolve_position(program, &uri, position, encoding)
+                        .and_then(|(file, offset)| {
+                            capabilities::selection_range_at(program, file, offset, encoding)
+                        })
+                        .unwrap_or(SelectionRange {
+                            range: lsp_types::Range {
+                                start: position,
+                                end: position,
+                            },
+                            parent: None,
+                        })
+                })
+                .collect();
+            Ok(Some(ranges))
         })
     }
 }

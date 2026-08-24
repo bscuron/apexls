@@ -5,13 +5,18 @@
 //! turning a resolved `SymbolId` back into an LSP `Location`.
 
 use crate::line_index::{LineIndex, PositionEncoding};
-use apex_binder::{BoundProgram, FileId, SchemaObjectRef, SymbolId, SymbolKind, Visibility};
+use apex_binder::{
+    BoundProgram, FileId, SchemaObjectRef, Symbol, SymbolId, SymbolKind, Visibility,
+};
 use apex_syntax::ast::decl::{
     ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, HasDocComment, InterfaceDecl, MethodDecl,
     PropertyDecl, TriggerUnit,
 };
-use lsp_types::{Location, Position, Range, Url};
-use rowan::TextSize;
+use lsp_types::{
+    DocumentSymbol, FoldingRange, Location, Position, Range, SelectionRange, SymbolInformation,
+    SymbolKind as LspSymbolKind, Url,
+};
+use rowan::{TextRange, TextSize};
 
 /// `uri`/`position` -> the `FileId`/byte-offset `program`'s own API
 /// understands. `None` whenever `uri` doesn't name a file this bound
@@ -199,6 +204,225 @@ fn push_params(program: &BoundProgram, out: &mut String, method_or_ctor: SymbolI
 /// `VarDeclarator` (a field statement can declare more than one name:
 /// `Integer a, b;`), one level below the `FieldDecl` a doc comment
 /// actually attaches to, so that one case climbs to the parent first.
+/// A symbol kind that belongs in an outline/search result -- excludes
+/// parameters and every local-variable kind, which don't belong in a
+/// document outline or a project-wide symbol search the way a type or
+/// member does. Shared by [`document_symbols`] and [`workspace_symbols`].
+fn is_outline_kind(kind: SymbolKind) -> bool {
+    !matches!(
+        kind,
+        SymbolKind::Parameter
+            | SymbolKind::LocalVar
+            | SymbolKind::CatchVar
+            | SymbolKind::ForEachVar
+            | SymbolKind::SwitchBindingVar
+    )
+}
+
+/// `apex_binder::SymbolKind` -> the closest `lsp_types::SymbolKind`.
+/// `Trigger` has no direct LSP equivalent -- `EVENT` is the closest
+/// semantic fit (a trigger responds to a DDL event), not a literal
+/// mapping. The local-variable kinds are never actually reached (see
+/// [`is_outline_kind`]) but are mapped anyway to keep this exhaustive.
+fn lsp_symbol_kind(kind: SymbolKind) -> LspSymbolKind {
+    match kind {
+        SymbolKind::Class => LspSymbolKind::CLASS,
+        SymbolKind::Interface => LspSymbolKind::INTERFACE,
+        SymbolKind::Enum => LspSymbolKind::ENUM,
+        SymbolKind::EnumConstant => LspSymbolKind::ENUM_MEMBER,
+        SymbolKind::Trigger => LspSymbolKind::EVENT,
+        SymbolKind::Method => LspSymbolKind::METHOD,
+        SymbolKind::Constructor => LspSymbolKind::CONSTRUCTOR,
+        SymbolKind::Field => LspSymbolKind::FIELD,
+        SymbolKind::Property => LspSymbolKind::PROPERTY,
+        SymbolKind::Parameter
+        | SymbolKind::LocalVar
+        | SymbolKind::CatchVar
+        | SymbolKind::ForEachVar
+        | SymbolKind::SwitchBindingVar => LspSymbolKind::VARIABLE,
+    }
+}
+
+/// `textDocument/documentSymbol`'s outline tree for `file`: every
+/// declaration-shaped symbol (`is_outline_kind`), nested by
+/// `Symbol::container` -- a type's members and any nested types become
+/// its `children`, top-level types (`container: None`) are the roots.
+pub(crate) fn document_symbols(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<DocumentSymbol> {
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+    let to_range = |r: TextRange| Range {
+        start: index.to_position(&text, r.start().into(), encoding),
+        end: index.to_position(&text, r.end().into(), encoding),
+    };
+
+    let entries: Vec<(SymbolId, &Symbol)> = program
+        .symbols
+        .iter()
+        .filter(|(_, s)| s.file == file && is_outline_kind(s.kind))
+        .collect();
+
+    fn build(
+        entries: &[(SymbolId, &Symbol)],
+        container: Option<SymbolId>,
+        to_range: &impl Fn(TextRange) -> Range,
+    ) -> Vec<DocumentSymbol> {
+        entries
+            .iter()
+            .filter(|entry| entry.1.container == container)
+            .map(|&(id, s)| {
+                let children = build(entries, Some(id), to_range);
+                #[allow(deprecated)] // `deprecated` field, superseded by `tags` -- neither used here
+                DocumentSymbol {
+                    name: s.name.to_string(),
+                    detail: s.type_name.as_ref().map(|t| t.to_string()),
+                    kind: lsp_symbol_kind(s.kind),
+                    tags: None,
+                    deprecated: None,
+                    range: to_range(s.ptr.range()),
+                    selection_range: to_range(s.name_range),
+                    children: (!children.is_empty()).then_some(children),
+                }
+            })
+            .collect()
+    }
+    build(&entries, None, &to_range)
+}
+
+/// `workspace/symbol`'s project-wide search: every declaration-shaped
+/// symbol (`is_outline_kind`) whose name contains `query`,
+/// case-insensitively. A plain substring scan, not fuzzy scoring --
+/// simplest correct baseline, matching how many language servers start
+/// before layering ranking on top.
+pub(crate) fn workspace_symbols(
+    program: &BoundProgram,
+    query: &str,
+    encoding: PositionEncoding,
+) -> Vec<SymbolInformation> {
+    let query = query.to_lowercase();
+    program
+        .symbols
+        .iter()
+        .filter(|(_, s)| is_outline_kind(s.kind) && s.name.to_lowercase().contains(&query))
+        .filter_map(|(id, s)| {
+            let location = symbol_location(program, id, encoding)?;
+            let container_name = s
+                .container
+                .map(|c| program.symbols.get(c).name.to_string());
+            #[allow(deprecated)] // `deprecated` field, superseded by `tags` -- neither used here
+            Some(SymbolInformation {
+                name: s.name.to_string(),
+                kind: lsp_symbol_kind(s.kind),
+                tags: None,
+                deprecated: None,
+                location,
+                container_name,
+            })
+        })
+        .collect()
+}
+
+/// `textDocument/foldingRange`: every brace-delimited region (a class/
+/// interface body, a method/constructor/property-accessor/trigger body,
+/// a `{ ... }` collection initializer) that spans more than one line.
+/// Directly derivable from the CST alone -- no semantic/binder info
+/// needed, so this never fails or comes back empty just because the
+/// bind hasn't caught up with the very latest edit. Deliberately line-
+/// granular (no `start_character`/`end_character`): the brace's own
+/// line stays visible when collapsed (`{...}`), matching how most
+/// editors fold anyway.
+pub(crate) fn folding_ranges(program: &BoundProgram, file: FileId) -> Vec<FoldingRange> {
+    const FOLDABLE_KINDS: [apex_syntax::SyntaxKind; 7] = [
+        apex_syntax::SyntaxKind::ClassBody,
+        apex_syntax::SyntaxKind::InterfaceBody,
+        apex_syntax::SyntaxKind::Block,
+        apex_syntax::SyntaxKind::TriggerBlock,
+        apex_syntax::SyntaxKind::ArrayInitializer,
+        apex_syntax::SyntaxKind::SetInitializer,
+        apex_syntax::SyntaxKind::MapInitializer,
+    ];
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+    // The encoding passed here only ever affects `Position::character`,
+    // which a line-granular folding range never reports -- `Utf8` is an
+    // arbitrary, cost-free choice, not a real encoding decision.
+    let line_of = |offset: TextSize| index.to_position(&text, offset.into(), PositionEncoding::Utf8).line;
+
+    program
+        .syntax(file)
+        .descendants()
+        .filter(|n| FOLDABLE_KINDS.contains(&n.kind()))
+        .filter_map(|n| {
+            let range = n.text_range();
+            let start_line = line_of(range.start());
+            let end_line = line_of(range.end());
+            (start_line != end_line).then_some(FoldingRange {
+                start_line,
+                start_character: None,
+                end_line,
+                end_character: None,
+                kind: None,
+                collapsed_text: None,
+            })
+        })
+        .collect()
+}
+
+/// `textDocument/selectionRange` for one position: every ancestor
+/// node's range, innermost first, chained via `parent` -- rowan's tree
+/// already *is* exactly this nesting, so no semantic/binder info is
+/// needed, only the CST. Consecutive levels with an identical range
+/// (a single-child wrapper node) collapse into one, so an "expand
+/// selection" command never appears to do nothing.
+pub(crate) fn selection_range_at(
+    program: &BoundProgram,
+    file: FileId,
+    offset: TextSize,
+    encoding: PositionEncoding,
+) -> Option<SelectionRange> {
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+    let to_range = |r: TextRange| Range {
+        start: index.to_position(&text, r.start().into(), encoding),
+        end: index.to_position(&text, r.end().into(), encoding),
+    };
+
+    let root = program.syntax(file);
+    let token = match root.token_at_offset(offset) {
+        rowan::TokenAtOffset::None => return None,
+        rowan::TokenAtOffset::Single(t) => t,
+        rowan::TokenAtOffset::Between(left, right) => {
+            if left.kind().is_trivia() {
+                right
+            } else {
+                left
+            }
+        }
+    };
+
+    let mut chain: Vec<TextRange> = vec![token.text_range()];
+    let mut node = token.parent();
+    while let Some(n) = node {
+        let r = n.text_range();
+        if chain.last() != Some(&r) {
+            chain.push(r);
+        }
+        node = n.parent();
+    }
+
+    let mut result: Option<SelectionRange> = None;
+    for range in chain.into_iter().rev() {
+        result = Some(SelectionRange {
+            range: to_range(range),
+            parent: result.map(Box::new),
+        });
+    }
+    result
+}
+
 fn doc_comment_for(program: &BoundProgram, id: SymbolId) -> Option<String> {
     use rowan::ast::AstNode;
 
