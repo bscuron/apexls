@@ -455,4 +455,19 @@ impl SymbolTable {
                 )
             })
     }
+
+    /// Like [`Self::nested_type`], but also checks `container`'s
+    /// inherited chain -- an *unqualified* reference to a nested type
+    /// from within `container` itself, or a subclass, doesn't need to
+    /// qualify it by whichever ancestor actually declared it, the same
+    /// way an inherited field/method doesn't. The fallback
+    /// `crate::resolve::resolve_type_ref` reaches for once a plain
+    /// `SymbolTable::top_level` lookup fails on a single-segment name --
+    /// real NPSP shape: `TDTM_Runnable`'s own abstract `run` method
+    /// returns `List<DmlWrapper>`, not `List<TDTM_Runnable.DmlWrapper>`.
+    pub fn nested_type_visible_from(&self, container: SymbolId, name: &str) -> Option<SymbolId> {
+        std::iter::once(container)
+            .chain(self.inherited_chain(container).iter().copied())
+            .find_map(|id| self.nested_type(id, name))
+    }
 }

@@ -445,3 +445,68 @@ fn each_segment_of_a_qualified_type_resolves_independently() {
         "cursor on `DmlWrapper` should resolve to `DmlWrapper`"
     );
 }
+
+/// An *unqualified* reference to a nested type from within its own
+/// enclosing type's scope used to never resolve at all -- real NPSP
+/// shape: `TDTM_Runnable`'s own abstract `run` method returns
+/// `List<DmlWrapper>`, not `List<TDTM_Runnable.DmlWrapper>` (Apex
+/// allows dropping the qualifier from inside the enclosing type).
+/// `resolve_type_ref`'s single-segment path only ever called
+/// `SymbolTable::top_level`, which indexes top-level type names only --
+/// a nested type was never reachable that way, so it silently landed on
+/// `Unresolved` (indistinguishable from a genuinely nonexistent name)
+/// even from directly inside its own declaring class.
+#[test]
+fn an_unqualified_nested_type_reference_resolves_from_within_its_enclosing_type() {
+    let dir = write_fixture_dir(
+        "unqualified-nested",
+        &[(
+            "TDTM_Runnable.cls",
+            "global abstract class TDTM_Runnable {\n    global virtual class DmlWrapper {\n    }\n    global abstract List<DmlWrapper> run();\n}\n",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "TDTM_Runnable");
+    let dml_wrapper_id = symbol_id(&program, SymbolKind::Class, "DmlWrapper");
+    let offset = type_ref_mid_offset(&program, file, "DmlWrapper");
+
+    assert_eq!(
+        program.resolution_at(file, offset).cloned(),
+        Some(Resolution::Resolved(dml_wrapper_id)),
+        "an unqualified reference to a sibling nested type should resolve from inside the enclosing class"
+    );
+}
+
+/// The same fallback also walks the *inherited* chain -- a subclass
+/// referencing its base class's nested type unqualified, same as an
+/// inherited field or method doesn't need qualifying either.
+#[test]
+fn an_unqualified_nested_type_reference_resolves_through_a_subclass() {
+    let dir = write_fixture_dir(
+        "unqualified-nested-inherited",
+        &[
+            (
+                "Base.cls",
+                "public virtual class Base { public class Inner { } }",
+            ),
+            (
+                "Sub.cls",
+                "public class Sub extends Base { public Inner make() { return null; } }",
+            ),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Sub");
+    let inner_id = symbol_id(&program, SymbolKind::Class, "Inner");
+    let offset = type_ref_mid_offset(&program, file, "Inner");
+
+    assert_eq!(
+        program.resolution_at(file, offset).cloned(),
+        Some(Resolution::Resolved(inner_id)),
+        "an unqualified reference to an inherited nested type should resolve from a subclass"
+    );
+}

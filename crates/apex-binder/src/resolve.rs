@@ -345,6 +345,7 @@ pub(crate) fn resolve_type_ref(
     schema: &SchemaIndex,
     refs: &mut ReferenceTable,
     file: FileId,
+    enclosing_type: Option<SymbolId>,
     ty: &Type,
 ) -> Option<Ty> {
     let name = ty.text();
@@ -357,11 +358,33 @@ pub(crate) fn resolve_type_ref(
         refs.set(ptr, Resolution::Resolved(id));
         return Some(Ty::Project(id));
     }
+    // A bare, unqualified reference to a *nested* type from within its
+    // own enclosing type (or a subclass) doesn't need qualifying --
+    // real NPSP shape: `TDTM_Runnable`'s own abstract `run` method
+    // returns `List<DmlWrapper>`, not `List<TDTM_Runnable.DmlWrapper>`.
+    // `resolve_dotted_top_level` above only ever checks `SymbolTable::top_level`
+    // (top-level type names only), so this never resolved without a
+    // separate check against the *lexically* enclosing type's own (and
+    // inherited) nested types -- the same fallback unqualified member
+    // lookup already gets via `SymbolTable::lookup_member`. Only
+    // attempted for a single-segment name: a partially-qualified deeper
+    // path (`Outer.Inner` referenced from three levels of nesting down)
+    // is a rarer shape not covered here.
+    if segments.len() == 1 {
+        if let Some(id) =
+            enclosing_type.and_then(|enclosing| table.nested_type_visible_from(enclosing, &name))
+        {
+            refs.set(ptr, Resolution::Resolved(id));
+            return Some(Ty::Project(id));
+        }
+    }
     let args: Vec<Ty> = ty
         .type_args()
         .map(|list| {
             list.args()
-                .filter_map(|arg| resolve_type_ref(table, schema, refs, file, &arg))
+                .filter_map(|arg| {
+                    resolve_type_ref(table, schema, refs, file, enclosing_type, &arg)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -458,9 +481,15 @@ fn record_qualified_segments(
 /// return type, or one `extends`/`implements` supertype name. Wrapped
 /// as a `BoundBody` purely so it merges through the same sequential
 /// path as every other Pass 2 result, same idea as [`bind_object_ref`].
-pub(crate) fn bind_type_ref(table: &SymbolTable, schema: &SchemaIndex, file: FileId, ty: &Type) -> BoundBody {
+pub(crate) fn bind_type_ref(
+    table: &SymbolTable,
+    schema: &SchemaIndex,
+    file: FileId,
+    enclosing_type: Option<SymbolId>,
+    ty: &Type,
+) -> BoundBody {
     let mut refs = ReferenceTable::default();
-    resolve_type_ref(table, schema, &mut refs, file, ty);
+    resolve_type_ref(table, schema, &mut refs, file, enclosing_type, ty);
     let (scopes, _) = ScopeTree::new_root(ScopeKind::Body, rowan::TextRange::empty(0.into()));
     BoundBody {
         scopes,
@@ -562,7 +591,14 @@ impl<'a> BodyBinder<'a> {
     /// an `extends`/`implements` supertype) that has no body to walk and
     /// so no `BodyBinder` to be a method on.
     pub(crate) fn resolve_type_ref(&mut self, ty: &Type) -> Option<Ty> {
-        resolve_type_ref(self.table, self.schema, &mut self.refs, self.file, ty)
+        resolve_type_ref(
+            self.table,
+            self.schema,
+            &mut self.refs,
+            self.file,
+            self.enclosing_type,
+            ty,
+        )
     }
 
     fn bind_block_stmts(&mut self, scope: ScopeId, block: &Block) {

@@ -495,12 +495,18 @@ impl BoundProgram {
                         .get(file)
                         .into_iter()
                         .flatten()
-                        .filter_map(|(_, ptr)| {
+                        .filter_map(|(owner, ptr)| {
                             let ty = ptr.to_node(&root_node)?;
                             Some((
                                 *file,
                                 None,
-                                resolve::bind_type_ref(&cache.table, &schema, *file, &ty),
+                                resolve::bind_type_ref(
+                                    &cache.table,
+                                    &schema,
+                                    *file,
+                                    Some(*owner),
+                                    &ty,
+                                ),
                             ))
                         })
                         .collect::<Vec<_>>()
@@ -752,6 +758,23 @@ fn declarations_equivalent(old: &[Symbol], new: &[Symbol]) -> bool {
 /// that's a real body worth keeping a `ScopeTree` for (`None` for the
 /// trigger's bare object-name resolution, which has no scope of its
 /// own).
+/// Walks `symbol.container` up until it lands on a type-kind symbol
+/// (`Class`/`Interface`/`Enum`) -- for a `Field`/`Property`/`Method`
+/// that's the immediate container already; for a `Parameter`, whose
+/// immediate container is the `Method`/`Constructor` it belongs to,
+/// this climbs one level further. The scope an unqualified type
+/// reference's fallback nested-type lookup (`resolve::resolve_type_ref`)
+/// should search from.
+fn enclosing_type_of(table: &SymbolTable, symbol: &Symbol) -> Option<SymbolId> {
+    let mut current = symbol.container?;
+    loop {
+        match table.get(current).kind {
+            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum => return Some(current),
+            _ => current = table.get(current).container?,
+        }
+    }
+}
+
 fn bind_symbol_body(
     table: &SymbolTable,
     schema: &SchemaIndex,
@@ -764,11 +787,14 @@ fn bind_symbol_body(
     // a symbol kind with no type of its own (`Symbol::type_ref`'s own
     // doc comment), or when the file's tree has moved on since this
     // pointer was captured (defensive; shouldn't happen mid-call).
+    let enclosing_type = enclosing_type_of(table, symbol);
     let declared_type = || {
-        symbol
-            .type_ref
-            .and_then(|type_ref| type_ref.to_node(root))
-            .map(|ty| (None, resolve::bind_type_ref(table, schema, symbol.file, &ty)))
+        symbol.type_ref.and_then(|type_ref| type_ref.to_node(root)).map(|ty| {
+            (
+                None,
+                resolve::bind_type_ref(table, schema, symbol.file, enclosing_type, &ty),
+            )
+        })
     };
     match symbol.kind {
         SymbolKind::Method => {
