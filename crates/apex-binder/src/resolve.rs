@@ -349,7 +349,7 @@ pub(crate) fn resolve_type_ref(
 ) -> Option<Ty> {
     let name = ty.text();
     let ptr = SyntaxPtr::new(file, ty.syntax());
-    if let Some(id) = table.top_level(&name) {
+    if let Some(id) = resolve_dotted_top_level(table, &ty.base_name_tokens()) {
         refs.set(ptr, Resolution::Resolved(id));
         return Some(Ty::Project(id));
     }
@@ -380,6 +380,31 @@ pub(crate) fn resolve_type_ref(
     // the returned `Ty` keeps it.
     refs.set(ptr, Resolution::Unresolved);
     Some(Ty::system_owned(name, args))
+}
+
+/// Resolves a type's dotted base-name path (`Outer.Inner` -- the first
+/// segment via `SymbolTable::top_level`, then each further segment as a
+/// nested type declared directly on the previous one via
+/// `SymbolTable::nested_type`) one segment at a time. The overwhelmingly
+/// common single-segment case (`Account`) is just the one `top_level`
+/// lookup, unchanged from before qualified nested-type references
+/// (`fflib_Application.UnitOfWorkFactory`, a common Enterprise-pattern
+/// shape) were handled at all -- previously `resolve_type_ref` looked up
+/// the *whole* dotted string as one name via `top_level`, which only
+/// indexes top-level (undotted) type names, so any qualified reference
+/// to a nested type silently fell all the way through to `Unresolved`.
+/// `segments` comes from `Type::base_name_tokens`, so array brackets and
+/// any `TypeArgList` are already excluded.
+fn resolve_dotted_top_level(
+    table: &SymbolTable,
+    segments: &[apex_syntax::SyntaxToken],
+) -> Option<SymbolId> {
+    let mut iter = segments.iter();
+    let mut current = table.top_level(iter.next()?.text())?;
+    for seg in iter {
+        current = table.nested_type(current, seg.text())?;
+    }
+    Some(current)
 }
 
 /// Binds a single declaration-site type reference with no enclosing

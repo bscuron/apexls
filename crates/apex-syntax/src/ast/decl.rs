@@ -367,7 +367,7 @@ impl Type {
     /// the same way as `SoqlFieldName::segments()`.
     pub fn base_name_tokens(&self) -> Vec<SyntaxToken> {
         direct_tokens(self.syntax())
-            .filter(|t| !matches!(t.kind(), SyntaxKind::LBrack | SyntaxKind::RBrack))
+            .filter(|t| !matches!(t.kind(), SyntaxKind::LBrack | SyntaxKind::RBrack | SyntaxKind::Dot))
             .collect()
     }
 
@@ -381,7 +381,7 @@ impl Type {
     /// only a genuinely dotted path (`Outer.Inner`) pays for building one.
     pub fn text(&self) -> SmolStr {
         let mut tokens = direct_tokens(self.syntax())
-            .filter(|t| !matches!(t.kind(), SyntaxKind::LBrack | SyntaxKind::RBrack));
+            .filter(|t| !matches!(t.kind(), SyntaxKind::LBrack | SyntaxKind::RBrack | SyntaxKind::Dot));
         let Some(first) = tokens.next() else {
             return SmolStr::default();
         };

@@ -431,4 +431,28 @@ impl SymbolTable {
         }
         found
     }
+
+    /// A *direct* (non-inherited) nested type declared on `container`
+    /// named `name` -- the `Inner` of a qualified `Outer.Inner` type
+    /// reference (`crate::resolve::resolve_type_ref`'s dotted-name case).
+    /// Deliberately not [`Self::lookup_member`]: that also walks the
+    /// inherited chain and applies override-arity elimination, both
+    /// meant for methods -- a qualified type reference names exactly
+    /// what `container` itself declares as a nested type, not something
+    /// inherited or overload-shaped.
+    pub fn nested_type(&self, container: SymbolId, name: &str) -> Option<SymbolId> {
+        self.indices
+            .members_by_name
+            .get(&MemberQuery(container, CiQuery(name)))?
+            .iter()
+            .copied()
+            .find(|&id| {
+                matches!(
+                    self.get(id).kind,
+                    crate::symbol::SymbolKind::Class
+                        | crate::symbol::SymbolKind::Interface
+                        | crate::symbol::SymbolKind::Enum
+                )
+            })
+    }
 }

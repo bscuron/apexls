@@ -267,6 +267,66 @@ fn an_interfaces_extends_clause_resolves_each_supertype_independently() {
     );
 }
 
+/// A qualified `Outer.Inner` supertype reference (the fflib/Enterprise-
+/// pattern shape: `extends fflib_Application.UnitOfWorkFactory`) used to
+/// silently fall through to `Unresolved` -- `resolve_type_ref` looked up
+/// the *whole* dotted string as one name via `SymbolTable::top_level`,
+/// which only indexes undotted top-level type names, so a nested type
+/// referenced through its outer class was indistinguishable from a
+/// genuinely nonexistent name. Covers both `extends` and a field's own
+/// type, since both go through the same `resolve_type_ref`.
+#[test]
+fn a_qualified_outer_dot_inner_supertype_resolves_to_the_nested_type() {
+    let dir = write_fixture_dir(
+        "decl-type-qualified-supertype",
+        &[
+            (
+                "fflib_Application.cls",
+                "public class fflib_Application { public virtual class UnitOfWorkFactory { } }",
+            ),
+            (
+                "fflib_ClassicUnitOfWorkFactory.cls",
+                "public virtual class fflib_ClassicUnitOfWorkFactory extends fflib_Application.UnitOfWorkFactory { }",
+            ),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "fflib_ClassicUnitOfWorkFactory");
+    let inner_id = symbol_id(&program, SymbolKind::Class, "UnitOfWorkFactory");
+    let offset = type_ref_mid_offset(&program, file, "fflib_Application.UnitOfWorkFactory");
+
+    assert_eq!(
+        program.resolution_at(file, offset).cloned(),
+        Some(Resolution::Resolved(inner_id)),
+        "a qualified Outer.Inner extends clause should resolve to the nested type"
+    );
+}
+
+#[test]
+fn a_qualified_outer_dot_inner_field_type_resolves_to_the_nested_type() {
+    let dir = write_fixture_dir(
+        "decl-type-qualified-field",
+        &[(
+            "Foo.cls",
+            "public class Foo { public class Inner { } public Foo.Inner i; }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let inner_id = symbol_id(&program, SymbolKind::Class, "Inner");
+    let offset = type_ref_mid_offset(&program, file, "Foo.Inner");
+
+    assert_eq!(
+        program.resolution_at(file, offset).cloned(),
+        Some(Resolution::Resolved(inner_id)),
+        "a qualified Outer.Inner field type should resolve to the nested type"
+    );
+}
+
 /// An `extends`/`implements` supertype name that doesn't exist anywhere
 /// in the project stays `Unresolved`, same as any other unmodeled type
 /// reference -- not silently unrecorded.
@@ -286,4 +346,39 @@ fn an_unresolvable_supertype_name_is_recorded_as_unresolved() {
         program.resolution_at(file, offset).cloned(),
         Some(Resolution::Unresolved)
     );
+}
+
+/// A for-each loop variable referenced multiple times, including inside
+/// a `new List<T>{ ... }` collection-initializer -- every occurrence
+/// (not just the first) resolves back to the same `ForEachVar` symbol.
+#[test]
+fn a_foreach_variable_resolves_at_every_reference_including_inside_a_collection_initializer() {
+    let src = "public class Foo {\n    Map<String, List<SObject>> sObjectsByType = new Map<String, List<SObject>>();\n    public void run(List<SObject> sObjects) {\n        for (SObject sObj : sObjects) {\n            String sObjType = sObj.getSObjectType().getDescribe().getName();\n            if (sObjectsByType.containsKey(sObjType)) {\n                sObjectsByType.get(sObjType).add(sObj);\n            } else {\n                sObjectsByType.put(sObjType, new List<SObject>{ sObj });\n            }\n        }\n    }\n}\n";
+    let dir = write_fixture_dir("foreach-repro", &[("Foo.cls", src)]);
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let sobj_id = symbol_id(&program, SymbolKind::ForEachVar, "sObj");
+
+    let root = program.syntax(file);
+    let sobj_refs: Vec<_> = root
+        .descendants()
+        .filter_map(apex_syntax::ast::expr::NameExpr::cast)
+        .filter(|n| n.name_token().is_some_and(|t| t.text() == "sObj"))
+        .collect();
+    assert_eq!(
+        sobj_refs.len(),
+        3,
+        "expected 3 references to `sObj` (receiver, `.add(sObj)`, and inside the collection initializer)"
+    );
+    for r in sobj_refs {
+        let offset = r.syntax().text_range().start() + rowan::TextSize::from(1);
+        assert_eq!(
+            program.resolution_at(file, offset).cloned(),
+            Some(Resolution::Resolved(sobj_id)),
+            "every `sObj` reference (range {:?}) should resolve to the for-each variable",
+            r.syntax().text_range()
+        );
+    }
 }
