@@ -18,7 +18,7 @@
 
 use crate::file_id::FileId;
 use crate::ptr::{AstPtr, SyntaxPtr};
-use crate::symbol::{ModifierSet, Symbol, SymbolId, SymbolKind};
+use crate::symbol::{ModifierSet, Symbol, SymbolId, SymbolKind, Visibility};
 use apex_syntax::ast::decl::{
     ClassDecl, CompilationUnit, ConstructorDecl, EnumDecl, FieldDecl, FormalParamList,
     HasModifiers, InterfaceDecl, Member, MethodDecl, PropertyDecl, TriggerUnit, TypeDecl,
@@ -246,7 +246,7 @@ fn collect_interface(
 
     if let Some(body) = iface.body() {
         for method in body.methods() {
-            collect_method(out, file, &method, iface_id);
+            collect_method(out, file, &method, iface_id, true);
         }
     }
 }
@@ -317,7 +317,7 @@ fn collect_enum(
 
 fn collect_member(out: &mut FileCollection, file: FileId, member: &Member, container: SymbolId) {
     match member {
-        Member::Method(m) => collect_method(out, file, m, container),
+        Member::Method(m) => collect_method(out, file, m, container, false),
         Member::Constructor(c) => collect_constructor(out, file, c, container),
         Member::Field(f) => collect_field(out, file, f, container),
         Member::Property(p) => collect_property(out, file, p, container),
@@ -327,7 +327,13 @@ fn collect_member(out: &mut FileCollection, file: FileId, member: &Member, conta
     }
 }
 
-fn collect_method(out: &mut FileCollection, file: FileId, m: &MethodDecl, container: SymbolId) {
+fn collect_method(
+    out: &mut FileCollection,
+    file: FileId,
+    m: &MethodDecl,
+    container: SymbolId,
+    in_interface: bool,
+) {
     let Some(name) = m.name() else {
         return;
     };
@@ -335,6 +341,17 @@ fn collect_method(out: &mut FileCollection, file: FileId, m: &MethodDecl, contai
         return;
     };
     let (type_ref, type_name, type_args) = type_ptr_and_name(file, m.return_type());
+    let mut modifiers = ModifierSet::from_modifiers(m.modifiers());
+    if in_interface && modifiers.visibility == Visibility::Private {
+        // Apex interface methods can't carry an explicit access modifier
+        // at all -- every interface member is implicitly public, unlike
+        // a class member's modifier-less default, which really is
+        // Private (Apex's real default there, see `Visibility`'s doc
+        // comment). Only overrides the untouched default, never an
+        // explicit modifier the grammar might permit (e.g. a `global
+        // interface`'s methods).
+        modifiers.visibility = Visibility::Public;
+    }
     let method_id = out.push(
         file,
         Symbol {
@@ -347,7 +364,7 @@ fn collect_method(out: &mut FileCollection, file: FileId, m: &MethodDecl, contai
             type_ref,
             type_name,
             type_args,
-            modifiers: ModifierSet::from_modifiers(m.modifiers()),
+            modifiers,
         },
     );
 
