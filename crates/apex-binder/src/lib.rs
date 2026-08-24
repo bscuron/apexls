@@ -629,16 +629,37 @@ impl BoundProgram {
         let token = match root.token_at_offset(offset) {
             rowan::TokenAtOffset::None => return None,
             rowan::TokenAtOffset::Single(t) => t,
-            // Cursor sits exactly between two tokens -- prefer the left
-            // one whenever it's real content, matching the common "cursor
-            // right after an identifier" hover/definition case; fall back
-            // to the right when the left is trivia (cursor right before
-            // an identifier, preceded by whitespace).
+            // Cursor sits exactly between two tokens -- whichever side is
+            // an actual `Identifier` token wins, regardless of which
+            // side it's on: that's unambiguously the name the cursor is
+            // "on," whether the cursor is at an identifier's start (right
+            // after an open paren/comma/brace with no space, e.g.
+            // `foo(bar)`'s `bar`) or its end (right before a dot/semi/
+            // close-paren with no space, e.g. `other` in `other.field`).
+            // A first cut here preferred left-when-non-trivia, which
+            // happened to cover the "end of identifier" case but actively
+            // broke the "start of identifier" one -- any identifier
+            // immediately preceded by punctuation with no space (any
+            // call argument, any brace-initializer element, ...) climbed
+            // from the punctuation token instead, landing on whatever
+            // enclosing expression *that* belonged to. Falls back to the
+            // old trivia-based rule only for the (practically unreachable
+            // for an identifier boundary) case where neither or both
+            // sides are `Identifier` tokens.
             rowan::TokenAtOffset::Between(left, right) => {
-                if left.kind().is_trivia() {
-                    right
-                } else {
-                    left
+                match (
+                    left.kind() == apex_syntax::SyntaxKind::Identifier,
+                    right.kind() == apex_syntax::SyntaxKind::Identifier,
+                ) {
+                    (true, false) => left,
+                    (false, true) => right,
+                    _ => {
+                        if left.kind().is_trivia() {
+                            right
+                        } else {
+                            left
+                        }
+                    }
                 }
             }
         };

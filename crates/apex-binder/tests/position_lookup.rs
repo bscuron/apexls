@@ -152,6 +152,50 @@ fn cursor_on_a_declarations_own_name_is_found_via_symbol_at_not_resolution_at() 
     );
 }
 
+/// A reference immediately preceded by punctuation with no space (a call
+/// argument's opening paren, a brace-initializer's opening brace) used
+/// to resolve from the *second* character onward but not the first:
+/// `resolution_at`'s token-boundary tie-break preferred whichever token
+/// was "real content" on the *left*, which happened to be the paren/
+/// brace itself, not the identifier starting immediately to its right.
+/// Now prefers whichever side is actually an `Identifier` token,
+/// wherever it falls.
+#[test]
+fn cursor_on_the_very_first_character_of_a_call_argument_resolves() {
+    let dir = write_fixture_dir(
+        "position-call-arg-first-char",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             public void take(Integer x) { } \
+             public void run() { Integer value = 1; take(value); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for_class(&program, "Foo");
+    let value_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::LocalVar && s.name == "value")
+        .map(|(id, _)| id)
+        .expect("`value` local should have been collected");
+
+    // `value`'s declaration site is a bare `DeclName`, not a `NameExpr`
+    // -- the call argument is the only `NameExpr` named `value` at all,
+    // so `name_expr_range`'s "exactly one match" convention applies here
+    // too.
+    let arg_range = name_expr_range(&program, file, "value");
+
+    assert_eq!(
+        program.resolution_at(file, arg_range.start()).cloned(),
+        Some(Resolution::Resolved(value_id)),
+        "cursor on the very first character of `take(value)`'s argument should resolve"
+    );
+}
+
 #[test]
 fn cursor_in_whitespace_finds_nothing_from_either_lookup() {
     let dir = write_fixture_dir(
