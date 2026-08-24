@@ -1144,6 +1144,7 @@ impl<'a> BodyBinder<'a> {
         let tok = f.member_token()?;
         let name = tok.text();
         let ptr = SyntaxPtr::new(self.file, f.syntax());
+        let highlight = tok.text_range();
 
         let container = match target_type {
             Some(Ty::Project(container)) => container,
@@ -1176,7 +1177,7 @@ impl<'a> BodyBinder<'a> {
                     }
                     None => Resolution::Unresolved,
                 };
-                self.refs.set(ptr, resolution);
+                self.refs.set_with_highlight(ptr, highlight, resolution);
                 return field_schema
                     .and_then(|f| f.reference_to.first())
                     .map(|next| Ty::system_owned(next.clone(), Vec::new()));
@@ -1184,7 +1185,8 @@ impl<'a> BodyBinder<'a> {
             // `target_type` is entirely unknown -- honestly `Unresolved`
             // rather than a guess.
             None => {
-                self.refs.set(ptr, Resolution::Unresolved);
+                self.refs
+                    .set_with_highlight(ptr, highlight, Resolution::Unresolved);
                 return None;
             }
         };
@@ -1201,15 +1203,21 @@ impl<'a> BodyBinder<'a> {
             .collect();
         match members.as_slice() {
             [] => {
-                self.refs.set(ptr, Resolution::Unresolved);
+                self.refs
+                    .set_with_highlight(ptr, highlight, Resolution::Unresolved);
                 None
             }
             [one] => {
-                self.refs.set(ptr, Resolution::Resolved(*one));
+                self.refs
+                    .set_with_highlight(ptr, highlight, Resolution::Resolved(*one));
                 self.type_of_symbol(*one)
             }
             many => {
-                self.refs.set(ptr, Resolution::Candidates(many.to_vec()));
+                self.refs.set_with_highlight(
+                    ptr,
+                    highlight,
+                    Resolution::Candidates(many.to_vec()),
+                );
                 None
             }
         }
@@ -1226,6 +1234,7 @@ impl<'a> BodyBinder<'a> {
         let tok = mc.method_name_token()?;
         let name = tok.text();
         let ptr = SyntaxPtr::new(self.file, mc.syntax());
+        let highlight = tok.text_range();
 
         match target_type {
             Some(Ty::Project(container)) => {
@@ -1243,7 +1252,7 @@ impl<'a> BodyBinder<'a> {
                     Resolution::Resolved(id) => self.type_of_symbol(*id),
                     _ => None,
                 };
-                self.refs.set(ptr, resolution);
+                self.refs.set_with_highlight(ptr, highlight, resolution);
                 result_type
             }
             Some(Ty::System { name: base, args }) => {
@@ -1255,11 +1264,13 @@ impl<'a> BodyBinder<'a> {
                 // `Ty` still flows upward for further chaining, e.g.
                 // `myList.get(0).Name` resolving `Name` when the list's
                 // element type is project-local.
-                self.refs.set(ptr, Resolution::Unresolved);
+                self.refs
+                    .set_with_highlight(ptr, highlight, Resolution::Unresolved);
                 crate::generics::builtin_generic_member_type(&base, &args, name)
             }
             None => {
-                self.refs.set(ptr, Resolution::Unresolved);
+                self.refs
+                    .set_with_highlight(ptr, highlight, Resolution::Unresolved);
                 None
             }
         }
@@ -1274,6 +1285,7 @@ impl<'a> BodyBinder<'a> {
         }
         let tok = c.callee_token()?;
         let ptr = SyntaxPtr::new(self.file, c.syntax());
+        let highlight = tok.text_range();
 
         let (target_type, want_ctor) = match tok.kind() {
             SyntaxKind::This => (self.enclosing_type, true),
@@ -1284,7 +1296,8 @@ impl<'a> BodyBinder<'a> {
             _ => (self.enclosing_type, false),
         };
         let Some(container) = target_type else {
-            self.refs.set(ptr, Resolution::Unresolved);
+            self.refs
+                .set_with_highlight(ptr, highlight, Resolution::Unresolved);
             return None;
         };
 
@@ -1323,7 +1336,7 @@ impl<'a> BodyBinder<'a> {
             Resolution::Resolved(id) => self.type_of_symbol(*id),
             _ => None,
         };
-        self.refs.set(ptr, resolution);
+        self.refs.set_with_highlight(ptr, highlight, resolution);
         result_type
     }
 
@@ -1347,8 +1360,21 @@ impl<'a> BodyBinder<'a> {
                     .collect();
                 if !ctors.is_empty() {
                     let resolution = narrow_by_overload(self.table, ctors, &arg_types);
-                    self.refs
-                        .set(SyntaxPtr::new(self.file, ne.syntax()), resolution);
+                    // `new Outer.Inner(...)` names its constructor after
+                    // the *last* segment (`Inner`) -- the type's own
+                    // constructor, never `Outer`'s -- so this narrows to
+                    // that segment alone rather than the whole dotted
+                    // `Type` node, matching `bind_method_call_expr`'s own
+                    // method-name-token narrowing.
+                    let highlight = ne
+                        .type_ref()
+                        .and_then(|t| t.base_name_tokens().last().map(|tok| tok.text_range()))
+                        .unwrap_or_else(|| ne.syntax().text_range());
+                    self.refs.set_with_highlight(
+                        SyntaxPtr::new(self.file, ne.syntax()),
+                        highlight,
+                        resolution,
+                    );
                 }
             }
         }

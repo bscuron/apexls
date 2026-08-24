@@ -300,6 +300,63 @@ fn references_includes_the_declaration_when_requested() {
 }
 
 #[test]
+fn references_reports_only_the_method_name_range_not_the_whole_call() {
+    // Regression test: a `MethodCallExpr` reference used to be keyed by
+    // (and reported at) its *whole* node range -- target through closing
+    // paren -- so `references`/`documentHighlight` on `greet` returned a
+    // range spanning all of `new Base().greet()` instead of just the
+    // `greet` token.
+    let dir = write_fixture_dir(
+        "references-method-name-range",
+        &[
+            ("Base.cls", BASE_SRC),
+            ("CallerA.cls", CALLER_A_SRC),
+            ("CallerB.cls", CALLER_B_SRC),
+        ],
+    );
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let base_uri = Url::from_file_path(dir.join("Base.cls")).unwrap();
+    let caller_a_uri = Url::from_file_path(dir.join("CallerA.cls")).unwrap();
+
+    let mut session = Session::start(&root_uri, &base_uri, BASE_SRC);
+
+    let (line, character) = position_of(BASE_SRC, "greet");
+    let response = session.request(
+        2,
+        "textDocument/references",
+        serde_json::json!({
+            "textDocument": { "uri": base_uri },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": false },
+        }),
+    );
+    let result = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a Location array, got {response:?}"));
+    let caller_a_loc = result
+        .iter()
+        .find(|l| l["uri"].as_str() == Some(caller_a_uri.as_str()))
+        .unwrap_or_else(|| panic!("expected a reference in CallerA.cls: {result:?}"));
+
+    let (want_line, want_character) = position_of(CALLER_A_SRC, "greet");
+    let start = &caller_a_loc["range"]["start"];
+    let end = &caller_a_loc["range"]["end"];
+    assert_eq!(
+        (start["line"].as_u64(), start["character"].as_u64()),
+        (Some(want_line as u64), Some(want_character as u64)),
+        "range should start at the `greet` token, not the whole call: {caller_a_loc:?}"
+    );
+    assert_eq!(
+        (end["line"].as_u64(), end["character"].as_u64()),
+        (Some(want_line as u64), Some(want_character as u64 + "greet".len() as u64)),
+        "range should end at the `greet` token's own end, not the call's closing paren: {caller_a_loc:?}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn document_highlight_finds_every_occurrence_of_a_local_in_one_file() {
     const SRC: &str = "public class Widget {\n    \
          public void run() {\n        \

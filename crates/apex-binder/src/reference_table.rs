@@ -4,6 +4,7 @@
 
 use crate::ptr::SyntaxPtr;
 use crate::symbol::SymbolId;
+use rowan::TextRange;
 use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
@@ -98,6 +99,19 @@ pub struct ReferenceTable {
     /// comment) -- there's no persistent-across-rebuilds mutation or
     /// stale-entry cleanup to reason about, same as `resolutions` itself.
     by_symbol: FxHashMap<SymbolId, Vec<SyntaxPtr>>,
+    /// Narrower highlight range for a reference whose own `SyntaxPtr::range()`
+    /// spans more than just its identifying token -- a method/constructor
+    /// call node's range covers target-through-closing-paren, a
+    /// `FieldExpr`'s covers receiver-through-member. Populated only by
+    /// `set_with_highlight` (`MethodCallExpr`/`CallExpr`/`FieldExpr`/a
+    /// `NewExpr` constructor call, in `resolve.rs`); every other
+    /// reference kind's own node/token range already is just its
+    /// identifier, so `highlight_range` falls back to `reference.range()`
+    /// itself when this map has no entry. Keyed by the same full-node
+    /// `SyntaxPtr` as `resolutions`/`by_symbol`, not by `SymbolId`, so
+    /// `map_ids_into` can carry it over with a plain merge -- no
+    /// `SymbolId` remapping needed, since nothing here is keyed by one.
+    highlight_ranges: FxHashMap<SyntaxPtr, TextRange>,
 }
 
 impl ReferenceTable {
@@ -108,8 +122,32 @@ impl ReferenceTable {
         self.resolutions.insert(reference, resolution);
     }
 
+    /// Like [`Self::set`], but additionally records `highlight_range` as
+    /// the narrower range `documentHighlight`/`references` should report
+    /// for this reference instead of `reference.range()` -- see
+    /// `Self::highlight_range`.
+    pub(crate) fn set_with_highlight(
+        &mut self,
+        reference: SyntaxPtr,
+        highlight_range: TextRange,
+        resolution: Resolution,
+    ) {
+        self.highlight_ranges.insert(reference, highlight_range);
+        self.set(reference, resolution);
+    }
+
     pub fn get(&self, reference: SyntaxPtr) -> Option<&Resolution> {
         self.resolutions.get(&reference)
+    }
+
+    /// The range `documentHighlight`/`references` should report for
+    /// `reference` -- the narrow identifier range recorded via
+    /// `set_with_highlight`, if any, else `reference.range()` itself.
+    pub fn highlight_range(&self, reference: SyntaxPtr) -> TextRange {
+        self.highlight_ranges
+            .get(&reference)
+            .copied()
+            .unwrap_or_else(|| reference.range())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&SyntaxPtr, &Resolution)> {
@@ -149,6 +187,7 @@ impl ReferenceTable {
         target: &mut ReferenceTable,
     ) {
         target.resolutions.reserve(self.resolutions.len());
+        target.highlight_ranges.extend(self.highlight_ranges);
         for (ptr, res) in self.resolutions {
             let remapped = res.map_ids(f);
             for &id in remapped.symbol_ids() {

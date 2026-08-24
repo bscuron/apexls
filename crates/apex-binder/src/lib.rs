@@ -699,6 +699,18 @@ impl BoundProgram {
         self.bodies.get(&ptr.file())?.refs.get(ptr)
     }
 
+    /// The range `documentHighlight`/`references` should report for
+    /// `ptr` -- narrower than `ptr.range()` for a call/field-access
+    /// reference (`ReferenceTable::highlight_range`'s doc comment), and
+    /// otherwise just `ptr.range()` itself. Falls back to `ptr.range()`
+    /// when `ptr`'s file has no bound body at all, matching every other
+    /// `bodies.get(...)`-backed lookup's "nothing recorded" behavior.
+    pub fn highlight_range(&self, ptr: SyntaxPtr) -> rowan::TextRange {
+        self.bodies
+            .get(&ptr.file())
+            .map_or_else(|| ptr.range(), |fb| fb.refs.highlight_range(ptr))
+    }
+
     /// Finds the reference (if any) covering `offset` in `file` -- first
     /// checks whether the token itself has its own recorded `Resolution`
     /// (only ever true for one segment of a qualified `Outer.Inner` type

@@ -64,7 +64,13 @@ pub(crate) fn symbol_location(
 /// counterpart to `symbol_location`, which is declaration-site only
 /// (keyed off a `Symbol`'s `name_range`). `ptr` here is a reference's own
 /// `SyntaxPtr` (from `BoundProgram::references_to`/`references_to_in_file`),
-/// so this keys off `ptr.file()`/`ptr.range()` directly instead.
+/// so this keys off `ptr.file()` directly, and `BoundProgram::highlight_range(ptr)`
+/// for the range rather than `ptr.range()` itself -- for a call/field-access
+/// reference (`MethodCallExpr`, `CallExpr`, `FieldExpr`, a `NewExpr`
+/// constructor call) `ptr.range()` spans the *whole* node (target through
+/// closing paren for a call, receiver through member for a field access),
+/// which would over-highlight the entire expression instead of just the
+/// identifier the cursor is actually on.
 pub(crate) fn ptr_location(
     program: &BoundProgram,
     ptr: SyntaxPtr,
@@ -73,7 +79,7 @@ pub(crate) fn ptr_location(
     let uri = Url::from_file_path(program.file_path(ptr.file())).ok()?;
     let text = program.syntax(ptr.file()).text().to_string();
     let index = LineIndex::new(&text);
-    let range = ptr.range();
+    let range = program.highlight_range(ptr);
     let start = index.to_position(&text, range.start().into(), encoding);
     let end = index.to_position(&text, range.end().into(), encoding);
     Some(Location {
