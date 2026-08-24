@@ -10,7 +10,7 @@
 
 use crate::file_id::FileId;
 use crate::file_table::FileTable;
-use crate::ptr::SyntaxPtr;
+use crate::ptr::{AstPtr, SyntaxPtr};
 use crate::reference_table::ReferenceTable;
 use crate::schema_index::SchemaIndex;
 use crate::scope::ScopeTree;
@@ -18,10 +18,56 @@ use crate::symbol::SymbolId;
 use crate::symbol_table::SymbolTable;
 use apex_discover::Discovery;
 use apex_parser::Parse;
-use rustc_hash::FxHashMap;
+use apex_syntax::ast::Type;
+use rustc_hash::{FxHashMap, FxHasher};
 use smol_str::SmolStr;
+use std::hash::Hasher;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
+
+/// A cheap, whole-content fingerprint for an `overrides`-supplied buffer's
+/// "is this unchanged since last time" check -- see [`BindCache::parses`]'s
+/// doc comment for why a hash replaced a stored `String` copy, and the
+/// honest tradeoff that comes with it. Only used for `overrides` entries
+/// ([`Freshness::ContentHash`]): an unsaved editor buffer has no
+/// filesystem metadata to check instead, but there's normally at most a
+/// handful of these per call (the file(s) actually being edited), so
+/// hashing them costs nothing worth avoiding.
+pub(crate) fn content_fingerprint(content: &str) -> u64 {
+    let mut hasher = FxHasher::default();
+    hasher.write(content.as_bytes());
+    hasher.finish()
+}
+
+/// What [`BindCache::parses`] compares against to decide whether a
+/// cached `Parse` can be reused as-is. Two independent bases, matched by
+/// variant (a mismatch -- e.g. a file that used to arrive via
+/// `overrides` and now doesn't -- always falls through to "treat as
+/// changed," never silently compares across kinds):
+///
+/// - [`Freshness::Stat`]: a file read from disk. `len`/`modified` come
+///   from one `std::fs::metadata` call -- cheap enough to check *before*
+///   reading the file at all, so a stat match skips the read (and any
+///   hash) entirely for every unaffected file, not just the reparse.
+///   This is the same size+mtime staleness check `make`/Cargo's own
+///   fingerprinting/most incremental build systems use, with the same
+///   honest caveat: a filesystem with coarse mtime resolution (or an
+///   external tool that preserves mtime after rewriting a file with the
+///   same length) could in principle produce a false "unchanged." No
+///   worse than -- and for this project's dominant edit-in-the-editor
+///   workflow, strictly better than -- the already-accepted "no
+///   filesystem-watcher" staleness limit `BoundProgram::from_files_cached`'s
+///   doc comment already documents for exactly this class of out-of-band
+///   disk change.
+/// - [`Freshness::ContentHash`]: an `overrides`-supplied buffer, checked
+///   via [`content_fingerprint`] instead, since an unsaved buffer has no
+///   metadata to stat.
+#[derive(Clone, PartialEq)]
+pub(crate) enum Freshness {
+    Stat { len: u64, modified: SystemTime },
+    ContentHash(u64),
+}
 
 /// One file's Pass 2 output: every reference resolved and every body's
 /// scope tree, for bodies declared in that one file. Replaced wholesale
@@ -51,10 +97,14 @@ pub struct BindCache {
     /// metadata XML edited with no corresponding Apex-file signal).
     pub(crate) discovery: Option<Discovery>,
     pub(crate) schema: Option<Arc<SchemaIndex>>,
-    /// Each path's last-seen `(content, Parse)` -- a parse is reused
-    /// as-is whenever a file's content is byte-for-byte identical to
-    /// last time, skipping that file's lex/parse entirely.
-    pub(crate) parses: FxHashMap<PathBuf, (String, Parse)>,
+    /// Each path's last-seen `(Freshness, Parse)` -- a parse is reused
+    /// as-is whenever `Freshness::matches` says nothing changed, skipping
+    /// that file's read *and* lex/parse entirely. No separate copy of the
+    /// content itself is kept here (real, measured memory cost -- see
+    /// `examples/mem_profile.rs`): see [`Freshness`]'s doc comment for
+    /// what's compared instead, and the two attempts before it (a stored
+    /// `String`, then a content hash) that this superseded.
+    pub(crate) parses: FxHashMap<PathBuf, (Freshness, Parse)>,
     /// The project's declared symbols, persisted and patched file-by-file
     /// across calls rather than rebuilt from nothing -- see
     /// `SymbolTable`'s module doc comment.
@@ -68,5 +118,12 @@ pub struct BindCache {
     /// project, not something one file's edit can resolve in isolation).
     pub(crate) raw_extends: FxHashMap<FileId, Vec<(SymbolId, Vec<SmolStr>)>>,
     pub(crate) raw_super: FxHashMap<FileId, Vec<(SymbolId, SmolStr)>>,
+    /// Each `extends`/`implements` supertype name's own `Type` node
+    /// pointer, by the file that declared it -- `crate::collect::FileCollection::supertype_ptrs`'s
+    /// doc comment explains why this is separate from `raw_extends`/
+    /// `raw_super`. Persisted the same way, and resolved (recording a
+    /// `Resolution` for goto-definition) alongside Pass 2 whenever that
+    /// file gets rebound.
+    pub(crate) supertype_ptrs: FxHashMap<FileId, Vec<(SymbolId, AstPtr<Type>)>>,
     pub(crate) bodies: FxHashMap<FileId, Arc<FileBodies>>,
 }

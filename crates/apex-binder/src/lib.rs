@@ -52,7 +52,7 @@ mod ty;
 pub use file_id::FileId;
 pub use incremental::BindCache;
 pub use ptr::{AstPtr, SyntaxPtr};
-pub use reference_table::{ReferenceTable, Resolution};
+pub use reference_table::{ReferenceTable, Resolution, SchemaObjectRef, UnknownSchemaRef};
 pub use schema_index::SchemaIndex;
 pub use scope::{Scope, ScopeId, ScopeKind, ScopeTree};
 pub use symbol::{ModifierSet, Sharing, Symbol, SymbolId, SymbolKind, Visibility};
@@ -63,7 +63,7 @@ use apex_syntax::ast::decl::{
     CompilationUnit, ConstructorDecl, MethodDecl, PropertyDecl, TriggerUnit, VarDeclarator,
 };
 use apex_syntax::SyntaxNode;
-use incremental::FileBodies;
+use incremental::{FileBodies, Freshness};
 use rayon::prelude::*;
 use rowan::ast::AstNode;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -93,6 +93,11 @@ use std::sync::Arc;
 /// motivated both.
 pub struct BoundProgram {
     files: FxHashMap<FileId, PathBuf>,
+    /// Reverse of `files` -- an LSP request only ever names a file by its
+    /// URI/path, never by `FileId`, so this is what `Self::file_id` looks
+    /// up through. Small (one entry per file) and cheap to keep alongside
+    /// `files` rather than searched linearly per request.
+    file_ids: FxHashMap<PathBuf, FileId>,
     parses: FxHashMap<FileId, Parse>,
     pub symbols: SymbolTable,
     /// `Arc`-wrapped for the same reason `symbols`/`bodies` are cheap to
@@ -244,43 +249,97 @@ impl BoundProgram {
             file: FileId,
             trigger: bool,
             dirty: bool,
-            content: String,
+            freshness: Freshness,
             parse: Parse,
         }
         let parsed: Vec<ParsedFile> = candidates
             .par_iter()
             .filter_map(|(path, file)| {
-                let content = match overrides.get(path) {
-                    Some(c) => c.clone(),
-                    None => std::fs::read_to_string(path).ok()?,
-                };
                 let trigger = path
                     .extension()
                     .and_then(|e| e.to_str())
                     .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
-                if let Some((cached_content, cached_parse)) = cache.parses.get(path) {
-                    if cached_content == &content {
-                        return Some(ParsedFile {
-                            path: path.clone(),
-                            file: *file,
-                            trigger,
-                            dirty: false,
-                            content,
-                            parse: cached_parse.clone(),
-                        });
+
+                // An `overrides` entry (an unsaved editor buffer) has no
+                // filesystem metadata to stat -- content is already in
+                // memory (the caller supplied it, no disk I/O either
+                // way), so it's compared by content hash, same as
+                // before. In practice this is at most a handful of
+                // files per call (whatever's actually being edited).
+                if let Some(content) = overrides.get(path) {
+                    let freshness =
+                        Freshness::ContentHash(incremental::content_fingerprint(content));
+                    if let Some((cached, cached_parse)) = cache.parses.get(path) {
+                        if *cached == freshness {
+                            return Some(ParsedFile {
+                                path: path.clone(),
+                                file: *file,
+                                trigger,
+                                dirty: false,
+                                freshness,
+                                parse: cached_parse.clone(),
+                            });
+                        }
+                    }
+                    let parse = if trigger {
+                        apex_parser::parse_trigger_unit(content)
+                    } else {
+                        apex_parser::parse_compilation_unit(content)
+                    };
+                    return Some(ParsedFile {
+                        path: path.clone(),
+                        file: *file,
+                        trigger,
+                        dirty: true,
+                        freshness,
+                        parse,
+                    });
+                }
+
+                // No override: stat the file *before* reading it -- a
+                // size+mtime match against the cached entry means the
+                // read (not just the reparse) can be skipped entirely,
+                // which is the common case for every file besides the
+                // one actually being edited. See `Freshness::Stat`'s
+                // doc comment for the honest staleness caveat this
+                // trades for that.
+                let metadata = std::fs::metadata(path).ok()?;
+                let stat_freshness = metadata.modified().ok().map(|modified| Freshness::Stat {
+                    len: metadata.len(),
+                    modified,
+                });
+                if let Some(freshness) = &stat_freshness {
+                    if let Some((cached, cached_parse)) = cache.parses.get(path) {
+                        if cached == freshness {
+                            return Some(ParsedFile {
+                                path: path.clone(),
+                                file: *file,
+                                trigger,
+                                dirty: false,
+                                freshness: freshness.clone(),
+                                parse: cached_parse.clone(),
+                            });
+                        }
                     }
                 }
+                let content = std::fs::read_to_string(path).ok()?;
                 let parse = if trigger {
                     apex_parser::parse_trigger_unit(&content)
                 } else {
                     apex_parser::parse_compilation_unit(&content)
                 };
+                // `metadata().modified()` failing at all is rare and
+                // platform-dependent -- fall back to a content hash so
+                // this file still gets *some* freshness check next call,
+                // just not the read-skipping kind.
+                let freshness = stat_freshness
+                    .unwrap_or_else(|| Freshness::ContentHash(incremental::content_fingerprint(&content)));
                 Some(ParsedFile {
                     path: path.clone(),
                     file: *file,
                     trigger,
                     dirty: true,
-                    content,
+                    freshness,
                     parse,
                 })
             })
@@ -291,7 +350,7 @@ impl BoundProgram {
         for p in parsed.iter().filter(|p| p.dirty) {
             cache
                 .parses
-                .insert(p.path.clone(), (p.content.clone(), p.parse.clone()));
+                .insert(p.path.clone(), (p.freshness.clone(), p.parse.clone()));
         }
 
         // The *actual* current file set is whatever was just
@@ -314,6 +373,7 @@ impl BoundProgram {
             cache.table.remove_file(file);
             cache.raw_extends.remove(&file);
             cache.raw_super.remove(&file);
+            cache.supertype_ptrs.remove(&file);
             cache.bodies.remove(&file);
         }
         cache
@@ -359,6 +419,9 @@ impl BoundProgram {
             cache.table.set_file_symbols(file, collection.symbols);
             cache.raw_extends.insert(file, collection.raw_extends);
             cache.raw_super.insert(file, collection.raw_super);
+            cache
+                .supertype_ptrs
+                .insert(file, collection.supertype_ptrs);
         }
 
         // Pass 1.5 + derived-index rebuild only when something actually
@@ -416,6 +479,34 @@ impl BoundProgram {
             })
             .collect();
 
+        // Same idea as `bound`, but for `extends`/`implements` supertype
+        // names -- these aren't attached to a `Symbol::type_ref` (a
+        // class/interface can have more than one, see
+        // `collect::FileCollection::supertype_ptrs`'s doc comment), so
+        // they're resolved as their own small stage rather than through
+        // `bind_symbol_body`.
+        let supertype_bound: Vec<(FileId, Option<SyntaxPtr>, resolve::BoundBody)> =
+            files_to_rebind
+                .par_iter()
+                .flat_map(|file| {
+                    let root_node = parse_by_file[file].syntax();
+                    cache
+                        .supertype_ptrs
+                        .get(file)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|(_, ptr)| {
+                            let ty = ptr.to_node(&root_node)?;
+                            Some((
+                                *file,
+                                None,
+                                resolve::bind_type_ref(&cache.table, &schema, *file, &ty),
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+
         // Sequential merge, mirroring Pass 1's: group each file's bound
         // bodies together, then -- one file at a time -- allocate its
         // bodies' pending locals onto the end of *that file's own*
@@ -429,7 +520,7 @@ impl BoundProgram {
         // before that edit would silently survive in `cache.bodies`.
         let mut by_file: FxHashMap<FileId, Vec<(Option<SyntaxPtr>, resolve::BoundBody)>> =
             files_to_rebind.iter().map(|&f| (f, Vec::new())).collect();
-        for (file, key, body) in bound {
+        for (file, key, body) in bound.into_iter().chain(supertype_bound) {
             by_file.entry(file).or_default().push((key, body));
         }
         for (file, bodies) in by_file {
@@ -457,8 +548,10 @@ impl BoundProgram {
         // of project size -- an *unaffected* file only costs a pointer
         // clone, not a deep copy of its `Symbol`s/references/scopes.
         let mut files = FxHashMap::with_capacity_and_hasher(parsed.len(), Default::default());
+        let mut file_ids = FxHashMap::with_capacity_and_hasher(parsed.len(), Default::default());
         let mut parses = FxHashMap::with_capacity_and_hasher(parsed.len(), Default::default());
         for p in parsed {
+            file_ids.insert(p.path.clone(), p.file);
             files.insert(p.file, p.path);
             parses.insert(p.file, p.parse);
         }
@@ -469,6 +562,7 @@ impl BoundProgram {
 
         BoundProgram {
             files,
+            file_ids,
             parses,
             symbols: cache.table.clone(),
             schema,
@@ -478,6 +572,15 @@ impl BoundProgram {
 
     pub fn file_path(&self, file: FileId) -> &Path {
         &self.files[&file]
+    }
+
+    /// Reverse of [`Self::file_path`] -- the `FileId` a request-supplied
+    /// path corresponds to, if it names a file that's actually part of
+    /// this bound project. `path` must match exactly as discovered
+    /// (canonicalization/case-folding, if a caller's path came from
+    /// somewhere less exact than `apex_discover`, is the caller's job).
+    pub fn file_id(&self, path: &Path) -> Option<FileId> {
+        self.file_ids.get(path).copied()
     }
 
     pub fn syntax(&self, file: FileId) -> SyntaxNode {
@@ -493,6 +596,79 @@ impl BoundProgram {
     /// ever recorded for it.
     pub fn resolution(&self, ptr: SyntaxPtr) -> Option<&Resolution> {
         self.bodies.get(&ptr.file())?.refs.get(ptr)
+    }
+
+    /// Finds the reference (if any) covering `offset` in `file` -- the
+    /// token at that position, walked up through ancestors until the
+    /// first node whose kind is one Pass 2 actually registers a
+    /// `Resolution` for. Confirmed exhaustive by reading every
+    /// `refs.set(...)` call site in `resolve.rs`/`soql.rs`: exactly
+    /// `NameExpr`, `FieldExpr`, `Type`, `QualifiedName` (a catch clause's
+    /// exception type), `MethodCallExpr`, `CallExpr`, `NewExpr`, and
+    /// `SoqlFieldName` ever get registered, each keyed by its *whole*
+    /// node range, never a sub-token range. `FieldExpr` in particular is
+    /// keyed by the entire `a.b` (receiver included, not just the
+    /// member) -- this still resolves `a` and `b` independently without
+    /// any special-casing, since `a` (when itself a simple name) has its
+    /// own, smaller, closer `NameExpr` ancestor, reached by the walk-up
+    /// before it ever gets to `FieldExpr`; `b` has no node of its own, so
+    /// climbing from its token lands directly on the enclosing
+    /// `FieldExpr`.
+    pub fn resolution_at(&self, file: FileId, offset: rowan::TextSize) -> Option<&Resolution> {
+        const REFERENCE_KINDS: [apex_syntax::SyntaxKind; 8] = [
+            apex_syntax::SyntaxKind::NameExpr,
+            apex_syntax::SyntaxKind::FieldExpr,
+            apex_syntax::SyntaxKind::Type,
+            apex_syntax::SyntaxKind::QualifiedName,
+            apex_syntax::SyntaxKind::MethodCallExpr,
+            apex_syntax::SyntaxKind::CallExpr,
+            apex_syntax::SyntaxKind::NewExpr,
+            apex_syntax::SyntaxKind::SoqlFieldName,
+        ];
+        let root = self.syntax(file);
+        let token = match root.token_at_offset(offset) {
+            rowan::TokenAtOffset::None => return None,
+            rowan::TokenAtOffset::Single(t) => t,
+            // Cursor sits exactly between two tokens -- prefer the left
+            // one whenever it's real content, matching the common "cursor
+            // right after an identifier" hover/definition case; fall back
+            // to the right when the left is trivia (cursor right before
+            // an identifier, preceded by whitespace).
+            rowan::TokenAtOffset::Between(left, right) => {
+                if left.kind().is_trivia() {
+                    right
+                } else {
+                    left
+                }
+            }
+        };
+        let mut node = token.parent()?;
+        loop {
+            if REFERENCE_KINDS.contains(&node.kind()) {
+                let ptr = SyntaxPtr::new(file, &node);
+                return self.resolution(ptr);
+            }
+            node = node.parent()?;
+        }
+    }
+
+    /// Finds a `Symbol` declared in `file` whose own name occupies
+    /// `offset` -- the declaration-site counterpart to
+    /// [`Self::resolution_at`]: hovering a declaration's own name (the
+    /// `Foo` in `class Foo`) is never itself a reference recorded in
+    /// `ReferenceTable` (a declaration doesn't reference itself), so
+    /// answering "what's the user looking at" there needs a direct scan
+    /// of this file's own declared symbols instead. Includes locals
+    /// (parameters, block-local variables, ...), same as
+    /// `symbols_of_file` always has -- hovering a local's own declared
+    /// name is exactly as valid a query as hovering a field's.
+    pub fn symbol_at(&self, file: FileId, offset: rowan::TextSize) -> Option<SymbolId> {
+        self.symbols
+            .symbols_of_file(file)
+            .iter()
+            .enumerate()
+            .find(|(_, symbol)| symbol.name_range.contains(offset))
+            .map(|(local, _)| SymbolId::new(file, local as u32))
     }
 
     /// Every reference's `SyntaxPtr` and its `Resolution`, across every
@@ -547,26 +723,41 @@ fn bind_symbol_body(
     id: SymbolId,
     symbol: &Symbol,
 ) -> Vec<(Option<SyntaxPtr>, resolve::BoundBody)> {
+    // A field/property/parameter's own type, or a method's return type
+    // -- shared by several arms below, so factored out once. `None` for
+    // a symbol kind with no type of its own (`Symbol::type_ref`'s own
+    // doc comment), or when the file's tree has moved on since this
+    // pointer was captured (defensive; shouldn't happen mid-call).
+    let declared_type = || {
+        symbol
+            .type_ref
+            .and_then(|type_ref| type_ref.to_node(root))
+            .map(|ty| (None, resolve::bind_type_ref(table, schema, symbol.file, &ty)))
+    };
     match symbol.kind {
         SymbolKind::Method => {
-            let Some(m) = symbol.ptr.to_node(root).and_then(MethodDecl::cast) else {
-                return Vec::new();
-            };
-            let Some(body) = m.body() else {
-                return Vec::new();
-            };
-            let params = table.params(id);
-            let key = SyntaxPtr::new(symbol.file, body.syntax());
-            let bound = resolve::bind_body(
-                table,
-                schema,
-                symbol.file,
-                symbol.container,
-                Some(id),
-                &params,
-                &body,
-            );
-            vec![(Some(key), bound)]
+            let mut out: Vec<(Option<SyntaxPtr>, resolve::BoundBody)> =
+                declared_type().into_iter().collect();
+            if let Some(body) = symbol
+                .ptr
+                .to_node(root)
+                .and_then(MethodDecl::cast)
+                .and_then(|m| m.body())
+            {
+                let params = table.params(id);
+                let key = SyntaxPtr::new(symbol.file, body.syntax());
+                let bound = resolve::bind_body(
+                    table,
+                    schema,
+                    symbol.file,
+                    symbol.container,
+                    Some(id),
+                    &params,
+                    &body,
+                );
+                out.push((Some(key), bound));
+            }
+            out
         }
         SymbolKind::Constructor => {
             let Some(c) = symbol.ptr.to_node(root).and_then(ConstructorDecl::cast) else {
@@ -589,11 +780,10 @@ fn bind_symbol_body(
             vec![(Some(key), bound)]
         }
         SymbolKind::Property => {
-            let Some(p) = symbol.ptr.to_node(root).and_then(PropertyDecl::cast) else {
-                return Vec::new();
-            };
-            p.accessors()
-                .filter_map(|accessor| {
+            let mut out: Vec<(Option<SyntaxPtr>, resolve::BoundBody)> =
+                declared_type().into_iter().collect();
+            if let Some(p) = symbol.ptr.to_node(root).and_then(PropertyDecl::cast) {
+                out.extend(p.accessors().filter_map(|accessor| {
                     let body = accessor.body()?;
                     let key = SyntaxPtr::new(symbol.file, body.syntax());
                     let bound = resolve::bind_body(
@@ -606,20 +796,31 @@ fn bind_symbol_body(
                         &body,
                     );
                     Some((Some(key), bound))
-                })
-                .collect()
+                }));
+            }
+            out
         }
         SymbolKind::Field => {
-            let Some(decl) = symbol.ptr.to_node(root).and_then(VarDeclarator::cast) else {
-                return Vec::new();
-            };
-            let Some(init) = decl.init() else {
-                return Vec::new();
-            };
-            let bound =
-                resolve::bind_initializer(table, schema, symbol.file, symbol.container, &init);
-            vec![(None, bound)]
+            let mut out: Vec<(Option<SyntaxPtr>, resolve::BoundBody)> =
+                declared_type().into_iter().collect();
+            if let Some(init) = symbol
+                .ptr
+                .to_node(root)
+                .and_then(VarDeclarator::cast)
+                .and_then(|decl| decl.init())
+            {
+                let bound = resolve::bind_initializer(
+                    table,
+                    schema,
+                    symbol.file,
+                    symbol.container,
+                    &init,
+                );
+                out.push((None, bound));
+            }
+            out
         }
+        SymbolKind::Parameter => declared_type().into_iter().collect(),
         SymbolKind::Trigger => {
             let Some(tu) = symbol.ptr.to_node(root).and_then(TriggerUnit::cast) else {
                 return Vec::new();
@@ -647,7 +848,6 @@ fn bind_symbol_body(
         | SymbolKind::Class
         | SymbolKind::Enum
         | SymbolKind::EnumConstant
-        | SymbolKind::Parameter
         | SymbolKind::LocalVar
         | SymbolKind::CatchVar
         | SymbolKind::ForEachVar

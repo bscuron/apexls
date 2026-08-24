@@ -45,6 +45,16 @@ pub(crate) struct FileCollection {
     /// member-lookup chain (whose internal ordering doesn't preserve
     /// "which one was `extends`" once interfaces are mixed in).
     pub(crate) raw_super: Vec<(SymbolId, SmolStr)>,
+    /// `(the class/interface symbol's id, one `extends`/`implements`
+    /// supertype's own `Type` node)` -- one entry per supertype name (so
+    /// a class with `implements A, B` gets two entries), consumed by a
+    /// declaration-type-resolution step alongside Pass 2 to record a
+    /// `Resolution` for each, the same goto-definition support a field's
+    /// or parameter's own type reference gets (`Symbol::type_ref`).
+    /// Kept separate from `raw_extends`/`raw_super` (which only need
+    /// names, for `crate::inherit`'s chain-building) since this is a
+    /// flat per-reference list, not grouped by symbol.
+    pub(crate) supertype_ptrs: Vec<(SymbolId, AstPtr<Type>)>,
 }
 
 impl FileCollection {
@@ -172,10 +182,15 @@ fn collect_class(
     let mut supertypes = Vec::new();
     if let Some(extends) = class.extends() {
         out.raw_super.push((class_id, extends.text()));
+        out.supertype_ptrs
+            .push((class_id, AstPtr::new(file, &extends)));
         supertypes.push(extends.text());
     }
     if let Some(implements) = class.implements() {
-        supertypes.extend(implements.types().map(|t| t.text()));
+        for t in implements.types() {
+            out.supertype_ptrs.push((class_id, AstPtr::new(file, &t)));
+            supertypes.push(t.text());
+        }
     }
     if !supertypes.is_empty() {
         out.raw_extends.push((class_id, supertypes));
@@ -217,7 +232,11 @@ fn collect_interface(
     );
 
     if let Some(extends) = iface.extends() {
-        let supertypes: Vec<SmolStr> = extends.types().map(|t| t.text()).collect();
+        let mut supertypes = Vec::new();
+        for t in extends.types() {
+            out.supertype_ptrs.push((iface_id, AstPtr::new(file, &t)));
+            supertypes.push(t.text());
+        }
         if !supertypes.is_empty() {
             out.raw_extends.push((iface_id, supertypes));
         }

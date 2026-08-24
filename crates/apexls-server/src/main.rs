@@ -55,7 +55,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use apex_binder::{BindCache, BoundProgram};
+use apex_binder::{BindCache, BoundProgram, Resolution};
 use async_lsp::client_monitor::ClientProcessMonitorLayer;
 use async_lsp::concurrency::ConcurrencyLayer;
 use async_lsp::panic::CatchUnwindLayer;
@@ -66,13 +66,15 @@ use async_lsp::{ClientSocket, LanguageServer, ResponseError};
 use futures::future::BoxFuture;
 use lsp_types::{
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, InitializeParams, InitializeResult,
-    InitializedParams, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, MarkupContent, MarkupKind, OneOf,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 use tower::ServiceBuilder;
 use tracing::{info, warn, Level};
 
+mod capabilities;
 mod line_index;
 
 use line_index::PositionEncoding;
@@ -236,6 +238,8 @@ impl LanguageServer for Backend {
                     // but being explicit means a client inspecting the
                     // response never has to know that default by heart.
                     position_encoding: Some(position_encoding.into()),
+                    hover_provider: Some(HoverProviderCapability::Simple(true)),
+                    definition_provider: Some(OneOf::Left(true)),
                     ..ServerCapabilities::default()
                 },
                 server_info: Some(ServerInfo {
@@ -300,6 +304,109 @@ impl LanguageServer for Backend {
     fn did_save(&mut self, params: DidSaveTextDocumentParams) -> Self::NotifyResult {
         info!(uri = %params.text_document.uri, "did_save");
         ControlFlow::Continue(())
+    }
+
+    /// `BACKLOG.md` §3's first real consumer of the bind: what's the
+    /// user's cursor on. Tries a declaration's own name first
+    /// (`BoundProgram::symbol_at`), then falls back to a reference's
+    /// resolution (`BoundProgram::resolution_at`) -- see
+    /// `capabilities::describe_symbol`'s doc comment for how a `Symbol`
+    /// becomes hover text. `Candidates` (no overload narrowing for a bare
+    /// name) shows the first candidate plus an honest "+N more" note
+    /// rather than silently picking one; `SchemaObject`/`UnknownSchema`/
+    /// `Unresolved`/no bind yet all fall through to no hover, matching
+    /// this binder's existing honesty about the still-unmodeled stdlib/
+    /// schema surface (`BACKLOG.md` §4).
+    fn hover(
+        &mut self,
+        params: HoverParams,
+    ) -> BoxFuture<'static, Result<Option<Hover>, Self::Error>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let encoding = self.position_encoding;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some((file, offset)) =
+                capabilities::resolve_position(program, &uri, position, encoding)
+            else {
+                return Ok(None);
+            };
+
+            let value = if let Some(id) = program.symbol_at(file, offset) {
+                Some(capabilities::describe_symbol(program, id))
+            } else {
+                match program.resolution_at(file, offset) {
+                    Some(Resolution::Resolved(id)) => {
+                        Some(capabilities::describe_symbol(program, *id))
+                    }
+                    Some(Resolution::Candidates(ids)) => ids.first().map(|&id| {
+                        let mut text = capabilities::describe_symbol(program, id);
+                        if ids.len() > 1 {
+                            text.push_str(&format!("\n\n*+{} more overload(s)*", ids.len() - 1));
+                        }
+                        text
+                    }),
+                    _ => None,
+                }
+            };
+
+            Ok(value.map(|value| Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value,
+                }),
+                range: None,
+            }))
+        })
+    }
+
+    /// Only ever follows a *reference*'s resolution
+    /// (`BoundProgram::resolution_at`), not a declaration's own name
+    /// (`symbol_at`) -- "go to definition" on your own declaration has
+    /// nowhere useful to go, so that case stays `None` rather than being
+    /// specially handled, matching common LSP server behavior.
+    fn definition(
+        &mut self,
+        params: GotoDefinitionParams,
+    ) -> BoxFuture<'static, Result<Option<GotoDefinitionResponse>, Self::Error>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let encoding = self.position_encoding;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some((file, offset)) =
+                capabilities::resolve_position(program, &uri, position, encoding)
+            else {
+                return Ok(None);
+            };
+
+            let response = match program.resolution_at(file, offset) {
+                Some(Resolution::Resolved(id)) => {
+                    capabilities::symbol_location(program, *id, encoding)
+                        .map(GotoDefinitionResponse::Scalar)
+                }
+                Some(Resolution::Candidates(ids)) => {
+                    let locations: Vec<_> = ids
+                        .iter()
+                        .filter_map(|&id| capabilities::symbol_location(program, id, encoding))
+                        .collect();
+                    (!locations.is_empty()).then_some(GotoDefinitionResponse::Array(locations))
+                }
+                Some(Resolution::SchemaObject(r)) => capabilities::schema_location(program, r)
+                    .map(GotoDefinitionResponse::Scalar),
+                _ => None,
+            };
+
+            Ok(response)
+        })
     }
 }
 

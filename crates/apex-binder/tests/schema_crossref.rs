@@ -34,16 +34,13 @@ fn custom_object_references_resolve_against_independently_discovered_metadata() 
     let mut unknown_custom_objects = 0usize;
     for (_, resolution) in program.all_resolutions() {
         match resolution {
-            Resolution::SchemaObject {
-                object,
-                field: None,
-            } if object.ends_with("__c") => {
+            Resolution::SchemaObject(r) if r.field.is_none() && r.object.ends_with("__c") => {
                 resolved_custom_objects += 1;
             }
-            Resolution::UnknownSchema {
-                object: Some(object),
-                field: None,
-            } if object.ends_with("__c") => {
+            Resolution::UnknownSchema(r)
+                if r.field.is_none()
+                    && r.object.as_deref().is_some_and(|o| o.ends_with("__c")) =>
+            {
                 unknown_custom_objects += 1;
             }
             _ => {}

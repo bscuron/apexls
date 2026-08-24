@@ -6,7 +6,7 @@
 
 use crate::ci_key::{CiKey, CiMap, CiQuery};
 use crate::ptr::SyntaxPtr;
-use crate::reference_table::{ReferenceTable, Resolution};
+use crate::reference_table::{ReferenceTable, Resolution, SchemaObjectRef, UnknownSchemaRef};
 use apex_metadata::{FieldSchema, SObjectSchema};
 use std::path::Path;
 
@@ -89,15 +89,15 @@ pub(crate) fn resolve_object(
     name: &str,
 ) {
     let resolution = if schema.object(name).is_some() {
-        Resolution::SchemaObject {
+        Resolution::SchemaObject(Box::new(SchemaObjectRef {
             object: name.into(),
             field: None,
-        }
+        }))
     } else {
-        Resolution::UnknownSchema {
+        Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
             object: Some(name.into()),
             field: None,
-        }
+        }))
     };
     refs.set(ptr, resolution);
 }

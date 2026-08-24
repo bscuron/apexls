@@ -11,7 +11,7 @@
 //! one object to the next via [`SchemaIndex::field`]'s `reference_to`.
 
 use crate::ptr::SyntaxPtr;
-use crate::reference_table::Resolution;
+use crate::reference_table::{Resolution, SchemaObjectRef, UnknownSchemaRef};
 use crate::resolve::BodyBinder;
 use crate::scope::ScopeId;
 use apex_syntax::ast::soql::{
@@ -71,14 +71,14 @@ fn resolve_field_path(
         let seg_text = SmolStr::new(seg.text());
         if i == last {
             let resolution = match binder.schema.field(&current_object, &seg_text) {
-                Some(_) => Resolution::SchemaObject {
+                Some(_) => Resolution::SchemaObject(Box::new(SchemaObjectRef {
                     object: current_object,
                     field: Some(seg_text),
-                },
-                None => Resolution::UnknownSchema {
+                })),
+                None => Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
                     object: Some(current_object),
                     field: Some(seg_text),
-                },
+                })),
             };
             binder.refs.set(ptr, resolution);
             return;
@@ -94,10 +94,10 @@ fn resolve_field_path(
             None => {
                 binder.refs.set(
                     ptr,
-                    Resolution::UnknownSchema {
+                    Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
                         object: Some(current_object),
                         field: Some(seg_text),
-                    },
+                    })),
                 );
                 return;
             }

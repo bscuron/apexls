@@ -46,7 +46,7 @@
 
 use crate::file_id::FileId;
 use crate::ptr::{AstPtr, SyntaxPtr};
-use crate::reference_table::{ReferenceTable, Resolution};
+use crate::reference_table::{ReferenceTable, Resolution, SchemaObjectRef};
 use crate::schema_index::SchemaIndex;
 use crate::scope::{ScopeId, ScopeKind, ScopeTree};
 use crate::symbol::{ModifierSet, Symbol, SymbolId, SymbolKind};
@@ -323,6 +323,81 @@ pub(crate) fn bind_object_ref(schema: &SchemaIndex, ptr: SyntaxPtr, name: &str) 
     }
 }
 
+/// Resolves a plain Apex `Type` reference (a field/param/local/return
+/// type, a `new`/`instanceof`/cast target, an `extends`/`implements`
+/// supertype, ...) against project-local types first, then
+/// `apex-metadata`'s schema (an SObject-typed declaration, e.g. `Account
+/// a;`) -- recursively resolving (and registering `refs` resolutions
+/// for) any type arguments along the way regardless of which case the
+/// base name itself falls into, since `List<Account>`'s `Account` is a
+/// real, independently-resolvable reference in its own right. Returns
+/// the resulting [`Ty`] either way -- the "one hop" other resolvers
+/// chain through, now never losing the type entirely just because it
+/// isn't project-local (see [`Ty`]'s own doc comment).
+///
+/// A free function, not a `BodyBinder` method, specifically so a
+/// declaration's own type (a field/property/parameter/method-return
+/// type, an `extends`/`implements` clause) can share this exact
+/// resolution rule even though none of those have a body to walk, and
+/// so no `BodyBinder` to be bound through -- see [`bind_type_ref`].
+pub(crate) fn resolve_type_ref(
+    table: &SymbolTable,
+    schema: &SchemaIndex,
+    refs: &mut ReferenceTable,
+    file: FileId,
+    ty: &Type,
+) -> Option<Ty> {
+    let name = ty.text();
+    let ptr = SyntaxPtr::new(file, ty.syntax());
+    if let Some(id) = table.top_level(&name) {
+        refs.set(ptr, Resolution::Resolved(id));
+        return Some(Ty::Project(id));
+    }
+    let args: Vec<Ty> = ty
+        .type_args()
+        .map(|list| {
+            list.args()
+                .filter_map(|arg| resolve_type_ref(table, schema, refs, file, &arg))
+                .collect()
+        })
+        .unwrap_or_default();
+    if schema.object(&name).is_some() {
+        refs.set(
+            ptr,
+            Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                object: name.clone(),
+                field: None,
+            })),
+        );
+        return Some(Ty::system_owned(name, args));
+    }
+    // Could be a standard object this repo never locally extended
+    // (indistinguishable, using `apex-metadata` alone, from a genuinely
+    // nonexistent name), or an unmodeled system/library type (`String`,
+    // `List`, an `Exception` subtype, ...) -- v1 can't tell these apart,
+    // so both land here as `Unresolved` rather than one of them being
+    // misreported as `UnknownSchema`. The name is still real, though, so
+    // the returned `Ty` keeps it.
+    refs.set(ptr, Resolution::Unresolved);
+    Some(Ty::system_owned(name, args))
+}
+
+/// Binds a single declaration-site type reference with no enclosing
+/// body at all -- a field/property/parameter's own type, a method's
+/// return type, or one `extends`/`implements` supertype name. Wrapped
+/// as a `BoundBody` purely so it merges through the same sequential
+/// path as every other Pass 2 result, same idea as [`bind_object_ref`].
+pub(crate) fn bind_type_ref(table: &SymbolTable, schema: &SchemaIndex, file: FileId, ty: &Type) -> BoundBody {
+    let mut refs = ReferenceTable::default();
+    resolve_type_ref(table, schema, &mut refs, file, ty);
+    let (scopes, _) = ScopeTree::new_root(ScopeKind::Body, rowan::TextRange::empty(0.into()));
+    BoundBody {
+        scopes,
+        pending_locals: Vec::new(),
+        refs,
+    }
+}
+
 impl<'a> BodyBinder<'a> {
     fn into_bound_body(self) -> BoundBody {
         BoundBody {
@@ -409,51 +484,14 @@ impl<'a> BodyBinder<'a> {
         Some(Ty::system_owned(type_name.to_string(), args))
     }
 
-    /// Resolves a plain Apex `Type` reference (a field/param/local/
-    /// return type, a `new`/`instanceof`/cast target, ...) against
-    /// project-local types first, then `apex-metadata`'s schema (an
-    /// SObject-typed declaration, e.g. `Account a;`) -- recursively
-    /// resolving (and registering `self.refs` resolutions for) any type
-    /// arguments along the way regardless of which case the base name
-    /// itself falls into, since `List<Account>`'s `Account` is a real,
-    /// independently-resolvable reference in its own right. Returns the
-    /// resulting [`Ty`] either way -- the "one hop" other resolvers chain
-    /// through, now never losing the type entirely just because it isn't
-    /// project-local (see [`Ty`]'s own doc comment).
+    /// A body-context type reference (a local/param/return type, a
+    /// `new`/`instanceof`/cast target, ...) -- delegates to the free
+    /// function [`resolve_type_ref`], which also backs declaration-site
+    /// type resolution (a field/property/parameter/method-return type,
+    /// an `extends`/`implements` supertype) that has no body to walk and
+    /// so no `BodyBinder` to be a method on.
     pub(crate) fn resolve_type_ref(&mut self, ty: &Type) -> Option<Ty> {
-        let name = ty.text();
-        let ptr = SyntaxPtr::new(self.file, ty.syntax());
-        if let Some(id) = self.table.top_level(&name) {
-            self.refs.set(ptr, Resolution::Resolved(id));
-            return Some(Ty::Project(id));
-        }
-        let args: Vec<Ty> = ty
-            .type_args()
-            .map(|list| {
-                list.args()
-                    .filter_map(|arg| self.resolve_type_ref(&arg))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if self.schema.object(&name).is_some() {
-            self.refs.set(
-                ptr,
-                Resolution::SchemaObject {
-                    object: name.clone(),
-                    field: None,
-                },
-            );
-            return Some(Ty::system_owned(name, args));
-        }
-        // Could be a standard object this repo never locally extended
-        // (indistinguishable, using `apex-metadata` alone, from a
-        // genuinely nonexistent name), or an unmodeled system/library
-        // type (`String`, `List`, an `Exception` subtype, ...) -- v1
-        // can't tell these apart, so both land here as `Unresolved`
-        // rather than one of them being misreported as `UnknownSchema`.
-        // The name is still real, though, so the returned `Ty` keeps it.
-        self.refs.set(ptr, Resolution::Unresolved);
-        Some(Ty::system_owned(name, args))
+        resolve_type_ref(self.table, self.schema, &mut self.refs, self.file, ty)
     }
 
     fn bind_block_stmts(&mut self, scope: ScopeId, block: &Block) {
@@ -819,41 +857,51 @@ impl<'a> BodyBinder<'a> {
             return self.type_of_symbol(local);
         }
 
-        let Some(container) = self.enclosing_type else {
-            self.refs.set(ptr, Resolution::Unresolved);
-            return None;
-        };
-        // Methods/constructors are excluded from plain-name resolution:
-        // a bare `NameExpr` naming a method with no call wouldn't
-        // compile in real Apex, and including them here would let a
-        // field and a same-named method collide in the candidate set
-        // for no reason -- `CallExpr`/`MethodCallExpr` handle the
-        // call-position case separately.
-        let members: Vec<SymbolId> = self
-            .table
-            .lookup_member(container, name)
-            .into_iter()
-            .filter(|&id| {
-                !matches!(
-                    self.table.get(id).kind,
-                    SymbolKind::Method | SymbolKind::Constructor
-                ) && self.table.is_visible_from(id, self.enclosing_type)
-            })
-            .collect();
-        match members.as_slice() {
-            [] => {
-                self.refs.set(ptr, Resolution::Unresolved);
-                None
-            }
-            [one] => {
-                self.refs.set(ptr, Resolution::Resolved(*one));
-                self.type_of_symbol(*one)
-            }
-            many => {
-                self.refs.set(ptr, Resolution::Candidates(many.to_vec()));
-                None
+        if let Some(container) = self.enclosing_type {
+            // Methods/constructors are excluded from plain-name
+            // resolution: a bare `NameExpr` naming a method with no call
+            // wouldn't compile in real Apex, and including them here
+            // would let a field and a same-named method collide in the
+            // candidate set for no reason -- `CallExpr`/`MethodCallExpr`
+            // handle the call-position case separately.
+            let members: Vec<SymbolId> = self
+                .table
+                .lookup_member(container, name)
+                .into_iter()
+                .filter(|&id| {
+                    !matches!(
+                        self.table.get(id).kind,
+                        SymbolKind::Method | SymbolKind::Constructor
+                    ) && self.table.is_visible_from(id, self.enclosing_type)
+                })
+                .collect();
+            match members.as_slice() {
+                [] => {} // fall through to the type-name check below
+                [one] => {
+                    self.refs.set(ptr, Resolution::Resolved(*one));
+                    return self.type_of_symbol(*one);
+                }
+                many => {
+                    self.refs.set(ptr, Resolution::Candidates(many.to_vec()));
+                    return None;
+                }
             }
         }
+
+        // Neither a local/param nor a member of the enclosing type -- a
+        // bare name can also legally name a project-local top-level type
+        // itself, used as the receiver of a static member/method access
+        // (`UtilClass.staticMethod(...)`, `MyClass.MY_CONSTANT`) rather
+        // than as a value in its own right. Checked last, after member
+        // lookup, matching real Apex/Java semantics: an instance member
+        // shadows a same-named type in expression position.
+        if let Some(type_id) = self.table.top_level(name) {
+            self.refs.set(ptr, Resolution::Resolved(type_id));
+            return Some(Ty::Project(type_id));
+        }
+
+        self.refs.set(ptr, Resolution::Unresolved);
+        None
     }
 
     fn bind_field_expr(&mut self, scope: ScopeId, f: &FieldExpr) -> Option<Ty> {

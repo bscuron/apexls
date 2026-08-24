@@ -27,17 +27,28 @@ use smol_str::SmolStr;
 ///   likely a genuine error, or a reference to the (currently
 ///   unmodeled) Apex standard library.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaObjectRef {
+    pub object: SmolStr,
+    pub field: Option<SmolStr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownSchemaRef {
+    pub object: Option<SmolStr>,
+    pub field: Option<SmolStr>,
+}
+
+/// `SchemaObject`/`UnknownSchema` box their payload so their two
+/// `SmolStr`-carrying fields don't force every other variant -- in
+/// particular the by-far-most-common `Resolved`/`Unresolved`, one entry
+/// per reference in the whole project -- to pay for the largest
+/// variant's size (a real, measured cost: see `examples/mem_profile.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
     Resolved(SymbolId),
     Candidates(Vec<SymbolId>),
-    SchemaObject {
-        object: SmolStr,
-        field: Option<SmolStr>,
-    },
-    UnknownSchema {
-        object: Option<SmolStr>,
-        field: Option<SmolStr>,
-    },
+    SchemaObject(Box<SchemaObjectRef>),
+    UnknownSchema(Box<UnknownSchemaRef>),
     Unresolved,
 }
 

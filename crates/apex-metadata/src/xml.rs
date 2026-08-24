@@ -7,8 +7,9 @@
 
 use crate::FieldSchema;
 use smol_str::SmolStr;
+use std::path::PathBuf;
 
-pub(crate) fn parse_field_meta(xml: &str) -> Option<FieldSchema> {
+pub(crate) fn parse_field_meta(xml: &str, source_path: PathBuf) -> Option<FieldSchema> {
     let doc = roxmltree::Document::parse(xml).ok()?;
     let root = doc.root_element();
 
@@ -25,6 +26,7 @@ pub(crate) fn parse_field_meta(xml: &str) -> Option<FieldSchema> {
         api_name,
         field_type,
         reference_to,
+        source_path,
     })
 }
 
@@ -49,7 +51,7 @@ mod tests {
     <relationshipName>Accounts</relationshipName>
     <type>Lookup</type>
 </CustomField>"#;
-        let field = parse_field_meta(xml).unwrap();
+        let field = parse_field_meta(xml, PathBuf::from("Batch__c.field-meta.xml")).unwrap();
         assert_eq!(field.api_name, "Batch__c");
         assert_eq!(field.field_type.as_deref(), Some("Lookup"));
         assert_eq!(field.reference_to, vec![SmolStr::new("Batch__c")]);
@@ -63,7 +65,11 @@ mod tests {
     <defaultValue>false</defaultValue>
     <type>Checkbox</type>
 </CustomField>"#;
-        let field = parse_field_meta(xml).unwrap();
+        let field = parse_field_meta(
+            xml,
+            PathBuf::from("All_Members_Deceased__c.field-meta.xml"),
+        )
+        .unwrap();
         assert_eq!(field.api_name, "All_Members_Deceased__c");
         assert_eq!(field.field_type.as_deref(), Some("Checkbox"));
         assert!(field.reference_to.is_empty());
@@ -75,6 +81,6 @@ mod tests {
 <CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
     <type>Checkbox</type>
 </CustomField>"#;
-        assert!(parse_field_meta(xml).is_none());
+        assert!(parse_field_meta(xml, PathBuf::from("x.field-meta.xml")).is_none());
     }
 }

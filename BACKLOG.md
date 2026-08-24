@@ -18,9 +18,11 @@ parallelized across passes. `apexls-cli` is still a pre-binder debug tool
 shell (§1 is fully checked off) that now background-rebuilds a real
 `apex_binder::BoundProgram` on every edit, incrementally (§2, fully
 checked off -- a warm single-file-edit rebind measures ~17ms on the real
-NPSP corpus, down from ~677ms cold) -- but nothing consumes that bind
-through the protocol yet, so it still can't answer a single real language
-question over the wire. That's squarely §3 next.
+NPSP corpus, down from ~677ms cold). `textDocument/hover` and
+`textDocument/definition` (§3) are the first two capabilities to actually
+consume that bind over the wire -- the rest of §3's "buildable now" list
+(`documentSymbol`, `workspace/symbol`, `foldingRange`/`selectionRange`)
+is next.
 
 ## 1. Protocol / server layer
 
@@ -240,10 +242,30 @@ featureful LSP needs. Ordered roughly by how directly current data
 supports each one.
 
 **Buildable now, no new binder work needed:**
-- [ ] `textDocument/hover` -- resolved symbol's kind/type/doc comment
-      (`HasDocComment` already gives us the doc text).
-- [ ] `textDocument/definition` -- `AstPtr`/`SyntaxPtr` already give a
-      resolved symbol's declaration location.
+- [x] `textDocument/hover` -- **done.** Two new position-resolution
+      primitives on `BoundProgram` (`resolution_at`/`symbol_at`,
+      `crates/apex-binder/src/lib.rs`) back it: `resolution_at` finds the
+      token at a byte offset and walks up to the nearest ancestor node of
+      a kind Pass 2 actually registers a `Resolution` for (confirmed
+      exhaustive by reading every `refs.set` call site: `NameExpr`/
+      `FieldExpr`/`Type`/`QualifiedName`/`MethodCallExpr`/`CallExpr`/
+      `NewExpr`/`SoqlFieldName`); `symbol_at` separately answers "is the
+      cursor on a declaration's own name" (never itself a recorded
+      reference). `apexls-server/src/capabilities.rs`'s `describe_symbol`
+      renders a resolved `Symbol` as a fenced-code signature (modifiers +
+      kind + type + name, plus a method/constructor's params via
+      `SymbolTable::params`) with its doc comment (`HasDocComment`)
+      appended. Deliberately out of scope for this pass: rendering
+      `apex_metadata` schema info for a `SchemaObject`/`UnknownSchema`
+      resolution (stays no-hover, consistent with §4's still-open
+      stdlib/schema gaps) and disambiguating `Candidates` beyond showing
+      the first plus an honest "+N more overload(s)" note.
+- [x] `textDocument/definition` -- **done**, same `resolution_at`
+      primitive, `Resolved` -> `GotoDefinitionResponse::Scalar`,
+      `Candidates` -> `Array` of every candidate's location (not a
+      silently-picked one). Deliberately *not* wired to `symbol_at` --
+      "go to definition" on your own declaration has nowhere useful to
+      go, so that stays a no-op rather than a special case.
 - [ ] `textDocument/documentSymbol` -- outline view, from `SymbolTable`
       filtered to one file.
 - [ ] `workspace/symbol` -- from `SymbolTable::by_name_ci`.

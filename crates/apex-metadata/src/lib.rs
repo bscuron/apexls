@@ -31,6 +31,7 @@ mod xml;
 pub use discover::{discover_sobjects, sobjects_from_discovery};
 
 use smol_str::SmolStr;
+use std::path::PathBuf;
 
 /// One SObject's schema, as reconstructed from local repo metadata only
 /// -- see the module doc comment for the standard-object gap this
@@ -45,6 +46,14 @@ pub struct SObjectSchema {
     /// *declared* custom object), as opposed to only appearing here
     /// because custom fields were added to a standard object.
     pub is_custom: bool,
+    /// The path to this object's own `<ApiName>.object-meta.xml`, if it
+    /// has one (`is_custom` is exactly "this is `Some`") -- a goto-
+    /// definition target for a bare object-name reference (`FROM
+    /// My_Object__c`, `trigger ... on My_Object__c`, ...). `None` for a
+    /// standard object that only appears here because a custom field was
+    /// added to it (`Account` with a custom `Batch__c` field, say) --
+    /// there's no local file describing the object itself to jump to.
+    pub object_path: Option<PathBuf>,
     pub fields: Vec<FieldSchema>,
 }
 
@@ -66,6 +75,12 @@ pub struct FieldSchema {
     /// itself is a standard field and so never appears here, but custom
     /// polymorphic lookups follow the same shape).
     pub reference_to: Vec<SmolStr>,
+    /// The path to this field's own `.field-meta.xml` -- always present
+    /// (unlike `SObjectSchema::object_path`), since every `FieldSchema`
+    /// is, by construction, parsed from a real file. A goto-definition
+    /// target for a field reference (`Account.My_Field__c`, a SOQL
+    /// relationship-field chain segment, ...).
+    pub source_path: PathBuf,
 }
 
 #[cfg(test)]

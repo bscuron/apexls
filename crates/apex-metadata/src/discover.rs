@@ -9,7 +9,7 @@
 use crate::xml::parse_field_meta;
 use crate::{FieldSchema, SObjectSchema};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Discovers every `objects/<ApiName>/` directory under `root` and
 /// parses its `.object-meta.xml`/`fields/*.field-meta.xml` files into one
@@ -28,11 +28,19 @@ pub fn discover_sobjects(root: impl AsRef<Path>) -> Vec<SObjectSchema> {
 /// Like [`discover_sobjects`], but parses an already-computed
 /// [`apex_discover::Discovery`] instead of walking `root` itself.
 pub fn sobjects_from_discovery(found: &apex_discover::Discovery) -> Vec<SObjectSchema> {
-    let mut objects: HashMap<String, (bool, Vec<FieldSchema>)> = HashMap::new();
+    #[derive(Default)]
+    struct Entry {
+        is_custom: bool,
+        object_path: Option<PathBuf>,
+        fields: Vec<FieldSchema>,
+    }
+    let mut objects: HashMap<String, Entry> = HashMap::new();
 
     for path in &found.object_meta_files {
         if let Some(api_name) = object_api_name(path) {
-            objects.entry(api_name).or_default().0 = true;
+            let entry = objects.entry(api_name).or_default();
+            entry.is_custom = true;
+            entry.object_path = Some(path.clone());
         }
     }
 
@@ -43,18 +51,19 @@ pub fn sobjects_from_discovery(found: &apex_discover::Discovery) -> Vec<SObjectS
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        let Some(field) = parse_field_meta(&content) else {
+        let Some(field) = parse_field_meta(&content, path.clone()) else {
             continue;
         };
-        objects.entry(api_name).or_default().1.push(field);
+        objects.entry(api_name).or_default().fields.push(field);
     }
 
     objects
         .into_iter()
-        .map(|(api_name, (is_custom, fields))| SObjectSchema {
+        .map(|(api_name, entry)| SObjectSchema {
             api_name: api_name.into(),
-            is_custom,
-            fields,
+            is_custom: entry.is_custom,
+            object_path: entry.object_path,
+            fields: entry.fields,
         })
         .collect()
 }

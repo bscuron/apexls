@@ -6,7 +6,11 @@
 //! 10%, but 10% is still nonzero so the floor still passes." A fixed,
 //! narrow numeric target would be too brittle (any grammar/AST change
 //! shifts these counts), so the ceiling is set well above the current
-//! observed ratio (~54%) rather than pinned to it.
+//! observed ratio (~45%, down from ~54% once `bind_name_expr` gained a
+//! fallback for a bare name that's itself a project-local type used as
+//! a static-access receiver, e.g. `UtilClass.staticMethod(...)` --
+//! common enough in real Apex to move the whole-corpus ratio by ~9
+//! points) rather than pinned to it.
 
 use apex_binder::{BoundProgram, Resolution};
 use std::path::{Path, PathBuf};
@@ -39,8 +43,8 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
         match resolution {
             Resolution::Resolved(_) => counts.resolved += 1,
             Resolution::Candidates(_) => counts.candidates += 1,
-            Resolution::SchemaObject { .. } => counts.schema_object += 1,
-            Resolution::UnknownSchema { .. } => counts.unknown_schema += 1,
+            Resolution::SchemaObject(_) => counts.schema_object += 1,
+            Resolution::UnknownSchema(_) => counts.unknown_schema += 1,
             Resolution::Unresolved => counts.unresolved += 1,
         }
     }
