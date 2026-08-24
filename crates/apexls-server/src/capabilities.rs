@@ -252,7 +252,8 @@ pub(crate) fn document_symbols(
     file: FileId,
     encoding: PositionEncoding,
 ) -> Vec<DocumentSymbol> {
-    let text = program.syntax(file).text().to_string();
+    let root = program.syntax(file);
+    let text = root.text().to_string();
     let index = LineIndex::new(&text);
     let to_range = |r: TextRange| Range {
         start: index.to_position(&text, r.start().into(), encoding),
@@ -268,13 +269,14 @@ pub(crate) fn document_symbols(
     fn build(
         entries: &[(SymbolId, &Symbol)],
         container: Option<SymbolId>,
+        root: &apex_syntax::SyntaxNode,
         to_range: &impl Fn(TextRange) -> Range,
     ) -> Vec<DocumentSymbol> {
         entries
             .iter()
             .filter(|entry| entry.1.container == container)
             .map(|&(id, s)| {
-                let children = build(entries, Some(id), to_range);
+                let children = build(entries, Some(id), root, to_range);
                 #[allow(deprecated)] // `deprecated` field, superseded by `tags` -- neither used here
                 DocumentSymbol {
                     name: s.name.to_string(),
@@ -282,14 +284,37 @@ pub(crate) fn document_symbols(
                     kind: lsp_symbol_kind(s.kind),
                     tags: None,
                     deprecated: None,
-                    range: to_range(s.ptr.range()),
+                    range: to_range(declaration_range(root, s.ptr)),
                     selection_range: to_range(s.name_range),
                     children: (!children.is_empty()).then_some(children),
                 }
             })
             .collect()
     }
-    build(&entries, None, &to_range)
+    build(&entries, None, &root, &to_range)
+}
+
+/// `ptr`'s own range, but starting at its first non-trivia token instead
+/// of wherever its span literally begins -- a declaration's doc comment
+/// ends up nested *inside* its own node (see `apex_syntax::ast::decl::HasDocComment`'s
+/// doc comment: it attaches as leading trivia on the first real child,
+/// e.g. the first `Modifier`, not as a sibling before the node), so the
+/// node's raw `text_range()` starts at the doc comment, not the
+/// declaration. Left as the raw range if `ptr` fails to resolve
+/// (defensive; shouldn't happen against this file's own root).
+fn declaration_range(root: &apex_syntax::SyntaxNode, ptr: apex_binder::SyntaxPtr) -> TextRange {
+    let raw = ptr.range();
+    let Some(node) = ptr.to_node(root) else {
+        return raw;
+    };
+    let start = node
+        .descendants_with_tokens()
+        .find_map(|elem| {
+            let t = elem.as_token()?;
+            (!t.kind().is_trivia()).then(|| t.text_range().start())
+        })
+        .unwrap_or_else(|| raw.start());
+    TextRange::new(start, raw.end())
 }
 
 /// `workspace/symbol`'s project-wide search: every declaration-shaped

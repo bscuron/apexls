@@ -66,6 +66,10 @@ struct Session {
 
 impl Session {
     fn start(foo_uri: &Url, root_uri: &Url) -> Self {
+        Self::start_with_text(foo_uri, root_uri, FOO_SRC)
+    }
+
+    fn start_with_text(foo_uri: &Url, root_uri: &Url, text: &str) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_apexls-server"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -122,7 +126,7 @@ impl Session {
                         "uri": foo_uri,
                         "languageId": "apex",
                         "version": 1,
-                        "text": FOO_SRC,
+                        "text": text,
                     }
                 }
             }),
@@ -301,6 +305,49 @@ fn document_symbol_returns_the_class_nesting_its_field_and_method() {
         .collect();
     assert!(names.contains(&"value"), "children should include `value`: {names:?}");
     assert!(names.contains(&"run"), "children should include `run`: {names:?}");
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A doc comment ends up nested *inside* its declaration's own CST node
+/// (leading trivia on the node's first real child -- see
+/// `apex_syntax::ast::decl::HasDocComment`'s doc comment), so the node's
+/// raw range starts at the comment, not the declaration. Jumping to a
+/// `documentSymbol` entry used to land there instead of on the method
+/// itself.
+#[test]
+fn document_symbol_range_starts_after_a_leading_doc_comment_not_at_it() {
+    let src = "public class Foo {\n    /**\n     * Does the thing.\n     */\n    public void run() {\n    }\n}\n";
+    let dir = write_fixture_dir("document-symbol-doc-comment", &[("Foo.cls", src)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+
+    let mut session = Session::start_with_text(&foo_uri, &root_uri, src);
+
+    let response = session.request(
+        2,
+        "textDocument/documentSymbol",
+        serde_json::json!({ "textDocument": { "uri": foo_uri } }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "documentSymbol returned an error: {response:?}"
+    );
+    let result = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a symbol array, got {response:?}"));
+    let run = result[0]["children"]
+        .as_array()
+        .and_then(|children| children.iter().find(|c| c["name"] == "run"))
+        .unwrap_or_else(|| panic!("expected a `run` child symbol, got {result:?}"));
+    // Line 4 is `    public void run() {` -- the method's own
+    // declaration line, not line 1 where the doc comment starts.
+    assert_eq!(
+        run["range"]["start"]["line"], 4,
+        "range should start at `run`'s own declaration, not its doc comment: {run:?}"
+    );
+    assert_eq!(run["selectionRange"]["start"]["line"], 4);
 
     session.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
