@@ -658,17 +658,24 @@ impl BoundProgram {
     /// Confirmed exhaustive by reading every `refs.set(...)` call site in
     /// `resolve.rs`/`soql.rs`: exactly `NameExpr`, `FieldExpr`, `Type`,
     /// `QualifiedName` (a catch clause's exception type), `MethodCallExpr`,
-    /// `CallExpr`, `NewExpr`, and `SoqlFieldName` ever get registered at
-    /// the node level, each keyed by its *whole* node range. `FieldExpr`
-    /// in particular is keyed by the entire `a.b` (receiver included, not
-    /// just the member) -- this still resolves `a` and `b` independently
-    /// without any special-casing, since `a` (when itself a simple name)
-    /// has its own, smaller, closer `NameExpr` ancestor, reached by the
-    /// walk-up before it ever gets to `FieldExpr`; `b` has no node of its
-    /// own, so climbing from its token lands directly on the enclosing
-    /// `FieldExpr`.
+    /// `CallExpr`, `NewExpr`, `SoqlFieldName`, `ThisExpr`, and `SuperExpr`
+    /// ever get registered at the node level, each keyed by its *whole*
+    /// node range. `FieldExpr` in particular is keyed by the entire `a.b`
+    /// (receiver included, not just the member) -- this still resolves
+    /// `a` and `b` independently without any special-casing, since `a`
+    /// (when itself a simple name) has its own, smaller, closer `NameExpr`
+    /// ancestor, reached by the walk-up before it ever gets to `FieldExpr`;
+    /// `b` has no node of its own, so climbing from its token lands
+    /// directly on the enclosing `FieldExpr`. `ThisExpr`/`SuperExpr` are
+    /// the same story for `this.member`/`super.member`: `this`/`super`
+    /// each have their own smaller, closer node (resolving to the
+    /// enclosing type / its direct `extends` target respectively),
+    /// reached before the walk-up ever gets to the enclosing
+    /// `FieldExpr`/`MethodCallExpr` -- without these two, clicking `this`
+    /// or `super` itself (not the member after the dot) fell through to
+    /// that enclosing node instead, landing on the member being accessed.
     pub fn resolution_at(&self, file: FileId, offset: rowan::TextSize) -> Option<&Resolution> {
-        const REFERENCE_KINDS: [apex_syntax::SyntaxKind; 8] = [
+        const REFERENCE_KINDS: [apex_syntax::SyntaxKind; 10] = [
             apex_syntax::SyntaxKind::NameExpr,
             apex_syntax::SyntaxKind::FieldExpr,
             apex_syntax::SyntaxKind::Type,
@@ -677,6 +684,8 @@ impl BoundProgram {
             apex_syntax::SyntaxKind::CallExpr,
             apex_syntax::SyntaxKind::NewExpr,
             apex_syntax::SyntaxKind::SoqlFieldName,
+            apex_syntax::SyntaxKind::ThisExpr,
+            apex_syntax::SyntaxKind::SuperExpr,
         ];
         let root = self.syntax(file);
         let token = match root.token_at_offset(offset) {

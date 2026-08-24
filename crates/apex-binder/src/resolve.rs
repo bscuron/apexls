@@ -880,11 +880,33 @@ impl<'a> BodyBinder<'a> {
         match expr {
             Expr::Literal(lit) => lit.token().and_then(|t| Ty::for_literal(t.kind())),
             Expr::Name(n) => self.bind_name_expr(scope, n),
-            Expr::This(_) => self.enclosing_type.map(Ty::Project),
-            Expr::Super(_) => self
-                .enclosing_type
-                .and_then(|t| self.table.direct_super(t))
-                .map(Ty::Project),
+            Expr::This(t) => {
+                // `this` itself gets a recorded `Resolution` (pointing at
+                // the enclosing type) distinct from whatever `this` is
+                // qualifying (e.g. `this.field`'s `FieldExpr`, or
+                // `this.method()`'s `MethodCallExpr`) -- without this, a
+                // click on the bare `this` token had nothing of its own
+                // to resolve to, so `BoundProgram::resolution_at`'s
+                // ancestor climb fell through to the nearest enclosing
+                // node that *did* have one, landing on the member being
+                // accessed instead of `this` itself.
+                let enclosing = self.enclosing_type;
+                self.refs.set(
+                    SyntaxPtr::new(self.file, t.syntax()),
+                    enclosing.map_or(Resolution::Unresolved, Resolution::Resolved),
+                );
+                enclosing.map(Ty::Project)
+            }
+            Expr::Super(s) => {
+                // Same idea as `this` above, but resolving to the direct
+                // `extends` target instead of the enclosing type itself.
+                let direct_super = self.enclosing_type.and_then(|t| self.table.direct_super(t));
+                self.refs.set(
+                    SyntaxPtr::new(self.file, s.syntax()),
+                    direct_super.map_or(Resolution::Unresolved, Resolution::Resolved),
+                );
+                direct_super.map(Ty::Project)
+            }
             Expr::Paren(p) => p.inner().and_then(|inner| self.bind_expr(scope, &inner)),
             Expr::Cast(c) => {
                 if let Some(op) = c.operand() {
