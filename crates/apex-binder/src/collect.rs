@@ -261,6 +261,7 @@ fn collect_enum(
     let Some(name_text) = name.text() else {
         return;
     };
+    let modifiers = ModifierSet::from_modifiers(en.modifiers());
     let enum_id = out.push(
         file,
         Symbol {
@@ -273,7 +274,7 @@ fn collect_enum(
             type_ref: None,
             type_name: None,
             type_args: Vec::new(),
-            modifiers: ModifierSet::from_modifiers(en.modifiers()),
+            modifiers,
         },
     );
 
@@ -294,7 +295,18 @@ fn collect_enum(
                     type_ref: None,
                     type_name: None,
                     type_args: Vec::new(),
-                    modifiers: ModifierSet::default(),
+                    // Apex gives an enum's *values* no visibility syntax
+                    // of their own at all -- `enum Integration { A, B }`
+                    // has no per-constant modifier to write -- so a
+                    // constant is visible exactly wherever the enum
+                    // *type* itself is, never independently `Private`
+                    // (`ModifierSet::default()`'s default, correct for a
+                    // genuinely-unmarked member but wrong here: it made
+                    // `is_visible_from` reject every enum constant
+                    // referenced from outside the enum's own top-level
+                    // declaring type, e.g. `Outer.SomeEnum.VALUE` used
+                    // from any other class).
+                    modifiers,
                 },
             );
         }

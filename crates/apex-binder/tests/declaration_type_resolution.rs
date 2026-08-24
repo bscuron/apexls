@@ -510,3 +510,57 @@ fn an_unqualified_nested_type_reference_resolves_through_a_subclass() {
         "an unqualified reference to an inherited nested type should resolve from a subclass"
     );
 }
+
+/// A nested enum's constant, referenced through the full
+/// `Outer.NestedEnum.CONSTANT` chain from a *different* top-level class
+/// -- the real shape `UTIL_IntegrationConfig.Integration.ArchiveBridge`
+/// takes. Two independent bugs combined to break this:
+/// 1. `EnumConstant` symbols got `ModifierSet::default()` at collection
+///    time, defaulting their visibility to `Private` -- correct for a
+///    genuinely-unmarked *member*, but Apex enum values have no
+///    visibility syntax of their own at all; access is governed by the
+///    enum type's own visibility. `is_visible_from` then rejected every
+///    enum constant referenced from outside its declaring top-level
+///    type.
+/// 2. Even with visibility fixed, `type_of_symbol` returned `None` for
+///    a type-declaration symbol (`Class`/`Interface`/`Enum`) itself, so
+///    resolving the `Integration` link of the chain produced no `Ty` to
+///    chain `.ArchiveBridge` off of -- any reference chained past a
+///    nested type/enum used as a qualifier dead-ended at `Unresolved`
+///    regardless of the final member's own visibility.
+#[test]
+fn a_nested_enum_constant_resolves_through_the_full_qualifier_chain_from_another_class() {
+    let dir = write_fixture_dir(
+        "enum-constant-chain",
+        &[
+            (
+                "UTIL_IntegrationConfig.cls",
+                "public class UTIL_IntegrationConfig {\n    public enum Integration { ArchiveBridge, Other }\n    public static Integration getConfig(Integration i) { return i; }\n}\n",
+            ),
+            (
+                "Foo.cls",
+                "public class Foo {\n    public void run() {\n        Object archiveBridgeConfig = UTIL_IntegrationConfig.getConfig(UTIL_IntegrationConfig.Integration.ArchiveBridge);\n    }\n}\n",
+            ),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let archive_bridge_id = symbol_id(&program, SymbolKind::EnumConstant, "ArchiveBridge");
+
+    let root = program.syntax(file);
+    let chain_range = root
+        .descendants()
+        .filter_map(apex_syntax::ast::expr::FieldExpr::cast)
+        .map(|f| f.syntax().text_range())
+        .max_by_key(|r| r.len())
+        .expect("expected at least one FieldExpr");
+    let offset = chain_range.end() - rowan::TextSize::from(1);
+
+    assert_eq!(
+        program.resolution_at(file, offset).cloned(),
+        Some(Resolution::Resolved(archive_bridge_id)),
+        "the full Outer.NestedEnum.CONSTANT chain should resolve to the enum constant"
+    );
+}

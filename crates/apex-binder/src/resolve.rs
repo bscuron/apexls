@@ -565,10 +565,26 @@ impl<'a> BodyBinder<'a> {
     /// a generic collection with its type argument(s) substituted in --
     /// see `Symbol::type_args`), never lost to `None` just because it
     /// isn't project-local. `None` only when the symbol has no type of
-    /// its own at all (a type itself, an enum constant, a `void` method,
-    /// a constructor).
+    /// its own at all (an enum constant, a `void` method, a constructor).
+    ///
+    /// A type declaration itself (`Class`/`Interface`/`Enum`) is *not*
+    /// one of those `None` cases, even though it has no `type_name` of
+    /// its own the way a field does: resolving a chain link to a type
+    /// (`UTIL_IntegrationConfig.Integration` inside `...Integration.ArchiveBridge`,
+    /// `TDTM_Runnable.DmlWrapper`) means *that type itself* is now the
+    /// receiver for whatever comes next, exactly like `resolve_type_ref`
+    /// already treats a resolved type name as `Ty::Project(id)`. Without
+    /// this, chaining past a nested type/enum used as a qualifier always
+    /// went straight to `Unresolved` from there on, no matter how
+    /// visible the final member was.
     fn type_of_symbol(&self, id: SymbolId) -> Option<Ty> {
         let symbol = self.get_symbol(id);
+        if matches!(
+            symbol.kind,
+            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum
+        ) {
+            return Some(Ty::Project(id));
+        }
         let type_name = symbol.type_name.as_deref()?;
         if let Some(project_id) = self.table.top_level(type_name) {
             return Some(Ty::Project(project_id));
