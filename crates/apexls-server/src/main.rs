@@ -37,7 +37,7 @@
 //!
 //! **`apex-binder` integration (`BACKLOG.md` §2 Step 1).** `Backend`
 //! keeps a background-rebuilt `apex_binder::BoundProgram` (`Backend::bind`,
-//! `Backend::schedule_rebuild`) in sync with `self.root`/`self.documents`,
+//! `Backend::schedule_rebuild`) in sync with `self.root`/`self.bind.documents`,
 //! naively -- every `didOpen`/`didChange`/`didClose` triggers a full
 //! project rebuild on a `spawn_blocking` task, so the main loop never
 //! blocks on it, but there's no debouncing or cancellation of a
@@ -49,11 +49,21 @@
 //! silently dropped: any real language feature that would *consume* the
 //! bind (hover/goto-definition/etc) -- this pass only proves a bind
 //! happens and can be measured.
+//!
+//! **Filesystem watching** (`Backend::start_watcher`). `apexls` owns its
+//! own `notify`-based watch on `self.root`, matching rust-analyzer's
+//! `vfs-notify` rather than depending on the LSP client to register and
+//! reliably deliver `workspace/didChangeWatchedFiles` -- client support
+//! for that is inconsistent across editors. Closes the "a file added/
+//! removed on disk but never opened in the editor isn't picked up" gap
+//! `apex_binder::BoundProgram::from_files_cached`'s own doc comment
+//! otherwise accepts as an honest limit.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use apex_binder::{BindCache, BoundProgram, Resolution};
 use async_lsp::client_monitor::ClientProcessMonitorLayer;
@@ -69,11 +79,13 @@ use lsp_types::{
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
     DocumentSymbolResponse, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    MarkupContent, MarkupKind, OneOf, SelectionRange, SelectionRangeParams,
-    SelectionRangeProviderCapability, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, MarkupContent,
+    MarkupKind, OneOf, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
+use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use tower::ServiceBuilder;
 use tracing::{info, warn, Level};
 
@@ -83,12 +95,13 @@ mod line_index;
 use line_index::PositionEncoding;
 
 /// The server's whole mutable state: the single resolved project root
-/// (see the module doc comment's "single-root only" section) and an
-/// in-memory document store (URI -> current full text, kept in sync via
-/// full-document `didChange` notifications). Will grow to hold an
-/// `apex_binder::BoundProgram` once a real language feature is wired
-/// in -- deliberately not yet, to keep this first pass scoped to the
-/// protocol layer alone (see the module doc comment).
+/// (see the module doc comment's "single-root only" section) plus
+/// whatever's local to the protocol layer itself. The in-memory document
+/// store (URI -> current full text, kept in sync via full-document
+/// `didChange` notifications) and the background-rebuilt bind both live
+/// on `bind` (`Arc<BindState>`) instead of directly here -- both need to
+/// be reachable from the filesystem watcher's own callback thread, which
+/// has no access to `&Backend` (see `BindState`'s doc comment).
 struct Backend {
     #[allow(dead_code)] // not sent anything yet -- kept for the features this scaffolds toward
     client: ClientSocket,
@@ -110,7 +123,14 @@ struct Backend {
     /// standard-library-stub toggle, no metadata-root override) --
     /// see `BACKLOG.md` §4 for what those settings will eventually be.
     config: Option<serde_json::Value>,
-    documents: HashMap<Url, String>,
+    /// Kept alive only so the watch stays active -- `Debouncer` stops
+    /// watching on drop. `None` until `initialize` resolves a real
+    /// `self.root` to watch, and permanently `None` in single-file mode
+    /// or if the watcher failed to start (a missing/unreadable root, or
+    /// the platform's watch API erroring -- logged, not fatal, since
+    /// `apexls` still works without it via document-sync-triggered
+    /// rebuilds alone, just without picking up out-of-band disk changes).
+    watcher: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
     /// The current `apex-binder` bind, rebuilt in the background (see
     /// `Backend::schedule_rebuild`) after `initialized` and every
     /// document-sync notification. Every edit schedules a rebuild, but
@@ -128,22 +148,30 @@ struct Backend {
 }
 
 /// The mutable state a background rebuild task needs, shared via `Arc`
-/// so `Backend::schedule_rebuild` can hand a clone to
-/// `tokio::task::spawn_blocking` without borrowing `Backend` itself
-/// across an async boundary. `std::sync::Mutex`/`RwLock`, not `tokio`'s --
+/// so `Backend::schedule_rebuild`/the filesystem watcher's callback can
+/// each hand a clone to `tokio::task::spawn_blocking` without borrowing
+/// `Backend` itself across an async boundary -- the watcher's callback
+/// in particular runs on a thread `notify` owns, not one `Backend`'s own
+/// `&mut self` methods ever run on, so it needs its own independent
+/// handle to this state. `std::sync::Mutex`/`RwLock`, not `tokio`'s --
 /// every access happens either on a blocking-pool thread (the rebuild
 /// itself) or held only long enough to swap a value (never held across
 /// an `.await`), so there's no blocking-executor hazard to avoid.
+/// `documents` moved here (from `Backend` directly) for the same reason:
+/// a rebuild the watcher triggers still needs to know which files are
+/// open, unsaved buffers so their in-memory content keeps overriding
+/// on-disk content, exactly as a document-sync-triggered rebuild does.
 #[derive(Default)]
 struct BindState {
     program: RwLock<Option<BoundProgram>>,
     cache: Mutex<BindCache>,
+    documents: Mutex<HashMap<Url, String>>,
 }
 
 impl Backend {
     /// Kicks off a background rebuild of `self.bind` against the current
-    /// `self.root` and `self.documents` (each open buffer's in-memory
-    /// text overriding its on-disk content -- see
+    /// `self.root` and `self.bind.documents` (each open buffer's
+    /// in-memory text overriding its on-disk content -- see
     /// `BoundProgram::from_files_with_overrides`'s doc comment for why
     /// that matters). A no-op if there's no root yet (single-file mode,
     /// or a request that raced ahead of `initialize`).
@@ -162,22 +190,110 @@ impl Backend {
         let Some(root) = self.root.as_ref().and_then(|url| url.to_file_path().ok()) else {
             return;
         };
-        let overrides: HashMap<PathBuf, String> = self
+        spawn_rebuild(
+            root,
+            Arc::clone(&self.bind),
+            tokio::runtime::Handle::current(),
+        );
+    }
+
+    /// Starts a debounced filesystem watcher on `root`, matching
+    /// rust-analyzer's own approach (`vfs-notify`, also built on
+    /// `notify`) rather than depending on the LSP client to register and
+    /// reliably deliver `workspace/didChangeWatchedFiles` notifications
+    /// -- client support for that is inconsistent across editors. Any
+    /// create/remove/modify under `root` touching a file
+    /// `apex_discover::is_relevant_path` cares about
+    /// (`.cls`/`.trigger`/`.object-meta.xml`/`.field-meta.xml`)
+    /// invalidates `bind.cache`'s cached directory walk
+    /// (`BindCache::invalidate_discovery`) and triggers a rebuild --
+    /// closing the "a file added/removed on disk but never opened in the
+    /// editor isn't picked up" gap `BoundProgram::from_files_cached`'s
+    /// own doc comment otherwise accepts as an honest v1 limit. Events
+    /// are debounced (a 500ms quiet period) since a single save, `git`
+    /// operation, or build script routinely fires several raw events in
+    /// quick succession for what's conceptually one change.
+    ///
+    /// Called from `initialize` (running on the Tokio runtime, unlike the
+    /// watcher's own callback thread below) so `tokio::runtime::Handle::current()`
+    /// is captured once here, up front, and reused from inside the
+    /// callback -- `tokio::task::spawn_blocking`'s free-function form
+    /// looks up the *ambient* current-thread runtime and panics off the
+    /// runtime, which the watcher's callback thread always is (`notify`
+    /// owns it, not Tokio).
+    ///
+    /// Returns `None` (logged, not fatal -- see `Backend::watcher`'s doc
+    /// comment) if the watcher fails to start; the server still works
+    /// via document-sync-triggered rebuilds alone in that case, just
+    /// without picking up out-of-band disk changes.
+    fn start_watcher(
+        root: PathBuf,
+        bind: Arc<BindState>,
+    ) -> Option<Debouncer<RecommendedWatcher, RecommendedCache>> {
+        let watch_root = root.clone();
+        let handle = tokio::runtime::Handle::current();
+        let mut debouncer = match new_debouncer(
+            Duration::from_millis(500),
+            None,
+            move |result: DebounceEventResult| {
+                let events = match result {
+                    Ok(events) => events,
+                    Err(errors) => {
+                        for error in errors {
+                            warn!(%error, "filesystem watcher error");
+                        }
+                        return;
+                    }
+                };
+                let relevant = events
+                    .iter()
+                    .flat_map(|event| event.paths.iter())
+                    .any(|path| apex_discover::is_relevant_path(path));
+                if !relevant {
+                    return;
+                }
+                bind.cache.lock().unwrap().invalidate_discovery();
+                spawn_rebuild(root.clone(), Arc::clone(&bind), handle.clone());
+            },
+        ) {
+            Ok(debouncer) => debouncer,
+            Err(error) => {
+                warn!(%error, "failed to create filesystem watcher");
+                return None;
+            }
+        };
+        if let Err(error) = debouncer.watch(&watch_root, RecursiveMode::Recursive) {
+            warn!(%error, root = %watch_root.display(), "failed to start filesystem watcher");
+            return None;
+        }
+        Some(debouncer)
+    }
+}
+
+/// The actual rebuild work `Backend::schedule_rebuild` and the
+/// filesystem watcher's debounced callback both trigger -- factored out
+/// since the watcher's callback runs on a thread `notify` owns, not one
+/// with access to `&Backend`, so it needs a version taking only the
+/// `Arc<BindState>` handle both callers already have, plus an explicit
+/// `Handle` (see `Backend::start_watcher`'s doc comment for why that
+/// can't just be `tokio::task::spawn_blocking`'s ambient-runtime form).
+fn spawn_rebuild(root: PathBuf, bind: Arc<BindState>, handle: tokio::runtime::Handle) {
+    handle.spawn_blocking(move || {
+        let overrides: HashMap<PathBuf, String> = bind
             .documents
+            .lock()
+            .unwrap()
             .iter()
             .filter_map(|(uri, text)| uri.to_file_path().ok().map(|path| (path, text.clone())))
             .collect();
-        let bind = Arc::clone(&self.bind);
-        tokio::task::spawn_blocking(move || {
-            let program = {
-                let mut cache = bind.cache.lock().unwrap();
-                BoundProgram::from_files_cached(&root, &overrides, &mut cache)
-            };
-            let file_count = program.file_count();
-            *bind.program.write().unwrap() = Some(program);
-            info!(file_count, "rebuild complete");
-        });
-    }
+        let program = {
+            let mut cache = bind.cache.lock().unwrap();
+            BoundProgram::from_files_cached(&root, &overrides, &mut cache)
+        };
+        let file_count = program.file_count();
+        *bind.program.write().unwrap() = Some(program);
+        info!(file_count, "rebuild complete");
+    });
 }
 
 impl LanguageServer for Backend {
@@ -221,6 +337,11 @@ impl LanguageServer for Backend {
         self.root = root;
         self.position_encoding = position_encoding;
         self.config = params.initialization_options;
+        self.watcher = self
+            .root
+            .as_ref()
+            .and_then(|url| url.to_file_path().ok())
+            .and_then(|root| Backend::start_watcher(root, Arc::clone(&self.bind)));
 
         Box::pin(async move {
             Ok(InitializeResult {
@@ -280,7 +401,11 @@ impl LanguageServer for Backend {
     fn did_open(&mut self, params: DidOpenTextDocumentParams) -> Self::NotifyResult {
         let uri = params.text_document.uri;
         info!(%uri, "did_open");
-        self.documents.insert(uri, params.text_document.text);
+        self.bind
+            .documents
+            .lock()
+            .unwrap()
+            .insert(uri, params.text_document.text);
         self.schedule_rebuild();
         ControlFlow::Continue(())
     }
@@ -295,7 +420,7 @@ impl LanguageServer for Backend {
             return ControlFlow::Continue(());
         };
         info!(%uri, len = change.text.len(), "did_change");
-        self.documents.insert(uri, change.text);
+        self.bind.documents.lock().unwrap().insert(uri, change.text);
         self.schedule_rebuild();
         ControlFlow::Continue(())
     }
@@ -303,7 +428,7 @@ impl LanguageServer for Backend {
     fn did_close(&mut self, params: DidCloseTextDocumentParams) -> Self::NotifyResult {
         let uri = params.text_document.uri;
         info!(%uri, "did_close");
-        self.documents.remove(&uri);
+        self.bind.documents.lock().unwrap().remove(&uri);
         self.schedule_rebuild();
         ControlFlow::Continue(())
     }
@@ -407,8 +532,9 @@ impl LanguageServer for Backend {
                         .collect();
                     (!locations.is_empty()).then_some(GotoDefinitionResponse::Array(locations))
                 }
-                Some(Resolution::SchemaObject(r)) => capabilities::schema_location(program, r)
-                    .map(GotoDefinitionResponse::Scalar),
+                Some(Resolution::SchemaObject(r)) => {
+                    capabilities::schema_location(program, r).map(GotoDefinitionResponse::Scalar)
+                }
                 _ => None,
             };
 
@@ -541,7 +667,7 @@ async fn main() {
             root: None,
             position_encoding: PositionEncoding::Utf16,
             config: None,
-            documents: HashMap::new(),
+            watcher: None,
             bind: Arc::new(BindState::default()),
         });
 

@@ -88,6 +88,15 @@ pub struct Discovery {
     pub field_meta_files: Vec<PathBuf>,
 }
 
+/// Whether `path` is one of the four file types [`discover`] indexes
+/// (`.cls`/`.trigger`/`.object-meta.xml`/`.field-meta.xml`) -- the
+/// per-path check a caller reacting to individual filesystem events (a
+/// watcher) needs, without walking a whole directory tree just to
+/// classify one path.
+pub fn is_relevant_path(path: &Path) -> bool {
+    is_apex_file(path) || is_object_meta_file(path) || is_field_meta_file(path)
+}
+
 fn is_apex_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())

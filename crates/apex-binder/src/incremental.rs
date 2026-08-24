@@ -92,9 +92,13 @@ pub struct BindCache {
     /// every SFDX metadata XML file) unconditionally on every edit.
     /// `None` only before the first call. See
     /// `BoundProgram::from_files_cached`'s doc comment for exactly when
-    /// this gets refreshed, and what staleness it accepts as an honest
-    /// v1 limit (a file added on disk but never opened in the editor, or
-    /// metadata XML edited with no corresponding Apex-file signal).
+    /// this gets refreshed on its own, and what staleness it otherwise
+    /// accepts as an honest v1 limit (a file added on disk but never
+    /// opened in the editor, or metadata XML edited with no
+    /// corresponding Apex-file signal) -- [`Self::invalidate_discovery`]
+    /// is the hook a caller with its own out-of-band change signal (a
+    /// filesystem watcher) uses to force a fresh walk instead of relying
+    /// on that limit.
     pub(crate) discovery: Option<Discovery>,
     pub(crate) schema: Option<Arc<SchemaIndex>>,
     /// Each path's last-seen `(Freshness, Parse)` -- a parse is reused
@@ -148,4 +152,17 @@ pub struct BindCache {
     /// file gets rebound.
     pub(crate) supertype_ptrs: FxHashMap<FileId, Vec<(SymbolId, AstPtr<Type>)>>,
     pub(crate) bodies: FxHashMap<FileId, Arc<FileBodies>>,
+}
+
+impl BindCache {
+    /// Forces the next [`crate::BoundProgram::from_files_cached`] call to
+    /// redo the directory walk (and SFDX metadata parse) instead of
+    /// reusing the cached one -- the hook a filesystem-watcher-driven
+    /// caller needs to pick up a file added/removed/edited on disk
+    /// outside the editor, which `from_files_cached`'s own staleness
+    /// check can't detect by itself (see `discovery`'s doc comment above
+    /// for the honest limit this closes).
+    pub fn invalidate_discovery(&mut self) {
+        self.discovery = None;
+    }
 }
