@@ -14,6 +14,7 @@ rayon = "1.12.0"
 rustc-hash = "2.1.3"
 smol_str = "0.3.6"
 hashbrown = "0.17.1"
+hotpath = "0.24.0"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
@@ -22,3 +23,8 @@ dhat = "0.3.3"
 [[bench]]
 name = "binder_bench"
 harness = false
+
+[features]
+hotpath = ["hotpath/hotpath", "apex-parser/hotpath", "apex-discover/hotpath"]
+hotpath-cpu = ["hotpath/hotpath-cpu", "apex-parser/hotpath-cpu", "apex-discover/hotpath-cpu"]
+hotpath-alloc = ["hotpath/hotpath-alloc", "apex-parser/hotpath-alloc", "apex-discover/hotpath-alloc"]

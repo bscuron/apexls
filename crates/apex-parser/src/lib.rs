@@ -82,12 +82,14 @@ pub fn parse_block(src: &str) -> Parse {
 
 /// Parse `src` as a whole `.cls` compilation unit: `modifier* (class |
 /// interface | enum)` declaration, EOF (Phase 3).
+#[hotpath::measure]
 pub fn parse_compilation_unit(src: &str) -> Parse {
     parse_root(src, grammar::declarations::compilation_unit)
 }
 
 /// Parse `src` as a whole `.trigger` file: `trigger Name on Object
 /// (before insert, ...) { ... }` (Phase 3).
+#[hotpath::measure]
 pub fn parse_trigger_unit(src: &str) -> Parse {
     parse_root(src, grammar::declarations::trigger_unit)
 }

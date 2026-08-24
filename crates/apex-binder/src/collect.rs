@@ -95,6 +95,7 @@ fn type_ptr_and_name(
 }
 
 /// Collects every declaration in one parsed `.cls` `CompilationUnit`.
+#[hotpath::measure]
 pub(crate) fn collect_compilation_unit(file: FileId, cu: &CompilationUnit) -> FileCollection {
     let mut out = FileCollection::default();
     if let Some(type_decl) = cu.type_decl() {
@@ -106,6 +107,7 @@ pub(crate) fn collect_compilation_unit(file: FileId, cu: &CompilationUnit) -> Fi
 /// Collects every declaration in one parsed `.trigger` `TriggerUnit`. A
 /// trigger has no `extends`/`implements` of its own, but its body can
 /// declare helper members the same way a class body can.
+#[hotpath::measure]
 pub(crate) fn collect_trigger_unit(file: FileId, tu: &TriggerUnit) -> FileCollection {
     let mut out = FileCollection::default();
     let Some(name) = tu.name() else {

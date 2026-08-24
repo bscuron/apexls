@@ -28,6 +28,7 @@ use smol_str::SmolStr;
 /// `extends`/`implements` clause, its id plus the unresolved supertype
 /// names as written (a dotted base name, e.g. `Outer.Inner` -- generic
 /// arguments/array suffixes are already stripped by `Type::text()`).
+#[hotpath::measure]
 pub(crate) fn resolve_inheritance(
     table: &mut SymbolTable,
     raw_extends: &[(SymbolId, Vec<SmolStr>)],

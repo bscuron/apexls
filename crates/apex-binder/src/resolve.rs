@@ -223,6 +223,7 @@ pub(crate) struct BodyBinder<'a> {
 /// its `ScopeTree` seeded with `params` in the root scope, walks every
 /// statement/expression, and returns the (still sentinel-tagged) result.
 #[allow(clippy::too_many_arguments)]
+#[hotpath::measure]
 pub(crate) fn bind_body(
     table: &SymbolTable,
     schema: &SchemaIndex,
@@ -256,6 +257,7 @@ pub(crate) fn bind_body(
 /// shaped children only) never reaches. Walks direct `Stmt` children
 /// alongside (interleaved with, in source order) the `Member`
 /// declarations Pass 1 already collected separately.
+#[hotpath::measure]
 pub(crate) fn bind_trigger_body(
     table: &SymbolTable,
     schema: &SchemaIndex,
@@ -285,6 +287,7 @@ pub(crate) fn bind_trigger_body(
 /// Binds a bare expression with no enclosing statement context (a
 /// field/property initializer) -- member lookup only, no locals, no
 /// `ScopeTree` worth keeping around afterward.
+#[hotpath::measure]
 pub(crate) fn bind_initializer(
     table: &SymbolTable,
     schema: &SchemaIndex,
@@ -383,9 +386,7 @@ pub(crate) fn resolve_type_ref(
         .type_args()
         .map(|list| {
             list.args()
-                .filter_map(|arg| {
-                    resolve_type_ref(table, schema, refs, file, enclosing_type, &arg)
-                })
+                .filter_map(|arg| resolve_type_ref(table, schema, refs, file, enclosing_type, &arg))
                 .collect()
         })
         .unwrap_or_default();

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 apex-lexer.workspace = true
 apex-syntax.workspace = true
+hotpath = "0.24.0"
 
 [dev-dependencies]
 apex-discover.workspace = true
@@ -19,3 +20,8 @@ rayon = "1.12.0"
 [[bench]]
 name = "parser_bench"
 harness = false
+
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-cpu = ["hotpath/hotpath-cpu"]
+hotpath-alloc = ["hotpath/hotpath-alloc"]

@@ -60,6 +60,7 @@ pub fn find_apex_files(root: impl AsRef<Path>) -> Vec<PathBuf> {
 /// caller needing both Apex source and SObject/field schema (a real
 /// apexls invocation) should use instead of `find_apex_files` plus a
 /// separate metadata walk.
+#[hotpath::measure]
 pub fn discover(root: impl AsRef<Path>) -> Discovery {
     walk(
         root,

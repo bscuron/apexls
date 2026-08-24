@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+hotpath = "0.24.0"
 ignore = "0.4.33"
 phf = { version = "0.11", features = ["macros"] }
 
@@ -14,3 +15,8 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 [[bench]]
 name = "discover_bench"
 harness = false
+
+[features]
+hotpath = ["hotpath/hotpath"]
+hotpath-cpu = ["hotpath/hotpath-cpu"]
+hotpath-alloc = ["hotpath/hotpath-alloc"]

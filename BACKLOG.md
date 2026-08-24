@@ -237,6 +237,75 @@ below could be measured against something real instead of guessed at.
         isn't wired up), a real, separate, and already-tracked gap, not
         papered over by this fix. Metadata XML edited with no
         corresponding Apex-file signal has the same limit.
+- [ ] **Function-level breakdown of the cold/warm bind costs, and a
+      ranked follow-up plan.** The measurements above only ever timed
+      `from_files`/`from_files_cached` from the outside; nothing broke
+      down where inside the pipeline the ~431ms cold / ~17ms warm totals
+      actually go. Instrumented the real pipeline with the
+      [`hotpath`](https://github.com/pawurb/hotpath-rs) crate --
+      `#[hotpath::measure]` on `apex_discover::discover`,
+      `apex_parser::parse_compilation_unit`/`parse_trigger_unit`,
+      `collect::collect_compilation_unit`/`collect_trigger_unit`,
+      `inherit::resolve_inheritance`, `resolve::bind_body`/
+      `bind_trigger_body`/`bind_initializer`, plus `measure_block!`
+      around `from_files_cached`'s named stages -- gated behind
+      `hotpath`/`hotpath-cpu`/`hotpath-alloc` Cargo features that are
+      true no-ops when off (verified `apexls-server`/`apexls-cli` build
+      unaffected), cascaded through `apex-parser`/`apex-discover`'s own
+      same-named features. A new
+      `crates/apex-binder/examples/cpu_profile.rs` (sibling to
+      `mem_profile.rs`, same "ad-hoc, not a permanent fixture" status)
+      mirrors `binder_bench.rs`'s two corpus cases via
+      `hotpath::HotpathGuardBuilder` and a `hotpath::CountingAllocator`
+      global allocator (needed for real, nonzero `hotpath-alloc`
+      numbers -- an allocator-tracking library, same as `dhat`, doesn't
+      count anything without one). Run with `cargo run -p apex-binder
+      --release --features hotpath,hotpath-alloc --example cpu_profile`
+      against the real NPSP corpus (`hotpath-cpu`, sampling-based CPU
+      attribution, is Linux/macOS only -- unavailable on this Windows
+      dev machine, so not used here). One real run (totals: 373.6ms
+      cold / 6.4ms warm -- in the same ballpark as the criterion
+      baselines above, not identical, since this is a single instrumented
+      run rather than criterion's warmed-up statistical sampling):
+      - **Cold bind, two previously-invisible costs:**
+        1. `discover_and_build_schema` (the `SchemaIndex::from_discovery`
+           SFDX metadata XML parse, run every time discovery is
+           refreshed) took 78.57ms -- 21% of the whole cold bind --
+           of which `apex_discover::discover`'s own directory walk was
+           only 9.41ms. The remaining ~69ms is metadata XML parsing that
+           was never broken out as its own cost before, and unlike every
+           other pipeline stage, isn't parallelized.
+        2. `pass2_merge_bodies` -- the **sequential** step that remaps
+           each bound body's sentinel ids and merges it into
+           `cache.bodies` -- took 37.89ms wall (10%, comparable to the
+           *entire parallel* Pass 2 binding stage's 45.77ms) and was the
+           single largest individual allocator in the whole cold bind:
+           110.0 MB exclusive, 20% of all 544.5 MB allocated project-wide
+           -- more than 25x what the parallel binding stage it follows
+           allocates directly (4.1 MB). A single-threaded stage that
+           allocates a fifth of a whole project bind's memory is a real
+           optimization candidate.
+      - **Warm single-edit rebind: both dominant costs scale with total
+        project size (~1044 files), not edit size**, despite incremental
+        rebind already correctly skipping the actual re-parse/re-collect/
+        re-resolve work for unchanged files:
+        1. `stage_1a_read_and_parse` took 55% of warm-rebind wall time
+           (3.55ms of 6.42ms) -- because it still calls `std::fs::metadata`
+           (a stat syscall) plus a cache lookup for *every* one of the
+           ~1044 candidate files on every single call, just to determine
+           which one(s) are dirty, even when only one file changed.
+        2. 69% of warm-rebind's allocated bytes (836.3 KB of 1.2 MB) were
+           attributed to `from_files_cached`'s own top-level frame, outside
+           every instrumented sub-stage -- pointing at the un-instrumented
+           "glue" code: the `candidates: Vec<(PathBuf, FileId)>` built by
+           cloning every discovered path (`crates/apex-binder/src/lib.rs`
+           Stage 0) and, at the end, the "assemble this call's independent
+           owned snapshot" step that rebuilds `files`/`file_ids`/`parses`
+           -- three project-wide `FxHashMap`s, each keyed by a cloned
+           `PathBuf` -- from scratch on *every* call, from all of `parsed`,
+           regardless of how many files actually changed
+           (`crates/apex-binder/src/lib.rs`, "Assemble this call's
+           independent, owned snapshot").
 
 ## 3. Feature surface
 

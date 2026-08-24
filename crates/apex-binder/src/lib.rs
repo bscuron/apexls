@@ -215,10 +215,12 @@ impl BoundProgram {
             }
         };
         if need_fresh_discovery {
-            let discovery = apex_discover::discover(root);
-            let schema = Arc::new(SchemaIndex::from_discovery(&discovery));
-            cache.discovery = Some(discovery);
-            cache.schema = Some(schema);
+            hotpath::measure_block!("discover_and_build_schema", {
+                let discovery = apex_discover::discover(root);
+                let schema = Arc::new(SchemaIndex::from_discovery(&discovery));
+                cache.discovery = Some(discovery);
+                cache.schema = Some(schema);
+            });
         }
         let discovery = cache.discovery.as_ref().unwrap();
         let schema = Arc::clone(cache.schema.as_ref().unwrap());
@@ -252,98 +254,101 @@ impl BoundProgram {
             freshness: Freshness,
             parse: Parse,
         }
-        let parsed: Vec<ParsedFile> = candidates
-            .par_iter()
-            .filter_map(|(path, file)| {
-                let trigger = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
+        let parsed: Vec<ParsedFile> = hotpath::measure_block!("stage_1a_read_and_parse", {
+            candidates
+                .par_iter()
+                .filter_map(|(path, file)| {
+                    let trigger = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
 
-                // An `overrides` entry (an unsaved editor buffer) has no
-                // filesystem metadata to stat -- content is already in
-                // memory (the caller supplied it, no disk I/O either
-                // way), so it's compared by content hash, same as
-                // before. In practice this is at most a handful of
-                // files per call (whatever's actually being edited).
-                if let Some(content) = overrides.get(path) {
-                    let freshness =
-                        Freshness::ContentHash(incremental::content_fingerprint(content));
-                    if let Some((cached, cached_parse)) = cache.parses.get(path) {
-                        if *cached == freshness {
-                            return Some(ParsedFile {
-                                path: path.clone(),
-                                file: *file,
-                                trigger,
-                                dirty: false,
-                                freshness,
-                                parse: cached_parse.clone(),
-                            });
+                    // An `overrides` entry (an unsaved editor buffer) has no
+                    // filesystem metadata to stat -- content is already in
+                    // memory (the caller supplied it, no disk I/O either
+                    // way), so it's compared by content hash, same as
+                    // before. In practice this is at most a handful of
+                    // files per call (whatever's actually being edited).
+                    if let Some(content) = overrides.get(path) {
+                        let freshness =
+                            Freshness::ContentHash(incremental::content_fingerprint(content));
+                        if let Some((cached, cached_parse)) = cache.parses.get(path) {
+                            if *cached == freshness {
+                                return Some(ParsedFile {
+                                    path: path.clone(),
+                                    file: *file,
+                                    trigger,
+                                    dirty: false,
+                                    freshness,
+                                    parse: cached_parse.clone(),
+                                });
+                            }
+                        }
+                        let parse = if trigger {
+                            apex_parser::parse_trigger_unit(content)
+                        } else {
+                            apex_parser::parse_compilation_unit(content)
+                        };
+                        return Some(ParsedFile {
+                            path: path.clone(),
+                            file: *file,
+                            trigger,
+                            dirty: true,
+                            freshness,
+                            parse,
+                        });
+                    }
+
+                    // No override: stat the file *before* reading it -- a
+                    // size+mtime match against the cached entry means the
+                    // read (not just the reparse) can be skipped entirely,
+                    // which is the common case for every file besides the
+                    // one actually being edited. See `Freshness::Stat`'s
+                    // doc comment for the honest staleness caveat this
+                    // trades for that.
+                    let metadata = std::fs::metadata(path).ok()?;
+                    let stat_freshness = metadata.modified().ok().map(|modified| Freshness::Stat {
+                        len: metadata.len(),
+                        modified,
+                    });
+                    if let Some(freshness) = &stat_freshness {
+                        if let Some((cached, cached_parse)) = cache.parses.get(path) {
+                            if cached == freshness {
+                                return Some(ParsedFile {
+                                    path: path.clone(),
+                                    file: *file,
+                                    trigger,
+                                    dirty: false,
+                                    freshness: freshness.clone(),
+                                    parse: cached_parse.clone(),
+                                });
+                            }
                         }
                     }
+                    let content = std::fs::read_to_string(path).ok()?;
                     let parse = if trigger {
-                        apex_parser::parse_trigger_unit(content)
+                        apex_parser::parse_trigger_unit(&content)
                     } else {
-                        apex_parser::parse_compilation_unit(content)
+                        apex_parser::parse_compilation_unit(&content)
                     };
-                    return Some(ParsedFile {
+                    // `metadata().modified()` failing at all is rare and
+                    // platform-dependent -- fall back to a content hash so
+                    // this file still gets *some* freshness check next call,
+                    // just not the read-skipping kind.
+                    let freshness = stat_freshness.unwrap_or_else(|| {
+                        Freshness::ContentHash(incremental::content_fingerprint(&content))
+                    });
+                    Some(ParsedFile {
                         path: path.clone(),
                         file: *file,
                         trigger,
                         dirty: true,
                         freshness,
                         parse,
-                    });
-                }
-
-                // No override: stat the file *before* reading it -- a
-                // size+mtime match against the cached entry means the
-                // read (not just the reparse) can be skipped entirely,
-                // which is the common case for every file besides the
-                // one actually being edited. See `Freshness::Stat`'s
-                // doc comment for the honest staleness caveat this
-                // trades for that.
-                let metadata = std::fs::metadata(path).ok()?;
-                let stat_freshness = metadata.modified().ok().map(|modified| Freshness::Stat {
-                    len: metadata.len(),
-                    modified,
-                });
-                if let Some(freshness) = &stat_freshness {
-                    if let Some((cached, cached_parse)) = cache.parses.get(path) {
-                        if cached == freshness {
-                            return Some(ParsedFile {
-                                path: path.clone(),
-                                file: *file,
-                                trigger,
-                                dirty: false,
-                                freshness: freshness.clone(),
-                                parse: cached_parse.clone(),
-                            });
-                        }
-                    }
-                }
-                let content = std::fs::read_to_string(path).ok()?;
-                let parse = if trigger {
-                    apex_parser::parse_trigger_unit(&content)
-                } else {
-                    apex_parser::parse_compilation_unit(&content)
-                };
-                // `metadata().modified()` failing at all is rare and
-                // platform-dependent -- fall back to a content hash so
-                // this file still gets *some* freshness check next call,
-                // just not the read-skipping kind.
-                let freshness = stat_freshness
-                    .unwrap_or_else(|| Freshness::ContentHash(incremental::content_fingerprint(&content)));
-                Some(ParsedFile {
-                    path: path.clone(),
-                    file: *file,
-                    trigger,
-                    dirty: true,
-                    freshness,
-                    parse,
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        });
 
         // Refresh the parse cache for dirty files only -- an unchanged
         // file's entry is already correct.
@@ -384,22 +389,25 @@ impl BoundProgram {
         // for dirty files -- an unchanged file's declarations are still
         // exactly what `cache.table`/`cache.raw_extends`/`cache.raw_super`
         // already hold.
-        let fresh: Vec<(FileId, collect::FileCollection)> = parsed
-            .par_iter()
-            .filter(|p| p.dirty)
-            .map(|p| {
-                let root_node = p.parse.syntax();
-                let collection = if p.trigger {
-                    TriggerUnit::cast(root_node.clone())
-                        .map(|tu| collect::collect_trigger_unit(p.file, &tu))
-                } else {
-                    CompilationUnit::cast(root_node.clone())
-                        .map(|cu| collect::collect_compilation_unit(p.file, &cu))
-                }
-                .unwrap_or_default();
-                (p.file, collection)
-            })
-            .collect();
+        let fresh: Vec<(FileId, collect::FileCollection)> =
+            hotpath::measure_block!("pass1_collect_dirty_files", {
+                parsed
+                    .par_iter()
+                    .filter(|p| p.dirty)
+                    .map(|p| {
+                        let root_node = p.parse.syntax();
+                        let collection = if p.trigger {
+                            TriggerUnit::cast(root_node.clone())
+                                .map(|tu| collect::collect_trigger_unit(p.file, &tu))
+                        } else {
+                            CompilationUnit::cast(root_node.clone())
+                                .map(|cu| collect::collect_compilation_unit(p.file, &cu))
+                        }
+                        .unwrap_or_default();
+                        (p.file, collection)
+                    })
+                    .collect()
+            });
 
         // Sequential merge: patch each dirty file's slice of the
         // persistent `SymbolTable`/Pass-1.5 inputs, tracking whether any
@@ -419,9 +427,7 @@ impl BoundProgram {
             cache.table.set_file_symbols(file, collection.symbols);
             cache.raw_extends.insert(file, collection.raw_extends);
             cache.raw_super.insert(file, collection.raw_super);
-            cache
-                .supertype_ptrs
-                .insert(file, collection.supertype_ptrs);
+            cache.supertype_ptrs.insert(file, collection.supertype_ptrs);
         }
 
         // Pass 1.5 + derived-index rebuild only when something actually
@@ -430,12 +436,14 @@ impl BoundProgram {
         // correct from the previous call (see `SymbolTable::rebuild_indices`'s
         // doc comment for why skipping this is sound, not just fast).
         if declarations_changed {
-            cache.table.rebuild_indices();
-            let all_raw_extends: Vec<(SymbolId, Vec<SmolStr>)> =
-                cache.raw_extends.values().flatten().cloned().collect();
-            let all_raw_super: Vec<(SymbolId, SmolStr)> =
-                cache.raw_super.values().flatten().cloned().collect();
-            inherit::resolve_inheritance(&mut cache.table, &all_raw_extends, &all_raw_super);
+            hotpath::measure_block!("pass1_5_inherit_and_rebuild_indices", {
+                cache.table.rebuild_indices();
+                let all_raw_extends: Vec<(SymbolId, Vec<SmolStr>)> =
+                    cache.raw_extends.values().flatten().cloned().collect();
+                let all_raw_super: Vec<(SymbolId, SmolStr)> =
+                    cache.raw_super.values().flatten().cloned().collect();
+                inherit::resolve_inheritance(&mut cache.table, &all_raw_extends, &all_raw_super);
+            });
         }
 
         // Pass 2 (parallel): rebind every current file if declarations
@@ -468,16 +476,19 @@ impl BoundProgram {
                     )
                 })
                 .collect();
-        let bound: Vec<(FileId, Option<SyntaxPtr>, resolve::BoundBody)> = to_bind
-            .par_iter()
-            .flat_map(|(file, id, symbol)| {
-                let root_node = parse_by_file[file].syntax();
-                bind_symbol_body(&cache.table, &schema, &root_node, *id, symbol)
-                    .into_iter()
-                    .map(move |(key, body)| (*file, key, body))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let bound: Vec<(FileId, Option<SyntaxPtr>, resolve::BoundBody)> =
+            hotpath::measure_block!("pass2_bind_symbol_bodies", {
+                to_bind
+                    .par_iter()
+                    .flat_map(|(file, id, symbol)| {
+                        let root_node = parse_by_file[file].syntax();
+                        bind_symbol_body(&cache.table, &schema, &root_node, *id, symbol)
+                            .into_iter()
+                            .map(move |(key, body)| (*file, key, body))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            });
 
         // Same idea as `bound`, but for `extends`/`implements` supertype
         // names -- these aren't attached to a `Symbol::type_ref` (a
@@ -486,32 +497,34 @@ impl BoundProgram {
         // they're resolved as their own small stage rather than through
         // `bind_symbol_body`.
         let supertype_bound: Vec<(FileId, Option<SyntaxPtr>, resolve::BoundBody)> =
-            files_to_rebind
-                .par_iter()
-                .flat_map(|file| {
-                    let root_node = parse_by_file[file].syntax();
-                    cache
-                        .supertype_ptrs
-                        .get(file)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|(owner, ptr)| {
-                            let ty = ptr.to_node(&root_node)?;
-                            Some((
-                                *file,
-                                None,
-                                resolve::bind_type_ref(
-                                    &cache.table,
-                                    &schema,
+            hotpath::measure_block!("pass2_bind_supertypes", {
+                files_to_rebind
+                    .par_iter()
+                    .flat_map(|file| {
+                        let root_node = parse_by_file[file].syntax();
+                        cache
+                            .supertype_ptrs
+                            .get(file)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|(owner, ptr)| {
+                                let ty = ptr.to_node(&root_node)?;
+                                Some((
                                     *file,
-                                    Some(*owner),
-                                    &ty,
-                                ),
-                            ))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect();
+                                    None,
+                                    resolve::bind_type_ref(
+                                        &cache.table,
+                                        &schema,
+                                        *file,
+                                        Some(*owner),
+                                        &ty,
+                                    ),
+                                ))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            });
 
         // Sequential merge, mirroring Pass 1's: group each file's bound
         // bodies together, then -- one file at a time -- allocate its
@@ -524,29 +537,31 @@ impl BoundProgram {
         // entry even if it produced zero bound bodies (e.g. every method
         // in it was just deleted) -- otherwise a stale fragment from
         // before that edit would silently survive in `cache.bodies`.
-        let mut by_file: FxHashMap<FileId, Vec<(Option<SyntaxPtr>, resolve::BoundBody)>> =
-            files_to_rebind.iter().map(|&f| (f, Vec::new())).collect();
-        for (file, key, body) in bound.into_iter().chain(supertype_bound) {
-            by_file.entry(file).or_default().push((key, body));
-        }
-        for (file, bodies) in by_file {
-            let mut base = cache.table.declared_len(file) as u32;
-            let mut extra_symbols = Vec::new();
-            let mut file_bodies = incremental::FileBodies::default();
-            for (key, body) in bodies {
-                let remap = |id: SymbolId| resolve::remap_local_id(id, base);
-                let mut scopes = body.scopes;
-                scopes.remap_symbol_ids(&remap);
-                body.refs.map_ids(&remap).merge_into(&mut file_bodies.refs);
-                if let Some(key) = key {
-                    file_bodies.scopes.insert(key, scopes);
-                }
-                base += body.pending_locals.len() as u32;
-                extra_symbols.extend(body.pending_locals);
+        hotpath::measure_block!("pass2_merge_bodies", {
+            let mut by_file: FxHashMap<FileId, Vec<(Option<SyntaxPtr>, resolve::BoundBody)>> =
+                files_to_rebind.iter().map(|&f| (f, Vec::new())).collect();
+            for (file, key, body) in bound.into_iter().chain(supertype_bound) {
+                by_file.entry(file).or_default().push((key, body));
             }
-            cache.table.append_file_symbols(file, extra_symbols);
-            cache.bodies.insert(file, Arc::new(file_bodies));
-        }
+            for (file, bodies) in by_file {
+                let mut base = cache.table.declared_len(file) as u32;
+                let mut extra_symbols = Vec::new();
+                let mut file_bodies = incremental::FileBodies::default();
+                for (key, body) in bodies {
+                    let remap = |id: SymbolId| resolve::remap_local_id(id, base);
+                    let mut scopes = body.scopes;
+                    scopes.remap_symbol_ids(&remap);
+                    body.refs.map_ids(&remap).merge_into(&mut file_bodies.refs);
+                    if let Some(key) = key {
+                        file_bodies.scopes.insert(key, scopes);
+                    }
+                    base += body.pending_locals.len() as u32;
+                    extra_symbols.extend(body.pending_locals);
+                }
+                cache.table.append_file_symbols(file, extra_symbols);
+                cache.bodies.insert(file, Arc::new(file_bodies));
+            }
+        });
 
         // Assemble this call's independent, owned snapshot. `symbols`
         // (`Arc`-backed, see `symbol_table`'s module doc comment) and
@@ -789,12 +804,15 @@ fn bind_symbol_body(
     // pointer was captured (defensive; shouldn't happen mid-call).
     let enclosing_type = enclosing_type_of(table, symbol);
     let declared_type = || {
-        symbol.type_ref.and_then(|type_ref| type_ref.to_node(root)).map(|ty| {
-            (
-                None,
-                resolve::bind_type_ref(table, schema, symbol.file, enclosing_type, &ty),
-            )
-        })
+        symbol
+            .type_ref
+            .and_then(|type_ref| type_ref.to_node(root))
+            .map(|ty| {
+                (
+                    None,
+                    resolve::bind_type_ref(table, schema, symbol.file, enclosing_type, &ty),
+                )
+            })
     };
     match symbol.kind {
         SymbolKind::Method => {
@@ -871,13 +889,8 @@ fn bind_symbol_body(
                 .and_then(VarDeclarator::cast)
                 .and_then(|decl| decl.init())
             {
-                let bound = resolve::bind_initializer(
-                    table,
-                    schema,
-                    symbol.file,
-                    symbol.container,
-                    &init,
-                );
+                let bound =
+                    resolve::bind_initializer(table, schema, symbol.file, symbol.container, &init);
                 out.push((None, bound));
             }
             out
