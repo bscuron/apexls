@@ -6,6 +6,7 @@
 
 use crate::symbol::SymbolId;
 use rowan::TextRange;
+use smol_str::SmolStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ScopeId(pub(crate) u32);
@@ -34,7 +35,7 @@ pub struct Scope {
     /// not a `HashMap`: block-local variable counts are tiny (single
     /// digits to low tens), so a linear scan beats hashing, and it
     /// naturally supports "most recent wins" if ever queried mid-walk.
-    bindings: Vec<(String, SymbolId)>,
+    bindings: Vec<(SmolStr, SymbolId)>,
 }
 
 impl Scope {
@@ -46,7 +47,7 @@ impl Scope {
         }
     }
 
-    pub fn bindings(&self) -> &[(String, SymbolId)] {
+    pub fn bindings(&self) -> &[(SmolStr, SymbolId)] {
         &self.bindings
     }
 
@@ -100,7 +101,7 @@ impl ScopeTree {
         id
     }
 
-    pub(crate) fn bind(&mut self, scope: ScopeId, name: String, symbol: SymbolId) {
+    pub(crate) fn bind(&mut self, scope: ScopeId, name: SmolStr, symbol: SymbolId) {
         self.scopes[scope.0 as usize].bindings.push((name, symbol));
     }
 

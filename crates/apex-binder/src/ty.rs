@@ -12,7 +12,7 @@
 //! represent that once true type inference and generics were added.
 
 use crate::symbol::SymbolId;
-use std::borrow::Cow;
+use smol_str::SmolStr;
 
 /// `System` deliberately covers two distinct "not project-local" cases
 /// under one name, both honestly unable to resolve *members* in v1 (see
@@ -30,28 +30,28 @@ pub(crate) enum Ty {
     /// A project-local class/interface/enum -- exactly what
     /// `Option<SymbolId>` used to be the whole story for.
     Project(SymbolId),
-    /// `Cow`, not a plain `String`: a *literal*'s type (`Ty::for_literal`)
-    /// and every hand-written name in `crate::generics` are always one of
-    /// a handful of `&'static str`s, and literals in particular are by
-    /// far the most common thing `bind_expr` types in a real project --
-    /// `Cow::Borrowed` there costs nothing, keeping `String`'s real
-    /// allocation only for names captured from actual dynamic source
-    /// text (a declared type's own spelling, which isn't known until
-    /// parse time and must be owned). A measured, not guessed, tradeoff:
-    /// the first version of this type used a plain `String` throughout
-    /// and cost a real, consistent ~15-17% slowdown across every
-    /// `apex-binder` benchmark -- every literal in the whole project
-    /// walks through `Ty::for_literal`, so that allocation is squarely
-    /// on the hottest path in the crate.
+    /// `SmolStr`, not a plain `String`: a *literal*'s type
+    /// (`Ty::for_literal`) and every hand-written name in `crate::generics`
+    /// are always one of a handful of short `&'static str`s, and literals
+    /// in particular are by far the most common thing `bind_expr` types in
+    /// a real project -- `SmolStr::new_static` there costs nothing, same
+    /// as the `Cow::Borrowed` this replaced. Unlike `Cow<'static, str>`,
+    /// `SmolStr` *also* keeps names captured from actual dynamic source
+    /// text (a declared type's own spelling, via `Ty::system_owned`)
+    /// allocation-free as long as they fit inline (23 bytes -- true of
+    /// almost every real Apex identifier), which `Cow`'s always-heap
+    /// `Owned` variant structurally couldn't do. A measured, not guessed,
+    /// tradeoff: the first version of this type used a plain `String`
+    /// throughout and cost a real, consistent ~15-17% slowdown across
+    /// every `apex-binder` benchmark -- every literal in the whole project
+    /// walks through `Ty::for_literal`, so that allocation is squarely on
+    /// the hottest path in the crate.
     ///
     /// `args`: `name`'s type arguments, if any (`List<Account>` ->
     /// `args: [Ty::Project(Account)]`). Empty for a non-generic system
     /// type or when the argument itself couldn't be resolved to anything
     /// more specific than a bare name.
-    System {
-        name: Cow<'static, str>,
-        args: Vec<Ty>,
-    },
+    System { name: SmolStr, args: Vec<Ty> },
 }
 
 impl Ty {
@@ -60,7 +60,7 @@ impl Ty {
     /// free, see [`Self::System`]'s doc comment for why that matters.
     pub(crate) fn system(name: &'static str) -> Ty {
         Ty::System {
-            name: Cow::Borrowed(name),
+            name: SmolStr::new_static(name),
             args: Vec::new(),
         }
     }
@@ -70,17 +70,19 @@ impl Ty {
     /// `Set<K>`).
     pub(crate) fn system_with_args(name: &'static str, args: Vec<Ty>) -> Ty {
         Ty::System {
-            name: Cow::Borrowed(name),
+            name: SmolStr::new_static(name),
             args,
         }
     }
 
     /// For a type name captured from real, dynamic source text (a
-    /// declared type's own spelling) -- necessarily owned, since it
-    /// isn't known until parse time.
-    pub(crate) fn system_owned(name: String, args: Vec<Ty>) -> Ty {
+    /// declared type's own spelling) -- accepts a borrowed `&str` (or an
+    /// already-owned `SmolStr`/`String`) directly rather than forcing the
+    /// caller to pre-allocate a `String` first; allocation-free as long as
+    /// `name` fits inline (see [`Self::System`]'s doc comment).
+    pub(crate) fn system_owned(name: impl Into<SmolStr>, args: Vec<Ty>) -> Ty {
         Ty::System {
-            name: Cow::Owned(name),
+            name: name.into(),
             args,
         }
     }

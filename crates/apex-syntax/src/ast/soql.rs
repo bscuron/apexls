@@ -15,6 +15,7 @@ use super::{
 };
 use crate::{ApexLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::ast::{support, AstChildren, AstNode};
+use smol_str::SmolStr;
 
 // A `GROUP BY`/`ORDER BY` element -- both are `fieldName | soqlFunction`
 // per the reference grammar, the same shape, so one dispatch enum
@@ -206,15 +207,32 @@ impl SoqlFieldName {
             .collect()
     }
 
-    /// The dotted path as plain text (`Account.Owner.Name`), built from
-    /// `segments()` rather than `self.syntax().text()` so it can never
-    /// pick up stray trivia.
-    pub fn text(&self) -> String {
-        self.segments()
-            .iter()
-            .map(|t| t.text())
-            .collect::<Vec<_>>()
-            .join(".")
+    /// The dotted path as plain text (`Account.Owner.Name`), built by
+    /// walking tokens directly (not via `segments()`, and not
+    /// `self.syntax().text()`, so it can never pick up stray trivia) so
+    /// the common single-segment case (`Name`, `Amount`, no dots)
+    /// converts straight from the one token's `&str` into a `SmolStr`
+    /// with no intermediate `Vec`/`String`/`join` allocation -- only a
+    /// genuinely dotted relationship path (`Account.Owner.Name`) pays for
+    /// building one.
+    pub fn text(&self) -> SmolStr {
+        let mut tokens = direct_tokens(self.syntax()).filter(|t| t.kind() != SyntaxKind::Dot);
+        let Some(first) = tokens.next() else {
+            return SmolStr::default();
+        };
+        match tokens.next() {
+            None => SmolStr::new(first.text()),
+            Some(second) => {
+                let mut joined = String::from(first.text());
+                joined.push('.');
+                joined.push_str(second.text());
+                for t in tokens {
+                    joined.push('.');
+                    joined.push_str(t.text());
+                }
+                SmolStr::from(joined)
+            }
+        }
     }
 }
 

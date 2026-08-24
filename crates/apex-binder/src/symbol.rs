@@ -10,6 +10,7 @@ use apex_syntax::ast::decl::Modifier;
 use apex_syntax::ast::Type;
 use apex_syntax::SyntaxKind;
 use rowan::TextRange;
+use smol_str::SmolStr;
 
 /// A symbol's identity: which file declared it, plus its position among
 /// that file's own declarations. Deliberately **not** a flat project-wide
@@ -144,7 +145,7 @@ pub struct Symbol {
     /// case-insensitive for lookup purposes (`SymbolTable`'s name maps
     /// are lowercase-keyed), but hover/goto-definition text must show
     /// the real declared spelling.
-    pub name: String,
+    pub name: SmolStr,
     pub file: FileId,
     /// The whole declaration node (`ClassDecl`, `MethodDecl`, ...).
     /// Untyped (`SyntaxPtr`, not `AstPtr<N>`) because `Symbol` is
@@ -174,7 +175,7 @@ pub struct Symbol {
     /// cross-file lookup entirely; `type_ref` itself is kept for callers
     /// that *do* have the right root and want the real `Type` node (e.g.
     /// goto-definition on the type reference itself).
-    pub type_name: Option<String>,
+    pub type_name: Option<SmolStr>,
     /// `type_name`'s own type argument names (`List<Account>` ->
     /// `["Account"]`), cached eagerly for the same cross-file reason as
     /// `type_name` itself -- see `crate::collect`'s `type_ptr_and_name`.
@@ -183,6 +184,6 @@ pub struct Symbol {
     /// captured, matching the only shape Apex generics actually have
     /// (`List`/`Map`/`Set`, never user-defined, never meaningfully
     /// nested more than a project chooses to write by hand).
-    pub type_args: Vec<String>,
+    pub type_args: Vec<SmolStr>,
     pub modifiers: ModifierSet,
 }

@@ -12,12 +12,12 @@
 //! now depends on for its own stability guarantee.
 
 use crate::file_id::FileId;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Default)]
 pub(crate) struct FileTable {
-    ids: HashMap<PathBuf, FileId>,
+    ids: FxHashMap<PathBuf, FileId>,
     next: u32,
 }
 

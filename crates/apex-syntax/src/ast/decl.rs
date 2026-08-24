@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{ApexLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::ast::{support, AstChildren, AstNode};
+use smol_str::SmolStr;
 
 dispatch_enum! {
     TypeDecl {
@@ -371,15 +372,32 @@ impl Type {
     }
 
     /// The dotted path as plain text (`Outer.Inner`), excluding any type
-    /// arguments or array suffix -- built from `base_name_tokens()`
-    /// rather than `self.syntax().text()` so it can't pick up trivia or
-    /// generic-argument text.
-    pub fn text(&self) -> String {
-        self.base_name_tokens()
-            .iter()
-            .map(|t| t.text())
-            .collect::<Vec<_>>()
-            .join(".")
+    /// arguments or array suffix -- walks tokens directly (not via
+    /// `base_name_tokens()`, and not `self.syntax().text()`, so it can't
+    /// pick up trivia or generic-argument text) so the overwhelmingly
+    /// common single-segment case (`Integer`, `Account`, no dots) can
+    /// convert straight from the one token's `&str` into a `SmolStr`
+    /// with no intermediate `Vec`/`String`/`join` allocation at all --
+    /// only a genuinely dotted path (`Outer.Inner`) pays for building one.
+    pub fn text(&self) -> SmolStr {
+        let mut tokens = direct_tokens(self.syntax())
+            .filter(|t| !matches!(t.kind(), SyntaxKind::LBrack | SyntaxKind::RBrack));
+        let Some(first) = tokens.next() else {
+            return SmolStr::default();
+        };
+        match tokens.next() {
+            None => SmolStr::new(first.text()),
+            Some(second) => {
+                let mut joined = String::from(first.text());
+                joined.push('.');
+                joined.push_str(second.text());
+                for t in tokens {
+                    joined.push('.');
+                    joined.push_str(t.text());
+                }
+                SmolStr::from(joined)
+            }
+        }
     }
 
     /// The first segment's `<...>` type arguments, if any. Per the

@@ -18,7 +18,8 @@ use crate::symbol::SymbolId;
 use crate::symbol_table::SymbolTable;
 use apex_discover::Discovery;
 use apex_parser::Parse;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use smol_str::SmolStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -33,7 +34,7 @@ use std::sync::Arc;
 #[derive(Default)]
 pub(crate) struct FileBodies {
     pub(crate) refs: ReferenceTable,
-    pub(crate) scopes: HashMap<SyntaxPtr, ScopeTree>,
+    pub(crate) scopes: FxHashMap<SyntaxPtr, ScopeTree>,
 }
 
 #[derive(Default)]
@@ -53,7 +54,7 @@ pub struct BindCache {
     /// Each path's last-seen `(content, Parse)` -- a parse is reused
     /// as-is whenever a file's content is byte-for-byte identical to
     /// last time, skipping that file's lex/parse entirely.
-    pub(crate) parses: HashMap<PathBuf, (String, Parse)>,
+    pub(crate) parses: FxHashMap<PathBuf, (String, Parse)>,
     /// The project's declared symbols, persisted and patched file-by-file
     /// across calls rather than rebuilt from nothing -- see
     /// `SymbolTable`'s module doc comment.
@@ -65,7 +66,7 @@ pub struct BindCache {
     /// `crate::inherit::resolve_inheritance` together whenever *any*
     /// file's declarations changed (inheritance is inherently whole-
     /// project, not something one file's edit can resolve in isolation).
-    pub(crate) raw_extends: HashMap<FileId, Vec<(SymbolId, Vec<String>)>>,
-    pub(crate) raw_super: HashMap<FileId, Vec<(SymbolId, String)>>,
-    pub(crate) bodies: HashMap<FileId, Arc<FileBodies>>,
+    pub(crate) raw_extends: FxHashMap<FileId, Vec<(SymbolId, Vec<SmolStr>)>>,
+    pub(crate) raw_super: FxHashMap<FileId, Vec<(SymbolId, SmolStr)>>,
+    pub(crate) bodies: FxHashMap<FileId, Arc<FileBodies>>,
 }

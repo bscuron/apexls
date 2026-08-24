@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 apex-discover.workspace = true
 roxmltree = "0.20"
+smol_str = "0.3.6"

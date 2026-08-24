@@ -4,20 +4,21 @@
 //! `crate::soql`/`crate::resolve` goes through this rather than
 //! matching `api_name` fields directly.
 
+use crate::ci_key::{CiKey, CiMap, CiQuery};
 use crate::ptr::SyntaxPtr;
 use crate::reference_table::{ReferenceTable, Resolution};
 use apex_metadata::{FieldSchema, SObjectSchema};
-use std::collections::HashMap;
 use std::path::Path;
 
 pub struct SchemaIndex {
-    objects: HashMap<String, ObjectEntry>,
+    objects: CiMap<ObjectEntry>,
 }
 
 struct ObjectEntry {
     schema: SObjectSchema,
-    /// Lowercase field API name -> index into `schema.fields`.
-    fields: HashMap<String, usize>,
+    /// Field API name -> index into `schema.fields`, case-insensitively
+    /// keyed via [`CiKey`]/[`CiQuery`] the same way `objects` itself is.
+    fields: CiMap<usize>,
 }
 
 impl SchemaIndex {
@@ -45,10 +46,10 @@ impl SchemaIndex {
                     .fields
                     .iter()
                     .enumerate()
-                    .map(|(i, f)| (f.api_name.to_ascii_lowercase(), i))
+                    .map(|(i, f)| (CiKey::from(f.api_name.as_str()), i))
                     .collect();
                 (
-                    schema.api_name.to_ascii_lowercase(),
+                    CiKey::from(schema.api_name.as_str()),
                     ObjectEntry { schema, fields },
                 )
             })
@@ -57,14 +58,12 @@ impl SchemaIndex {
     }
 
     pub fn object(&self, api_name: &str) -> Option<&SObjectSchema> {
-        self.objects
-            .get(&api_name.to_ascii_lowercase())
-            .map(|e| &e.schema)
+        self.objects.get(&CiQuery(api_name)).map(|e| &e.schema)
     }
 
     pub fn field(&self, object_api_name: &str, field_api_name: &str) -> Option<&FieldSchema> {
-        let entry = self.objects.get(&object_api_name.to_ascii_lowercase())?;
-        let idx = *entry.fields.get(&field_api_name.to_ascii_lowercase())?;
+        let entry = self.objects.get(&CiQuery(object_api_name))?;
+        let idx = *entry.fields.get(&CiQuery(field_api_name))?;
         entry.schema.fields.get(idx)
     }
 
@@ -91,12 +90,12 @@ pub(crate) fn resolve_object(
 ) {
     let resolution = if schema.object(name).is_some() {
         Resolution::SchemaObject {
-            object: name.to_string(),
+            object: name.into(),
             field: None,
         }
     } else {
         Resolution::UnknownSchema {
-            object: Some(name.to_string()),
+            object: Some(name.into()),
             field: None,
         }
     };

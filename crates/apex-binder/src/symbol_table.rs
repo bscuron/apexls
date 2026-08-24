@@ -41,14 +41,38 @@
 //! when a file's *declared shape* actually changed, not on every rebuild
 //! (see `BoundProgram::from_files_cached`).
 
+use crate::ci_key::{CiKey, CiMap, CiQuery};
 use crate::file_id::FileId;
 use crate::symbol::{Symbol, SymbolId, Visibility};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
+/// A `members_by_name` lookup query -- `(container, member name)`, the
+/// borrowed-name counterpart to that map's stored `(SymbolId, CiKey)` key.
+/// Can't reuse a bare tuple for this the way [`CiQuery`] alone works for
+/// the single-string maps: `impl hashbrown::Equivalent<..> for (T, CiQuery)`
+/// is rejected by Rust's orphan rule (tuples are always a foreign type,
+/// regardless of what their fields are), so this small local wrapper
+/// exists purely to give the query side a type this crate actually owns.
+struct MemberQuery<'a>(SymbolId, CiQuery<'a>);
+
+impl Hash for MemberQuery<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+        self.1.hash(state);
+    }
+}
+
+impl hashbrown::Equivalent<(SymbolId, CiKey)> for MemberQuery<'_> {
+    fn equivalent(&self, key: &(SymbolId, CiKey)) -> bool {
+        self.0 == key.0 && self.1.equivalent(&key.1)
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 struct Indices {
-    members_of: HashMap<SymbolId, Vec<SymbolId>>,
+    members_of: FxHashMap<SymbolId, Vec<SymbolId>>,
     /// `(container, lowercase member name) -> every member of `container`
     /// with that name`. Exists purely so `lookup_member` -- called once
     /// per name reference anywhere in the program, the single hottest
@@ -60,7 +84,7 @@ struct Indices {
     /// times O(M) lookups, i.e. trend toward O(M^2) in aggregate for
     /// that one class -- exactly the kind of accidental quadratic
     /// behavior a hash-indexed lookup avoids.
-    members_by_name: HashMap<(SymbolId, String), Vec<SymbolId>>,
+    members_by_name: hashbrown::HashMap<(SymbolId, CiKey), Vec<SymbolId>, FxBuildHasher>,
     /// Lowercase declared type name -> its `SymbolId`, project-wide (not
     /// per-file): unlike most languages this binder targets, Apex has no
     /// import/package system -- every top-level class/interface/enum in
@@ -73,28 +97,28 @@ struct Indices {
     /// order, for determinism) rather than trying to detect and report
     /// it -- out of scope for a binder whose job is resolution, not
     /// diagnostics, in v1.
-    top_level: HashMap<String, SymbolId>,
+    top_level: CiMap<SymbolId>,
     /// Lowercase simple name -> every symbol (type or member) with that
     /// name, project-wide. Backs `workspace/symbol`-style lookups and is
     /// the fallback candidate set for reference resolution that can't
     /// narrow further.
-    by_name_ci: HashMap<String, Vec<SymbolId>>,
+    by_name_ci: CiMap<Vec<SymbolId>>,
     /// Populated by Pass 1.5 (`crate::inherit`): each type symbol's own
     /// id followed by every `SymbolId` transitively reachable through
     /// `extends`/`implements`, cycle-guarded. Absent (empty slice) for
     /// non-type symbols and for types Pass 1.5 hasn't processed yet.
-    inherited_chain: HashMap<SymbolId, Vec<SymbolId>>,
+    inherited_chain: FxHashMap<SymbolId, Vec<SymbolId>>,
     /// Populated by Pass 1.5: a class symbol's direct `extends` target
     /// only (never an `implements` target), for `super`/`super(...)`
     /// resolution -- narrower than `inherited_chain`, whose flattened
     /// order doesn't reliably preserve "which ancestor was the direct
     /// base class" once interfaces are mixed in.
-    direct_super: HashMap<SymbolId, SymbolId>,
+    direct_super: FxHashMap<SymbolId, SymbolId>,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct SymbolTable {
-    by_file: HashMap<FileId, Arc<Vec<Symbol>>>,
+    by_file: FxHashMap<FileId, Arc<Vec<Symbol>>>,
     /// Each file's declared-symbol count as of its last [`Self::set_file_symbols`]
     /// call -- i.e. `by_file[file]`'s length *before* any
     /// [`Self::append_file_symbols`] call added that rebind's locals on
@@ -107,7 +131,7 @@ pub struct SymbolTable {
     /// end" from "freshly declared, no locals yet" and would append onto
     /// the previous call's locals instead of replacing them, growing
     /// `by_file[file]` without bound over repeated calls.
-    declared_len: HashMap<FileId, usize>,
+    declared_len: FxHashMap<FileId, usize>,
     indices: Arc<Indices>,
 }
 
@@ -180,17 +204,17 @@ impl SymbolTable {
             };
             for (local, symbol) in symbols.iter().enumerate() {
                 let id = SymbolId::new(file, local as u32);
-                let lower = symbol.name.to_ascii_lowercase();
+                let key = CiKey::from(symbol.name.as_str());
 
-                fresh.by_name_ci.entry(lower.clone()).or_default().push(id);
+                fresh.by_name_ci.entry(key.clone()).or_default().push(id);
                 if symbol.container.is_none() && symbol.kind.is_type() {
-                    fresh.top_level.entry(lower.clone()).or_insert(id);
+                    fresh.top_level.entry(key.clone()).or_insert(id);
                 }
                 if let Some(container) = symbol.container {
                     fresh.members_of.entry(container).or_default().push(id);
                     fresh
                         .members_by_name
-                        .entry((container, lower))
+                        .entry((container, key))
                         .or_default()
                         .push(id);
                 }
@@ -259,16 +283,13 @@ impl SymbolTable {
     }
 
     pub fn top_level(&self, name: &str) -> Option<SymbolId> {
-        self.indices
-            .top_level
-            .get(&name.to_ascii_lowercase())
-            .copied()
+        self.indices.top_level.get(&CiQuery(name)).copied()
     }
 
     pub fn by_name_ci(&self, name: &str) -> &[SymbolId] {
         self.indices
             .by_name_ci
-            .get(&name.to_ascii_lowercase())
+            .get(&CiQuery(name))
             .map_or(&[], |v| v.as_slice())
     }
 
@@ -383,13 +404,16 @@ impl SymbolTable {
     /// level's own overrides are only folded into the shadow set after
     /// that whole level has already been processed.
     pub fn lookup_member(&self, type_id: SymbolId, name: &str) -> Vec<SymbolId> {
-        let lower = name.to_ascii_lowercase();
         let mut found = Vec::new();
-        let mut overridden_arities: HashSet<usize> = HashSet::new();
+        let mut overridden_arities: FxHashSet<usize> = FxHashSet::default();
         for chain_id in
             std::iter::once(type_id).chain(self.inherited_chain(type_id).iter().copied())
         {
-            let Some(members) = self.indices.members_by_name.get(&(chain_id, lower.clone())) else {
+            let Some(members) = self
+                .indices
+                .members_by_name
+                .get(&MemberQuery(chain_id, CiQuery(name)))
+            else {
                 continue;
             };
             let mut newly_overridden = Vec::new();

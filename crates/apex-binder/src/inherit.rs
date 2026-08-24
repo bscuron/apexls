@@ -21,7 +21,8 @@
 use crate::symbol::SymbolId;
 use crate::symbol_table::SymbolTable;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use smol_str::SmolStr;
 
 /// `raw_extends`: for each type symbol that declared at least one
 /// `extends`/`implements` clause, its id plus the unresolved supertype
@@ -29,8 +30,8 @@ use std::collections::{HashMap, HashSet};
 /// arguments/array suffixes are already stripped by `Type::text()`).
 pub(crate) fn resolve_inheritance(
     table: &mut SymbolTable,
-    raw_extends: &[(SymbolId, Vec<String>)],
-    raw_super: &[(SymbolId, String)],
+    raw_extends: &[(SymbolId, Vec<SmolStr>)],
+    raw_super: &[(SymbolId, SmolStr)],
 ) {
     let direct_super: Vec<(SymbolId, SymbolId)> = raw_super
         .par_iter()
@@ -47,7 +48,7 @@ pub(crate) fn resolve_inheritance(
     // is keyed by simple declared name only, v1 doesn't resolve those)
     // is simply dropped: an unresolvable supertype contributes nothing
     // to the chain, it doesn't abort collection.
-    let direct: HashMap<SymbolId, Vec<SymbolId>> = raw_extends
+    let direct: FxHashMap<SymbolId, Vec<SymbolId>> = raw_extends
         .par_iter()
         .map(|(type_id, names)| {
             let resolved = names.iter().filter_map(|n| table.top_level(n)).collect();
@@ -70,8 +71,8 @@ pub(crate) fn resolve_inheritance(
 /// infinite-loop or duplicate an ancestor. Does not include `type_id`
 /// itself -- callers wanting "this type or an ancestor" (like
 /// `SymbolTable::lookup_member`) prepend it themselves.
-fn flatten(direct: &HashMap<SymbolId, Vec<SymbolId>>, type_id: SymbolId) -> Vec<SymbolId> {
-    let mut visited = HashSet::new();
+fn flatten(direct: &FxHashMap<SymbolId, Vec<SymbolId>>, type_id: SymbolId) -> Vec<SymbolId> {
+    let mut visited = FxHashSet::default();
     visited.insert(type_id);
     let mut chain = Vec::new();
     let mut stack: Vec<SymbolId> = direct.get(&type_id).cloned().unwrap_or_default();

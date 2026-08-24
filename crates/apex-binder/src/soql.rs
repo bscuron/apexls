@@ -20,6 +20,7 @@ use apex_syntax::ast::soql::{
     SoqlValue, SoslExpr, SoslFieldSpec,
 };
 use rowan::ast::AstNode;
+use smol_str::SmolStr;
 
 /// A custom relationship name's field-schema-lookup form (`Batch__r` ->
 /// `Batch__c`) -- the common, documented Salesforce convention for
@@ -56,7 +57,7 @@ fn resolve_field_path(
 ) {
     let ptr = SyntaxPtr::new(binder.file, field_name.syntax());
     let segments = field_name.segments();
-    let Some(mut current_object) = object.map(str::to_string) else {
+    let Some(mut current_object) = object.map(SmolStr::new) else {
         binder.refs.set(ptr, Resolution::Unresolved);
         return;
     };
@@ -67,7 +68,7 @@ fn resolve_field_path(
 
     let last = segments.len() - 1;
     for (i, seg) in segments.iter().enumerate() {
-        let seg_text = seg.text().to_string();
+        let seg_text = SmolStr::new(seg.text());
         if i == last {
             let resolution = match binder.schema.field(&current_object, &seg_text) {
                 Some(_) => Resolution::SchemaObject {
@@ -233,7 +234,7 @@ fn bind_type_of(binder: &mut BodyBinder<'_>, type_of: &SoqlTypeOf, object: Optio
     }
 }
 
-fn bind_from_list(binder: &mut BodyBinder<'_>, from: Option<SoqlFromList>) -> Option<String> {
+fn bind_from_list(binder: &mut BodyBinder<'_>, from: Option<SoqlFromList>) -> Option<SmolStr> {
     let from = from?;
     let mut first = None;
     for entry in from.entries() {

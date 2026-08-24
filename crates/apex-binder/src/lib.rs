@@ -32,6 +32,7 @@
 //! (`Resolution::Candidates`/`Unresolved` rather than a guessed single
 //! answer in those cases).
 
+mod ci_key;
 mod collect;
 mod file_id;
 mod file_table;
@@ -65,7 +66,9 @@ use apex_syntax::SyntaxNode;
 use incremental::FileBodies;
 use rayon::prelude::*;
 use rowan::ast::AstNode;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use smol_str::SmolStr;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -89,8 +92,8 @@ use std::sync::Arc;
 /// reasoning applied to `symbols`, and the measured regression that
 /// motivated both.
 pub struct BoundProgram {
-    files: HashMap<FileId, PathBuf>,
-    parses: HashMap<FileId, Parse>,
+    files: FxHashMap<FileId, PathBuf>,
+    parses: FxHashMap<FileId, Parse>,
     pub symbols: SymbolTable,
     /// `Arc`-wrapped for the same reason `symbols`/`bodies` are cheap to
     /// clone into each call's snapshot: `cache.schema` is only ever
@@ -98,7 +101,7 @@ pub struct BoundProgram {
     /// `Self::from_files_cached`), so the common case is a pointer clone,
     /// not re-parsing every SFDX metadata XML file.
     pub schema: Arc<SchemaIndex>,
-    bodies: HashMap<FileId, Arc<FileBodies>>,
+    bodies: FxHashMap<FileId, Arc<FileBodies>>,
 }
 
 /// Rayon lazily builds its global thread pool (default stack size, ~1
@@ -201,7 +204,7 @@ impl BoundProgram {
         let need_fresh_discovery = match &cache.discovery {
             None => true,
             Some(discovery) => {
-                let known: HashSet<&Path> =
+                let known: FxHashSet<&Path> =
                     discovery.apex_files.iter().map(PathBuf::as_path).collect();
                 overrides.keys().any(|p| !known.contains(p.as_path()))
             }
@@ -298,8 +301,8 @@ impl BoundProgram {
         // simply isn't in `parsed`. A removal changes the project-wide
         // namespace just as much as an addition does, so it also forces
         // the conservative "declarations changed" path below.
-        let current_ids: HashSet<FileId> = parsed.iter().map(|p| p.file).collect();
-        let current_paths: HashSet<&Path> = parsed.iter().map(|p| p.path.as_path()).collect();
+        let current_ids: FxHashSet<FileId> = parsed.iter().map(|p| p.file).collect();
+        let current_paths: FxHashSet<&Path> = parsed.iter().map(|p| p.path.as_path()).collect();
 
         let removed: Vec<FileId> = cache
             .table
@@ -365,9 +368,9 @@ impl BoundProgram {
         // doc comment for why skipping this is sound, not just fast).
         if declarations_changed {
             cache.table.rebuild_indices();
-            let all_raw_extends: Vec<(SymbolId, Vec<String>)> =
+            let all_raw_extends: Vec<(SymbolId, Vec<SmolStr>)> =
                 cache.raw_extends.values().flatten().cloned().collect();
-            let all_raw_super: Vec<(SymbolId, String)> =
+            let all_raw_super: Vec<(SymbolId, SmolStr)> =
                 cache.raw_super.values().flatten().cloned().collect();
             inherit::resolve_inheritance(&mut cache.table, &all_raw_extends, &all_raw_super);
         }
@@ -381,21 +384,24 @@ impl BoundProgram {
         // so `SyntaxNode` itself is neither `Send` nor `Sync`) -- each
         // parallel closure below calls `.syntax()` itself to build its
         // own thread-local node from the shared `Parse`.
-        let parse_by_file: HashMap<FileId, &Parse> =
+        let parse_by_file: FxHashMap<FileId, &Parse> =
             parsed.iter().map(|p| (p.file, &p.parse)).collect();
         let files_to_rebind: Vec<FileId> = if declarations_changed {
             current_ids.iter().copied().collect()
         } else {
             parsed.iter().filter(|p| p.dirty).map(|p| p.file).collect()
         };
-        let to_bind: Vec<(FileId, SymbolId, Symbol)> =
+        // Borrows straight from `cache.table` instead of cloning each
+        // `Symbol` -- `bind_symbol_body` only ever needs `&Symbol`, and
+        // `cache.table` isn't mutated again until after `bound` (below) is
+        // fully collected, so there's nothing for an owned copy to buy
+        // here except a String/Vec allocation per symbol, on every rebind.
+        let to_bind: Vec<(FileId, SymbolId, &Symbol)> =
             files_to_rebind
                 .iter()
                 .flat_map(|&file| {
                     cache.table.symbols_of_file(file).iter().enumerate().map(
-                        move |(local, symbol)| {
-                            (file, SymbolId::new(file, local as u32), symbol.clone())
-                        },
+                        move |(local, symbol)| (file, SymbolId::new(file, local as u32), symbol),
                     )
                 })
                 .collect();
@@ -421,7 +427,7 @@ impl BoundProgram {
         // entry even if it produced zero bound bodies (e.g. every method
         // in it was just deleted) -- otherwise a stale fragment from
         // before that edit would silently survive in `cache.bodies`.
-        let mut by_file: HashMap<FileId, Vec<(Option<SyntaxPtr>, resolve::BoundBody)>> =
+        let mut by_file: FxHashMap<FileId, Vec<(Option<SyntaxPtr>, resolve::BoundBody)>> =
             files_to_rebind.iter().map(|&f| (f, Vec::new())).collect();
         for (file, key, body) in bound {
             by_file.entry(file).or_default().push((key, body));
@@ -450,13 +456,13 @@ impl BoundProgram {
         // `bodies` (`Arc`-shared per file) are both cheap here regardless
         // of project size -- an *unaffected* file only costs a pointer
         // clone, not a deep copy of its `Symbol`s/references/scopes.
-        let mut files = HashMap::with_capacity(parsed.len());
-        let mut parses = HashMap::with_capacity(parsed.len());
+        let mut files = FxHashMap::with_capacity_and_hasher(parsed.len(), Default::default());
+        let mut parses = FxHashMap::with_capacity_and_hasher(parsed.len(), Default::default());
         for p in parsed {
             files.insert(p.file, p.path);
             parses.insert(p.file, p.parse);
         }
-        let bodies: HashMap<FileId, Arc<FileBodies>> = current_ids
+        let bodies: FxHashMap<FileId, Arc<FileBodies>> = current_ids
             .iter()
             .filter_map(|&file| cache.bodies.get(&file).map(|fb| (file, Arc::clone(fb))))
             .collect();

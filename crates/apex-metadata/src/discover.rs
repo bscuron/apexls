@@ -52,7 +52,7 @@ pub fn sobjects_from_discovery(found: &apex_discover::Discovery) -> Vec<SObjectS
     objects
         .into_iter()
         .map(|(api_name, (is_custom, fields))| SObjectSchema {
-            api_name,
+            api_name: api_name.into(),
             is_custom,
             fields,
         })

@@ -4,7 +4,8 @@
 
 use crate::ptr::SyntaxPtr;
 use crate::symbol::SymbolId;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use smol_str::SmolStr;
 
 /// What a reference (an unqualified name, a `.member` access, a SOQL
 /// object/field path segment, ...) resolved to. Deliberately more than
@@ -30,12 +31,12 @@ pub enum Resolution {
     Resolved(SymbolId),
     Candidates(Vec<SymbolId>),
     SchemaObject {
-        object: String,
-        field: Option<String>,
+        object: SmolStr,
+        field: Option<SmolStr>,
     },
     UnknownSchema {
-        object: Option<String>,
-        field: Option<String>,
+        object: Option<SmolStr>,
+        field: Option<SmolStr>,
     },
     Unresolved,
 }
@@ -58,7 +59,7 @@ impl Resolution {
 
 #[derive(Debug, Default, Clone)]
 pub struct ReferenceTable {
-    resolutions: HashMap<SyntaxPtr, Resolution>,
+    resolutions: FxHashMap<SyntaxPtr, Resolution>,
 }
 
 impl ReferenceTable {

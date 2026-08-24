@@ -30,6 +30,8 @@ mod xml;
 
 pub use discover::{discover_sobjects, sobjects_from_discovery};
 
+use smol_str::SmolStr;
+
 /// One SObject's schema, as reconstructed from local repo metadata only
 /// -- see the module doc comment for the standard-object gap this
 /// implies.
@@ -38,7 +40,7 @@ pub struct SObjectSchema {
     /// The object's API name, e.g. `Contact` or `My_Object__c` -- taken
     /// from the containing `objects/<ApiName>/` directory name, since
     /// `.object-meta.xml` never repeats it in its own content.
-    pub api_name: String,
+    pub api_name: SmolStr,
     /// Whether this object has its own `<ApiName>.object-meta.xml` (a
     /// *declared* custom object), as opposed to only appearing here
     /// because custom fields were added to a standard object.
@@ -50,7 +52,7 @@ pub struct SObjectSchema {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldSchema {
     /// The field's API name (`<fullName>`), e.g. `My_Field__c`.
-    pub api_name: String,
+    pub api_name: SmolStr,
     /// The raw `<type>` element text (`Lookup`, `Checkbox`, `Picklist`,
     /// ...), or `None` on the handful of custom-field shapes that omit
     /// it. Kept as an owned string rather than a closed enum so a
@@ -58,12 +60,12 @@ pub struct FieldSchema {
     /// forward-compatible "just a string" rather than a parse failure --
     /// converting to a closed enum, if a consumer wants one, is a
     /// lossless operation layered on top of this.
-    pub field_type: Option<String>,
+    pub field_type: Option<SmolStr>,
     /// The target object(s) of a `Lookup`/`MasterDetail` field -- more
     /// than one only for a polymorphic lookup (e.g. `Task.WhoId`, which
     /// itself is a standard field and so never appears here, but custom
     /// polymorphic lookups follow the same shape).
-    pub reference_to: Vec<String>,
+    pub reference_to: Vec<SmolStr>,
 }
 
 #[cfg(test)]
@@ -120,7 +122,10 @@ mod tests {
         assert_eq!(account.fields.len(), 1);
         assert_eq!(account.fields[0].api_name, "Batch__c");
         assert_eq!(account.fields[0].field_type.as_deref(), Some("Lookup"));
-        assert_eq!(account.fields[0].reference_to, vec!["Batch__c".to_string()]);
+        assert_eq!(
+            account.fields[0].reference_to,
+            vec![SmolStr::new("Batch__c")]
+        );
 
         let my_object = &objects[1];
         assert_eq!(my_object.api_name, "My_Object__c");

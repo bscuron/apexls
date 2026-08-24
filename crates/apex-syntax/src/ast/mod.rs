@@ -9,6 +9,7 @@
 
 use crate::{ApexLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::ast::AstNode;
+use smol_str::SmolStr;
 
 pub mod decl;
 pub mod expr;
@@ -103,8 +104,8 @@ impl Name {
         first_non_trivia_token(self.syntax())
     }
 
-    pub fn text(&self) -> Option<String> {
-        self.token().map(|t| t.text().to_string())
+    pub fn text(&self) -> Option<SmolStr> {
+        self.token().map(|t| SmolStr::new(t.text()))
     }
 }
 

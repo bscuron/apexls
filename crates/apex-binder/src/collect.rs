@@ -25,6 +25,7 @@ use apex_syntax::ast::decl::{
 };
 use apex_syntax::ast::Type;
 use rowan::ast::AstNode;
+use smol_str::SmolStr;
 
 /// One file's collected declarations, already carrying final, stable
 /// `SymbolId`s (see the module doc comment).
@@ -35,7 +36,7 @@ pub(crate) struct FileCollection {
     /// names as written)`, consumed by Pass 1.5 (`crate::inherit`) once
     /// every file's symbols have been merged into one project-wide
     /// `SymbolTable`, to build the member-lookup `inherited_chain`.
-    pub(crate) raw_extends: Vec<(SymbolId, Vec<String>)>,
+    pub(crate) raw_extends: Vec<(SymbolId, Vec<SmolStr>)>,
     /// `(a *class* symbol's id, its direct `extends` target's unresolved
     /// name)`, present only when that class actually declared `extends`
     /// -- narrower than `raw_extends` (which also folds in
@@ -43,7 +44,7 @@ pub(crate) struct FileCollection {
     /// exactly "the one direct base class," not the whole flattened
     /// member-lookup chain (whose internal ordering doesn't preserve
     /// "which one was `extends`" once interfaces are mixed in).
-    pub(crate) raw_super: Vec<(SymbolId, String)>,
+    pub(crate) raw_super: Vec<(SymbolId, SmolStr)>,
 }
 
 impl FileCollection {
@@ -70,7 +71,7 @@ impl FileCollection {
 fn type_ptr_and_name(
     file: FileId,
     ty: Option<Type>,
-) -> (Option<AstPtr<Type>>, Option<String>, Vec<String>) {
+) -> (Option<AstPtr<Type>>, Option<SmolStr>, Vec<SmolStr>) {
     match ty {
         Some(ty) => {
             let args = ty
@@ -216,7 +217,7 @@ fn collect_interface(
     );
 
     if let Some(extends) = iface.extends() {
-        let supertypes: Vec<String> = extends.types().map(|t| t.text()).collect();
+        let supertypes: Vec<SmolStr> = extends.types().map(|t| t.text()).collect();
         if !supertypes.is_empty() {
             out.raw_extends.push((iface_id, supertypes));
         }

@@ -6,18 +6,19 @@
 //! another child here, not touching the walk or discovery logic.
 
 use crate::FieldSchema;
+use smol_str::SmolStr;
 
 pub(crate) fn parse_field_meta(xml: &str) -> Option<FieldSchema> {
     let doc = roxmltree::Document::parse(xml).ok()?;
     let root = doc.root_element();
 
-    let api_name = child_text(root, "fullName")?.to_string();
-    let field_type = child_text(root, "type").map(str::to_string);
+    let api_name = SmolStr::new(child_text(root, "fullName")?);
+    let field_type = child_text(root, "type").map(SmolStr::new);
     let reference_to = root
         .children()
         .filter(|n| n.is_element() && n.tag_name().name() == "referenceTo")
         .filter_map(|n| n.text())
-        .map(str::to_string)
+        .map(SmolStr::new)
         .collect();
 
     Some(FieldSchema {
@@ -51,7 +52,7 @@ mod tests {
         let field = parse_field_meta(xml).unwrap();
         assert_eq!(field.api_name, "Batch__c");
         assert_eq!(field.field_type.as_deref(), Some("Lookup"));
-        assert_eq!(field.reference_to, vec!["Batch__c".to_string()]);
+        assert_eq!(field.reference_to, vec![SmolStr::new("Batch__c")]);
     }
 
     #[test]

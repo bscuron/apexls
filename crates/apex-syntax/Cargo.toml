@@ -13,3 +13,4 @@ num_enum = "0.7.6"
 # O(1)-clone, structurally-shared immutable trees, a natural fit for a
 # language server reparsing on every keystroke.
 rowan = "0.17.0"
+smol_str = "0.3.6"
