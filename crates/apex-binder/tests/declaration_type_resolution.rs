@@ -620,3 +620,75 @@ fn a_custom_sobject_field_accessed_via_dot_notation_resolves() {
         "this.dataImport.Status__c should resolve against the schema, not fall to Unresolved"
     );
 }
+
+/// The `SObjectType.Field` token form (`DataImport__c.Elevate_Payment_Status__c`,
+/// most often passed straight to `String.valueOf(...)` to get a field's
+/// API name) -- a *bare* SObject name used directly as an expression,
+/// not preceded by `this.`/a variable. `bind_name_expr`'s final
+/// fallback only ever checked `SymbolTable::top_level` (project-local
+/// types); `resolve_type_ref` already had the equivalent
+/// `SchemaIndex::object` fallback for a *type* reference, but the
+/// *expression* path never got it. Without it, `DataImport__c` itself
+/// never resolved, so the field chained off it never got a target type
+/// to resolve against either -- both the object and every field on it
+/// failed together.
+#[test]
+fn a_bare_sobject_type_token_and_its_field_both_resolve() {
+    let dir = write_fixture_dir(
+        "sobject-field-token",
+        &[
+            (
+                "Foo.cls",
+                "public class Foo {\n    private List<String> elevateFields() {\n        List<String> names = new List<String>{\n            String.valueOf(DataImport__c.Elevate_Payment_Status__c)\n        };\n        return names;\n    }\n}\n",
+            ),
+            (
+                "objects/DataImport__c/DataImport__c.object-meta.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomObject xmlns=\"http://soap.sforce.com/2006/04/metadata\"><label>Data Import</label></CustomObject>",
+            ),
+            (
+                "objects/DataImport__c/fields/Elevate_Payment_Status__c.field-meta.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomField xmlns=\"http://soap.sforce.com/2006/04/metadata\"><fullName>Elevate_Payment_Status__c</fullName><type>Picklist</type></CustomField>",
+            ),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let root = program.syntax(file);
+
+    let object_offset = root
+        .descendants()
+        .filter_map(apex_syntax::ast::expr::NameExpr::cast)
+        .find(|n| n.name_token().is_some_and(|t| t.text() == "DataImport__c"))
+        .map(|n| n.syntax().text_range().start() + rowan::TextSize::from(1))
+        .expect("expected a DataImport__c NameExpr");
+    assert_eq!(
+        program.resolution_at(file, object_offset).cloned(),
+        Some(Resolution::SchemaObject(Box::new(
+            apex_binder::SchemaObjectRef {
+                object: "DataImport__c".into(),
+                field: None,
+            }
+        ))),
+        "the bare SObject type name itself should resolve"
+    );
+
+    let chain_range = root
+        .descendants()
+        .filter_map(apex_syntax::ast::expr::FieldExpr::cast)
+        .map(|f| f.syntax().text_range())
+        .max_by_key(|r| r.len())
+        .expect("expected at least one FieldExpr");
+    let field_offset = chain_range.end() - rowan::TextSize::from(1);
+    assert_eq!(
+        program.resolution_at(file, field_offset).cloned(),
+        Some(Resolution::SchemaObject(Box::new(
+            apex_binder::SchemaObjectRef {
+                object: "DataImport__c".into(),
+                field: Some("Elevate_Payment_Status__c".into()),
+            }
+        ))),
+        "the field chained off the bare SObject type should also resolve"
+    );
+}

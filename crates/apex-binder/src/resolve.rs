@@ -1023,6 +1023,26 @@ impl<'a> BodyBinder<'a> {
             self.refs.set(ptr, Resolution::Resolved(type_id));
             return Some(Ty::Project(type_id));
         }
+        // Or an SObject used as the receiver of the `Type.Field` token
+        // form (`DataImport__c.Status__c`, most often passed straight to
+        // `String.valueOf(...)` for the field's API name) -- the same
+        // schema fallback `resolve_type_ref` already has for a *type*
+        // reference, missing here for the *expression* one. Without
+        // this, `DataImport__c` itself never resolved, so the
+        // `FieldExpr` chained off it (`bind_field_expr`'s own `Ty::System`
+        // fallback) never got a target type to resolve the field
+        // against either -- both the object and every field on it
+        // failed together, not independently.
+        if self.schema.object(name).is_some() {
+            self.refs.set(
+                ptr,
+                Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                    object: SmolStr::new(name),
+                    field: None,
+                })),
+            );
+            return Some(Ty::system_owned(SmolStr::new(name), Vec::new()));
+        }
 
         self.refs.set(ptr, Resolution::Unresolved);
         None
