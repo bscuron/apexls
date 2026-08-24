@@ -36,6 +36,7 @@ mod input;
 mod parser;
 
 pub use errors::{Parse, ParseError};
+pub use apex_syntax::NodeCache;
 
 use input::Input;
 use parser::Parser;
@@ -59,7 +60,8 @@ pub const RECOMMENDED_MIN_STACK_SIZE: usize = 64 * 1024 * 1024;
 /// one expression" should check `Parse::errors` is empty and that the
 /// tree's text covers all of `src`.
 pub fn parse_expression(src: &str) -> Parse {
-    parse_with(src, apex_syntax::SyntaxKind::ExprRoot, |p| {
+    let mut cache = NodeCache::default();
+    parse_with(src, apex_syntax::SyntaxKind::ExprRoot, &mut cache, |p| {
         grammar::expressions::expr(p);
     })
 }
@@ -68,14 +70,16 @@ pub fn parse_expression(src: &str) -> Parse {
 /// `grammar::statements`, including the six DML statements, `switch on`,
 /// and `System.runAs`).
 pub fn parse_statement(src: &str) -> Parse {
-    parse_with(src, apex_syntax::SyntaxKind::StmtRoot, |p| {
+    let mut cache = NodeCache::default();
+    parse_with(src, apex_syntax::SyntaxKind::StmtRoot, &mut cache, |p| {
         grammar::statements::statement(p);
     })
 }
 
 /// Parse `src` as a brace-delimited block (`{ stmt* }`).
 pub fn parse_block(src: &str) -> Parse {
-    parse_with(src, apex_syntax::SyntaxKind::BlockRoot, |p| {
+    let mut cache = NodeCache::default();
+    parse_with(src, apex_syntax::SyntaxKind::BlockRoot, &mut cache, |p| {
         grammar::statements::block(p);
     })
 }
@@ -84,32 +88,72 @@ pub fn parse_block(src: &str) -> Parse {
 /// interface | enum)` declaration, EOF (Phase 3).
 #[hotpath::measure]
 pub fn parse_compilation_unit(src: &str) -> Parse {
-    parse_root(src, grammar::declarations::compilation_unit)
+    let mut cache = NodeCache::default();
+    parse_compilation_unit_with_cache(src, &mut cache)
 }
 
 /// Parse `src` as a whole `.trigger` file: `trigger Name on Object
 /// (before insert, ...) { ... }` (Phase 3).
 #[hotpath::measure]
 pub fn parse_trigger_unit(src: &str) -> Parse {
-    parse_root(src, grammar::declarations::trigger_unit)
+    let mut cache = NodeCache::default();
+    parse_trigger_unit_with_cache(src, &mut cache)
+}
+
+/// Like [`parse_compilation_unit`], but interns the resulting tree's
+/// nodes/tokens into a caller-supplied [`NodeCache`] instead of a fresh,
+/// throwaway one. A `NodeCache` lets rowan structurally share identical
+/// green nodes/tokens (built once, reused via `Arc` clone) rather than
+/// allocating a fresh copy every time the same text/shape recurs -- e.g. a
+/// `public` keyword token, a `;` separator, or a single-child wrapper node
+/// each currently allocate anew for every occurrence within one parse.
+/// Within a single file that already saves relatively little (each token
+/// still occurs at most as many times as the file repeats it), but a
+/// caller parsing a whole *project* full of files one `Parse` at a time
+/// (`apex-binder`'s cold bind) shares essentially the whole keyword/
+/// punctuation vocabulary and plenty of small recurring node shapes
+/// *across* files instead of paying for them again per file -- measured
+/// as the single largest contributor to `apexls-server`'s steady-state
+/// memory (see `crates/apex-binder/examples/mem_profile.rs` and
+/// `BACKLOG.md`). Safe to reuse a `NodeCache` indefinitely (nothing about
+/// it depends on which files fed it), but this project deliberately scopes
+/// reuse to one bind batch (see `apex-binder`'s Stage 1a) rather than a
+/// whole editor session, so the cache's own footprint stays bounded by
+/// "however much of the project's vocabulary got parsed this batch"
+/// instead of growing across however many edits a session accumulates.
+#[hotpath::measure]
+pub fn parse_compilation_unit_with_cache(src: &str, cache: &mut NodeCache) -> Parse {
+    parse_root(src, cache, grammar::declarations::compilation_unit)
+}
+
+/// Like [`parse_trigger_unit`], but shares `cache` -- see
+/// [`parse_compilation_unit_with_cache`]'s doc comment.
+#[hotpath::measure]
+pub fn parse_trigger_unit_with_cache(src: &str, cache: &mut NodeCache) -> Parse {
+    parse_root(src, cache, grammar::declarations::trigger_unit)
 }
 
 /// Like `parse_with`, but for entry points whose grammar function always
 /// produces a real node (never `Option::None`) and opens/completes its
 /// *own* root marker as the very first parser action -- no extra
 /// generic-root wrapping needed on top.
-fn parse_root(src: &str, f: impl FnOnce(&mut Parser<'_>) -> parser::CompletedMarker) -> Parse {
+fn parse_root(
+    src: &str,
+    cache: &mut NodeCache,
+    f: impl FnOnce(&mut Parser<'_>) -> parser::CompletedMarker,
+) -> Parse {
     let input = Input::new(src);
     let mut p = Parser::new(&input);
     f(&mut p);
     let (events, errors) = p.finish();
-    let green = event::build(src, &input, events);
+    let green = event::build(src, &input, events, cache);
     Parse { green, errors }
 }
 
 fn parse_with(
     src: &str,
     root_kind: apex_syntax::SyntaxKind,
+    cache: &mut NodeCache,
     f: impl FnOnce(&mut Parser<'_>),
 ) -> Parse {
     let input = Input::new(src);
@@ -118,7 +162,7 @@ fn parse_with(
     f(&mut p);
     m.complete(&mut p, root_kind);
     let (events, errors) = p.finish();
-    let green = event::build(src, &input, events);
+    let green = event::build(src, &input, events, cache);
     Parse { green, errors }
 }
 
@@ -143,7 +187,8 @@ mod tests {
         let (events, errors) = p.finish();
         assert!(errors.is_empty());
 
-        let green = event::build(src, &input, events);
+        let mut cache = NodeCache::default();
+        let green = event::build(src, &input, events, &mut cache);
         let parse = Parse {
             green,
             errors: Vec::new(),
@@ -183,7 +228,8 @@ mod tests {
         let (events, errors) = p.finish();
         assert!(errors.is_empty());
 
-        let green = event::build(src, &input, events);
+        let mut cache = NodeCache::default();
+        let green = event::build(src, &input, events, &mut cache);
         let parse = Parse {
             green,
             errors: Vec::new(),

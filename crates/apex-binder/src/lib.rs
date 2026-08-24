@@ -254,10 +254,35 @@ impl BoundProgram {
             freshness: Freshness,
             parse: Parse,
         }
-        let parsed: Vec<ParsedFile> = hotpath::measure_block!("stage_1a_read_and_parse", {
-            candidates
-                .into_par_iter()
-                .filter_map(|(path, file)| {
+        // Every file `rayon` groups into the same fold segment (its own
+        // adaptive work-stealing split, not a fixed size this crate
+        // picks) shares one `NodeCache` instead of each file getting its
+        // own, empty one: `apex_parser::parse_compilation_unit_with_cache`'s
+        // doc comment explains why that matters (identical keyword/
+        // punctuation/small-node text across files interns into one
+        // `Arc`-shared allocation instead of a fresh one per file --
+        // measured as a real, if modest, share of steady-state memory,
+        // see `crates/apex-binder/examples/mem_profile.rs` and
+        // `BACKLOG.md`). `fold` (not a hand-chosen chunk size fed through
+        // `.chunks()`) is what makes this scale to any machine rather
+        // than one tuned to a specific core count: a first attempt
+        // pre-partitioned `candidates` into fixed 64-item chunks via
+        // `.chunks(64).flat_map(...)`, which pays for materializing a
+        // `Vec` per chunk *and* a `Vec` of per-chunk results before
+        // flattening -- fine for the memory-dominated cold-project case,
+        // but that fixed per-call overhead regressed the far more latency-
+        // sensitive warm single-file-edit rebind by ~47% (measured via
+        // `cargo bench -p apex-binder`), since nearly all of its ~1044
+        // candidates never parse at all (a cache/stat hit) and pay pure
+        // grouping overhead for no benefit. `fold`'s accumulator
+        // (`(NodeCache, Vec<ParsedFile>)`, built up in place per segment)
+        // has no such fixed cost -- confirmed via the same benchmark to
+        // leave warm-rebind's timing within its usual run-to-run noise.
+        // The `NodeCache` in a fold segment is discarded when that
+        // segment's accumulator is consumed by `flat_map` below, so
+        // (same as the rejected chunking approach) nothing about it can
+        // grow unbounded across an editing session.
+        let parse_one = |path: PathBuf, file: FileId, node_cache: &mut apex_parser::NodeCache| -> Option<ParsedFile> {
                     let trigger = path
                         .extension()
                         .and_then(|e| e.to_str())
@@ -290,9 +315,9 @@ impl BoundProgram {
                             }
                         }
                         let parse = if trigger {
-                            apex_parser::parse_trigger_unit(content)
+                            apex_parser::parse_trigger_unit_with_cache(content, node_cache)
                         } else {
-                            apex_parser::parse_compilation_unit(content)
+                            apex_parser::parse_compilation_unit_with_cache(content, node_cache)
                         };
                         return Some(ParsedFile {
                             path,
@@ -332,9 +357,9 @@ impl BoundProgram {
                     }
                     let content = std::fs::read_to_string(&path).ok()?;
                     let parse = if trigger {
-                        apex_parser::parse_trigger_unit(&content)
+                        apex_parser::parse_trigger_unit_with_cache(&content, node_cache)
                     } else {
-                        apex_parser::parse_compilation_unit(&content)
+                        apex_parser::parse_compilation_unit_with_cache(&content, node_cache)
                     };
                     // `metadata().modified()` failing at all is rare and
                     // platform-dependent -- fall back to a content hash so
@@ -351,7 +376,34 @@ impl BoundProgram {
                         freshness,
                         parse,
                     })
-                })
+        };
+        let parsed: Vec<ParsedFile> = hotpath::measure_block!("stage_1a_read_and_parse", {
+            candidates
+                .into_par_iter()
+                // `rayon`'s default adaptive splitting favors near-perfect
+                // load balance over grouping -- left alone, it split this
+                // source finely enough that `fold`'s segments barely
+                // grouped any files together at all (measured: almost no
+                // memory win over no sharing whatsoever). `with_min_len`
+                // is a workload property, not a machine-specific tuning
+                // knob: it just says "don't bother splitting a group of
+                // candidates smaller than this," and `rayon` still freely
+                // decides *how many* such groups to make (as many as it
+                // wants, capped by however many threads/cores the running
+                // machine actually has) -- unlike a fixed chunk count or
+                // count derived from `rayon::current_num_threads()`, nothing
+                // here is tuned to any particular machine.
+                .with_min_len(64)
+                .fold(
+                    || (apex_parser::NodeCache::default(), Vec::new()),
+                    |(mut node_cache, mut out), (path, file)| {
+                        if let Some(parsed_file) = parse_one(path, file, &mut node_cache) {
+                            out.push(parsed_file);
+                        }
+                        (node_cache, out)
+                    },
+                )
+                .flat_map(|(_, files)| files)
                 .collect()
         });
 

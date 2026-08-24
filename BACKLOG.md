@@ -392,6 +392,85 @@ below could be measured against something real instead of guessed at.
           `BoundProgram` snapshots share data with `BindCache` across
           calls (rejected this round as described in #1), not a
           same-shaped incremental tweak.
+- [x] **Actually run `examples/mem_profile.rs` (it existed but its output
+      was never recorded here) and act on what it found.** `dhat`-profiled
+      `apexls-server`'s real steady-state shape (`BindCache` and a
+      `BoundProgram` snapshot both alive at once, over the real NPSP
+      corpus): **134.7 MB retained across 1,047,791 live heap blocks.**
+      Ranking `dhat`'s allocation sites by size, rowan's green-tree node/
+      token interning dominated everything else -- roughly 90 MB and
+      ~750,000 of those blocks, about two-thirds of retained memory.
+      Root cause: `crates/apex-parser/src/event.rs` called
+      `GreenNodeBuilder::new()` -- a **fresh, empty `rowan::NodeCache`
+      per file**. A `NodeCache` is rowan's structural-sharing interner:
+      an identical node/token (a `public` keyword, a `;`, a small
+      wrapper node, ...) built twice becomes one `Arc`-shared allocation
+      reused via clone, *if* both builds go through the same cache. With
+      1,044 independent caches (one per file), that sharing only ever
+      happened within one file, never across the project's shared
+      keyword/punctuation/short-identifier vocabulary.
+      **Fix**: `apex_parser::parse_compilation_unit_with_cache`/
+      `parse_trigger_unit_with_cache` (new, alongside the original no-
+      cache entry points, which now just delegate through a throwaway
+      cache -- every existing caller is unaffected) let a caller thread a
+      shared `rowan::NodeCache` (re-exported as `apex_syntax`/
+      `apex_parser::NodeCache`) through many parses.
+      `BoundProgram::from_files_cached`'s Stage 1a now shares one
+      `NodeCache` across every file `rayon` groups into the same `fold`
+      segment, rather than one per file.
+      **Two honest false starts before landing on `fold`, both measured
+      via `cargo bench -p apex-binder`, not guessed:**
+      1. First attempt pre-partitioned `candidates` into fixed 64-item
+         chunks via `.chunks(64).flat_map(...)`, each chunk building its
+         own `NodeCache`. Memory win was real (134.7 MB/1,047,791 blocks
+         -> 127.9 MB/908,240 blocks), but `.chunks()` pays for
+         materializing a `Vec` per chunk *and* a `Vec` of per-chunk
+         results before flattening -- a fixed per-call cost that doesn't
+         care how much actual parsing happens inside it. Fine for a cold,
+         1,044-file build; **regressed the far more latency-sensitive
+         warm single-file-edit rebind by ~47%** (measured, not
+         estimated), since nearly all ~1,044 candidates on a warm rebind
+         never parse at all (a cache/stat hit) and paid pure grouping
+         overhead for zero benefit.
+      2. Second attempt replaced the fixed chunk size with `rayon`'s
+         `fold` (accumulate `(NodeCache, Vec<ParsedFile>)` per adaptively-
+         sized segment, no pre-partitioning `Vec` needed) -- but with no
+         other hint, `rayon`'s default splitting for a plain `Vec` source
+         favors near-perfect load balance over grouping, and split so
+         finely that almost no cross-file sharing happened at all
+         (measured: memory barely moved from the no-sharing baseline).
+      3. **What actually worked**: `fold`, plus `.with_min_len(64)` so
+         `rayon`'s adaptive splitter won't create a segment smaller than
+         64 candidates (it can still make segments larger, or split
+         differently, entirely at its own discretion -- this only sets a
+         floor). Deliberately *not* a chunk count or size derived from
+         `rayon::current_num_threads()`/core count: `with_min_len`'s `64`
+         describes "how many files need to share a cache for the
+         interning to pay off," a property of the workload, not of
+         however many cores happen to be on whichever machine runs this
+         -- `rayon` still freely decides how many such groups to make,
+         scaled to however many threads actually exist.
+      **Final measured result** (`examples/mem_profile.rs`, `cargo bench
+      -p apex-binder`, each run repeated to separate real signal from
+      this machine's already-documented run-to-run noise): retained
+      memory **134.7 MB/1,047,791 blocks -> 128.1 MB/912,193 blocks**
+      (-4.9% bytes, -12.9% blocks), with cold-bind (~355-370ms) and warm-
+      rebind (~5.7-6.1ms) wall time both unchanged within noise -- a real
+      but modest win, well short of the ~90 MB the raw green-tree
+      allocation total first suggested, because most of that total was
+      already being deduplicated *within* each file by its own (still
+      per-file-at-minimum) cache; only the slice of it that's genuinely
+      shared *across* files (common keyword/punctuation/short-node
+      vocabulary) was ever recoverable this way. Smaller, lower-priority
+      findings from the same profiling pass, not yet acted on:
+      `ReferenceTable::map_ids_into` (`reference_table.rs`) pre-sizes
+      `target.resolutions` before its merge loop but not
+      `target.by_symbol`, which grows from empty via repeated rehashes;
+      `SymbolTable::rebuild_indices`'s derived-index maps
+      (`members_by_name`/`by_name_ci`/`members_of`) have the same
+      grow-from-empty pattern; `apex_lexer::tokenize`'s `Vec<Token>`
+      isn't pre-sized from the source length. Each is a few MB, not the
+      dominant cost this item targeted.
 
 ## 3. Feature surface
 

@@ -21,7 +21,7 @@
 
 use crate::input::Input;
 use apex_lexer::{Token, TokenKind};
-use apex_syntax::{GreenNode, GreenNodeBuilder, SyntaxKind};
+use apex_syntax::{GreenNode, GreenNodeBuilder, NodeCache, SyntaxKind};
 
 pub(crate) enum Event {
     /// Placeholder until the matching `Marker` is completed, at which
@@ -35,9 +35,14 @@ pub(crate) enum Event {
     Token,
 }
 
-pub(crate) fn build(src: &str, input: &Input, events: Vec<Event>) -> GreenNode {
+/// Replays `events` into a green tree, interning nodes/tokens through
+/// `cache` rather than a fresh, throwaway one -- see
+/// `apex_parser::parse_compilation_unit_with_cache`'s doc comment for why
+/// a caller building many trees (e.g. `apex-binder`'s project-wide bind)
+/// wants to share one `NodeCache` across them.
+pub(crate) fn build(src: &str, input: &Input, events: Vec<Event>, cache: &mut NodeCache) -> GreenNode {
     let raw = &input.raw;
-    let mut builder = GreenNodeBuilder::new();
+    let mut builder = GreenNodeBuilder::with_cache(cache);
     let mut pos = 0usize;
     let last = events.len().saturating_sub(1);
 

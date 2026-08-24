@@ -15,6 +15,7 @@ pub type SyntaxNodeChildren = rowan::SyntaxNodeChildren<ApexLanguage>;
 pub type SyntaxElementChildren = rowan::SyntaxElementChildren<ApexLanguage>;
 pub type GreenNode = rowan::GreenNode;
 pub type GreenNodeBuilder<'a> = rowan::GreenNodeBuilder<'a>;
+pub type NodeCache = rowan::NodeCache;
 
 pub use rowan::ast::AstNode;
 pub use rowan::NodeOrToken;
