@@ -57,7 +57,10 @@
 //! for that is inconsistent across editors. Closes the "a file added/
 //! removed on disk but never opened in the editor isn't picked up" gap
 //! `apex_binder::BoundProgram::from_files_cached`'s own doc comment
-//! otherwise accepts as an honest limit.
+//! otherwise accepts as an honest limit. Registration is `spawn_blocking`ed
+//! from `initialized` rather than run synchronously in `initialize` --
+//! measured at ~330ms against the real NPSP corpus, which used to sit
+//! directly in `initialize`'s own response path.
 
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -123,14 +126,6 @@ struct Backend {
     /// standard-library-stub toggle, no metadata-root override) --
     /// see `BACKLOG.md` §4 for what those settings will eventually be.
     config: Option<serde_json::Value>,
-    /// Kept alive only so the watch stays active -- `Debouncer` stops
-    /// watching on drop. `None` until `initialize` resolves a real
-    /// `self.root` to watch, and permanently `None` in single-file mode
-    /// or if the watcher failed to start (a missing/unreadable root, or
-    /// the platform's watch API erroring -- logged, not fatal, since
-    /// `apexls` still works without it via document-sync-triggered
-    /// rebuilds alone, just without picking up out-of-band disk changes).
-    watcher: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
     /// The current `apex-binder` bind, rebuilt in the background (see
     /// `Backend::schedule_rebuild`) after `initialized` and every
     /// document-sync notification. Every edit schedules a rebuild, but
@@ -161,11 +156,33 @@ struct Backend {
 /// a rebuild the watcher triggers still needs to know which files are
 /// open, unsaved buffers so their in-memory content keeps overriding
 /// on-disk content, exactly as a document-sync-triggered rebuild does.
+/// `watcher` lives here too, not on `Backend`, for a related but
+/// different reason: registering the actual OS-level recursive watch
+/// (`Debouncer::watch`) is itself slow on a real project (measured
+/// ~330ms against the real NPSP corpus, ~1044 files) and runs on a
+/// `spawn_blocking` task kicked off from `initialized` rather than
+/// synchronously in `initialize`, so it can't be written back through
+/// `&mut self` -- see `Backend::start_watcher`'s doc comment.
 #[derive(Default)]
 struct BindState {
     program: RwLock<Option<BoundProgram>>,
     cache: Mutex<BindCache>,
     documents: Mutex<HashMap<Url, String>>,
+    /// Kept alive only so the watch stays active -- `Debouncer` stops
+    /// watching on drop. `None` until `Backend::start_watcher`'s
+    /// `spawn_blocking` task finishes registering it, and permanently
+    /// `None` in single-file mode or if the watcher failed to start (a
+    /// missing/unreadable root, or the platform's watch API erroring --
+    /// logged, not fatal, since `apexls` still works without it via
+    /// document-sync-triggered rebuilds alone, just without picking up
+    /// out-of-band disk changes). Honest race window: a file added/
+    /// removed purely on disk between `initialized` firing and this
+    /// finishing registration (real but brief -- ~330ms on the real NPSP
+    /// corpus, likely far less on a smaller project) won't be caught
+    /// until some *other* trigger (an edit, a later out-of-band change
+    /// once the watch is live) causes a rebuild -- strictly better than
+    /// before this feature existed, when that window was unbounded.
+    watcher: Mutex<Option<Debouncer<RecommendedWatcher, RecommendedCache>>>,
 }
 
 impl Backend {
@@ -197,14 +214,14 @@ impl Backend {
         );
     }
 
-    /// Starts a debounced filesystem watcher on `root`, matching
-    /// rust-analyzer's own approach (`vfs-notify`, also built on
-    /// `notify`) rather than depending on the LSP client to register and
-    /// reliably deliver `workspace/didChangeWatchedFiles` notifications
-    /// -- client support for that is inconsistent across editors. Any
-    /// create/remove/modify under `root` touching a file
-    /// `apex_discover::is_relevant_path` cares about
-    /// (`.cls`/`.trigger`/`.object-meta.xml`/`.field-meta.xml`)
+    /// Spawns a background task that registers a debounced filesystem
+    /// watcher on `root`, matching rust-analyzer's own approach
+    /// (`vfs-notify`, also built on `notify`) rather than depending on
+    /// the LSP client to register and reliably deliver
+    /// `workspace/didChangeWatchedFiles` notifications -- client support
+    /// for that is inconsistent across editors. Any create/remove/modify
+    /// under `root` touching a file `apex_discover::is_relevant_path`
+    /// cares about (`.cls`/`.trigger`/`.object-meta.xml`/`.field-meta.xml`)
     /// invalidates `bind.cache`'s cached directory walk
     /// (`BindCache::invalidate_discovery`) and triggers a rebuild --
     /// closing the "a file added/removed on disk but never opened in the
@@ -214,59 +231,57 @@ impl Backend {
     /// operation, or build script routinely fires several raw events in
     /// quick succession for what's conceptually one change.
     ///
-    /// Called from `initialize` (running on the Tokio runtime, unlike the
-    /// watcher's own callback thread below) so `tokio::runtime::Handle::current()`
-    /// is captured once here, up front, and reused from inside the
-    /// callback -- `tokio::task::spawn_blocking`'s free-function form
-    /// looks up the *ambient* current-thread runtime and panics off the
-    /// runtime, which the watcher's callback thread always is (`notify`
-    /// owns it, not Tokio).
-    ///
-    /// Returns `None` (logged, not fatal -- see `Backend::watcher`'s doc
-    /// comment) if the watcher fails to start; the server still works
-    /// via document-sync-triggered rebuilds alone in that case, just
-    /// without picking up out-of-band disk changes.
-    fn start_watcher(
-        root: PathBuf,
-        bind: Arc<BindState>,
-    ) -> Option<Debouncer<RecommendedWatcher, RecommendedCache>> {
-        let watch_root = root.clone();
+    /// Registration itself (`Debouncer::watch`) is `spawn_blocking`ed
+    /// rather than run inline -- measured at ~330ms against the real
+    /// NPSP corpus (~1044 files), which used to sit directly in
+    /// `initialize`'s response path (a real, measured regression to
+    /// server startup latency this fixed). Fire-and-forget, called from
+    /// `initialized` alongside `Self::schedule_rebuild`: nothing here
+    /// needs the watch to be live by any particular point, only
+    /// *eventually*, matching how relying on it at all already accepts
+    /// "not instant" (see the honest race-window note on `BindState::watcher`'s
+    /// doc comment).
+    fn start_watcher(root: PathBuf, bind: Arc<BindState>) {
         let handle = tokio::runtime::Handle::current();
-        let mut debouncer = match new_debouncer(
-            Duration::from_millis(500),
-            None,
-            move |result: DebounceEventResult| {
-                let events = match result {
-                    Ok(events) => events,
-                    Err(errors) => {
-                        for error in errors {
-                            warn!(%error, "filesystem watcher error");
+        tokio::task::spawn_blocking(move || {
+            let watch_root = root.clone();
+            let callback_bind = Arc::clone(&bind);
+            let mut debouncer = match new_debouncer(
+                Duration::from_millis(500),
+                None,
+                move |result: DebounceEventResult| {
+                    let events = match result {
+                        Ok(events) => events,
+                        Err(errors) => {
+                            for error in errors {
+                                warn!(%error, "filesystem watcher error");
+                            }
+                            return;
                         }
+                    };
+                    let relevant = events
+                        .iter()
+                        .flat_map(|event| event.paths.iter())
+                        .any(|path| apex_discover::is_relevant_path(path));
+                    if !relevant {
                         return;
                     }
-                };
-                let relevant = events
-                    .iter()
-                    .flat_map(|event| event.paths.iter())
-                    .any(|path| apex_discover::is_relevant_path(path));
-                if !relevant {
+                    callback_bind.cache.lock().unwrap().invalidate_discovery();
+                    spawn_rebuild(root.clone(), Arc::clone(&callback_bind), handle.clone());
+                },
+            ) {
+                Ok(debouncer) => debouncer,
+                Err(error) => {
+                    warn!(%error, "failed to create filesystem watcher");
                     return;
                 }
-                bind.cache.lock().unwrap().invalidate_discovery();
-                spawn_rebuild(root.clone(), Arc::clone(&bind), handle.clone());
-            },
-        ) {
-            Ok(debouncer) => debouncer,
-            Err(error) => {
-                warn!(%error, "failed to create filesystem watcher");
-                return None;
+            };
+            if let Err(error) = debouncer.watch(&watch_root, RecursiveMode::Recursive) {
+                warn!(%error, root = %watch_root.display(), "failed to start filesystem watcher");
+                return;
             }
-        };
-        if let Err(error) = debouncer.watch(&watch_root, RecursiveMode::Recursive) {
-            warn!(%error, root = %watch_root.display(), "failed to start filesystem watcher");
-            return None;
-        }
-        Some(debouncer)
+            *bind.watcher.lock().unwrap() = Some(debouncer);
+        });
     }
 }
 
@@ -337,11 +352,6 @@ impl LanguageServer for Backend {
         self.root = root;
         self.position_encoding = position_encoding;
         self.config = params.initialization_options;
-        self.watcher = self
-            .root
-            .as_ref()
-            .and_then(|url| url.to_file_path().ok())
-            .and_then(|root| Backend::start_watcher(root, Arc::clone(&self.bind)));
 
         Box::pin(async move {
             Ok(InitializeResult {
@@ -390,6 +400,9 @@ impl LanguageServer for Backend {
     fn initialized(&mut self, _: InitializedParams) -> Self::NotifyResult {
         info!("initialized");
         self.schedule_rebuild();
+        if let Some(root) = self.root.as_ref().and_then(|url| url.to_file_path().ok()) {
+            Backend::start_watcher(root, Arc::clone(&self.bind));
+        }
         ControlFlow::Continue(())
     }
 
@@ -667,7 +680,6 @@ async fn main() {
             root: None,
             position_encoding: PositionEncoding::Utf16,
             config: None,
-            watcher: None,
             bind: Arc::new(BindState::default()),
         });
 
