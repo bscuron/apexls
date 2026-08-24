@@ -9,7 +9,8 @@
 //! type names now resolves the same way a body-context type reference
 //! (a cast, a local variable's type, ...) always did.
 
-use apex_binder::{BoundProgram, FileId, Resolution, SymbolId, SymbolKind};
+use apex_binder::{BoundProgram, FileId, Resolution, SymbolId, SymbolKind, SyntaxPtr};
+use apex_syntax::ast::expr::FieldExpr;
 use apex_syntax::ast::Type;
 use rowan::ast::AstNode;
 
@@ -516,6 +517,96 @@ fn an_unqualified_reference_to_a_sibling_nested_type_resolves_through_their_shar
         program.resolution_at(other_file, offset).cloned(),
         Some(Resolution::Resolved(inner_id)),
         "an unqualified reference to a sibling nested type must resolve through their shared outer class"
+    );
+}
+
+/// A chained member access through a property/field whose *declared
+/// type* is a nested type (no name collision between the two -- see the
+/// test below for that variant) needs `BodyBinder::type_of_symbol` to
+/// infer a member's `Ty` from its `type_name` text so a *following*
+/// `.member` access has something to look up against. It had the exact
+/// same gap `resolve_type_ref` did: only checked `SymbolTable::top_level`
+/// (top-level names only), so a property/field typed as a *nested* type
+/// could never chain further.
+#[test]
+fn a_chained_member_access_through_a_nested_typed_property_resolves() {
+    let dir = write_fixture_dir(
+        "chained-nested-typed-property",
+        &[(
+            "Outer.cls",
+            "public class Outer { \
+             public Settings config { get; set; } \
+             public void run() { Boolean x = config.flag; } \
+             public class Settings { public Boolean flag; } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let outer_file = file_for(&program, SymbolKind::Class, "Outer");
+    let flag_id = symbol_id(&program, SymbolKind::Field, "flag");
+
+    let root = program.syntax(outer_file);
+    let field_expr = root
+        .descendants()
+        .find_map(FieldExpr::cast)
+        .expect("config.flag should be a FieldExpr");
+    let ptr = SyntaxPtr::new(outer_file, field_expr.syntax());
+
+    assert_eq!(
+        program.resolution(ptr).cloned(),
+        Some(Resolution::Resolved(flag_id)),
+        "a member access chained through a nested-typed property must resolve the member after the dot"
+    );
+}
+
+/// Regression test for a real bug found via a user report: a property
+/// named *identically* to its own nested-class type -- real NPSP shape:
+/// `fflib_SObjectDomain`'s `public Configuration Configuration { get;
+/// private set; }`, with a nested `public class Configuration { ... }`
+/// declared alongside it -- broke goto-definition/find-references on
+/// anything chained off it (`handleAfterUpdate` reading
+/// `Configuration.OldOnUpdateValidateBehaviour`). `lookup_member` finds
+/// *both* the property and the nested type for a bare "Configuration"
+/// reference (nested types are indexed as ordinary members, no kind
+/// partitioning), which used to land in `bind_name_expr`'s `Candidates`
+/// arm and return `None` immediately -- never even reaching
+/// `type_of_symbol`, so `.OldOnUpdateValidateBehaviour` had no type to
+/// look itself up against and stayed `Unresolved`, indistinguishable
+/// from a genuine typo. Real Apex (and this idiom's whole point) treats
+/// the value as winning over the same-named type in expression position.
+#[test]
+fn a_property_named_identically_to_its_own_nested_type_resolves_when_chained() {
+    let dir = write_fixture_dir(
+        "same-name-property-and-nested-type",
+        &[(
+            "Outer.cls",
+            "public class Outer { \
+             public Settings Settings { get; private set; } \
+             public void run() { Boolean x = Settings.flag; } \
+             public class Settings { public Boolean flag; } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let outer_file = file_for(&program, SymbolKind::Class, "Outer");
+    let flag_id = symbol_id(&program, SymbolKind::Field, "flag");
+
+    let root = program.syntax(outer_file);
+    let field_expr = root
+        .descendants()
+        .find_map(FieldExpr::cast)
+        .expect("Settings.flag should be a FieldExpr");
+    let ptr = SyntaxPtr::new(outer_file, field_expr.syntax());
+
+    assert_eq!(
+        program.resolution(ptr).cloned(),
+        Some(Resolution::Resolved(flag_id)),
+        "a property named identically to its own nested type must still resolve a chained member access, \
+         preferring the property (value) over the type"
     );
 }
 

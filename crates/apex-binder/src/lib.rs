@@ -844,7 +844,7 @@ fn declarations_equivalent(old: &[Symbol], new: &[Symbol]) -> bool {
 /// this climbs one level further. The scope an unqualified type
 /// reference's fallback nested-type lookup (`resolve::resolve_type_ref`)
 /// should search from.
-fn enclosing_type_of(table: &SymbolTable, symbol: &Symbol) -> Option<SymbolId> {
+pub(crate) fn enclosing_type_of(table: &SymbolTable, symbol: &Symbol) -> Option<SymbolId> {
     let mut current = symbol.container?;
     loop {
         match table.get(current).kind {

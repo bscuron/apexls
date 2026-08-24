@@ -604,6 +604,25 @@ impl<'a> BodyBinder<'a> {
         if let Some(project_id) = self.table.top_level(type_name) {
             return Some(Ty::Project(project_id));
         }
+        // A member (field/property/parameter) declared with a *nested*
+        // type as its own type -- same gap `resolve_type_ref`'s
+        // single-segment fallback had, and the same fix: walk outward
+        // through the whole lexical nesting chain starting from
+        // `symbol`'s own enclosing type, not just `top_level`. Real NPSP
+        // shape: `fflib_SObjectDomain`'s `Configuration` property is
+        // declared with its sibling-nested `Configuration` class as its
+        // type -- without this, `Configuration.OldOnUpdateValidateBehaviour`
+        // resolved `Configuration` fine (a plain member lookup) but could
+        // never chain to `OldOnUpdateValidateBehaviour` after the dot,
+        // since this method never produced a `Ty::Project` to look
+        // members up against.
+        let mut current = crate::enclosing_type_of(self.table, symbol);
+        while let Some(container) = current {
+            if let Some(id) = self.table.nested_type_visible_from(container, type_name) {
+                return Some(Ty::Project(id));
+            }
+            current = self.table.get(container).container;
+        }
         let args = symbol
             .type_args
             .iter()
@@ -1035,6 +1054,42 @@ impl<'a> BodyBinder<'a> {
                     ) && self.table.is_visible_from(id, self.enclosing_type)
                 })
                 .collect();
+            // A field/property named identically to a *nested type* also
+            // declared in the same enclosing class is a real, idiomatic
+            // Apex pattern (NPSP shape: `fflib_SObjectDomain`'s
+            // `Configuration Configuration { get; private set; }`) --
+            // `lookup_member` above finds both (nested types are indexed
+            // as members alongside fields/properties, with no kind
+            // partitioning), which used to land in the `Candidates` arm
+            // below and give up before ever inferring a type to chain
+            // `.member` off of. In expression position the *value* always
+            // wins over the same-named type -- the same "instance member
+            // shadows a type name" precedence `static_member_access.rs`
+            // already documents for the separate top-level-type fallback,
+            // extended here to when both candidates come from member
+            // lookup itself. Only actually drops anything when a
+            // non-type alternative exists; a lone nested-type match (the
+            // common "bare reference to a sibling nested type" case) is
+            // untouched.
+            let members = if members.len() > 1 {
+                let non_type: Vec<SymbolId> = members
+                    .iter()
+                    .copied()
+                    .filter(|&id| {
+                        !matches!(
+                            self.table.get(id).kind,
+                            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum
+                        )
+                    })
+                    .collect();
+                if non_type.is_empty() {
+                    members
+                } else {
+                    non_type
+                }
+            } else {
+                members
+            };
             match members.as_slice() {
                 [] => {} // fall through to the type-name check below
                 [one] => {
