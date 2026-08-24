@@ -47,7 +47,7 @@
 use crate::file_id::FileId;
 use crate::ptr::{AstPtr, SyntaxPtr};
 use crate::reference_table::{ReferenceTable, Resolution, SchemaObjectRef, UnknownSchemaRef};
-use crate::schema_index::SchemaIndex;
+use crate::schema_index::{relationship_field_api_name, SchemaIndex};
 use crate::scope::{ScopeId, ScopeKind, ScopeTree};
 use crate::symbol::{ModifierSet, Symbol, SymbolId, SymbolKind};
 use crate::symbol_table::SymbolTable;
@@ -1062,28 +1062,33 @@ impl<'a> BodyBinder<'a> {
             // even outside SOQL, so this isn't the same "no member
             // model" gap a genuinely unmodeled system type (`String`,
             // `List`, ...) is. Mirrors `crate::soql`'s own object/field
-            // hop resolution; unlike SOQL, a lookup/master-detail
-            // field's `reference_to` isn't chased any further here --
-            // continuing the chain in real code needs the field's `__r`
-            // relationship alias, a different name than the field's own
-            // API name this resolves against, which is its own separate
-            // gap, not silently guessed at.
+            // hop resolution, `__r` relationship alias included: `name`
+            // is converted through `relationship_field_api_name` before
+            // the schema lookup (a no-op for a plain field, which is
+            // already its own real API name), and a lookup/master-detail
+            // field's `reference_to` becomes the resulting `Ty::System`
+            // so a further hop (`dataImport.Related__r.Name__c`) keeps
+            // resolving instead of dead-ending after the first one.
             Some(Ty::System { name: object, .. }) => {
-                let resolution = if self.schema.field(&object, name).is_some() {
-                    Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                let real_field_name = relationship_field_api_name(name);
+                let field_schema = self.schema.field(&object, &real_field_name);
+                let resolution = match &field_schema {
+                    Some(_) => Resolution::SchemaObject(Box::new(SchemaObjectRef {
                         object: object.clone(),
-                        field: Some(SmolStr::new(name)),
-                    }))
-                } else if self.schema.object(&object).is_some() {
-                    Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
-                        object: Some(object.clone()),
-                        field: Some(SmolStr::new(name)),
-                    }))
-                } else {
-                    Resolution::Unresolved
+                        field: Some(SmolStr::new(&real_field_name)),
+                    })),
+                    None if self.schema.object(&object).is_some() => {
+                        Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
+                            object: Some(object.clone()),
+                            field: Some(SmolStr::new(&real_field_name)),
+                        }))
+                    }
+                    None => Resolution::Unresolved,
                 };
                 self.refs.set(ptr, resolution);
-                return None;
+                return field_schema
+                    .and_then(|f| f.reference_to.first())
+                    .map(|next| Ty::system_owned(next.clone(), Vec::new()));
             }
             // `target_type` is entirely unknown -- honestly `Unresolved`
             // rather than a guess.

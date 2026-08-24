@@ -13,6 +13,7 @@
 use crate::ptr::SyntaxPtr;
 use crate::reference_table::{Resolution, SchemaObjectRef, UnknownSchemaRef};
 use crate::resolve::BodyBinder;
+use crate::schema_index::relationship_field_api_name;
 use crate::scope::ScopeId;
 use apex_syntax::ast::soql::{
     SoqlBoundExpr, SoqlComparison, SoqlCondition, SoqlExpr, SoqlFieldName, SoqlFieldOrFunction,
@@ -21,23 +22,6 @@ use apex_syntax::ast::soql::{
 };
 use rowan::ast::AstNode;
 use smol_str::SmolStr;
-
-/// A custom relationship name's field-schema-lookup form (`Batch__r` ->
-/// `Batch__c`) -- the common, documented Salesforce convention for
-/// custom lookup/master-detail fields; a standard relationship name
-/// (`Owner`, `CreatedBy`, ...) has no such transform and is looked up
-/// as-is. v1 doesn't model the full relationship-name table Salesforce
-/// derives server-side, so a standard relationship name that doesn't
-/// happen to equal its field's own API name (rare, but possible) won't
-/// hop correctly -- an accepted, documented gap, not silently assumed
-/// away.
-fn relationship_field_api_name(segment: &str) -> String {
-    if segment.len() > 3 && segment.to_ascii_lowercase().ends_with("__r") {
-        format!("{}__c", &segment[..segment.len() - 3])
-    } else {
-        segment.to_string()
-    }
-}
 
 fn resolve_object_ptr(binder: &mut BodyBinder<'_>, ptr: SyntaxPtr, name: &str) {
     crate::schema_index::resolve_object(binder.schema, &mut binder.refs, ptr, name);

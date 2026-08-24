@@ -692,3 +692,76 @@ fn a_bare_sobject_type_token_and_its_field_both_resolve() {
         "the field chained off the bare SObject type should also resolve"
     );
 }
+
+/// A lookup field's `__r` relationship alias, accessed in a plain body
+/// expression (not SOQL): `dataImport.Related__r.Name__c`. `Related__r`
+/// itself should resolve to the real field `Related__c` (the alias, not
+/// a field in its own right), and the chain should keep going onto the
+/// *related* object's own `Name__c` -- mirroring `crate::soql`'s
+/// existing relationship-hop resolution, now shared via
+/// `schema_index::relationship_field_api_name` rather than duplicated.
+#[test]
+fn a_relationship_alias_resolves_and_chains_to_the_related_objects_field() {
+    let dir = write_fixture_dir(
+        "relationship-lookup",
+        &[
+            (
+                "Foo.cls",
+                "public class Foo {\n    DataImport__c dataImport;\n    public String getName() {\n        return this.dataImport.Related__r.Name__c;\n    }\n}\n",
+            ),
+            (
+                "objects/DataImport__c/DataImport__c.object-meta.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomObject xmlns=\"http://soap.sforce.com/2006/04/metadata\"><label>Data Import</label></CustomObject>",
+            ),
+            (
+                "objects/DataImport__c/fields/Related__c.field-meta.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomField xmlns=\"http://soap.sforce.com/2006/04/metadata\"><fullName>Related__c</fullName><type>Lookup</type><referenceTo>Related_Object__c</referenceTo></CustomField>",
+            ),
+            (
+                "objects/Related_Object__c/Related_Object__c.object-meta.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomObject xmlns=\"http://soap.sforce.com/2006/04/metadata\"><label>Related Object</label></CustomObject>",
+            ),
+            (
+                "objects/Related_Object__c/fields/Name__c.field-meta.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomField xmlns=\"http://soap.sforce.com/2006/04/metadata\"><fullName>Name__c</fullName><type>Text</type></CustomField>",
+            ),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let root = program.syntax(file);
+    let mut chains: Vec<rowan::TextRange> = root
+        .descendants()
+        .filter_map(apex_syntax::ast::expr::FieldExpr::cast)
+        .map(|f| f.syntax().text_range())
+        .collect();
+    chains.sort_by_key(|r| r.len());
+    // Three nested `FieldExpr`s in source order of increasing range:
+    // `this.dataImport`, `...Related__r`, `...Name__c` (the full chain).
+    assert_eq!(chains.len(), 3, "expected three nested FieldExprs");
+    let relationship_offset = chains[1].end() - rowan::TextSize::from(1);
+    let field_offset = chains[2].end() - rowan::TextSize::from(1);
+
+    assert_eq!(
+        program.resolution_at(file, relationship_offset).cloned(),
+        Some(Resolution::SchemaObject(Box::new(
+            apex_binder::SchemaObjectRef {
+                object: "DataImport__c".into(),
+                field: Some("Related__c".into()),
+            }
+        ))),
+        "Related__r should resolve to the real field Related__c"
+    );
+    assert_eq!(
+        program.resolution_at(file, field_offset).cloned(),
+        Some(Resolution::SchemaObject(Box::new(
+            apex_binder::SchemaObjectRef {
+                object: "Related_Object__c".into(),
+                field: Some("Name__c".into()),
+            }
+        ))),
+        "the chain should continue onto the related object's own field"
+    );
+}

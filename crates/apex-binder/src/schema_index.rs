@@ -101,3 +101,22 @@ pub(crate) fn resolve_object(
     };
     refs.set(ptr, resolution);
 }
+
+/// A custom relationship name's field-schema-lookup form (`Batch__r` ->
+/// `Batch__c`) -- the common, documented Salesforce convention for
+/// custom lookup/master-detail fields; a standard relationship name
+/// (`Owner`, `CreatedBy`, ...) has no such transform and is looked up
+/// as-is. v1 doesn't model the full relationship-name table Salesforce
+/// derives server-side, so a standard relationship name that doesn't
+/// happen to equal its field's own API name (rare, but possible) won't
+/// hop correctly -- an accepted, documented gap, not silently assumed
+/// away. Shared by `crate::soql` (a SOQL relationship-field chain) and
+/// `crate::resolve` (the same `__r` alias used in a plain Apex
+/// expression, e.g. `dataImport.Related__r.Name__c`).
+pub(crate) fn relationship_field_api_name(segment: &str) -> String {
+    if segment.len() > 3 && segment.to_ascii_lowercase().ends_with("__r") {
+        format!("{}__c", &segment[..segment.len() - 3])
+    } else {
+        segment.to_string()
+    }
+}
