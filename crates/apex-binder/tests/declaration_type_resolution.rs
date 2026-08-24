@@ -97,10 +97,7 @@ fn a_propertys_own_declared_type_resolves() {
     let dir = write_fixture_dir(
         "decl-type-property",
         &[
-            (
-                "Foo.cls",
-                "public class Foo { public Bar b { get; set; } }",
-            ),
+            ("Foo.cls", "public class Foo { public Bar b { get; set; } }"),
             ("Bar.cls", "public class Bar { }"),
         ],
     );
@@ -123,10 +120,7 @@ fn a_parameters_own_declared_type_resolves() {
     let dir = write_fixture_dir(
         "decl-type-param",
         &[
-            (
-                "Foo.cls",
-                "public class Foo { public void run(Bar b) { } }",
-            ),
+            ("Foo.cls", "public class Foo { public void run(Bar b) { } }"),
             ("Bar.cls", "public class Bar { }"),
         ],
     );
@@ -297,7 +291,11 @@ fn a_qualified_supertypes_first_segment_resolves_to_the_outer_type() {
     let program = BoundProgram::from_files(&dir);
     std::fs::remove_dir_all(&dir).ok();
 
-    let file = file_for(&program, SymbolKind::Class, "fflib_ClassicUnitOfWorkFactory");
+    let file = file_for(
+        &program,
+        SymbolKind::Class,
+        "fflib_ClassicUnitOfWorkFactory",
+    );
     // `type_ref_mid_offset` lands inside the *first* segment
     // (`fflib_Application`), which should resolve to itself, not the
     // nested `UnitOfWorkFactory` the whole path names -- see
@@ -480,6 +478,44 @@ fn an_unqualified_nested_type_reference_resolves_from_within_its_enclosing_type(
         program.resolution_at(file, offset).cloned(),
         Some(Resolution::Resolved(dml_wrapper_id)),
         "an unqualified reference to a sibling nested type should resolve from inside the enclosing class"
+    );
+}
+
+/// Regression test for a real bug found via a user report: an unqualified
+/// reference to a *sibling* nested type -- from inside one nested class
+/// to another nested class declared in the same enclosing outer class,
+/// neither one being the outer class itself nor extending the other --
+/// failed to resolve (`new TestSObjectDomain(...)` from inside
+/// `TestSObjectDomainConstructor`, both nested in `fflib_SObjectDomain`).
+/// `resolve_type_ref`'s single-segment fallback only ever tried
+/// `nested_type_visible_from` against the reference site's *immediate*
+/// enclosing type (plus what it extends/implements) -- never walked
+/// outward to that type's *own* container, so a name declared as a
+/// sibling one level up was never reachable, even though real Apex
+/// resolves it lexically through the whole enclosing-scope chain.
+#[test]
+fn an_unqualified_reference_to_a_sibling_nested_type_resolves_through_their_shared_outer_class() {
+    let dir = write_fixture_dir(
+        "unqualified-nested-sibling",
+        &[(
+            "Outer.cls",
+            "public class Outer { \
+             public class Inner { } \
+             public class Other { public Object make() { return new Inner(); } } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let other_file = file_for(&program, SymbolKind::Class, "Other");
+    let inner_id = symbol_id(&program, SymbolKind::Class, "Inner");
+    let offset = type_ref_mid_offset(&program, other_file, "Inner");
+
+    assert_eq!(
+        program.resolution_at(other_file, offset).cloned(),
+        Some(Resolution::Resolved(inner_id)),
+        "an unqualified reference to a sibling nested type must resolve through their shared outer class"
     );
 }
 

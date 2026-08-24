@@ -374,12 +374,25 @@ pub(crate) fn resolve_type_ref(
     // attempted for a single-segment name: a partially-qualified deeper
     // path (`Outer.Inner` referenced from three levels of nesting down)
     // is a rarer shape not covered here.
+    //
+    // Walks outward through the *whole* lexical nesting chain, not just
+    // the reference site's immediate enclosing type -- a reference from
+    // one nested class to a *sibling* nested class (both declared
+    // directly in a shared outer class, neither one being the outer
+    // class itself nor extending the other -- real NPSP shape:
+    // `fflib_SObjectDomain.TestSObjectDomainConstructor.construct`
+    // referencing `TestSObjectDomain` unqualified) has to check each
+    // enclosing level's own (and inherited) nested types in turn, since
+    // real Apex resolves an unqualified name through the full enclosing-
+    // scope chain, not just the one immediate container.
     if segments.len() == 1 {
-        if let Some(id) =
-            enclosing_type.and_then(|enclosing| table.nested_type_visible_from(enclosing, &name))
-        {
-            refs.set(ptr, Resolution::Resolved(id));
-            return Some(Ty::Project(id));
+        let mut current = enclosing_type;
+        while let Some(container) = current {
+            if let Some(id) = table.nested_type_visible_from(container, &name) {
+                refs.set(ptr, Resolution::Resolved(id));
+                return Some(Ty::Project(id));
+            }
+            current = table.get(container).container;
         }
     }
     let args: Vec<Ty> = ty
