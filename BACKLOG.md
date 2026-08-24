@@ -22,8 +22,10 @@ real NPSP corpus, down from ~677ms cold, after further memory/perf work
 past the original ~17ms). §3's whole "buildable now, no new binder work
 needed" list is checked off: `textDocument/hover`, `textDocument/definition`,
 `textDocument/documentSymbol`, `workspace/symbol`, `textDocument/foldingRange`,
-`textDocument/selectionRange`. Next up is §3's "needs new binder-side
-work first" list (`references`/`documentHighlight`, `rename`, `signatureHelp`,
+`textDocument/selectionRange`. `textDocument/references`/`textDocument/documentHighlight`
+are also now done, backed by a new incrementally-maintained reverse
+index on `ReferenceTable` (`by_symbol`). Next up is §3's remaining
+"needs new binder-side work first" list (`rename`, `signatureHelp`,
 `completion`, `semanticTokens`, `callHierarchy`, `inlayHint`), or §4's
 still-open standard-library/schema type-model gap.
 
@@ -451,12 +453,65 @@ supports each one.
       nothing.
 
 **Needs new binder-side work first:**
-- [ ] `textDocument/references` / `textDocument/documentHighlight` --
-      `ReferenceTable` currently only maps reference -> resolution, not
-      the reverse (symbol -> every reference to it). Needs a reverse
-      index built during or after Pass 2.
-- [ ] `textDocument/rename` (+ `prepareRename`) -- needs find-references
-      above, plus safe multi-file edit generation; risky to ship before
+- [x] `textDocument/references` / `textDocument/documentHighlight` --
+      **done.** Built the reverse index this item originally called for --
+      deliberately *not* a query-time scan over `all_resolutions()`
+      (which would've worked with zero binder changes, but pays an
+      O(references) cost on every request instead of O(1) per file; this
+      project's standing priority is that performance matters everywhere,
+      not just the parser/lexer, so the index was built up front rather
+      than deferred).
+      `ReferenceTable` (`reference_table.rs`) now carries a
+      `by_symbol: FxHashMap<SymbolId, Vec<SyntaxPtr>>` alongside
+      `resolutions`, maintained incrementally by `set`/`map_ids_into` (the
+      same call sites every reference-recording path -- `resolve.rs`'s
+      body walk *and* `soql.rs`'s SOQL field-name walk -- already funnels
+      through), not rebuilt separately: `Resolution::symbol_ids()` is a
+      new helper enumerating the `SymbolId`(s) a resolution touches
+      (`Resolved`'s one id, `Candidates`' whole set), and both `set`/
+      `map_ids_into` push the reference's `SyntaxPtr` onto each touched
+      id's entry in the same pass they already do their existing work --
+      no second scan, no intermediate allocation. Safe to build this way
+      because a `ReferenceTable` is always populated exactly once, from
+      empty, per file rebind (`FileBodies` is replaced wholesale on
+      rebind, never patched -- see its doc comment), so there's no
+      persistent-across-rebuilds mutation or stale-entry cleanup to
+      reason about. `BoundProgram::references_to`/`references_to_in_file`
+      expose it (project-wide and per-file respectively -- the latter is
+      what `documentHighlight` uses, since it never needs to leave the
+      current file). `capabilities::references`/`document_highlights`
+      gather target `SymbolId`(s) the same way `hover` already does
+      (`symbol_at` first for a declaration, else `resolution_at`'s
+      `Resolved`/`Candidates` for a reference -- `Candidates` reaches
+      every candidate, same "don't silently pick one" convention
+      hover/definition already use).
+      **Measured cost, honestly:** this roughly doubles per-reference
+      storage (each `SyntaxPtr` now lives once as a `resolutions` key and
+      again as a `by_symbol` value). Against the real NPSP corpus:
+      `pass2_merge_bodies`'s own exclusive allocation went from 75.6 MB
+      to a consistent 92.5 MB (+~17 MB, +22%, reproducible across
+      repeated `hotpath` runs) -- the real, bounded, and expected price
+      of the index. Wall-clock impact was *not* distinguishable from this
+      machine's already-documented run-to-run noise once measured
+      properly: `cargo bench`'s criterion numbers (the tool this project
+      trusts for real perf decisions, not single-shot `hotpath` runs)
+      came back at 322 ms median cold / 5.1 ms median warm -- both
+      squarely within, and the warm number better than, the healthy
+      ranges already recorded earlier in this section. The warm
+      single-edit path (what actually matters for editor responsiveness)
+      is essentially unaffected either way, since only one file's few
+      bodies get merged on a warm edit, not the whole project.
+      Verified two ways: `crates/apex-binder/tests/references_index.rs`
+      (binder-level, LSP-independent -- including the tricky case of an
+      ambiguous overload call site correctly reaching *every* candidate's
+      `by_symbol` entry, not just one) and
+      `crates/apexls-server/tests/references_highlight.rs` (full
+      protocol-level, spawns the real binary, proves the project-wide
+      index actually crosses file boundaries and that
+      `includeDeclaration` behaves correctly).
+- [ ] `textDocument/rename` (+ `prepareRename`) -- find-references above
+      is done and directly reusable (`BoundProgram::references_to`), but
+      still needs safe multi-file edit generation; risky to ship before
       resolution precision is higher than "arity + one-hop type" (see
       §4), since a bad rename is worse than a missing feature.
 - [ ] `textDocument/signatureHelp` -- have `narrow_by_overload`'s

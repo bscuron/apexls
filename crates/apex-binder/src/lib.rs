@@ -775,6 +775,33 @@ impl BoundProgram {
         self.bodies.values().flat_map(|fb| fb.refs.iter())
     }
 
+    /// Every reference (project-wide) whose `Resolution` touches `id` --
+    /// `textDocument/references`'s primitive. Backed by each file's own
+    /// `ReferenceTable::references_to`, an O(1) hash lookup per file
+    /// (`reference_table.rs`'s `by_symbol` reverse index), not a scan --
+    /// still O(files) to check every file (a reference can live in any
+    /// file, not just `id`'s declaring one), but each file's own
+    /// contribution no longer costs O(references in that file).
+    pub fn references_to(&self, id: SymbolId) -> impl Iterator<Item = SyntaxPtr> + '_ {
+        self.bodies
+            .values()
+            .flat_map(move |fb| fb.refs.references_to(id).iter().copied())
+    }
+
+    /// Like [`Self::references_to`], scoped to one file -- the cheaper
+    /// path `textDocument/documentHighlight` uses, since a highlight
+    /// request only ever cares about the currently-open file.
+    pub fn references_to_in_file(
+        &self,
+        file: FileId,
+        id: SymbolId,
+    ) -> impl Iterator<Item = SyntaxPtr> + '_ {
+        self.bodies
+            .get(&file)
+            .into_iter()
+            .flat_map(move |fb| fb.refs.references_to(id).iter().copied())
+    }
+
     pub fn scope_tree(&self, block: SyntaxPtr) -> Option<&ScopeTree> {
         self.bodies.get(&block.file())?.scopes.get(&block)
     }

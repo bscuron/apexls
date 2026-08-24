@@ -79,11 +79,12 @@ use async_lsp::{ClientSocket, LanguageServer, ResponseError};
 use futures::future::BoxFuture;
 use lsp_types::{
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
-    DocumentSymbolResponse, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, MarkupContent,
-    MarkupKind, OneOf, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentHighlight,
+    DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse, FoldingRange,
+    FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, Location, MarkupContent, MarkupKind,
+    OneOf, ReferenceParams, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
     ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
     WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
@@ -374,6 +375,8 @@ impl LanguageServer for Backend {
                     position_encoding: Some(position_encoding.into()),
                     hover_provider: Some(HoverProviderCapability::Simple(true)),
                     definition_provider: Some(OneOf::Left(true)),
+                    references_provider: Some(OneOf::Left(true)),
+                    document_highlight_provider: Some(OneOf::Left(true)),
                     document_symbol_provider: Some(OneOf::Left(true)),
                     workspace_symbol_provider: Some(OneOf::Left(true)),
                     folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
@@ -552,6 +555,62 @@ impl LanguageServer for Backend {
             };
 
             Ok(response)
+        })
+    }
+
+    /// `capabilities::references`: every location project-wide
+    /// referencing the symbol at the cursor (a declaration or a
+    /// reference), via `BoundProgram::references_to`'s reverse-index
+    /// lookup -- see `BACKLOG.md` §3.
+    fn references(
+        &mut self,
+        params: ReferenceParams,
+    ) -> BoxFuture<'static, Result<Option<Vec<Location>>, Self::Error>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
+        let encoding = self.position_encoding;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some((file, offset)) =
+                capabilities::resolve_position(program, &uri, position, encoding)
+            else {
+                return Ok(None);
+            };
+
+            let locations =
+                capabilities::references(program, file, offset, include_declaration, encoding);
+            Ok((!locations.is_empty()).then_some(locations))
+        })
+    }
+
+    /// `capabilities::document_highlights`: every occurrence of the
+    /// symbol at the cursor, scoped to this one file.
+    fn document_highlight(
+        &mut self,
+        params: DocumentHighlightParams,
+    ) -> BoxFuture<'static, Result<Option<Vec<DocumentHighlight>>, Self::Error>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let encoding = self.position_encoding;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some((file, offset)) =
+                capabilities::resolve_position(program, &uri, position, encoding)
+            else {
+                return Ok(None);
+            };
+
+            let highlights = capabilities::document_highlights(program, file, offset, encoding);
+            Ok((!highlights.is_empty()).then_some(highlights))
         })
     }
 

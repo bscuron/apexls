@@ -66,15 +66,45 @@ impl Resolution {
             other => other,
         }
     }
+
+    /// Every `SymbolId` this resolution touches -- `Resolved`'s one id,
+    /// `Candidates`' whole set, nothing for the schema/unresolved
+    /// variants (no `SymbolId` to touch). What `ReferenceTable`'s reverse
+    /// index (`by_symbol`) is built from: each id here gets this
+    /// resolution's `SyntaxPtr` recorded against it.
+    fn symbol_ids(&self) -> &[SymbolId] {
+        match self {
+            Resolution::Resolved(id) => std::slice::from_ref(id),
+            Resolution::Candidates(ids) => ids,
+            Resolution::SchemaObject(_) | Resolution::UnknownSchema(_) | Resolution::Unresolved => {
+                &[]
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct ReferenceTable {
     resolutions: FxHashMap<SyntaxPtr, Resolution>,
+    /// Reverse of `resolutions`: every `SyntaxPtr` whose `Resolution`
+    /// touches a given `SymbolId`, maintained incrementally by `set`/
+    /// `map_ids_into` as this table is built rather than recomputed at
+    /// query time -- the `textDocument/references`/`textDocument/documentHighlight`
+    /// lookup (`BACKLOG.md` §3) needs an O(1) hash lookup per file, not
+    /// an O(references) scan on every request. Safe to build this way
+    /// because a `ReferenceTable` is always populated exactly once, from
+    /// empty, per file rebind (`crate::incremental::FileBodies` is
+    /// replaced wholesale, never patched in place -- see its doc
+    /// comment) -- there's no persistent-across-rebuilds mutation or
+    /// stale-entry cleanup to reason about, same as `resolutions` itself.
+    by_symbol: FxHashMap<SymbolId, Vec<SyntaxPtr>>,
 }
 
 impl ReferenceTable {
     pub(crate) fn set(&mut self, reference: SyntaxPtr, resolution: Resolution) {
+        for &id in resolution.symbol_ids() {
+            self.by_symbol.entry(id).or_default().push(reference);
+        }
         self.resolutions.insert(reference, resolution);
     }
 
@@ -94,6 +124,12 @@ impl ReferenceTable {
         self.resolutions.is_empty()
     }
 
+    /// Every `SyntaxPtr` whose `Resolution` touches `id` -- an O(1) hash
+    /// lookup against `by_symbol`, not a scan over `resolutions`.
+    pub fn references_to(&self, id: SymbolId) -> &[SyntaxPtr] {
+        self.by_symbol.get(&id).map_or(&[], |v| v.as_slice())
+    }
+
     /// Consumes this table, applying `f` to every `SymbolId` any entry
     /// references (the whole-table counterpart to `Resolution::map_ids`),
     /// and folds the result directly into `target` -- used to merge one
@@ -105,17 +141,20 @@ impl ReferenceTable {
     /// see the `hotpath`-measured finding in `BACKLOG.md` §2 that
     /// motivated this: this exact intermediate-then-merge pattern, run
     /// once per body project-wide, was a real share of a cold bind's
-    /// allocation.
+    /// allocation. Updates `target.by_symbol` in the same pass, for the
+    /// same reason.
     pub(crate) fn map_ids_into(
         self,
         f: &impl Fn(SymbolId) -> SymbolId,
         target: &mut ReferenceTable,
     ) {
         target.resolutions.reserve(self.resolutions.len());
-        target.resolutions.extend(
-            self.resolutions
-                .into_iter()
-                .map(|(ptr, res)| (ptr, res.map_ids(f))),
-        );
+        for (ptr, res) in self.resolutions {
+            let remapped = res.map_ids(f);
+            for &id in remapped.symbol_ids() {
+                target.by_symbol.entry(id).or_default().push(ptr);
+            }
+            target.resolutions.insert(ptr, remapped);
+        }
     }
 }

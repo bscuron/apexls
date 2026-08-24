@@ -6,15 +6,16 @@
 
 use crate::line_index::{LineIndex, PositionEncoding};
 use apex_binder::{
-    BoundProgram, FileId, SchemaObjectRef, Symbol, SymbolId, SymbolKind, Visibility,
+    BoundProgram, FileId, Resolution, SchemaObjectRef, Symbol, SymbolId, SymbolKind, SyntaxPtr,
+    Visibility,
 };
 use apex_syntax::ast::decl::{
     ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, HasDocComment, InterfaceDecl, MethodDecl,
     PropertyDecl, TriggerUnit,
 };
 use lsp_types::{
-    DocumentSymbol, FoldingRange, Location, Position, Range, SelectionRange, SymbolInformation,
-    SymbolKind as LspSymbolKind, Url,
+    DocumentHighlight, DocumentSymbol, FoldingRange, Location, Position, Range, SelectionRange,
+    SymbolInformation, SymbolKind as LspSymbolKind, Url,
 };
 use rowan::{TextRange, TextSize};
 
@@ -51,6 +52,28 @@ pub(crate) fn symbol_location(
     let text = program.syntax(symbol.file).text().to_string();
     let index = LineIndex::new(&text);
     let range = symbol.name_range;
+    let start = index.to_position(&text, range.start().into(), encoding);
+    let end = index.to_position(&text, range.end().into(), encoding);
+    Some(Location {
+        uri,
+        range: Range { start, end },
+    })
+}
+
+/// A reference site's own location -- the `references`/`document_highlights`
+/// counterpart to `symbol_location`, which is declaration-site only
+/// (keyed off a `Symbol`'s `name_range`). `ptr` here is a reference's own
+/// `SyntaxPtr` (from `BoundProgram::references_to`/`references_to_in_file`),
+/// so this keys off `ptr.file()`/`ptr.range()` directly instead.
+pub(crate) fn ptr_location(
+    program: &BoundProgram,
+    ptr: SyntaxPtr,
+    encoding: PositionEncoding,
+) -> Option<Location> {
+    let uri = Url::from_file_path(program.file_path(ptr.file())).ok()?;
+    let text = program.syntax(ptr.file()).text().to_string();
+    let index = LineIndex::new(&text);
+    let range = ptr.range();
     let start = index.to_position(&text, range.start().into(), encoding);
     let end = index.to_position(&text, range.end().into(), encoding);
     Some(Location {
@@ -277,7 +300,8 @@ pub(crate) fn document_symbols(
             .filter(|entry| entry.1.container == container)
             .map(|&(id, s)| {
                 let children = build(entries, Some(id), root, to_range);
-                #[allow(deprecated)] // `deprecated` field, superseded by `tags` -- neither used here
+                #[allow(deprecated)]
+                // `deprecated` field, superseded by `tags` -- neither used here
                 DocumentSymbol {
                     name: s.name.to_string(),
                     detail: s.type_name.as_ref().map(|t| t.to_string()),
@@ -334,9 +358,7 @@ pub(crate) fn workspace_symbols(
         .filter(|(_, s)| is_outline_kind(s.kind) && s.name.to_lowercase().contains(&query))
         .filter_map(|(id, s)| {
             let location = symbol_location(program, id, encoding)?;
-            let container_name = s
-                .container
-                .map(|c| program.symbols.get(c).name.to_string());
+            let container_name = s.container.map(|c| program.symbols.get(c).name.to_string());
             #[allow(deprecated)] // `deprecated` field, superseded by `tags` -- neither used here
             Some(SymbolInformation {
                 name: s.name.to_string(),
@@ -347,6 +369,91 @@ pub(crate) fn workspace_symbols(
                 container_name,
             })
         })
+        .collect()
+}
+
+/// The `SymbolId`(s) a cursor position names -- shared by `references`
+/// and `document_highlights`. Mirrors `hover`'s own precedence
+/// (`main.rs`): a declaration's own name (`symbol_at`) first, else a
+/// reference's resolution (`resolution_at`)'s `Resolved`/`Candidates` --
+/// `Candidates` contributes every candidate rather than silently picking
+/// one, the same "don't guess" convention `hover`/`definition` already
+/// use for an ambiguous overload.
+fn targets_at(program: &BoundProgram, file: FileId, offset: TextSize) -> Vec<SymbolId> {
+    if let Some(id) = program.symbol_at(file, offset) {
+        return vec![id];
+    }
+    match program.resolution_at(file, offset) {
+        Some(Resolution::Resolved(id)) => vec![*id],
+        Some(Resolution::Candidates(ids)) => ids.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// `textDocument/references`: every location (project-wide) referencing
+/// the symbol at `file`/`offset`, via `BoundProgram::references_to`'s
+/// reverse-index lookup (`BACKLOG.md` §3) -- not a scan. `include_declaration`
+/// additionally prepends each target's own declaration site.
+pub(crate) fn references(
+    program: &BoundProgram,
+    file: FileId,
+    offset: TextSize,
+    include_declaration: bool,
+    encoding: PositionEncoding,
+) -> Vec<Location> {
+    let targets = targets_at(program, file, offset);
+    let mut locations = Vec::new();
+    if include_declaration {
+        locations.extend(
+            targets
+                .iter()
+                .filter_map(|&id| symbol_location(program, id, encoding)),
+        );
+    }
+    locations.extend(targets.iter().flat_map(|&id| {
+        program
+            .references_to(id)
+            .filter_map(|ptr| ptr_location(program, ptr, encoding))
+    }));
+    locations
+}
+
+/// `textDocument/documentHighlight`: every occurrence of the symbol at
+/// `file`/`offset`, scoped to `file` alone -- `BoundProgram::references_to_in_file`,
+/// the cheaper per-file counterpart to `references_to` `references` above
+/// uses project-wide. Always includes the declaration site when it falls
+/// in `file` (matching typical editor "highlight all occurrences in this
+/// file" UX, unlike `references`, which only includes it when asked).
+/// No `DocumentHighlightKind` (`Read`/`Write`) distinction -- this binder
+/// has no assignment-target tracking to base one on, so every highlight
+/// stays the LSP-default `Text` kind (`kind: None`) rather than inventing
+/// a distinction the resolver doesn't actually make.
+pub(crate) fn document_highlights(
+    program: &BoundProgram,
+    file: FileId,
+    offset: TextSize,
+    encoding: PositionEncoding,
+) -> Vec<DocumentHighlight> {
+    let targets = targets_at(program, file, offset);
+    let mut ranges: Vec<Range> = Vec::new();
+    for &id in &targets {
+        let symbol = program.symbols.get(id);
+        if symbol.file == file {
+            if let Some(loc) = symbol_location(program, id, encoding) {
+                ranges.push(loc.range);
+            }
+        }
+    }
+    for &id in &targets {
+        for ptr in program.references_to_in_file(file, id) {
+            if let Some(loc) = ptr_location(program, ptr, encoding) {
+                ranges.push(loc.range);
+            }
+        }
+    }
+    ranges
+        .into_iter()
+        .map(|range| DocumentHighlight { range, kind: None })
         .collect()
 }
 
@@ -374,7 +481,11 @@ pub(crate) fn folding_ranges(program: &BoundProgram, file: FileId) -> Vec<Foldin
     // The encoding passed here only ever affects `Position::character`,
     // which a line-granular folding range never reports -- `Utf8` is an
     // arbitrary, cost-free choice, not a real encoding decision.
-    let line_of = |offset: TextSize| index.to_position(&text, offset.into(), PositionEncoding::Utf8).line;
+    let line_of = |offset: TextSize| {
+        index
+            .to_position(&text, offset.into(), PositionEncoding::Utf8)
+            .line
+    };
 
     program
         .syntax(file)
