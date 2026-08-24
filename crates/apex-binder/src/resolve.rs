@@ -349,7 +349,11 @@ pub(crate) fn resolve_type_ref(
 ) -> Option<Ty> {
     let name = ty.text();
     let ptr = SyntaxPtr::new(file, ty.syntax());
-    if let Some(id) = resolve_dotted_top_level(table, &ty.base_name_tokens()) {
+    let segments = ty.base_name_tokens();
+    if segments.len() > 1 {
+        record_qualified_segments(table, refs, file, &segments);
+    }
+    if let Some(id) = resolve_dotted_top_level(table, &segments) {
         refs.set(ptr, Resolution::Resolved(id));
         return Some(Ty::Project(id));
     }
@@ -405,6 +409,48 @@ fn resolve_dotted_top_level(
         current = table.nested_type(current, seg.text())?;
     }
     Some(current)
+}
+
+/// A qualified `Outer.Inner` type reference is one flat `Type` node --
+/// there's no separate node for `Outer` to independently resolve
+/// through the way a `FieldExpr`'s receiver gets its own `NameExpr`
+/// (see `resolve_dotted_top_level`'s doc comment). Without this,
+/// clicking anywhere in `TDTM_Runnable.DmlWrapper` -- whichever segment
+/// -- resolved to whatever the *whole* path resolved to (`DmlWrapper`,
+/// the last segment), never `TDTM_Runnable` itself. This records each
+/// segment's own *prefix* resolution instead (`TDTM_Runnable` ->
+/// `TDTM_Runnable` itself, `TDTM_Runnable.DmlWrapper` -> `DmlWrapper`),
+/// keyed by that segment's own token (`SyntaxPtr::for_token`), which
+/// `BoundProgram::resolution_at` checks before falling back to the
+/// whole-node lookup `resolve_type_ref` still also records. A prefix
+/// that itself failed to resolve makes every later segment `Unresolved`
+/// too, not silently unrecorded -- hovering `Bogus` in `Bogus.Inner`
+/// should say so, not fall through to whatever the whole node says.
+/// Only called for an actually-dotted path: the single-segment case
+/// (the overwhelming majority of type references) would otherwise
+/// double `ReferenceTable`'s size with a redundant entry at an
+/// identical range under a different `SyntaxKind`.
+fn record_qualified_segments(
+    table: &SymbolTable,
+    refs: &mut ReferenceTable,
+    file: FileId,
+    segments: &[apex_syntax::SyntaxToken],
+) {
+    let Some((first, rest)) = segments.split_first() else {
+        return;
+    };
+    let mut current = table.top_level(first.text());
+    refs.set(
+        SyntaxPtr::for_token(file, first),
+        current.map_or(Resolution::Unresolved, Resolution::Resolved),
+    );
+    for seg in rest {
+        current = current.and_then(|prev| table.nested_type(prev, seg.text()));
+        refs.set(
+            SyntaxPtr::for_token(file, seg),
+            current.map_or(Resolution::Unresolved, Resolution::Resolved),
+        );
+    }
 }
 
 /// Binds a single declaration-site type reference with no enclosing

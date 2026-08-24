@@ -598,21 +598,25 @@ impl BoundProgram {
         self.bodies.get(&ptr.file())?.refs.get(ptr)
     }
 
-    /// Finds the reference (if any) covering `offset` in `file` -- the
-    /// token at that position, walked up through ancestors until the
-    /// first node whose kind is one Pass 2 actually registers a
-    /// `Resolution` for. Confirmed exhaustive by reading every
-    /// `refs.set(...)` call site in `resolve.rs`/`soql.rs`: exactly
-    /// `NameExpr`, `FieldExpr`, `Type`, `QualifiedName` (a catch clause's
-    /// exception type), `MethodCallExpr`, `CallExpr`, `NewExpr`, and
-    /// `SoqlFieldName` ever get registered, each keyed by its *whole*
-    /// node range, never a sub-token range. `FieldExpr` in particular is
-    /// keyed by the entire `a.b` (receiver included, not just the
-    /// member) -- this still resolves `a` and `b` independently without
-    /// any special-casing, since `a` (when itself a simple name) has its
-    /// own, smaller, closer `NameExpr` ancestor, reached by the walk-up
-    /// before it ever gets to `FieldExpr`; `b` has no node of its own, so
-    /// climbing from its token lands directly on the enclosing
+    /// Finds the reference (if any) covering `offset` in `file` -- first
+    /// checks whether the token itself has its own recorded `Resolution`
+    /// (only ever true for one segment of a qualified `Outer.Inner` type
+    /// reference, `resolve::record_qualified_segments` -- see that
+    /// function's doc comment for why a bare token, not a node, is the
+    /// only way to disambiguate which segment the cursor is on), then
+    /// falls back to walking up through ancestors until the first node
+    /// whose kind is one Pass 2 actually registers a `Resolution` for.
+    /// Confirmed exhaustive by reading every `refs.set(...)` call site in
+    /// `resolve.rs`/`soql.rs`: exactly `NameExpr`, `FieldExpr`, `Type`,
+    /// `QualifiedName` (a catch clause's exception type), `MethodCallExpr`,
+    /// `CallExpr`, `NewExpr`, and `SoqlFieldName` ever get registered at
+    /// the node level, each keyed by its *whole* node range. `FieldExpr`
+    /// in particular is keyed by the entire `a.b` (receiver included, not
+    /// just the member) -- this still resolves `a` and `b` independently
+    /// without any special-casing, since `a` (when itself a simple name)
+    /// has its own, smaller, closer `NameExpr` ancestor, reached by the
+    /// walk-up before it ever gets to `FieldExpr`; `b` has no node of its
+    /// own, so climbing from its token lands directly on the enclosing
     /// `FieldExpr`.
     pub fn resolution_at(&self, file: FileId, offset: rowan::TextSize) -> Option<&Resolution> {
         const REFERENCE_KINDS: [apex_syntax::SyntaxKind; 8] = [
@@ -663,6 +667,17 @@ impl BoundProgram {
                 }
             }
         };
+        // A qualified `Outer.Inner` type reference (`resolve::record_qualified_segments`)
+        // is the one case a bare *token* -- not just a node -- can have
+        // its own recorded `Resolution`: the whole dotted path is a
+        // single flat `Type` node, so `Outer` and `Inner` have no node
+        // of their own to disambiguate through the climb below. Checked
+        // first, before climbing to any ancestor node, so it takes
+        // priority whenever present; every other reference kind never
+        // populates a token-shaped key, so this is a no-op for them.
+        if let Some(res) = self.resolution(SyntaxPtr::for_token(file, &token)) {
+            return Some(res);
+        }
         let mut node = token.parent()?;
         loop {
             if REFERENCE_KINDS.contains(&node.kind()) {

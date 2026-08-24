@@ -26,7 +26,7 @@
 //! other file's.
 
 use crate::file_id::FileId;
-use apex_syntax::{ApexLanguage, SyntaxKind, SyntaxNode};
+use apex_syntax::{ApexLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::ast::AstNode;
 use rowan::{NodeOrToken, TextRange};
 use std::marker::PhantomData;
@@ -49,6 +49,23 @@ impl SyntaxPtr {
             file,
             kind: node.kind(),
             range: node.text_range(),
+        }
+    }
+
+    /// Like [`Self::new`], but for a single token rather than a node --
+    /// one segment of a qualified `Outer.Inner` reference (a dotted
+    /// `Type`), which has no node of its own to key a `Resolution` by
+    /// (the whole path is one flat `Type` node; see
+    /// `crate::resolve::resolve_type_ref`'s doc comment). Never re-resolved
+    /// via [`Self::to_node`] -- a `ReferenceTable` entry is only ever
+    /// looked up by exact `(file, kind, range)` equality, never walked
+    /// back into a live node, so a token-shaped `kind` (never a real
+    /// `SyntaxNode` kind for a multi-token path) is safe to store.
+    pub fn for_token(file: FileId, token: &SyntaxToken) -> Self {
+        SyntaxPtr {
+            file,
+            kind: token.kind(),
+            range: token.text_range(),
         }
     }
 

@@ -276,7 +276,7 @@ fn an_interfaces_extends_clause_resolves_each_supertype_independently() {
 /// genuinely nonexistent name. Covers both `extends` and a field's own
 /// type, since both go through the same `resolve_type_ref`.
 #[test]
-fn a_qualified_outer_dot_inner_supertype_resolves_to_the_nested_type() {
+fn a_qualified_supertypes_first_segment_resolves_to_the_outer_type() {
     let dir = write_fixture_dir(
         "decl-type-qualified-supertype",
         &[
@@ -294,18 +294,22 @@ fn a_qualified_outer_dot_inner_supertype_resolves_to_the_nested_type() {
     std::fs::remove_dir_all(&dir).ok();
 
     let file = file_for(&program, SymbolKind::Class, "fflib_ClassicUnitOfWorkFactory");
-    let inner_id = symbol_id(&program, SymbolKind::Class, "UnitOfWorkFactory");
+    // `type_ref_mid_offset` lands inside the *first* segment
+    // (`fflib_Application`), which should resolve to itself, not the
+    // nested `UnitOfWorkFactory` the whole path names -- see
+    // `each_segment_of_a_qualified_type_resolves_independently`.
+    let outer_id = symbol_id(&program, SymbolKind::Class, "fflib_Application");
     let offset = type_ref_mid_offset(&program, file, "fflib_Application.UnitOfWorkFactory");
 
     assert_eq!(
         program.resolution_at(file, offset).cloned(),
-        Some(Resolution::Resolved(inner_id)),
-        "a qualified Outer.Inner extends clause should resolve to the nested type"
+        Some(Resolution::Resolved(outer_id)),
+        "cursor on a qualified extends clause's first segment should resolve to the outer type"
     );
 }
 
 #[test]
-fn a_qualified_outer_dot_inner_field_type_resolves_to_the_nested_type() {
+fn a_qualified_field_types_first_segment_resolves_to_the_outer_type() {
     let dir = write_fixture_dir(
         "decl-type-qualified-field",
         &[(
@@ -317,13 +321,16 @@ fn a_qualified_outer_dot_inner_field_type_resolves_to_the_nested_type() {
     std::fs::remove_dir_all(&dir).ok();
 
     let file = file_for(&program, SymbolKind::Class, "Foo");
-    let inner_id = symbol_id(&program, SymbolKind::Class, "Inner");
+    // `type_ref_mid_offset` lands inside the *first* segment (`Foo`),
+    // which should resolve to itself, not the nested `Inner` the whole
+    // path names.
+    let outer_id = symbol_id(&program, SymbolKind::Class, "Foo");
     let offset = type_ref_mid_offset(&program, file, "Foo.Inner");
 
     assert_eq!(
         program.resolution_at(file, offset).cloned(),
-        Some(Resolution::Resolved(inner_id)),
-        "a qualified Outer.Inner field type should resolve to the nested type"
+        Some(Resolution::Resolved(outer_id)),
+        "cursor on a qualified field type's first segment should resolve to the outer type"
     );
 }
 
@@ -381,4 +388,60 @@ fn a_foreach_variable_resolves_at_every_reference_including_inside_a_collection_
             r.syntax().text_range()
         );
     }
+}
+
+/// Each segment of a qualified `Outer.Inner` type reference resolves
+/// independently, matching whichever part the cursor is actually on --
+/// `TDTM_Runnable` in `TDTM_Runnable.DmlWrapper` used to resolve to
+/// `DmlWrapper` (the *whole* path's answer) regardless of cursor
+/// position, since the dotted path is one flat `Type` node with no
+/// sub-node of its own for `TDTM_Runnable` to climb to independently
+/// (unlike a `FieldExpr`'s receiver, which does have its own `NameExpr`).
+#[test]
+fn each_segment_of_a_qualified_type_resolves_independently() {
+    let dir = write_fixture_dir(
+        "decl-type-qualified-segments",
+        &[
+            (
+                "TDTM_Runnable.cls",
+                "public class TDTM_Runnable { public class DmlWrapper { } }",
+            ),
+            (
+                "Foo.cls",
+                "public class Foo { public TDTM_Runnable.DmlWrapper w; }",
+            ),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let outer_id = symbol_id(&program, SymbolKind::Class, "TDTM_Runnable");
+    let inner_id = symbol_id(&program, SymbolKind::Class, "DmlWrapper");
+
+    let outer_offset = type_ref_mid_offset(&program, file, "TDTM_Runnable.DmlWrapper");
+    // `type_ref_mid_offset` lands inside the *first* segment (`start + 1`
+    // is inside `TDTM_Runnable`); the second segment's own offset is
+    // computed directly since it isn't its own `Type` node.
+    let whole_range = {
+        let root = program.syntax(file);
+        root.descendants()
+            .filter_map(Type::cast)
+            .find(|t| t.text().as_str() == "TDTM_Runnable.DmlWrapper")
+            .unwrap()
+            .syntax()
+            .text_range()
+    };
+    let inner_offset = whole_range.end() - rowan::TextSize::from(1);
+
+    assert_eq!(
+        program.resolution_at(file, outer_offset).cloned(),
+        Some(Resolution::Resolved(outer_id)),
+        "cursor on `TDTM_Runnable` should resolve to `TDTM_Runnable` itself, not `DmlWrapper`"
+    );
+    assert_eq!(
+        program.resolution_at(file, inner_offset).cloned(),
+        Some(Resolution::Resolved(inner_id)),
+        "cursor on `DmlWrapper` should resolve to `DmlWrapper`"
+    );
 }
