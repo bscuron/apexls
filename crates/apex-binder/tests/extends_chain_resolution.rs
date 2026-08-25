@@ -275,3 +275,45 @@ fn an_override_shadows_its_base_declaration_instead_of_adding_a_spurious_candida
         calls[0]
     );
 }
+
+/// Real NPSP shape (`UTIL_CurrencyCache`): a class implementing an
+/// interface nested *inside itself* (`implements Outer.Inner` where
+/// `Outer` is the implementing class's own name). The qualified name's
+/// first segment resolves to the class itself, not some other top-level
+/// type -- a case `SymbolTable::top_level`'s plain, single-name index
+/// can never match on its own, since it was never asked to resolve a
+/// dotted string in the first place.
+#[test]
+fn a_class_implementing_its_own_nested_interface_gets_it_in_its_inherited_chain() {
+    let dir = write_fixture_dir(
+        "nested-interface-self-implements",
+        &[(
+            "UTIL_CurrencyCache.cls",
+            "public class UTIL_CurrencyCache implements UTIL_CurrencyCache.Interface_x { \
+             public interface Interface_x { void run(); } \
+             public void run() { } \
+         }",
+        )],
+    );
+
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let class_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Class && s.name == "UTIL_CurrencyCache")
+        .map(|(id, _)| id)
+        .expect("UTIL_CurrencyCache should have been collected");
+    let iface_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Interface && s.name == "Interface_x")
+        .map(|(id, _)| id)
+        .expect("Interface_x should have been collected");
+
+    assert!(
+        program.symbols.inherited_chain(class_id).contains(&iface_id),
+        "UTIL_CurrencyCache's inherited chain should include its own nested Interface_x"
+    );
+}
