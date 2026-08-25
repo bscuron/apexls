@@ -32,6 +32,7 @@
 //! (`Resolution::Candidates`/`Unresolved` rather than a guessed single
 //! answer in those cases).
 
+mod call_hierarchy;
 mod ci_key;
 mod collect;
 mod conversions;
@@ -51,6 +52,7 @@ mod symbol;
 mod symbol_table;
 mod ty;
 
+pub use call_hierarchy::{incoming_calls, is_callable, outgoing_calls, IncomingCall, OutgoingCall};
 pub use dead_code::{kind_label, dead_symbols_in_file, DeadSymbol};
 pub use file_id::FileId;
 pub use incremental::BindCache;
@@ -940,6 +942,74 @@ impl BoundProgram {
 
     pub fn scope_tree(&self, block: SyntaxPtr) -> Option<&ScopeTree> {
         self.bodies.get(&block.file())?.scopes.get(&block)
+    }
+
+    /// Every reference in `file` whose own node lies fully within
+    /// `range`, restricted to the three reference kinds that are ever a
+    /// *call* (`MethodCallExpr`/`CallExpr`/`NewExpr` -- confirmed
+    /// exhaustive by the same read of every `refs.set(...)` call site
+    /// `Self::resolution_at`'s doc comment already did; `this(...)`/
+    /// `super(...)` are `CallExpr`, not a separate kind). The primitive
+    /// `crate::call_hierarchy::outgoing_calls` needs "what does this
+    /// method's body call," not every reference in it -- a field access,
+    /// a local, a type name, none of which is a call.
+    pub fn call_sites_in_range(
+        &self,
+        file: FileId,
+        range: rowan::TextRange,
+    ) -> Vec<(SyntaxPtr, Resolution)> {
+        const CALL_KINDS: [apex_syntax::SyntaxKind; 3] = [
+            apex_syntax::SyntaxKind::MethodCallExpr,
+            apex_syntax::SyntaxKind::CallExpr,
+            apex_syntax::SyntaxKind::NewExpr,
+        ];
+        let Some(fb) = self.bodies.get(&file) else {
+            return Vec::new();
+        };
+        fb.refs
+            .iter()
+            .filter(|(ptr, _)| CALL_KINDS.contains(&ptr.kind()) && range.contains_range(ptr.range()))
+            .map(|(ptr, res)| (*ptr, res.clone()))
+            .collect()
+    }
+
+    /// The nearest enclosing `Method`/`Constructor` symbol whose
+    /// declaration contains `offset` in `file` -- `crate::call_hierarchy::incoming_calls`'s
+    /// "who called this, from where" primitive: each call site found via
+    /// `Self::references_to` needs mapping back to whichever callable
+    /// it's physically inside, to serve as the caller `CallHierarchyItem`.
+    /// `None` when `offset` isn't inside a method/constructor body at
+    /// all -- a field/property initializer (Apex allows a call there
+    /// too, e.g. `private static Integer x = computeSomething();`, but
+    /// there's no enclosing callable to honestly report it from).
+    pub fn enclosing_callable(&self, file: FileId, offset: rowan::TextSize) -> Option<SymbolId> {
+        let root = self.syntax(file);
+        let token = match root.token_at_offset(offset) {
+            rowan::TokenAtOffset::None => return None,
+            rowan::TokenAtOffset::Single(t) => t,
+            rowan::TokenAtOffset::Between(left, right) => {
+                if left.kind().is_trivia() {
+                    right
+                } else {
+                    left
+                }
+            }
+        };
+        let decl = token.parent()?.ancestors().find(|n| {
+            matches!(
+                n.kind(),
+                apex_syntax::SyntaxKind::MethodDecl | apex_syntax::SyntaxKind::ConstructorDecl
+            )
+        })?;
+        let range = decl.text_range();
+        self.symbols
+            .symbols_of_file(file)
+            .iter()
+            .enumerate()
+            .find(|(_, s)| {
+                matches!(s.kind, SymbolKind::Method | SymbolKind::Constructor) && s.ptr.range() == range
+            })
+            .map(|(local, _)| SymbolId::new(file, local as u32))
     }
 }
 

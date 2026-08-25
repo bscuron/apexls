@@ -41,9 +41,12 @@ detection (`private`/`public` methods/fields/properties/constructors and
 plain locals; VF-referenced classes and platform-invocation-annotated
 public members are exempted, see below) paired with a "Remove unused
 ..." quick-fix, and shared with the new `apexls dead` batch CLI report.
-Next up is §3's remaining "needs
+`textDocument/prepareCallHierarchy`/`callHierarchy/incomingCalls`/
+`callHierarchy/outgoingCalls` are also done now, computed entirely on
+demand per request rather than needing any precomputed whole-project
+call graph. Next up is §3's remaining "needs
 new binder-side work first" list (`signatureHelp`, `completion`,
-`semanticTokens`, `callHierarchy`, `inlayHint`), or §4's still-open
+`semanticTokens`, `inlayHint`), or §4's still-open
 standard-library/schema type-model gap.
 
 ## 1. Protocol / server layer
@@ -738,10 +741,57 @@ supports each one.
 - [ ] `textDocument/semanticTokens` -- needs a token-classification pass
       over the resolved AST (e.g. distinguishing a field access from a
       local, a resolved type name from an unresolved one).
-- [ ] `textDocument/callHierarchy` (prepare + incoming/outgoing) --
-      needs a real call graph, which the current per-reference
-      `Candidates`/`Resolved` model doesn't build as a first-class
-      structure yet.
+- [x] `textDocument/callHierarchy` (prepare + incoming/outgoing) -- done
+      without needing a precomputed whole-project call graph at all: LSP's
+      own call-hierarchy protocol is inherently lazy/expand-on-demand
+      (prepare returns an item, the client asks `incomingCalls`/
+      `outgoingCalls` per node it drills into), so each request is
+      answered on demand from primitives `references`/`rename` already
+      needed. `apex_binder::call_hierarchy` (`incoming_calls`,
+      `outgoing_calls`, `is_callable`) is the pure analysis layer:
+      `incoming_calls` groups `BoundProgram::references_to`'s project-wide
+      hits by each site's enclosing callable (a new
+      `BoundProgram::enclosing_callable` primitive -- walks a reference's
+      ancestors to the nearest `MethodDecl`/`ConstructorDecl`, then
+      re-resolves that declaration's own name via the existing
+      `symbol_at`); `outgoing_calls` scans a callable's own declaration
+      range for call-shaped references (`MethodCallExpr`/`CallExpr`/
+      `NewExpr` -- confirmed exhaustive by the same node-kind audit
+      `resolution_at`'s doc comment already did) via a new
+      `BoundProgram::call_sites_in_range`. `apexls-server::capabilities`
+      layers `CallHierarchyItem`/`CallHierarchyIncomingCall`/
+      `CallHierarchyOutgoingCall` construction on top, re-resolving each
+      request's `CallHierarchyItem` from its own `uri`/`selection_range`
+      against whatever bind is live *now* rather than round-tripping a
+      `SymbolId` through the `data` field -- the same "always resolve
+      against the current program" posture every other capability here
+      already takes. Constructors are callable targets too (`new Foo()`,
+      `this(...)`/`super(...)`), not just methods.
+
+      An ambiguous overload call (`Resolution::Candidates`) fans out to
+      *every* candidate rather than being silently dropped or guessed --
+      the same "don't guess, but don't hide it either" convention
+      `references`/`documentHighlight` already use for an ambiguous
+      target, not rename's stricter refuse-outright. This is the honest,
+      unavoidable consequence of not having a full type system: an
+      argument whose type comes from an unmodeled stdlib call, a system
+      type outside `crate::conversions`'s curated set, or a genuine tie
+      between equally-specific overloads all still resolve to
+      `Candidates`, not a single guessed answer -- see
+      `crate::resolve::narrow_by_overload`'s own doc comment. One honest
+      v1 gap: a call site with no enclosing method/constructor at all (a
+      field/property initializer, which Apex does allow to contain a
+      call) is silently excluded from `incoming_calls`, since there's no
+      `CallHierarchyItem` to report it from.
+
+      Tests: `apex_binder::call_hierarchy`'s own module (fast, in-process,
+      including the cross-file/field-initializer-exclusion case for
+      incoming calls, a constructor call for outgoing calls, the
+      ambiguous-overload fan-out, and a real-NPSP-corpus sweep proving
+      neither query panics across every callable in a project that size)
+      and `crates/apexls-server/tests/call_hierarchy.rs` (protocol-level,
+      the full prepare-then-incoming/outgoing round trip against the real
+      binary).
 - [ ] `textDocument/inlayHint` -- e.g. inferred local types; blocked on
       the same type-inference limits as §4.
 

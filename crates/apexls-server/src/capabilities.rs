@@ -14,9 +14,10 @@ use apex_syntax::ast::decl::{
     PropertyDecl, TriggerUnit,
 };
 use lsp_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, Diagnostic, DiagnosticSeverity,
-    DiagnosticTag, DocumentHighlight, DocumentSymbol, FoldingRange, Location, Position, Range,
-    SelectionRange, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url, WorkspaceEdit,
+    CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall, CodeAction,
+    CodeActionKind, CodeActionOrCommand, Diagnostic, DiagnosticSeverity, DiagnosticTag,
+    DocumentHighlight, DocumentSymbol, FoldingRange, Location, Position, Range, SelectionRange,
+    SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 use rowan::ast::AstNode;
 use rowan::{TextRange, TextSize};
@@ -965,5 +966,161 @@ pub(crate) fn dead_code_actions(
             })
         })
         .collect()
+}
+
+/// `symbol`'s declaring type's name, for a `CallHierarchyItem`'s
+/// `detail` field -- most clients show it alongside the bare method
+/// name (`Foo.bar`'s detail is `Foo`), the same "which class this
+/// belongs to" context `describe_symbol`'s hover signature line gives a
+/// different way.
+fn call_hierarchy_detail(program: &BoundProgram, symbol: &Symbol) -> Option<String> {
+    let container = symbol.container?;
+    Some(program.symbols.get(container).name.to_string())
+}
+
+/// One `SymbolId` (always `apex_binder::is_callable`, checked by every
+/// caller of this) as a `CallHierarchyItem` -- shared by
+/// `prepare_call_hierarchy` and both `incoming_calls`/`outgoing_calls`,
+/// which each need to render a caller/callee back into the same shape
+/// the client's own prepare request produced.
+fn call_hierarchy_item(
+    program: &BoundProgram,
+    id: SymbolId,
+    encoding: PositionEncoding,
+) -> Option<CallHierarchyItem> {
+    let symbol = program.symbols.get(id);
+    let uri = Url::from_file_path(program.file_path(symbol.file)).ok()?;
+    let root = program.syntax(symbol.file);
+    let text = root.text().to_string();
+    let index = LineIndex::new(&text);
+    let to_range = |r: TextRange| Range {
+        start: index.to_position(&text, r.start().into(), encoding),
+        end: index.to_position(&text, r.end().into(), encoding),
+    };
+    Some(CallHierarchyItem {
+        name: symbol.name.to_string(),
+        kind: lsp_symbol_kind(symbol.kind),
+        tags: None,
+        detail: call_hierarchy_detail(program, symbol),
+        uri,
+        range: to_range(declaration_range(&root, symbol.ptr)),
+        selection_range: to_range(symbol.name_range),
+        data: None,
+    })
+}
+
+/// `textDocument/prepareCallHierarchy`: the callable(s) at the cursor,
+/// the same declaration-then-reference precedence `targets_at` already
+/// gives `references`/`document_highlight`, filtered to
+/// `apex_binder::is_callable` -- a `CallHierarchyItem` is always a
+/// `Method`/`Constructor`, so a cursor on a field/local/type resolves to
+/// nothing here even though `targets_at` itself would find something.
+/// Every `Resolution::Candidates` entry is included, not just the
+/// first, matching `references`/`document_highlight`'s own "don't
+/// guess, show every candidate" convention for an ambiguous overload
+/// call -- see `apex_binder::call_hierarchy`'s module doc comment for
+/// exactly which calls stay ambiguous.
+pub(crate) fn prepare_call_hierarchy(
+    program: &BoundProgram,
+    file: FileId,
+    offset: TextSize,
+    encoding: PositionEncoding,
+) -> Vec<CallHierarchyItem> {
+    targets_at(program, file, offset)
+        .into_iter()
+        .filter(|&id| apex_binder::is_callable(program.symbols.get(id).kind))
+        .filter_map(|id| call_hierarchy_item(program, id, encoding))
+        .collect()
+}
+
+/// `callHierarchy/incomingCalls`: every distinct caller of the callable
+/// at `file`/`offset` (re-resolved from the client-echoed
+/// `CallHierarchyItem`'s own `uri`/`selection_range.start`, via
+/// `capabilities::resolve_position` in the caller of this function --
+/// `CallHierarchyItem` carries no `SymbolId` of its own, and `data` is
+/// left unused rather than round-tripping one, since re-resolving
+/// against whichever `BoundProgram` snapshot is live at request time is
+/// exactly the same "always resolve against the current bind" posture
+/// every other capability here already takes). `None` when `offset`
+/// doesn't land on a real callable's own declared name at all -- the
+/// file was edited out from under a still-open hierarchy view, say.
+pub(crate) fn incoming_calls(
+    program: &BoundProgram,
+    file: FileId,
+    offset: TextSize,
+    encoding: PositionEncoding,
+) -> Option<Vec<CallHierarchyIncomingCall>> {
+    let id = program.symbol_at(file, offset)?;
+    if !apex_binder::is_callable(program.symbols.get(id).kind) {
+        return None;
+    }
+    Some(
+        apex_binder::incoming_calls(program, id)
+            .into_iter()
+            .filter_map(|call| {
+                let from = call_hierarchy_item(program, call.from, encoding)?;
+                // Every call site in `call.call_sites` lives in the same
+                // file as `call.from` itself -- Apex has no partial
+                // classes, so a caller's own body can never span files --
+                // so one `LineIndex`, built once, covers the whole group.
+                let caller_file = program.symbols.get(call.from).file;
+                let root = program.syntax(caller_file);
+                let text = root.text().to_string();
+                let index = LineIndex::new(&text);
+                let from_ranges = call
+                    .call_sites
+                    .into_iter()
+                    .map(|ptr| {
+                        let range = program.highlight_range(ptr);
+                        Range {
+                            start: index.to_position(&text, range.start().into(), encoding),
+                            end: index.to_position(&text, range.end().into(), encoding),
+                        }
+                    })
+                    .collect();
+                Some(CallHierarchyIncomingCall { from, from_ranges })
+            })
+            .collect(),
+    )
+}
+
+/// `callHierarchy/outgoingCalls`: every distinct callable the callable
+/// at `file`/`offset` calls in its own body -- otherwise the mirror
+/// image of `incoming_calls`, down to the re-resolution posture and the
+/// same ambiguous-call fan-out.
+pub(crate) fn outgoing_calls(
+    program: &BoundProgram,
+    file: FileId,
+    offset: TextSize,
+    encoding: PositionEncoding,
+) -> Option<Vec<CallHierarchyOutgoingCall>> {
+    let id = program.symbol_at(file, offset)?;
+    if !apex_binder::is_callable(program.symbols.get(id).kind) {
+        return None;
+    }
+    let caller_file = program.symbols.get(id).file;
+    let root = program.syntax(caller_file);
+    let text = root.text().to_string();
+    let index = LineIndex::new(&text);
+    Some(
+        apex_binder::outgoing_calls(program, id)
+            .into_iter()
+            .filter_map(|call| {
+                let to = call_hierarchy_item(program, call.to, encoding)?;
+                let from_ranges = call
+                    .call_sites
+                    .into_iter()
+                    .map(|ptr| {
+                        let range = program.highlight_range(ptr);
+                        Range {
+                            start: index.to_position(&text, range.start().into(), encoding),
+                            end: index.to_position(&text, range.end().into(), encoding),
+                        }
+                    })
+                    .collect();
+                Some(CallHierarchyOutgoingCall { to, from_ranges })
+            })
+            .collect(),
+    )
 }
 

@@ -84,7 +84,9 @@ use async_lsp::tracing::TracingLayer;
 use async_lsp::{ClientSocket, ErrorCode, LanguageServer, ResponseError};
 use futures::future::BoxFuture;
 use lsp_types::{
-    CodeActionKind, CodeActionOptions, CodeActionParams, CodeActionProviderCapability,
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyOptions, CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
+    CallHierarchyPrepareParams, CallHierarchyServerCapability, CodeActionKind, CodeActionOptions, CodeActionParams, CodeActionProviderCapability,
     CodeActionResponse, DidChangeConfigurationParams, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
@@ -609,6 +611,11 @@ impl LanguageServer for Backend {
                             ..Default::default()
                         },
                     )),
+                    call_hierarchy_provider: Some(CallHierarchyServerCapability::Options(
+                        CallHierarchyOptions {
+                            work_done_progress_options: Default::default(),
+                        },
+                    )),
                     ..ServerCapabilities::default()
                 },
                 server_info: Some(ServerInfo {
@@ -935,6 +942,90 @@ impl LanguageServer for Backend {
                 Ok(edit) => Ok(Some(edit)),
                 Err(refusal) => Err(ResponseError::new(ErrorCode::REQUEST_FAILED, refusal.message())),
             }
+        })
+    }
+
+    /// `capabilities::prepare_call_hierarchy`: the callable(s) at the
+    /// cursor, the first leg of the three-request call-hierarchy dance
+    /// (prepare, then the client asks `incomingCalls`/`outgoingCalls`
+    /// per item it wants to expand).
+    fn prepare_call_hierarchy(
+        &mut self,
+        params: CallHierarchyPrepareParams,
+    ) -> BoxFuture<'static, Result<Option<Vec<CallHierarchyItem>>, Self::Error>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some((file, offset)) =
+                capabilities::resolve_position(program, &uri, position, encoding)
+            else {
+                return Ok(None);
+            };
+
+            let items = capabilities::prepare_call_hierarchy(program, file, offset, encoding);
+            Ok((!items.is_empty()).then_some(items))
+        })
+    }
+
+    /// `capabilities::incoming_calls`: every caller of the callable
+    /// `params.item` names, re-resolved from its own `uri`/
+    /// `selection_range` against whatever bind is live right now.
+    fn incoming_calls(
+        &mut self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> BoxFuture<'static, Result<Option<Vec<CallHierarchyIncomingCall>>, Self::Error>> {
+        let uri = params.item.uri;
+        let position = params.item.selection_range.start;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some((file, offset)) =
+                capabilities::resolve_position(program, &uri, position, encoding)
+            else {
+                return Ok(None);
+            };
+
+            Ok(capabilities::incoming_calls(program, file, offset, encoding))
+        })
+    }
+
+    /// `capabilities::outgoing_calls`: the mirror image of `incoming_calls`.
+    fn outgoing_calls(
+        &mut self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> BoxFuture<'static, Result<Option<Vec<CallHierarchyOutgoingCall>>, Self::Error>> {
+        let uri = params.item.uri;
+        let position = params.item.selection_range.start;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some((file, offset)) =
+                capabilities::resolve_position(program, &uri, position, encoding)
+            else {
+                return Ok(None);
+            };
+
+            Ok(capabilities::outgoing_calls(program, file, offset, encoding))
         })
     }
 
