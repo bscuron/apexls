@@ -819,6 +819,48 @@ impl<'a> BodyBinder<'a> {
         Some(Ty::system_owned(type_name.to_string(), args))
     }
 
+    /// The propagated `Ty` for a method/constructor-call `Resolution`:
+    /// exact for `Resolved` (`type_of_symbol` of the one candidate), and
+    /// also recoverable for `Candidates` when every surviving candidate
+    /// happens to declare the *identical* return type -- which chaining
+    /// off an overloaded or dynamically-dispatched call very often does
+    /// (a fluent builder's `withX(...)` overloads all returning the same
+    /// class, or a virtual method and its override sharing an identical
+    /// return type by construction). Without this, resolving to
+    /// `Candidates` -- itself often unavoidable, e.g.
+    /// `crate::conversions`'s curated type model has no rule for an
+    /// unmodeled system parameter type like `Schema.FieldSetMember`, so a
+    /// real, unambiguous call can still end up `Candidates` rather than
+    /// `Resolved` -- silently dropped the call's type entirely, breaking
+    /// resolution for *every* subsequent `.member`/`.method()` chained
+    /// onto it, even though the type itself was never actually in doubt.
+    /// Real NPSP shape this fixed: `UTIL_Finder`'s fluent
+    /// `.withSelectFields(...)` (three overloads, all returning
+    /// `UTIL_Finder`) chained into `.withSearchQuery(...)` -- the
+    /// ambiguous `withSelectFields` overload pick (`List<FieldSetMember>`
+    /// can't be positively ruled out for a `List<String>` argument,
+    /// `FieldSetMember` being outside `crate::conversions`'s curated set)
+    /// used to blank out the whole rest of the chain, permanently hiding
+    /// every real call to `withSearchQuery` and flagging it dead. `None`
+    /// whenever candidates disagree (or any one of them can't be typed at
+    /// all) -- "can't prove a shared type" must never guess one.
+    fn result_type_of(&self, resolution: &Resolution) -> Option<Ty> {
+        match resolution {
+            Resolution::Resolved(id) => self.type_of_symbol(*id),
+            Resolution::Candidates(ids) => {
+                let mut ids = ids.iter();
+                let first = self.type_of_symbol(*ids.next()?)?;
+                for &id in ids {
+                    if self.type_of_symbol(id).as_ref() != Some(&first) {
+                        return None;
+                    }
+                }
+                Some(first)
+            }
+            _ => None,
+        }
+    }
+
     /// A body-context type reference (a local/param/return type, a
     /// `new`/`instanceof`/cast target, ...) -- delegates to the free
     /// function [`resolve_type_ref`], which also backs declaration-site
@@ -1474,10 +1516,7 @@ impl<'a> BodyBinder<'a> {
                     self.table,
                     narrow_by_overload(self.table, methods, &arg_types),
                 );
-                let result_type = match &resolution {
-                    Resolution::Resolved(id) => self.type_of_symbol(*id),
-                    _ => None,
-                };
+                let result_type = self.result_type_of(&resolution);
                 self.refs.set_with_highlight(ptr, highlight, resolution);
                 result_type
             }
@@ -1586,10 +1625,7 @@ impl<'a> BodyBinder<'a> {
         // `collect::collect_constructor`), so `type_of_symbol` is `None`
         // for the `this(...)`/`super(...)` case without needing a
         // separate `want_ctor` guard here.
-        let result_type = match &resolution {
-            Resolution::Resolved(id) => self.type_of_symbol(*id),
-            _ => None,
-        };
+        let result_type = self.result_type_of(&resolution);
         self.refs.set_with_highlight(ptr, highlight, resolution);
         result_type
     }
