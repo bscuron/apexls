@@ -34,6 +34,7 @@
 
 mod ci_key;
 mod collect;
+mod conversions;
 mod file_id;
 mod file_table;
 mod generics;
@@ -699,16 +700,58 @@ impl BoundProgram {
         self.bodies.get(&ptr.file())?.refs.get(ptr)
     }
 
-    /// The range `documentHighlight`/`references` should report for
-    /// `ptr` -- narrower than `ptr.range()` for a call/field-access
-    /// reference (`ReferenceTable::highlight_range`'s doc comment), and
-    /// otherwise just `ptr.range()` itself. Falls back to `ptr.range()`
-    /// when `ptr`'s file has no bound body at all, matching every other
-    /// `bodies.get(...)`-backed lookup's "nothing recorded" behavior.
+    /// The range `documentHighlight`/`references`/`rename` should report
+    /// for `ptr`. Three tiers, cheapest/most-common first:
+    /// 1. A narrow range eagerly recorded via `set_with_highlight`
+    ///    (`ReferenceTable::stored_highlight_range`) -- a call/field-
+    ///    access-shaped reference, where the node spans well past the
+    ///    identifier (target through closing paren, say).
+    /// 2. Otherwise, computed here on demand for a reference kind whose
+    ///    node range is only ever off by trailing trivia (`NameExpr`/
+    ///    `Type`/`QualifiedName` -- see `crate::resolve::bind_name_expr`'s
+    ///    doc comment for why this is computed lazily, per query, rather
+    ///    than eagerly stored the same way tier 1 is: these three kinds
+    ///    are common enough in real code that eager storage measurably
+    ///    regressed bind time).
+    /// 3. Otherwise (or when `ptr`'s file has no bound body at all,
+    ///    matching every other `bodies.get(...)`-backed lookup's
+    ///    "nothing recorded" behavior), just `ptr.range()` itself --
+    ///    already exactly the identifier for every remaining reference
+    ///    kind (`ThisExpr`/`SuperExpr`/a `SoqlFieldName`'s own token-keyed
+    ///    entries).
     pub fn highlight_range(&self, ptr: SyntaxPtr) -> rowan::TextRange {
-        self.bodies
-            .get(&ptr.file())
-            .map_or_else(|| ptr.range(), |fb| fb.refs.highlight_range(ptr))
+        let Some(fb) = self.bodies.get(&ptr.file()) else {
+            return ptr.range();
+        };
+        if let Some(stored) = fb.refs.stored_highlight_range(ptr) {
+            return stored;
+        }
+        self.tight_range_for(ptr).unwrap_or_else(|| ptr.range())
+    }
+
+    /// Tier 2 of [`Self::highlight_range`]: for a reference `SyntaxPtr`
+    /// whose node range can include trailing trivia, re-resolves it
+    /// against the live tree and returns just the identifier's own
+    /// token(s) -- `None` when `ptr`'s kind isn't one of these, or it
+    /// fails to re-resolve (defensive; shouldn't happen against this
+    /// file's own current tree).
+    fn tight_range_for(&self, ptr: SyntaxPtr) -> Option<rowan::TextRange> {
+        use apex_syntax::ast::expr::NameExpr;
+        use apex_syntax::ast::{QualifiedName, Type};
+        use apex_syntax::SyntaxKind;
+
+        let node = ptr.to_node(&self.syntax(ptr.file()))?;
+        match ptr.kind() {
+            SyntaxKind::NameExpr => Some(NameExpr::cast(node)?.name_token()?.text_range()),
+            SyntaxKind::Type => Type::cast(node)?
+                .base_name_tokens()
+                .last()
+                .map(|t| t.text_range()),
+            SyntaxKind::QualifiedName => {
+                Some(QualifiedName::cast(node)?.last_token()?.text_range())
+            }
+            _ => None,
+        }
     }
 
     /// Finds the reference (if any) covering `offset` in `file` -- first

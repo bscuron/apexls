@@ -95,6 +95,17 @@ ast_node!(Name, DeclName);
 ast_node!(Type, Type);
 ast_node!(QualifiedName, QualifiedName);
 
+impl QualifiedName {
+    /// The last dotted segment's own token (`Exception` in
+    /// `System.Exception`) -- unlike `self.syntax().text_range()`, never
+    /// wider than the name itself: see [`Name::ident_range`]'s doc
+    /// comment for why a wrapping node's raw range can include trailing
+    /// trivia this parser attaches as one of its own children.
+    pub fn last_token(&self) -> Option<SyntaxToken> {
+        last_non_trivia_token(self.syntax())
+    }
+}
+
 impl Name {
     /// The single identifier-shaped token a `Name` node wraps -- may be
     /// `Identifier` or any of the many keyword tokens that double as
@@ -106,6 +117,26 @@ impl Name {
 
     pub fn text(&self) -> Option<SmolStr> {
         self.token().map(|t| SmolStr::new(t.text()))
+    }
+
+    /// The identifier's own token range -- deliberately *not*
+    /// `self.syntax().text_range()`, which this parser's tree-builder can
+    /// make wider than the identifier itself: trailing trivia between a
+    /// declared name and whatever follows it (almost always at least one
+    /// space) is attached as a trailing child *inside* the `DeclName`
+    /// node, not as leading trivia of the next token, so the node's own
+    /// range silently includes it. Every caller that needs an exact,
+    /// tight identifier span (a `Symbol::name_range`, a rename's
+    /// replacement range, ...) must go through this rather than the raw
+    /// node range -- using the latter is off by however much trailing
+    /// trivia happens to follow, which for most real declarations is
+    /// exactly one whitespace character, easy to miss until something
+    /// (like a rename's `TextEdit`) is actually sensitive to the exact
+    /// end boundary instead of just "close enough to place a cursor."
+    pub fn ident_range(&self) -> rowan::TextRange {
+        self.token()
+            .map(|t| t.text_range())
+            .unwrap_or_else(|| self.syntax().text_range())
     }
 }
 

@@ -98,17 +98,38 @@ pub fn is_relevant_path(path: &Path) -> bool {
 }
 
 fn is_apex_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("cls") || ext.eq_ignore_ascii_case("trigger"))
+    !is_hidden(path)
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cls") || ext.eq_ignore_ascii_case("trigger"))
 }
 
 fn is_object_meta_file(path: &Path) -> bool {
-    ends_with_ci(path, ".object-meta.xml")
+    !is_hidden(path) && ends_with_ci(path, ".object-meta.xml")
 }
 
 fn is_field_meta_file(path: &Path) -> bool {
-    ends_with_ci(path, ".field-meta.xml")
+    !is_hidden(path) && ends_with_ci(path, ".field-meta.xml")
+}
+
+/// Whether `path`'s own file name starts with `.` -- a hidden file on
+/// Unix-like conventions, and also the exact naming pattern several
+/// editors use for a lock/swap file that lives *alongside* the real file
+/// it's tracking while it's open (Emacs's `.#foo.cls` lock file, vim's
+/// `.foo.cls.swp`, ...). A real bug this closes: `Path::extension()`
+/// splits on the *last* `.` in the file name regardless of a leading one,
+/// so `.#TDTM_ObjectDataGateway.cls` -- a real Emacs lock file, ~30 bytes
+/// of plain text like `user@host.pid:boot-time`, not valid Apex -- has
+/// extension `cls` and was being discovered and fed into the binder as a
+/// genuine new class file. Unlike a real new source file, a lock file's
+/// *existence* is momentary and its content is never meaningful Apex, so
+/// it must never be treated as project state at all, not merely parsed
+/// leniently.
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.'))
 }
 
 fn ends_with_ci(path: &Path, suffix: &str) -> bool {

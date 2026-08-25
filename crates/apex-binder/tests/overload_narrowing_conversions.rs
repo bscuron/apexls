@@ -1,0 +1,260 @@
+//! `crate::conversions`'s curated Apex implicit-conversion rules, exercised
+//! through real overload calls (`crate::resolve::narrow_by_overload`) --
+//! complements `conversions.rs`'s own unit tests (which check the
+//! compatibility/specificity functions in isolation) by proving they're
+//! actually wired into real call-site resolution, and that the "never
+//! eliminate outside the curated set" safety property still holds.
+
+use apex_binder::{BoundProgram, Resolution, SymbolKind, SyntaxPtr};
+
+fn write_fixture_dir(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("apex-binder-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (file_name, src) in files {
+        std::fs::write(dir.join(file_name), src).unwrap();
+    }
+    dir
+}
+
+/// The `pick` overload whose sole parameter's declared type is exactly
+/// `param_type_name` (e.g. `"Integer"`, `"Long"`) -- picks it out
+/// unambiguously among several same-name overloads without depending on
+/// declaration order.
+fn pick_overload_with_param_type(program: &BoundProgram, param_type_name: &str) -> apex_binder::SymbolId {
+    program
+        .symbols
+        .iter()
+        .filter(|(_, s)| s.kind == SymbolKind::Method && s.name == "pick")
+        .find(|(id, _)| {
+            program
+                .symbols
+                .get(program.symbols.params(*id)[0])
+                .type_name
+                .as_deref()
+                == Some(param_type_name)
+        })
+        .map(|(id, _)| id)
+        .unwrap_or_else(|| panic!("pick({param_type_name}) should exist"))
+}
+
+/// The `pick` overload whose sole parameter is declared as
+/// `collection_name<element_type_name>` (e.g. `"List"`, `"Integer"`).
+fn pick_overload_with_collection_param(
+    program: &BoundProgram,
+    collection_name: &str,
+    element_type_name: &str,
+) -> apex_binder::SymbolId {
+    program
+        .symbols
+        .iter()
+        .filter(|(_, s)| s.kind == SymbolKind::Method && s.name == "pick")
+        .find(|(id, _)| {
+            let p = program.symbols.get(program.symbols.params(*id)[0]);
+            p.type_name.as_deref() == Some(collection_name)
+                && p.type_args.first().map(|s| s.as_str()) == Some(element_type_name)
+        })
+        .map(|(id, _)| id)
+        .unwrap_or_else(|| panic!("pick({collection_name}<{element_type_name}>) should exist"))
+}
+
+fn file_for(program: &BoundProgram, kind: SymbolKind, name: &str) -> apex_binder::FileId {
+    program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == kind && s.name == name)
+        .map(|(_, s)| s.file)
+        .unwrap_or_else(|| panic!("{name} should have been collected"))
+}
+
+/// The single `CallExpr`/`MethodCallExpr` whose callee text is `name`, in
+/// `file` -- asserts there's exactly one so a test's intent is
+/// unambiguous.
+fn the_call_resolution(
+    program: &BoundProgram,
+    file: apex_binder::FileId,
+    name: &str,
+) -> Option<Resolution> {
+    use apex_syntax::ast::expr::CallExpr;
+    use rowan::ast::AstNode;
+    let root = program.syntax(file);
+    let matches: Vec<_> = root
+        .descendants()
+        .filter_map(CallExpr::cast)
+        .filter(|c| c.callee_token().is_some_and(|t| t.text() == name))
+        .collect();
+    assert_eq!(matches.len(), 1, "expected exactly one call to `{name}`");
+    program
+        .resolution(SyntaxPtr::new(file, matches[0].syntax()))
+        .cloned()
+}
+
+#[test]
+fn numeric_literal_resolves_the_exact_overload_over_a_wider_one() {
+    let dir = write_fixture_dir(
+        "numeric-exact",
+        &[(
+            "Toolbox.cls",
+            "public class Toolbox { \
+             public void pick(Integer x) { } \
+             public void pick(Long x) { } \
+             public void pick(Decimal x) { } \
+             public void run() { pick(1); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let int_overload = pick_overload_with_param_type(&program, "Integer");
+
+    assert_eq!(
+        the_call_resolution(&program, file, "pick"),
+        Some(Resolution::Resolved(int_overload))
+    );
+}
+
+#[test]
+fn numeric_literal_widens_to_the_nearest_overload_when_no_exact_match_exists() {
+    let dir = write_fixture_dir(
+        "numeric-widen",
+        &[(
+            "Toolbox.cls",
+            "public class Toolbox { \
+             public void pick(Long x) { } \
+             public void pick(Decimal x) { } \
+             public void run() { pick(1); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let long_overload = pick_overload_with_param_type(&program, "Long");
+
+    assert_eq!(
+        the_call_resolution(&program, file, "pick"),
+        Some(Resolution::Resolved(long_overload))
+    );
+}
+
+#[test]
+fn a_string_argument_prefers_the_exact_overload_over_object() {
+    let dir = write_fixture_dir(
+        "object-vs-string",
+        &[(
+            "Toolbox.cls",
+            "public class Toolbox { \
+             public void pick(String x) { } \
+             public void pick(Object x) { } \
+             public void run() { pick('hi'); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let string_overload = pick_overload_with_param_type(&program, "String");
+
+    assert_eq!(
+        the_call_resolution(&program, file, "pick"),
+        Some(Resolution::Resolved(string_overload))
+    );
+}
+
+#[test]
+fn a_list_of_integer_argument_prefers_the_exact_element_type_over_a_widened_one() {
+    // Verified against a real connected org before encoding this rule:
+    // Apex's collection generics aren't invariant the way Java's are --
+    // `List<Integer>` also satisfies a `List<Long>`-only overload, so
+    // *both* declared overloads below are individually applicable; the
+    // most-specific tiebreak must still prefer the exact one.
+    let dir = write_fixture_dir(
+        "list-numeric-widen",
+        &[(
+            "Toolbox.cls",
+            "public class Toolbox { \
+             public void pick(List<Integer> x) { } \
+             public void pick(List<Long> x) { } \
+             public void run() { List<Integer> xs = new List<Integer>(); pick(xs); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let list_integer_overload = pick_overload_with_collection_param(&program, "List", "Integer");
+
+    assert_eq!(
+        the_call_resolution(&program, file, "pick"),
+        Some(Resolution::Resolved(list_integer_overload))
+    );
+}
+
+#[test]
+fn a_list_of_a_project_local_subtype_eliminates_a_mismatched_element_leaf_type() {
+    // A `List<Dog>` (`Dog extends Animal`) must still resolve
+    // `pick(List<Animal>)` over a `pick(List<String>)` sibling overload --
+    // the project-local element type's own `extends` upcast (already
+    // exact before this work) combines with the new system-vs-project
+    // elimination (a `Dog` element can never satisfy a `List<String>`
+    // parameter) to leave exactly one candidate.
+    let dir = write_fixture_dir(
+        "list-project-element",
+        &[
+            ("Animal.cls", "public virtual class Animal { }"),
+            ("Dog.cls", "public class Dog extends Animal { }"),
+            (
+                "Toolbox.cls",
+                "public class Toolbox { \
+                 public void pick(List<Animal> x) { } \
+                 public void pick(List<String> x) { } \
+                 public void run() { List<Dog> dogs = new List<Dog>(); pick(dogs); } \
+             }",
+            ),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let list_animal_overload = pick_overload_with_collection_param(&program, "List", "Animal");
+
+    assert_eq!(
+        the_call_resolution(&program, file, "pick"),
+        Some(Resolution::Resolved(list_animal_overload))
+    );
+}
+
+#[test]
+fn argument_and_parameter_types_outside_the_curated_set_stay_ambiguous() {
+    // `Id`/`Blob` are real Apex system types, but neither is in
+    // `crate::conversions`'s curated set -- an `Id`-typed argument must
+    // never eliminate a `Blob` overload (or vice versa), even though a
+    // real compiler would reject this call. "Can't prove wrong" must keep
+    // winning outside the curated rules, exactly as it did before this
+    // work for every system type.
+    let dir = write_fixture_dir(
+        "uncurated-stays-ambiguous",
+        &[(
+            "Toolbox.cls",
+            "public class Toolbox { \
+             public void pick(Id x) { } \
+             public void pick(Blob x) { } \
+             public void run() { Id anId; pick(anId); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let Some(Resolution::Candidates(remaining)) = the_call_resolution(&program, file, "pick") else {
+        panic!("expected pick(anId) to stay Candidates when both overloads are uncurated system types");
+    };
+    assert_eq!(remaining.len(), 2);
+}

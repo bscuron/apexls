@@ -15,9 +15,10 @@ use apex_syntax::ast::decl::{
 };
 use lsp_types::{
     DocumentHighlight, DocumentSymbol, FoldingRange, Location, Position, Range, SelectionRange,
-    SymbolInformation, SymbolKind as LspSymbolKind, Url,
+    SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 use rowan::{TextRange, TextSize};
+use std::collections::HashMap;
 
 /// `uri`/`position` -> the `FileId`/byte-offset `program`'s own API
 /// understands. `None` whenever `uri` doesn't name a file this bound
@@ -563,6 +564,287 @@ pub(crate) fn selection_range_at(
         });
     }
     result
+}
+
+/// Why `textDocument/rename`/`prepareRename` refused a target -- every
+/// variant becomes a `ResponseError` message in `main.rs`, never a
+/// silently empty or partial result. `references`/`document_highlight`
+/// can afford to show every `Resolution::Candidates` entry and let the
+/// user look; a rename is a mutating, project-wide operation, so the same
+/// "don't guess" convention means refusing outright here instead.
+pub(crate) enum RenameRefusal {
+    NoSymbolHere,
+    Ambiguous,
+    Trigger,
+    OverrideChain(&'static str),
+    InvalidIdentifier,
+    NameCollision,
+}
+
+impl RenameRefusal {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            RenameRefusal::NoSymbolHere => "no renameable symbol at this position".to_string(),
+            RenameRefusal::Ambiguous => "this reference is ambiguous (an unresolved overload or \
+                 unmodeled type) -- renaming could silently rewrite the wrong call site"
+                .to_string(),
+            RenameRefusal::Trigger => "a trigger's name is tied to its Salesforce object, not a \
+                 renameable identifier"
+                .to_string(),
+            RenameRefusal::OverrideChain(reason) => {
+                format!("can't safely rename this method: {reason}")
+            }
+            RenameRefusal::InvalidIdentifier => {
+                "the new name isn't a valid Apex identifier".to_string()
+            }
+            RenameRefusal::NameCollision => {
+                "the new name would collide with an existing declaration".to_string()
+            }
+        }
+    }
+}
+
+/// The single, safely-renameable `SymbolId` at `file`/`offset`, or why
+/// not. Mirrors `targets_at`'s declaration-then-reference precedence, but
+/// -- unlike the read-only requests that reuse `targets_at` and can afford
+/// to show every `Candidates` entry -- a rename must resolve to *exactly*
+/// one target and every one of its references must resolve just as
+/// cleanly, or it refuses outright.
+pub(crate) fn rename_target(
+    program: &BoundProgram,
+    file: FileId,
+    offset: TextSize,
+) -> Result<SymbolId, RenameRefusal> {
+    let id = if let Some(id) = program.symbol_at(file, offset) {
+        id
+    } else {
+        match program.resolution_at(file, offset) {
+            Some(Resolution::Resolved(id)) => *id,
+            Some(Resolution::Candidates(_)) => return Err(RenameRefusal::Ambiguous),
+            _ => return Err(RenameRefusal::NoSymbolHere),
+        }
+    };
+
+    let symbol = program.symbols.get(id);
+    if symbol.kind == SymbolKind::Trigger {
+        return Err(RenameRefusal::Trigger);
+    }
+    if symbol.kind == SymbolKind::Method {
+        check_method_eligible(program, id)?;
+    }
+
+    if !references_resolve_cleanly(program, id) {
+        return Err(RenameRefusal::Ambiguous);
+    }
+    Ok(id)
+}
+
+/// Whether every reference `program.references_to(id)` reports actually
+/// resolves *exactly* to `id` alone (`Resolution::Resolved`), not as one
+/// entry of an ambiguous `Resolution::Candidates` set it also happens to
+/// belong to (`ReferenceTable`'s reverse index deliberately includes a
+/// reference in *every* candidate's `by_symbol` entry, not just a
+/// silently-picked one -- see `BACKLOG.md` §3 -- so `references_to`
+/// alone can't tell the two cases apart).
+fn references_resolve_cleanly(program: &BoundProgram, id: SymbolId) -> bool {
+    program.references_to(id).all(|ptr| {
+        matches!(program.resolution(ptr), Some(Resolution::Resolved(resolved)) if *resolved == id)
+    })
+}
+
+/// A `Method` is renameable only when it can't be part of an override
+/// chain this feature doesn't cascade across (a distinct, unsolved problem
+/// from overload-call ambiguity): not itself marked `override`, not
+/// implementing an interface/base-class method of the same name and arity
+/// (Apex requires no `override` keyword for that case), and not itself
+/// overridden by any subclass. The last check scans every project symbol
+/// -- no index answers "which methods override this one" the way
+/// `SymbolTable`'s other lookups are O(1), but that's fine here: a rename
+/// is a rare, user-initiated action, not a per-keystroke path the rest of
+/// this codebase optimizes for.
+fn check_method_eligible(program: &BoundProgram, id: SymbolId) -> Result<(), RenameRefusal> {
+    let symbol = program.symbols.get(id);
+    if symbol.modifiers.is_override {
+        return Err(RenameRefusal::OverrideChain(
+            "it overrides a base class method",
+        ));
+    }
+    let Some(container) = symbol.container else {
+        return Ok(());
+    };
+    let arity = program.symbols.params(id).len();
+
+    for &ancestor in program.symbols.inherited_chain(container) {
+        for candidate in program.symbols.lookup_member(ancestor, &symbol.name) {
+            if candidate != id && program.symbols.params(candidate).len() == arity {
+                return Err(RenameRefusal::OverrideChain(
+                    "it implements an interface or base-class method of the same name",
+                ));
+            }
+        }
+    }
+
+    let overridden_by_subclass = program.symbols.iter().any(|(other_id, other)| {
+        other_id != id
+            && other.kind == SymbolKind::Method
+            && other.modifiers.is_override
+            && other.name.eq_ignore_ascii_case(&symbol.name)
+            && program.symbols.params(other_id).len() == arity
+            && other
+                .container
+                .is_some_and(|c| program.symbols.inherited_chain(c).contains(&container))
+    });
+    if overridden_by_subclass {
+        return Err(RenameRefusal::OverrideChain("it's overridden by a subclass"));
+    }
+    Ok(())
+}
+
+/// Whether `new_name` is a syntactically legal, non-keyword Apex
+/// identifier -- reuses `apex_lexer`'s own tokenizer rather than hand-
+/// rolling a second identifier/keyword rule set: `new_name` is legal only
+/// when it lexes as *exactly one* `Identifier` token (a keyword lexes as
+/// its own distinct `TokenKind`, and anything containing whitespace/
+/// punctuation/more than one word lexes as more than one token).
+fn is_valid_new_identifier(new_name: &str) -> bool {
+    let tokens = apex_lexer::tokenize(new_name);
+    tokens.len() == 1 && tokens[0].kind == apex_lexer::TokenKind::Identifier
+}
+
+/// Whether renaming `id` to `new_name` would collide with an existing
+/// declaration -- cheap, using only indices `SymbolTable` already builds
+/// (`top_level`/`lookup_member`, both already O(1)/case-insensitive).
+/// Honest v1 gap: a `Parameter`/local-variable kind isn't checked here --
+/// that needs a scope-tree walk this pass doesn't attempt yet, a narrower
+/// gap than skipping collision detection entirely (every other kind is
+/// still fully covered), and a real compiler still catches an actual
+/// shadowing conflict immediately, unlike a member/type collision, which
+/// can silently shadow across the whole project.
+fn renamed_symbol_collides(program: &BoundProgram, id: SymbolId, new_name: &str) -> bool {
+    let symbol = program.symbols.get(id);
+    match symbol.kind {
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum => {
+            program.symbols.top_level(new_name).is_some()
+        }
+        SymbolKind::Field
+        | SymbolKind::Property
+        | SymbolKind::Method
+        | SymbolKind::Constructor
+        | SymbolKind::EnumConstant => symbol.container.is_some_and(|container| {
+            program
+                .symbols
+                .lookup_member(container, new_name)
+                .into_iter()
+                .any(|other| other != id)
+        }),
+        _ => false,
+    }
+}
+
+/// `textDocument/prepareRename`'s range: the plain identifier token under
+/// the cursor, independent of whether it's a declaration or a reference --
+/// once `rename_target` has already confirmed the position names exactly
+/// one safely-renameable symbol, the client just needs the span its rename
+/// input box should cover. Same token-lookup pattern as `selection_range_at`.
+pub(crate) fn prepare_rename_range(
+    program: &BoundProgram,
+    file: FileId,
+    offset: TextSize,
+    encoding: PositionEncoding,
+) -> Option<Range> {
+    let root = program.syntax(file);
+    let token = match root.token_at_offset(offset) {
+        rowan::TokenAtOffset::None => return None,
+        rowan::TokenAtOffset::Single(t) => t,
+        rowan::TokenAtOffset::Between(left, right) => {
+            if left.kind().is_trivia() {
+                right
+            } else {
+                left
+            }
+        }
+    };
+    let text = root.text().to_string();
+    let index = LineIndex::new(&text);
+    let range = token.text_range();
+    Some(Range {
+        start: index.to_position(&text, range.start().into(), encoding),
+        end: index.to_position(&text, range.end().into(), encoding),
+    })
+}
+
+/// `textDocument/rename`: a project-wide `WorkspaceEdit` renaming the
+/// symbol at `file`/`offset` to `new_name`, or why not (`RenameRefusal`).
+/// Reuses exactly the data `references`/`document_highlight` already
+/// gather -- `references_to`'s reverse-index lookup, `highlight_range`'s
+/// narrow identifier-only range -- so this is `O(references)`, not a
+/// project-wide scan; a `LineIndex` is built at most once per touched
+/// file, not once per project file.
+pub(crate) fn rename_edits(
+    program: &BoundProgram,
+    file: FileId,
+    offset: TextSize,
+    new_name: &str,
+    encoding: PositionEncoding,
+) -> Result<WorkspaceEdit, RenameRefusal> {
+    if !is_valid_new_identifier(new_name) {
+        return Err(RenameRefusal::InvalidIdentifier);
+    }
+    let id = rename_target(program, file, offset)?;
+    if renamed_symbol_collides(program, id, new_name) {
+        return Err(RenameRefusal::NameCollision);
+    }
+
+    // Every edit site: the declaration itself, a class rename's own
+    // constructors (Apex requires a constructor's name to exactly match
+    // its class's -- a separate `Symbol` with its own `name_range`, never
+    // itself recorded as a *reference* to the class), and every project-
+    // wide reference.
+    let symbol = program.symbols.get(id);
+    let mut sites: Vec<(FileId, TextRange)> = vec![(symbol.file, symbol.name_range)];
+    if symbol.kind == SymbolKind::Class {
+        sites.extend(
+            program
+                .symbols
+                .members_of(id)
+                .iter()
+                .map(|&m| program.symbols.get(m))
+                .filter(|m| m.kind == SymbolKind::Constructor)
+                .map(|m| (m.file, m.name_range)),
+        );
+    }
+    sites.extend(
+        program
+            .references_to(id)
+            .map(|ptr| (ptr.file(), program.highlight_range(ptr))),
+    );
+
+    let mut per_file: HashMap<FileId, (Url, String, LineIndex)> = HashMap::new();
+    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+    for (site_file, range) in sites {
+        if let std::collections::hash_map::Entry::Vacant(e) = per_file.entry(site_file) {
+            let Some(uri) = Url::from_file_path(program.file_path(site_file)).ok() else {
+                continue;
+            };
+            let text = program.syntax(site_file).text().to_string();
+            let index = LineIndex::new(&text);
+            e.insert((uri, text, index));
+        }
+        let Some((uri, text, index)) = per_file.get(&site_file) else {
+            continue;
+        };
+        let start = index.to_position(text, range.start().into(), encoding);
+        let end = index.to_position(text, range.end().into(), encoding);
+        changes.entry(uri.clone()).or_default().push(TextEdit {
+            range: Range { start, end },
+            new_text: new_name.to_string(),
+        });
+    }
+
+    Ok(WorkspaceEdit {
+        changes: Some(changes),
+        ..Default::default()
+    })
 }
 
 fn doc_comment_for(program: &BoundProgram, id: SymbolId) -> Option<String> {

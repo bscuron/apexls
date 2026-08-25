@@ -140,14 +140,20 @@ impl ReferenceTable {
         self.resolutions.get(&reference)
     }
 
-    /// The range `documentHighlight`/`references` should report for
-    /// `reference` -- the narrow identifier range recorded via
-    /// `set_with_highlight`, if any, else `reference.range()` itself.
-    pub fn highlight_range(&self, reference: SyntaxPtr) -> TextRange {
-        self.highlight_ranges
-            .get(&reference)
-            .copied()
-            .unwrap_or_else(|| reference.range())
+    /// The narrow identifier range eagerly recorded via `set_with_highlight`
+    /// for `reference`, if any -- only ever populated for a call/field-
+    /// access-shaped reference (`MethodCallExpr`/`CallExpr`/`FieldExpr`/
+    /// `NewExpr`), where the node's own range spans well past the
+    /// identifier (target through closing paren, say). Every other
+    /// reference kind's narrow range -- including the common `NameExpr`/
+    /// `Type`/`QualifiedName` case, where the node range is only ever off
+    /// by trailing trivia -- is computed on demand by
+    /// `BoundProgram::highlight_range` instead of stored here: those
+    /// kinds are common enough in real code that eagerly storing a second
+    /// range per reference measurably regressed bind time when tried
+    /// (see `crate::resolve::bind_name_expr`'s doc comment).
+    pub fn stored_highlight_range(&self, reference: SyntaxPtr) -> Option<TextRange> {
+        self.highlight_ranges.get(&reference).copied()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&SyntaxPtr, &Resolution)> {

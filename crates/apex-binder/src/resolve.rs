@@ -36,14 +36,19 @@
 //!   `this(...)`/`super(...)`) go through [`narrow_by_overload`]: an
 //!   exact arity filter (real Apex semantics -- there's no varargs or
 //!   default parameter values for user-defined methods, so arity alone
-//!   is authoritative, not a heuristic), then a best-effort narrowing by
-//!   known project-local argument types among same-arity candidates. A
-//!   call resolves to a single `Resolved` symbol when exactly one
-//!   candidate survives; otherwise it's `Candidates` (genuinely
-//!   ambiguous, or argument types v1 can't check -- system/library
-//!   types have no model to compare against) or `Unresolved` (no
+//!   is authoritative, not a heuristic), then elimination by argument
+//!   type (`crate::conversions::type_compatible` -- project-local
+//!   subtyping *and* Apex's implicit-conversion rules for a curated set
+//!   of system types: numeric widening, `Object`, `List`/`Set`/`Map`),
+//!   then a most-specific tiebreak (`crate::conversions::is_more_specific`)
+//!   among whatever still survives. A call resolves to a single
+//!   `Resolved` symbol when exactly one candidate survives elimination,
+//!   or when the tiebreak finds a unique most-specific one; otherwise
+//!   it's `Candidates` (genuinely ambiguous, or argument/parameter types
+//!   outside `crate::conversions`'s curated set) or `Unresolved` (no
 //!   same-name member at all).
 
+use crate::conversions;
 use crate::file_id::FileId;
 use crate::ptr::{AstPtr, SyntaxPtr};
 use crate::reference_table::{ReferenceTable, Resolution, SchemaObjectRef, UnknownSchemaRef};
@@ -72,22 +77,28 @@ use smol_str::SmolStr;
 /// compile error, or a gap in this binder's own counting), the original
 /// full candidate set is reported rather than claiming nothing matched.
 ///
-/// Second, among same-arity survivors, elimination by known project-
-/// local argument types: a candidate is ruled out only when some
-/// argument's inferred type is *positively* incompatible with the
-/// corresponding parameter's declared type (neither an exact match nor
-/// a subtype via `extends`/`implements`). An argument whose type isn't
-/// known at all, or is only known as a *system* type (`Ty::System` --
-/// a literal, a `List<T>`, an uninferred call result, ...), or a
-/// parameter whose declared type isn't itself project-local (`String`,
-/// `List<T>`, ...) can never rule a candidate out: "can't prove wrong"
-/// always wins over "assume wrong." System-vs-system comparisons are
-/// deliberately never attempted either, even when both names are known
-/// (an `Integer` argument against a `Long` parameter, say) -- Apex's
-/// real implicit-numeric-widening rules aren't modeled, and a wrong
-/// elimination is a real correctness bug, not just a missed narrowing;
-/// only project-local-vs-project-local comparisons are exact enough to
-/// eliminate on.
+/// Second, among same-arity survivors, elimination by argument type via
+/// `crate::conversions::type_compatible`: project-local exact-match-or-
+/// upcast (as before), plus Apex's implicit-conversion rules for a
+/// curated set of system types (numeric widening, `Object`, `List`/
+/// `Set`/`Map`) -- see that module's doc comment for exactly what's
+/// covered and how it was verified. A candidate is ruled out only when
+/// some argument's inferred type is *positively* incompatible with the
+/// corresponding parameter's declared type; anything outside the
+/// curated set (an argument whose type isn't known at all, an unmodeled
+/// system type, ...) can never rule a candidate out: "can't prove
+/// wrong" always wins over "assume wrong."
+///
+/// Third, if more than one candidate survives elimination, a
+/// most-specific tiebreak (`crate::conversions::is_more_specific`) --
+/// real Apex overload resolution doesn't stop at "eliminate the
+/// impossible ones," it picks the most specific applicable candidate
+/// (e.g. `foo(Integer)` over `foo(Object)` for an `Integer` argument),
+/// the same way Java does. Only resolves to `Resolved` when exactly one
+/// candidate is at least as specific as every other survivor in every
+/// parameter position, with a strict improvement in at least one
+/// position; otherwise the set stays genuinely `Candidates` (real
+/// ambiguity, rare in code that actually compiles).
 fn narrow_by_overload(
     table: &SymbolTable,
     candidates: Vec<SymbolId>,
@@ -123,7 +134,10 @@ fn narrow_by_overload(
         // itself was already empty -- defensive, not expected) or still
         // ambiguous: report the honest pre-type-filter pool either way.
         0 => Resolution::Candidates(pool),
-        _ => Resolution::Candidates(by_type),
+        _ => match most_specific_candidate(table, &by_type) {
+            Some(winner) => Resolution::Resolved(winner),
+            None => Resolution::Candidates(by_type),
+        },
     }
 }
 
@@ -133,27 +147,74 @@ fn is_argument_type_compatible(
     arg_types: &[Option<Ty>],
 ) -> bool {
     for (param, arg_type) in table.params(candidate).iter().zip(arg_types.iter()) {
-        // Only a project-local argument type is exact enough to compare
-        // -- see this function's caller's doc comment for why a `Ty::System`
-        // argument (or an entirely unknown one) never eliminates.
-        let Some(Ty::Project(arg_type_id)) = arg_type else {
+        let Some(arg_type) = arg_type else {
+            continue; // an argument whose type isn't known at all never eliminates
+        };
+        let param_symbol = table.get(*param);
+        let Some(param_type_name) = param_symbol.type_name.as_deref() else {
             continue;
         };
-        let Some(param_type_name) = table.get(*param).type_name.as_deref() else {
-            continue;
-        };
-        let Some(param_type_id) = table.top_level(param_type_name) else {
-            continue;
-        };
-        if *arg_type_id == param_type_id {
-            continue;
+        if conversions::type_compatible(table, param_type_name, &param_symbol.type_args, arg_type)
+            == Some(false)
+        {
+            return false;
         }
-        if table.inherited_chain(*arg_type_id).contains(&param_type_id) {
-            continue; // the argument's type extends/implements the parameter's type -- a valid upcast
-        }
-        return false;
     }
     true
+}
+
+/// The unique candidate that's at least as specific as every other
+/// `candidates` entry in every parameter position, with a strict
+/// improvement in at least one position -- `None` if no such candidate
+/// exists (a real ambiguity between two candidates neither more specific
+/// than the other, or -- shouldn't arise once arity is already equal
+/// across `candidates` -- a parameter-count mismatch).
+fn most_specific_candidate(table: &SymbolTable, candidates: &[SymbolId]) -> Option<SymbolId> {
+    candidates
+        .iter()
+        .copied()
+        .find(|&c| {
+            candidates
+                .iter()
+                .all(|&d| d == c || dominates(table, c, d))
+        })
+}
+
+/// Whether `a`'s declared parameter list is at least as specific as `b`'s
+/// in every position, with a strict improvement in at least one --
+/// compares only the two candidates' own declared signatures, independent
+/// of the actual call's arguments (both are already known-applicable).
+fn dominates(table: &SymbolTable, a: SymbolId, b: SymbolId) -> bool {
+    let a_params = table.params(a);
+    let b_params = table.params(b);
+    if a_params.len() != b_params.len() {
+        return false;
+    }
+    let mut any_strict = false;
+    for (&ap, &bp) in a_params.iter().zip(b_params.iter()) {
+        let a_sym = table.get(ap);
+        let b_sym = table.get(bp);
+        let (Some(a_name), Some(b_name)) = (a_sym.type_name.as_deref(), b_sym.type_name.as_deref())
+        else {
+            return false;
+        };
+        let same_position = a_name.eq_ignore_ascii_case(b_name)
+            && a_sym.type_args.len() == b_sym.type_args.len()
+            && a_sym
+                .type_args
+                .iter()
+                .zip(b_sym.type_args.iter())
+                .all(|(x, y)| x.eq_ignore_ascii_case(y));
+        if same_position {
+            continue;
+        }
+        if conversions::is_more_specific(table, a_name, &a_sym.type_args, b_name, &b_sym.type_args) {
+            any_strict = true;
+        } else {
+            return false;
+        }
+    }
+    any_strict
 }
 
 /// The reserved `SymbolId` range `declare_local` allocates from during
@@ -355,6 +416,17 @@ pub(crate) fn resolve_type_ref(
     let name = ty.text();
     let ptr = SyntaxPtr::new(file, ty.syntax());
     let segments = ty.base_name_tokens();
+    // `ty.syntax().text_range()` can be wider than the type name itself
+    // (this parser attaches trailing trivia -- almost always at least
+    // one space, e.g. before a variable's own name in `Widget w` -- as a
+    // child *inside* the `Type` node), but this doesn't pre-record a
+    // narrowed range the way `bind_new_expr` does for a `new` call's own
+    // type: `Type` references are common enough in real code that eager
+    // per-reference storage here measurably regressed bind time (see
+    // `bind_name_expr`'s doc comment for the same reasoning, which found
+    // this the hard way). `BoundProgram::highlight_range` computes the
+    // last dotted segment's own token range on demand instead, only when
+    // a documentHighlight/references/rename request actually asks.
     if segments.len() > 1 {
         record_qualified_segments(table, refs, file, &segments);
     }
@@ -543,7 +615,7 @@ impl<'a> BodyBinder<'a> {
             name: name.text().unwrap_or_default(),
             file: self.file,
             ptr: SyntaxPtr::new(self.file, name.syntax()),
-            name_range: name.syntax().text_range(),
+            name_range: name.ident_range(),
             container: self.enclosing_member,
             type_ref: type_ptr,
             type_name,
@@ -793,6 +865,12 @@ impl<'a> BodyBinder<'a> {
                         // only; unlike `resolve_type_ref`, exception
                         // types are never SObject-shaped, so there's no
                         // schema fallback to attempt here.
+                        //
+                        // `ty.syntax().text_range()` can be wider than the
+                        // name (trailing trivia; see `bind_name_expr`'s
+                        // doc comment) -- `BoundProgram::highlight_range`
+                        // trims it on demand instead of pre-storing a
+                        // narrowed range for this rare a reference kind.
                         let name = ty.syntax().text().to_string();
                         match self.table.top_level(&name) {
                             Some(id) => self.refs.set(ptr, Resolution::Resolved(id)),
@@ -1030,7 +1108,20 @@ impl<'a> BodyBinder<'a> {
         let tok = n.name_token()?;
         let name = tok.text();
         let ptr = SyntaxPtr::new(self.file, n.syntax());
-
+        // The whole `NameExpr` node's own range can be wider than the
+        // identifier it wraps (this parser attaches trailing trivia --
+        // almost always at least one space -- as a child *inside* the
+        // node, not as leading trivia of whatever follows), but unlike
+        // `bind_field_expr`/`bind_method_call_expr`/`bind_call_expr`/
+        // `bind_new_expr`'s `set_with_highlight` calls, this doesn't
+        // pre-record a narrowed range here: `NameExpr` is by far the most
+        // common reference kind in real code (every local/field/param
+        // *read*, not just calls), so eagerly storing a second range per
+        // reference measurably regressed cold/warm bind time (~20-30%,
+        // not just the ~expected storage-doubling cost the far rarer
+        // call/field kinds already accepted). `BoundProgram::highlight_range`
+        // instead computes this on demand, only when a documentHighlight/
+        // references/rename request actually asks for it.
         if let Some(local) = self.scopes.resolve_local(scope, name) {
             self.refs.set(ptr, Resolution::Resolved(local));
             return self.type_of_symbol(local);

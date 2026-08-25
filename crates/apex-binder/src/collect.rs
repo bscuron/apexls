@@ -123,7 +123,7 @@ pub(crate) fn collect_trigger_unit(file: FileId, tu: &TriggerUnit) -> FileCollec
             name: name_text,
             file,
             ptr: SyntaxPtr::new(file, tu.syntax()),
-            name_range: name.syntax().text_range(),
+            name_range: name.ident_range(),
             container: None,
             type_ref: None,
             type_name: None,
@@ -172,7 +172,7 @@ fn collect_class(
             name: name_text,
             file,
             ptr: SyntaxPtr::new(file, class.syntax()),
-            name_range: name.syntax().text_range(),
+            name_range: name.ident_range(),
             container,
             type_ref: None,
             type_name: None,
@@ -224,7 +224,7 @@ fn collect_interface(
             name: name_text,
             file,
             ptr: SyntaxPtr::new(file, iface.syntax()),
-            name_range: name.syntax().text_range(),
+            name_range: name.ident_range(),
             container,
             type_ref: None,
             type_name: None,
@@ -271,7 +271,7 @@ fn collect_enum(
             name: name_text,
             file,
             ptr: SyntaxPtr::new(file, en.syntax()),
-            name_range: name.syntax().text_range(),
+            name_range: name.ident_range(),
             container,
             type_ref: None,
             type_name: None,
@@ -292,7 +292,7 @@ fn collect_enum(
                     name: constant_text,
                     file,
                     ptr: SyntaxPtr::new(file, constant.syntax()),
-                    name_range: constant.syntax().text_range(),
+                    name_range: constant.ident_range(),
                     container: Some(enum_id),
                     type_ref: None,
                     type_name: None,
@@ -359,7 +359,7 @@ fn collect_method(
             name: name_text,
             file,
             ptr: SyntaxPtr::new(file, m.syntax()),
-            name_range: name.syntax().text_range(),
+            name_range: name.ident_range(),
             container: Some(container),
             type_ref,
             type_name,
@@ -380,10 +380,20 @@ fn collect_constructor(
     container: SymbolId,
 ) {
     // A constructor's "name" reuses the `Type` slot (must equal its
-    // class's name -- see `ConstructorDecl::type_ref`'s doc comment).
+    // class's name -- see `ConstructorDecl::type_ref`'s doc comment). A
+    // constructor's own name is never dotted, so its last (only)
+    // `base_name_tokens()` entry is exactly the identifier -- same fix as
+    // `Name::ident_range()`, `Type` has no single-token wrapper of its
+    // own to hang an equivalent method off of, so this is inlined once
+    // here rather than adding a whole new accessor for one call site.
     let Some(type_ref) = c.type_ref() else {
         return;
     };
+    let name_range = type_ref
+        .base_name_tokens()
+        .last()
+        .map(|t| t.text_range())
+        .unwrap_or_else(|| type_ref.syntax().text_range());
     let ctor_id = out.push(
         file,
         Symbol {
@@ -391,7 +401,7 @@ fn collect_constructor(
             name: type_ref.text(),
             file,
             ptr: SyntaxPtr::new(file, c.syntax()),
-            name_range: type_ref.syntax().text_range(),
+            name_range,
             container: Some(container),
             type_ref: None,
             type_name: None,
@@ -421,7 +431,7 @@ fn collect_field(out: &mut FileCollection, file: FileId, f: &FieldDecl, containe
                 name: name_text,
                 file,
                 ptr: SyntaxPtr::new(file, declarator.syntax()),
-                name_range: name.syntax().text_range(),
+                name_range: name.ident_range(),
                 container: Some(container),
                 type_ref,
                 type_name: type_name.clone(),
@@ -447,7 +457,7 @@ fn collect_property(out: &mut FileCollection, file: FileId, p: &PropertyDecl, co
             name: name_text,
             file,
             ptr: SyntaxPtr::new(file, p.syntax()),
-            name_range: name.syntax().text_range(),
+            name_range: name.ident_range(),
             container: Some(container),
             type_ref,
             type_name,
@@ -478,7 +488,7 @@ fn collect_params(
                 name: name_text,
                 file,
                 ptr: SyntaxPtr::new(file, param.syntax()),
-                name_range: name.syntax().text_range(),
+                name_range: name.ident_range(),
                 container: Some(container),
                 type_ref,
                 type_name,

@@ -215,9 +215,14 @@ fn overload_resolution_narrows_by_arity_then_by_known_argument_types() {
     assert_eq!(calls[1], Some(Resolution::Resolved(two_widgets)));
 
     // `handle(1)`: arity narrows to the same two arity-1 candidates as
-    // `handle(w)`, but an integer literal's type isn't inferred (v1
-    // tracks no primitive/system types), so neither can be ruled out --
-    // stays genuinely ambiguous.
+    // `handle(w)`, but an `Integer` literal can never satisfy a
+    // project-local `Widget`/`Gadget` parameter (`crate::conversions`'s
+    // system-vs-project rule), so *both* get eliminated -- real Apex
+    // would reject this call outright, but `narrow_by_overload`'s
+    // defensive "every candidate ruled itself out" fallback reports the
+    // original pre-elimination pool rather than a more precise
+    // "no valid candidate" result, so this still surfaces as `Candidates`
+    // with both original candidates, not `Unresolved`.
     let Some(Resolution::Candidates(remaining)) = &calls[2] else {
         panic!("expected handle(1) to stay Candidates, got {:?}", calls[2]);
     };

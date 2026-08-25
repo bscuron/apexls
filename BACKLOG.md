@@ -24,10 +24,15 @@ needed" list is checked off: `textDocument/hover`, `textDocument/definition`,
 `textDocument/documentSymbol`, `workspace/symbol`, `textDocument/foldingRange`,
 `textDocument/selectionRange`. `textDocument/references`/`textDocument/documentHighlight`
 are also now done, backed by a new incrementally-maintained reverse
-index on `ReferenceTable` (`by_symbol`). Next up is §3's remaining
-"needs new binder-side work first" list (`rename`, `signatureHelp`,
-`completion`, `semanticTokens`, `callHierarchy`, `inlayHint`), or §4's
-still-open standard-library/schema type-model gap.
+index on `ReferenceTable` (`by_symbol`). `textDocument/rename` is done
+too, conservatively scoped (refuses rather than guesses on an ambiguous
+target, an override-chain method, or a colliding name) and preceded by
+a new `crate::conversions` module that narrows most real-world overload
+calls to a single candidate via Apex's actual implicit-conversion rules,
+rather than the old arity-only narrowing. Next up is §3's remaining
+"needs new binder-side work first" list (`signatureHelp`, `completion`,
+`semanticTokens`, `callHierarchy`, `inlayHint`), or §4's still-open
+standard-library/schema type-model gap.
 
 ## 1. Protocol / server layer
 
@@ -588,11 +593,127 @@ supports each one.
       protocol-level, spawns the real binary, proves the project-wide
       index actually crosses file boundaries and that
       `includeDeclaration` behaves correctly).
-- [ ] `textDocument/rename` (+ `prepareRename`) -- find-references above
-      is done and directly reusable (`BoundProgram::references_to`), but
-      still needs safe multi-file edit generation; risky to ship before
-      resolution precision is higher than "arity + one-hop type" (see
-      §4), since a bad rename is worse than a missing feature.
+- [x] `textDocument/rename` (+ `prepareRename`) -- **done, deliberately
+      scoped conservatively.** Two pieces landed together, in this order:
+      1. **Overload-narrowing precision, first** (the actual blocker this
+         item used to cite): `narrow_by_overload`'s elimination
+         (`crate::resolve::is_argument_type_compatible`) only ever
+         compared project-local-vs-project-local types before -- any
+         system-typed argument or parameter (`String`, `Integer`,
+         `List<T>`, a literal, ...) always took the "can't prove wrong"
+         path, which is why most real-world overload calls stayed
+         `Candidates`. New module `crate::conversions` hand-encodes
+         Apex's actual implicit-conversion rules for a small, curated,
+         *stable* type set (numeric widening, `Object`, `List`/`Set`/
+         `Map`) -- deliberately not the full stdlib method-surface model
+         this section's remaining stdlib bullet still tracks, since
+         *conversion rules* don't change as Salesforce ships new APIs the
+         way a method surface does. Verified against a real connected org
+         (`sf apex run` anonymous-Apex probes) before trusting any rule,
+         per this project's established oracle practice -- two real
+         surprises the verification caught, opposite of the initial
+         guess: `List<Object>`/`Map<_, Object>` accept *any* element
+         type the same way a bare `Object` parameter does, and that
+         permissiveness isn't Object-only -- numeric widening and
+         project-local `extends` upcasting both apply *nested* one level
+         inside a collection too (`List<Integer>` satisfies a
+         `List<Long>`-only overload, `List<Dog>` satisfies a
+         `List<Animal>`-only one), i.e. Apex's collection generics aren't
+         invariant the way Java's are. `narrow_by_overload` also gained a
+         most-specific tiebreak (`crate::conversions::is_more_specific`)
+         for when more than one candidate survives elimination (e.g.
+         `foo(Integer)` beating `foo(Object)` for an `Integer` argument)
+         -- elimination alone isn't enough even for the simplest case,
+         since a wider overload is never positively *incompatible*, just
+         less specific. `cargo bench -p apex-binder` showed no cold/warm
+         regression (`corpus/bind_npsp_full`/`corpus/warm_rebind_after_one_file_edit`
+         both within this machine's existing noise band). New tests:
+         `crates/apex-binder/src/conversions.rs`'s own unit tests, and
+         `crates/apex-binder/tests/overload_narrowing_conversions.rs`
+         (real overload calls through `narrow_by_overload`, including a
+         confirmation that anything outside the curated set -- `Id` vs
+         `Blob`, say -- still stays honestly `Candidates` rather than a
+         guessed elimination).
+      2. **Rename itself**, built entirely on already-shipped, already-
+         tested infrastructure (`symbol_at`/`resolution_at`,
+         `references_to`, `ReferenceTable::highlight_range`, the
+         `RwLock<Option<BoundProgram>>` snapshot model, the single
+         sequential rebuild worker) -- no new binder passes or indices.
+         `capabilities::rename_target`/`rename_edits`
+         (`crates/apexls-server/src/capabilities.rs`) refuse outright
+         (a `ResponseError`, never a silent empty/partial edit) rather
+         than guess whenever: the target or any of its references
+         resolves as `Resolution::Candidates`/`Unresolved`/schema-only;
+         it's a `Trigger`; it's a `Method` that's itself `override`,
+         implements an interface/base-class method of the same name and
+         arity, or is itself overridden by a subclass (a *distinct* risk
+         from overload ambiguity -- renaming a virtual method needs to
+         cascade across a whole override chain, a feature this doesn't
+         build); the new name isn't a legal, non-keyword Apex identifier
+         (checked by actually tokenizing it with `apex_lexer::tokenize`,
+         not a hand-rolled second keyword list); or the new name collides
+         with an existing top-level type or same-container member
+         (`SymbolTable::top_level`/`lookup_member`, both already O(1)).
+         Honest v1 gap: a `Parameter`/local-variable rename isn't checked
+         for a scope-shadowing collision yet (every other kind is).
+         Renaming a `Class` also renames its own `Constructor` symbol(s)
+         (a separate declaration from the class, sharing its name, never
+         itself recorded as a *reference* to the class). `WorkspaceEdit`
+         uses the plain `changes` map (not `document_changes`, which
+         needs per-document version numbers this server doesn't track).
+         Verified two ways: `crates/apexls-server/tests/rename.rs`
+         (protocol-level, spawns the real binary -- cross-file edits, the
+         class/constructor case, every refusal case) including a real-
+         NPSP-corpus case (a real, non-virtual, cross-file-referenced
+         method, following this project's own convention of running
+         whole-corpus checks as normal tests, not `#[ignore]`d).
+      **Real bug found via a user report, fixed the same day:** renaming
+      a variable to a *short* name corrupted the file (`Integer x= 0;`
+      instead of `Integer x = 0;`) -- root cause was a previously-
+      undetected, project-wide range-precision bug, not anything specific
+      to rename. This parser attaches trailing trivia (almost always at
+      least one space) as a child *inside* a `DeclName`/`NameExpr`/`Type`/
+      `QualifiedName` node itself, rather than as leading trivia of
+      whatever token follows -- so `Symbol::name_range` (every kind:
+      class/interface/enum/field/property/method/constructor/parameter/
+      local/enum-constant/trigger, all set via `name.syntax().text_range()`
+      in `collect.rs`/`resolve.rs`) and a plain-identifier/type reference's
+      node range were both silently one trivia-token too wide. Invisible
+      to every existing consumer (hover/definition/documentSymbol only
+      ever cared about the *start* of a range; `documentHighlight`'s own
+      tests only checked occurrence *counts*, never the exact end
+      character) until a `rename` `TextEdit` made the exact end boundary
+      load-bearing -- a range one character too wide silently eats the
+      next real character instead of just a harmless extra space.
+      Two-part fix: `apex_syntax::ast::Name::ident_range()` (the
+      identifier token's own range, not the wrapping node's) for every
+      `Symbol::name_range` call site, plus `BoundProgram::highlight_range`
+      recomputing a tight range **on demand**, per query, for a
+      `NameExpr`/`Type`/`QualifiedName` reference instead of pre-storing
+      one during binding. That second part isn't a stylistic choice: the
+      first attempt (calling `ReferenceTable::set_with_highlight` from
+      `bind_name_expr`/`resolve_type_ref`, mirroring the existing
+      `FieldExpr`/`MethodCallExpr`/`CallExpr`/`NewExpr` fix) was measured
+      via `cargo bench -p apex-binder` at a real ~20-30% cold/warm
+      regression, not just the ~22% *allocation* increase that fix's own
+      original rollout accepted for the far rarer call/field kinds --
+      `NameExpr` in particular is the single most common reference kind
+      in real code (every local/field/param *read*), so eagerly doubling
+      its storage was a much bigger cost than the original rollout ever
+      paid. Moving the computation to query time (only when a
+      documentHighlight/references/rename request actually asks)
+      eliminated the regression entirely (confirmed back within this
+      benchmark's own established noise band across two consecutive
+      re-runs) with no correctness cost. New regression coverage:
+      `crates/apex-binder/tests/name_range_precision.rs` (every
+      declaration kind's `name_range`, a local's reference `highlight_range`,
+      a type reference's, and an end-to-end "apply every returned range as
+      a literal splice and check the exact resulting text" proof -- the
+      specific check that would have caught this before it shipped), plus
+      a direct repro in `crates/apexls-server/tests/rename.rs`
+      (`renaming_a_local_variable_to_a_short_name_does_not_corrupt_the_file`)
+      and exact post-apply text assertions added to the other rename
+      tests that previously only checked edit count/`newText`.
 - [ ] `textDocument/signatureHelp` -- have `narrow_by_overload`'s
       candidate set; needs argument-position tracking (which parameter
       is the cursor currently in) layered on top.
@@ -755,6 +876,44 @@ two real fixes, not just measurement:
 
 ## 5. Smaller, concrete loose ends
 
+- [x] **Real bug found via a user report (Emacs/Eglot), fixed the same
+      day: an editor's own lock file could crash the server and
+      permanently break every later rebuild.** `Path::extension()` splits
+      on the *last* `.` in a file name regardless of a leading one, so
+      Emacs's `.#Foo.cls` lock file (~30 bytes of plain text, written
+      alongside a file while it's open, e.g. `user@host.pid:boot-time`)
+      has extension `cls` -- `apex_discover::is_apex_file` (and therefore
+      both the initial directory walk and `apexls-server`'s filesystem
+      watcher) was treating it as a genuine new Apex class. A *new* file
+      appearing forces `apex_binder`'s incremental rebind down its
+      conservative "declarations changed somewhere -- rebind everything"
+      fallback (§2), which -- for reasons not yet fully root-caused beyond
+      this trigger, since excluding the trigger entirely made the crash
+      unreproducible in every tested scenario -- panicked inside
+      `SymbolTable::get` with an index-out-of-bounds error, poisoning
+      `bind.cache`'s `Mutex` and (per the same failure mode `d1d882b`/
+      `c106cd6` already document) killing every subsequent rebuild for the
+      rest of the session. An initial fix attempt wrapped the rebuild in
+      `catch_unwind` with a cache reset and retry -- deliberately reverted
+      per explicit user direction: a defensive catch around a crash treats
+      the symptom, not the cause, and this project's -- and this user's --
+      standing preference is to find and fix the actual bug. The real fix:
+      `apex_discover::is_apex_file`/`is_object_meta_file`/`is_field_meta_file`
+      now all exclude a hidden file (name starts with `.`) via a new
+      `is_hidden` check, shared by both the walk and
+      `is_relevant_path` (the watcher's per-event check) -- closing the
+      whole class of editor lock/swap-file artifacts (vim's `.foo.cls.swp`
+      included), not just this one reporter's specific case. (An
+      autosave-style `#Foo.cls#` was never actually affected: its own
+      extension is `cls#`, not `cls`.) Verified two ways:
+      `crates/apex-discover/tests/hidden_editor_artifact_files.rs`
+      (`is_relevant_path` on each artifact-file shape, plus a real
+      directory walk proving a lock file sitting next to a real class is
+      never discovered) and an end-to-end reproduction against the real
+      binary (real filesystem watcher, a real `textDocument/rename`, then
+      dropping a real lock file on disk) confirming zero panics and a
+      correctly up-to-date bind afterward, where the same scenario
+      reliably crashed before the fix.
 - [ ] `apexls-cli` still doesn't call into `apex-binder` at all -- it's
       stuck on the pre-binder `parse_statement`-only debug path. Cheap
       to fix, useful for manually inspecting binder output without a
