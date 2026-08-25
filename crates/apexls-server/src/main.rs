@@ -413,41 +413,65 @@ fn spawn_rebuild_worker(root: PathBuf, bind: Arc<BindState>) {
             bind.rebuild_requested.notified().await;
             let bind = Arc::clone(&bind);
             let root = root.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let mut cache = bind.cache.lock().unwrap();
-                // `version` and `texts` come from the same lock
-                // acquisition -- see `BindState::documents`'s doc comment
-                // for why that pairing has to be atomic: this is the only
-                // thing that lets `bound_version` (published below)
-                // honestly describe what `program` covers.
-                let (version, overrides) = {
-                    let documents = bind.documents.lock().unwrap();
-                    let overrides: HashMap<PathBuf, String> = documents
-                        .texts
-                        .iter()
-                        .filter_map(|(uri, text)| uri.to_file_path().ok().map(|path| (path, text.clone())))
-                        .collect();
-                    (documents.version, overrides)
-                };
+            // `version`/`texts` come from the same lock acquisition --
+            // see `BindState::documents`'s doc comment for why that
+            // pairing has to be atomic: it's the only thing that lets
+            // `bound_version` (published below) honestly describe what
+            // `program` covers. Captured here, on this task, rather than
+            // inside the `spawn_blocking` closure below: `version` needs
+            // to survive into the `Err` arm past the closure, for exactly
+            // the reason explained there.
+            let (version, overrides) = {
+                let documents = bind.documents.lock().unwrap();
+                let overrides: HashMap<PathBuf, String> = documents
+                    .texts
+                    .iter()
+                    .filter_map(|(uri, text)| uri.to_file_path().ok().map(|path| (path, text.clone())))
+                    .collect();
+                (documents.version, overrides)
+            };
+            let rebuild_bind = Arc::clone(&bind);
+            let result = tokio::task::spawn_blocking(move || {
+                let mut cache = rebuild_bind.cache.lock().unwrap();
                 let program = BoundProgram::from_files_cached(&root, &overrides, &mut cache);
                 drop(cache);
                 let file_count = program.file_count();
-                *bind.program.write().unwrap() = Some(program);
-                // Published only after the swap above, so any request
-                // woken by `wait_for_rebuild` observing this new value is
-                // guaranteed to also observe the fresh `program`. `send_replace`,
-                // not `send`: `send` silently no-ops (doesn't even store the
-                // value) whenever the channel has zero active receivers --
-                // and since every `wait_for_rebuild` caller's `subscribe()`d
-                // `Receiver` is transient (dropped the moment its wait
-                // resolves), the receiver count is back to zero between
-                // requests far more often than not. `send_replace` updates
-                // the value unconditionally, exactly the "publish state for
-                // whoever looks next" semantics this needs.
-                bind.bound_version.send_replace(version);
-                info!(file_count, "rebuild complete");
+                *rebuild_bind.program.write().unwrap() = Some(program);
+                file_count
             })
             .await;
+            // `send_replace`, not `send`: `send` silently no-ops (doesn't
+            // even store the value) whenever the channel has zero active
+            // receivers -- and since every `wait_for_rebuild` caller's
+            // `subscribe()`d `Receiver` is transient (dropped the moment
+            // its wait resolves), the receiver count is back to zero
+            // between requests far more often than not. `send_replace`
+            // updates the value unconditionally, exactly the "publish
+            // state for whoever looks next" semantics this needs.
+            //
+            // Published on the `Err` arm too (a panic inside
+            // `from_files_cached`, e.g. `crates/apex-binder/src/symbol_table.rs`'s
+            // now-fixed index-out-of-bounds, or any future one) --
+            // `bind.program` simply keeps whatever it last held, matching
+            // this server's existing "serve stale data rather than go
+            // silent" degradation for a broken rebuild. Without this,
+            // `wait_for_rebuild` would block forever on every request
+            // from here on: nothing else ever moves `bound_version`
+            // again for a version a panicked rebuild was the one attempt
+            // at reflecting, turning one rebuild-worker bug into a
+            // permanently wedged server instead of a stale-but-responsive
+            // one -- a real regression this hit, live, the same day this
+            // waiting mechanism shipped.
+            match result {
+                Ok(file_count) => {
+                    bind.bound_version.send_replace(version);
+                    info!(file_count, "rebuild complete");
+                }
+                Err(join_error) => {
+                    bind.bound_version.send_replace(version);
+                    warn!(%join_error, "rebuild panicked; serving the last successful bind");
+                }
+            }
         }
     });
 }

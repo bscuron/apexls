@@ -202,7 +202,21 @@ impl SymbolTable {
             let Some(symbols) = self.by_file.get(&file) else {
                 continue;
             };
-            for (local, symbol) in symbols.iter().enumerate() {
+            // Declared symbols only (`declared_symbols_of_file`, not the
+            // full `by_file[file]`) -- a file's locals tail is truncated
+            // and re-appended by `append_file_symbols` on *every*
+            // body-only rebind, independent of this method, which only
+            // reruns when a *declaration* changed project-wide. Indexing
+            // a local's `SymbolId` here would let `members_of`/
+            // `members_by_name` hold one that a later, index-rebuild-free
+            // `append_file_symbols` call truncates away entirely --
+            // exactly the stale-id-past-the-end-of-`by_file[file]` shape
+            // that made `SymbolTable::get` panic (`local`s never belong
+            // in these indices anyway, per `append_file_symbols`'s own
+            // doc comment: lexical-scope lookup via `crate::scope::ScopeTree`
+            // handles locals entirely separately).
+            let declared_len = self.declared_len.get(&file).copied().unwrap_or(symbols.len());
+            for (local, symbol) in symbols.iter().enumerate().take(declared_len) {
                 let id = SymbolId::new(file, local as u32);
                 let key = CiKey::from(symbol.name.as_str());
 
