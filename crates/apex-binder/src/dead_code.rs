@@ -735,6 +735,86 @@ mod tests {
         assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
     }
 
+    /// Regression test for a real user report against the NPSP corpus
+    /// (`UTIL_CurrencyCache`): a singleton accessor's declared return
+    /// type is an interface, so every call chained off it -- `instance().greet()`
+    /// here -- resolves against the interface's own abstract `greet`
+    /// declaration. Without `crate::resolve::expand_dynamic_dispatch`
+    /// widening that resolution to also include `Foo.greet` (the
+    /// concrete implementation actually reached at runtime), `Foo.greet`
+    /// would show zero direct references and be misreported as dead.
+    #[test]
+    fn a_method_reached_only_through_interface_typed_dispatch_is_not_flagged() {
+        let src = "public class Foo implements Foo.Greeter { \
+             public static Greeter instance() { return new Foo(); } \
+             public String greet() { return 'hi'; } \
+             public interface Greeter { String greet(); } \
+             public void run() { String s = instance().greet(); } \
+         }\n";
+        let (_, _, dead) = dead_symbols_with_extra_files(
+            "interface-dispatch-not-flagged",
+            src,
+            &[("Caller.cls", CALLER)],
+        );
+        assert!(
+            !dead.iter().any(|d| d.name == "greet"),
+            "greet() implements Greeter.greet and is reached only via interface-typed dispatch \
+             -- must not be flagged dead: {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// The same dynamic-dispatch widening applies to a plain `virtual`/
+    /// `override` class method pair, not just interfaces: a call through
+    /// a base-typed reference (`Foo b = new Derived(); b.greet();`)
+    /// resolves against `Foo.greet`, but the object referenced at runtime
+    /// is a `Derived`, so `Derived.greet` (the override) is just as
+    /// reachable and must not be flagged dead despite never being called
+    /// through its own concrete type.
+    #[test]
+    fn an_override_reached_only_through_base_typed_dispatch_is_not_flagged() {
+        let src = "public virtual class Foo { \
+             public virtual void greet() { } \
+             public class Derived extends Foo { \
+                 public override void greet() { System.debug('hi'); } \
+             } \
+             public void run() { Foo b = new Derived(); b.greet(); } \
+         }\n";
+        let (_, _, dead) = dead_symbols_with_extra_files(
+            "override-dispatch-not-flagged",
+            src,
+            &[("Caller.cls", CALLER)],
+        );
+        assert!(
+            !dead.iter().any(|d| d.name == "greet"),
+            "Derived.greet overrides Foo.greet and is reached only via base-typed dispatch -- \
+             must not be flagged dead: {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// The dispatch-widening exemption above must stay precise -- it
+    /// should never blanket-exempt every method on a class that happens
+    /// to implement some interface, only the ones actually named on it.
+    #[test]
+    fn an_unrelated_method_on_an_interface_implementing_class_is_still_flagged() {
+        let src = "public class Foo implements Foo.Greeter { \
+             public String greet() { return 'hi'; } \
+             public interface Greeter { String greet(); } \
+             private void unrelatedHelper() { } \
+             public void run() { greet(); } \
+         }\n";
+        let (_, _, dead) = dead_symbols_with_extra_files(
+            "interface-implementation-unrelated-method-still-flagged",
+            src,
+            &[("Caller.cls", CALLER)],
+        );
+        assert_eq!(
+            dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["unrelatedHelper"]
+        );
+    }
+
     /// Real-corpus smoke test: `dead_symbols_in_file` must run to
     /// completion, without panicking, across every file in the real NPSP
     /// checkout (the scale that's actually exposed real bugs in this

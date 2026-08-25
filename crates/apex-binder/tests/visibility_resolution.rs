@@ -206,6 +206,20 @@ fn an_interface_methods_implicit_public_visibility_is_reachable_across_classes()
         })
         .map(|(id, _)| id)
         .expect("Greeter.greet should have been collected");
+    let impl_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Class && s.name == "Impl")
+        .map(|(id, _)| id)
+        .expect("Impl should have been collected");
+    let impl_greet_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| {
+            s.kind == SymbolKind::Method && s.name == "greet" && s.container == Some(impl_id)
+        })
+        .map(|(id, _)| id)
+        .expect("Impl.greet should have been collected");
 
     let caller_file = file_for_class(&program, "Caller");
     let root = program.syntax(caller_file);
@@ -215,10 +229,28 @@ fn an_interface_methods_implicit_public_visibility_is_reachable_across_classes()
         .expect("g.greet() should be a MethodCallExpr");
     let ptr = SyntaxPtr::new(caller_file, call.syntax());
 
-    assert_eq!(
-        program.resolution(ptr).cloned(),
-        Some(Resolution::Resolved(greet_id)),
-        "an interface method with no explicit modifier is implicitly \
-         public and must resolve from an unrelated class"
-    );
+    // An interface method call is dynamically dispatched -- `g`'s
+    // *declared* type is `Greeter`, but the actual object at runtime is
+    // an `Impl`, so a call through `g` could really run either
+    // declaration depending on what's assigned. Resolving to `Candidates`
+    // naming both (rather than just `Greeter.greet`, the pre-dispatch-
+    // widening behavior) is what makes `Impl.greet` show up as referenced
+    // for dead-code purposes despite never being called by its own
+    // concrete type directly -- see `crate::resolve::expand_dynamic_dispatch`.
+    match program.resolution(ptr).cloned() {
+        Some(Resolution::Candidates(ids)) => {
+            assert_eq!(
+                ids.len(),
+                2,
+                "expected exactly Greeter.greet and Impl.greet as dispatch candidates, got {ids:?}"
+            );
+            assert!(ids.contains(&greet_id), "missing Greeter.greet: {ids:?}");
+            assert!(ids.contains(&impl_greet_id), "missing Impl.greet: {ids:?}");
+        }
+        other => panic!(
+            "an interface method with no explicit modifier is implicitly public and must \
+             resolve from an unrelated class, as dynamic-dispatch Candidates naming both the \
+             interface declaration and Impl's override: got {other:?}"
+        ),
+    }
 }

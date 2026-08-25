@@ -141,6 +141,100 @@ fn narrow_by_overload(
     }
 }
 
+/// True for a `Method` symbol Apex could dispatch dynamically at
+/// runtime to a *different*, more-derived declaration than the one a
+/// static, declared-type-only lookup finds: any method declared directly
+/// on an `Interface` (implicitly abstract -- Apex forbids a method body
+/// there), or any `virtual`/`abstract`/`override` method on a class. A
+/// plain concrete method with none of those modifiers can never be
+/// further overridden in Apex, so it's the *only* case a resolved
+/// candidate is provably final -- excluding it here is what keeps
+/// [`expand_dynamic_dispatch`] a no-op (skips the `subtypes` walk
+/// entirely) for the overwhelming majority of real method calls.
+fn is_dynamically_dispatchable(table: &SymbolTable, id: SymbolId) -> bool {
+    let symbol = table.get(id);
+    if symbol.kind != SymbolKind::Method || symbol.modifiers.is_static {
+        return false;
+    }
+    let m = &symbol.modifiers;
+    if m.is_virtual || m.is_override || m.is_abstract {
+        return true;
+    }
+    symbol
+        .container
+        .is_some_and(|c| table.get(c).kind == SymbolKind::Interface)
+}
+
+/// Widens one resolved method candidate to every dynamically-reachable
+/// override/implementation, for the scenario [`is_dynamically_dispatchable`]
+/// identifies: Apex (like Java) dispatches an instance method call
+/// against the receiver's *actual runtime type*, not the reference's
+/// declared static type, so a `virtual`/`abstract`/interface method's own
+/// declaration is never provably the only real target -- any subtype in
+/// [`SymbolTable::subtypes`] that declares a same-name (case-insensitive),
+/// same-arity method is an equally valid one, and must be credited with
+/// this call site the same way the statically-resolved declaration is
+/// (this is exactly what makes `crate::dead_code`'s reference counting
+/// correct for a method reached only through interface-typed or
+/// base-typed dispatch, never called by its own concrete type directly).
+/// Returns just `base` (as a single-element `Vec`) unchanged when `base`
+/// isn't dispatchable at all, or has no known overriding/implementing
+/// subtype -- both the overwhelmingly common case, so this never
+/// allocates more than that one element for a call that turns out not to
+/// need widening.
+fn expand_dynamic_dispatch(table: &SymbolTable, base: SymbolId) -> Vec<SymbolId> {
+    if !is_dynamically_dispatchable(table, base) {
+        return vec![base];
+    }
+    let symbol = table.get(base);
+    let Some(container) = symbol.container else {
+        return vec![base];
+    };
+    let arity = table.params(base).len();
+    let mut targets = vec![base];
+    for &sub in table.subtypes(container) {
+        for &member_id in table.members_of(sub) {
+            let member = table.get(member_id);
+            if member.kind == SymbolKind::Method
+                && member.name.eq_ignore_ascii_case(symbol.name.as_str())
+                && table.params(member_id).len() == arity
+            {
+                targets.push(member_id);
+            }
+        }
+    }
+    targets
+}
+
+/// Applies [`expand_dynamic_dispatch`] to every `SymbolId` a method-call
+/// `Resolution` already names, widening a `Resolved` into `Candidates`
+/// (or widening an already-`Candidates` set further) whenever dynamic
+/// dispatch could reach more than one declaration. Never applied to a
+/// constructor resolution (`new`/`this(...)`/`super(...)`): a
+/// constructor call always instantiates the exact named type, and Apex
+/// has no virtual constructors to dispatch across, so widening one would
+/// only manufacture false candidates.
+fn widen_for_dynamic_dispatch(table: &SymbolTable, resolution: Resolution) -> Resolution {
+    let ids: &[SymbolId] = match &resolution {
+        Resolution::Resolved(id) => std::slice::from_ref(id),
+        Resolution::Candidates(ids) => ids.as_slice(),
+        _ => return resolution,
+    };
+    let mut expanded: Vec<SymbolId> = Vec::new();
+    for &id in ids {
+        for target in expand_dynamic_dispatch(table, id) {
+            if !expanded.contains(&target) {
+                expanded.push(target);
+            }
+        }
+    }
+    match expanded.as_slice() {
+        [] => resolution,
+        [one] => Resolution::Resolved(*one),
+        _ => Resolution::Candidates(expanded),
+    }
+}
+
 fn is_argument_type_compatible(
     table: &SymbolTable,
     candidate: SymbolId,
@@ -1348,7 +1442,10 @@ impl<'a> BodyBinder<'a> {
                             && self.table.is_visible_from(id, self.enclosing_type)
                     })
                     .collect();
-                let resolution = narrow_by_overload(self.table, methods, &arg_types);
+                let resolution = widen_for_dynamic_dispatch(
+                    self.table,
+                    narrow_by_overload(self.table, methods, &arg_types),
+                );
                 let result_type = match &resolution {
                     Resolution::Resolved(id) => self.type_of_symbol(*id),
                     _ => None,
@@ -1448,6 +1545,15 @@ impl<'a> BodyBinder<'a> {
         };
 
         let resolution = narrow_by_overload(self.table, candidates, &arg_types);
+        // Never widened for `want_ctor`: a constructor call always
+        // instantiates the exact named type, so there's no dynamic
+        // dispatch to expand across (see `widen_for_dynamic_dispatch`'s
+        // own doc comment).
+        let resolution = if want_ctor {
+            resolution
+        } else {
+            widen_for_dynamic_dispatch(self.table, resolution)
+        };
         // Constructor symbols never carry a `type_name` (see
         // `collect::collect_constructor`), so `type_of_symbol` is `None`
         // for the `this(...)`/`super(...)` case without needing a

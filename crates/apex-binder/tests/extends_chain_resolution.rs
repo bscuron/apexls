@@ -317,3 +317,120 @@ fn a_class_implementing_its_own_nested_interface_gets_it_in_its_inherited_chain(
         "UTIL_CurrencyCache's inherited chain should include its own nested Interface_x"
     );
 }
+
+/// A call resolved against a plain, non-`virtual`/`abstract`/`override`
+/// concrete method must stay a single `Resolved` -- Apex forbids
+/// overriding such a method at all, so there's no real dynamic-dispatch
+/// ambiguity to widen into `Candidates` for, even if some other,
+/// unrelated class in the project happens to declare a same-named,
+/// same-arity method of its own (`Other.greet` here, sharing nothing
+/// with `Foo`/`Foo.greet`).
+#[test]
+fn a_call_to_a_non_virtual_method_stays_resolved_even_with_an_unrelated_same_named_method() {
+    let dir = write_fixture_dir(
+        "non-virtual-no-dispatch-widening",
+        &[
+            (
+                "Foo.cls",
+                "public class Foo { \
+                 public String greet() { return 'hi'; } \
+                 public void run() { String s = greet(); } \
+             }",
+            ),
+            (
+                "Other.cls",
+                "public class Other { public String greet() { return 'bye'; } }",
+            ),
+        ],
+    );
+
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let foo_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Class && s.name == "Foo")
+        .map(|(id, _)| id)
+        .expect("Foo should have been collected");
+    let foo_greet_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| {
+            s.kind == SymbolKind::Method && s.name == "greet" && s.container == Some(foo_id)
+        })
+        .map(|(id, _)| id)
+        .expect("Foo.greet should have been collected");
+
+    let foo_file = program.symbols.get(foo_id).file;
+    let calls = call_resolutions(&program, foo_file);
+    assert_eq!(calls.len(), 1, "expected one CallExpr in Foo.run()");
+    assert_eq!(
+        calls[0],
+        Some(Resolution::Resolved(foo_greet_id)),
+        "a non-virtual method call must stay a single Resolved, not widen into Candidates \
+         just because an unrelated class declares a same-named method: {:?}",
+        calls[0]
+    );
+}
+
+/// `SymbolTable::subtypes` (the reverse of `inherited_chain`) must find
+/// every transitive implementor of an interface, not just the direct
+/// ones -- `GrandchildImpl` implements `Greeter` only through `Impl`,
+/// two levels down.
+#[test]
+fn subtypes_finds_every_transitive_implementor_of_an_interface() {
+    let dir = write_fixture_dir(
+        "subtypes-transitive",
+        &[
+            (
+                "Greeter.cls",
+                "public interface Greeter { String greet(); }",
+            ),
+            (
+                "Impl.cls",
+                "public virtual class Impl implements Greeter { \
+                 public virtual String greet() { return 'hi'; } \
+             }",
+            ),
+            (
+                "GrandchildImpl.cls",
+                "public class GrandchildImpl extends Impl { \
+                 public override String greet() { return 'hi again'; } \
+             }",
+            ),
+        ],
+    );
+
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let greeter_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Interface && s.name == "Greeter")
+        .map(|(id, _)| id)
+        .expect("Greeter should have been collected");
+    let impl_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Class && s.name == "Impl")
+        .map(|(id, _)| id)
+        .expect("Impl should have been collected");
+    let grandchild_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Class && s.name == "GrandchildImpl")
+        .map(|(id, _)| id)
+        .expect("GrandchildImpl should have been collected");
+
+    let subtypes = program.symbols.subtypes(greeter_id);
+    assert!(
+        subtypes.contains(&impl_id),
+        "Greeter's subtypes should include its direct implementor Impl: {subtypes:?}"
+    );
+    assert!(
+        subtypes.contains(&grandchild_id),
+        "Greeter's subtypes should include its transitive implementor GrandchildImpl: {subtypes:?}"
+    );
+}

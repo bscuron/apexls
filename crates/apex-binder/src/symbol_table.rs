@@ -114,6 +114,20 @@ struct Indices {
     /// order doesn't reliably preserve "which ancestor was the direct
     /// base class" once interfaces are mixed in.
     direct_super: FxHashMap<SymbolId, SymbolId>,
+    /// Populated by Pass 1.5: the reverse of `inherited_chain` -- for a
+    /// type symbol that has at least one, every `SymbolId` transitively
+    /// `extends`/`implements`-ing *it*, cycle-guarded the same way.
+    /// Backs dynamic-dispatch widening (`crate::resolve`'s
+    /// `expand_dynamic_dispatch`): a call resolved against a
+    /// `virtual`/`abstract`/interface method declared on this type could,
+    /// at runtime, actually run any subtype's own same-name/arity
+    /// override instead, so a reference credited to the statically-
+    /// resolved declaration alone would under-count real callers of
+    /// whichever subtype override actually executes. Absent (empty
+    /// slice) for a type with no known subtypes, which is by far the
+    /// common case -- most declared types are never extended/implemented
+    /// at all.
+    subtypes: FxHashMap<SymbolId, Vec<SymbolId>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -328,6 +342,17 @@ impl SymbolTable {
 
     pub fn direct_super(&self, id: SymbolId) -> Option<SymbolId> {
         self.indices.direct_super.get(&id).copied()
+    }
+
+    pub(crate) fn set_subtypes(&mut self, id: SymbolId, chain: Vec<SymbolId>) {
+        Arc::make_mut(&mut self.indices).subtypes.insert(id, chain);
+    }
+
+    /// Every `SymbolId` transitively `extends`/`implements`-ing `id`,
+    /// i.e. the reverse of [`Self::inherited_chain`] -- see `Indices::subtypes`'s
+    /// own doc comment for why `crate::resolve` needs this.
+    pub fn subtypes(&self, id: SymbolId) -> &[SymbolId] {
+        self.indices.subtypes.get(&id).map_or(&[], |v| v.as_slice())
     }
 
     /// Every `Parameter` symbol directly contained by `container` (a

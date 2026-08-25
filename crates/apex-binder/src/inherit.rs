@@ -62,6 +62,27 @@ pub(crate) fn resolve_inheritance(
     for (type_id, chain) in chains {
         table.set_inherited_chain(type_id, chain);
     }
+
+    // `subtypes` is `direct`'s reverse graph: every type that has at
+    // least one direct subtype becomes a key, mapping to every type that
+    // names *it* as a direct supertype -- then flattened transitively
+    // the same way `inherited_chain` flattens the forward graph. Backs
+    // dynamic-dispatch widening (`crate::resolve::expand_dynamic_dispatch`) --
+    // see `SymbolTable`'s own `subtypes` field doc comment.
+    let mut direct_subtypes: FxHashMap<SymbolId, Vec<SymbolId>> = FxHashMap::default();
+    for (&type_id, supers) in &direct {
+        for &super_id in supers {
+            direct_subtypes.entry(super_id).or_default().push(type_id);
+        }
+    }
+    let supertypes_with_subtypes: Vec<SymbolId> = direct_subtypes.keys().copied().collect();
+    let subtypes: Vec<(SymbolId, Vec<SymbolId>)> = supertypes_with_subtypes
+        .par_iter()
+        .map(|&super_id| (super_id, flatten(&direct_subtypes, super_id)))
+        .collect();
+    for (type_id, chain) in subtypes {
+        table.set_subtypes(type_id, chain);
+    }
 }
 
 /// Resolves one `extends`/`implements` supertype name -- as written,
