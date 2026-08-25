@@ -65,6 +65,7 @@
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -75,7 +76,7 @@ use async_lsp::panic::CatchUnwindLayer;
 use async_lsp::router::Router;
 use async_lsp::server::LifecycleLayer;
 use async_lsp::tracing::TracingLayer;
-use async_lsp::{ClientSocket, LanguageServer, ResponseError};
+use async_lsp::{ClientSocket, ErrorCode, LanguageServer, ResponseError};
 use futures::future::BoxFuture;
 use lsp_types::{
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -84,9 +85,10 @@ use lsp_types::{
     FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
     InitializeParams, InitializeResult, InitializedParams, Location, MarkupContent, MarkupKind,
-    OneOf, ReferenceParams, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    OneOf, PrepareRenameResponse, ReferenceParams, RenameOptions, RenameParams, SelectionRange,
+    SelectionRangeParams, SelectionRangeProviderCapability, ServerCapabilities, ServerInfo,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
@@ -166,11 +168,49 @@ struct Backend {
 /// `spawn_blocking` task kicked off from `initialized` rather than
 /// synchronously in `initialize`, so it can't be written back through
 /// `&mut self` -- see `Backend::start_watcher`'s doc comment.
-#[derive(Default)]
 struct BindState {
     program: RwLock<Option<BoundProgram>>,
     cache: Mutex<BindCache>,
-    documents: Mutex<HashMap<Url, String>>,
+    /// Every open buffer's in-memory text, plus a `version` bumped by
+    /// every `did_open`/`did_change`/`did_close` mutation. Both fields
+    /// share one lock deliberately, not two independent ones: a request
+    /// handler snapshots `version` (see `Backend::hover` and friends)
+    /// while the rebuild worker reads `texts`, and if those lived behind
+    /// separate locks the worker could observe a `texts` snapshot that
+    /// already reflects an edit while still reading the *previous*
+    /// `version` -- under-recording which edit its resulting
+    /// `BoundProgram` actually covers. One shared lock makes that pairing
+    /// atomic, so `bound_version` (below) is always an honest floor on
+    /// what `bind.program` reflects.
+    documents: Mutex<Documents>,
+    /// The `documents.version` that the currently-published `bind.program`
+    /// reflects -- published by `spawn_rebuild_worker` immediately after
+    /// swapping `program`, so a `Receiver::wait_for` observing a new
+    /// value is guaranteed (by `tokio::sync::watch`'s own synchronization)
+    /// to also observe that swap. This is the fix for a real race: a
+    /// `documentHighlight`/`hover`/... request dispatched right after a
+    /// `didChange` used to be free to read whatever `bind.program`
+    /// already happened to contain, with nothing tying the query to the
+    /// edit that just preceded it -- so it could (and, observed live
+    /// against a real editor, did) answer from the *pre-edit* bind, byte-
+    /// for-byte, even though the rebuild that would have fixed it landed
+    /// only milliseconds later. Every read-only request now snapshots
+    /// `documents.version` before dispatching (synchronously, so it's
+    /// guaranteed to already include any preceding `did_change` -- see
+    /// this module's own doc comment on notification-before-request
+    /// ordering) and awaits `wait_for_rebuild` on it before touching
+    /// `program`.
+    bound_version: tokio::sync::watch::Sender<u64>,
+    /// Whether `spawn_rebuild_worker` was ever actually spawned (a
+    /// resolved project root at `initialized` time). `wait_for_rebuild`
+    /// checks this first and returns immediately when it's `false`,
+    /// since single-file mode never publishes a `bound_version` update at
+    /// all -- without this check, any request made after even one edit
+    /// would wait forever. `bind.program` staying permanently `None` in
+    /// that mode already makes every handler's `let Some(program) = ...
+    /// else { return Ok(None) }` the right behavior, unaffected by this
+    /// flag.
+    worker_active: AtomicBool,
     /// Signals `spawn_rebuild_worker`'s single persistent background
     /// task that `documents` has changed and there's a rebuild to do --
     /// set by `Backend::schedule_rebuild` and the filesystem watcher's
@@ -210,6 +250,44 @@ struct BindState {
     /// once the watch is live) causes a rebuild -- strictly better than
     /// before this feature existed, when that window was unbounded.
     watcher: Mutex<Option<Debouncer<RecommendedWatcher, RecommendedCache>>>,
+}
+
+impl Default for BindState {
+    fn default() -> Self {
+        Self {
+            program: RwLock::default(),
+            cache: Mutex::default(),
+            documents: Mutex::default(),
+            bound_version: tokio::sync::watch::channel(0).0,
+            worker_active: AtomicBool::new(false),
+            rebuild_requested: tokio::sync::Notify::default(),
+            watcher: Mutex::default(),
+        }
+    }
+}
+
+/// Every open buffer's in-memory text, plus a monotonically increasing
+/// `version` -- see `BindState::documents`'s doc comment for why the two
+/// live behind one shared lock.
+#[derive(Default)]
+struct Documents {
+    version: u64,
+    texts: HashMap<Url, String>,
+}
+
+/// Blocks a read-only request's future until the background rebuild
+/// worker has published a `bind.program` reflecting at least
+/// `target_version` of `bind.documents` -- see `BindState::bound_version`'s
+/// doc comment for the race this closes. A no-op when the rebuild worker
+/// was never spawned (`BindState::worker_active`'s doc comment).
+async fn wait_for_rebuild(bind: &BindState, target_version: u64) {
+    if !bind.worker_active.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut bound_version = bind.bound_version.subscribe();
+    let _ = bound_version
+        .wait_for(|&version| version >= target_version)
+        .await;
 }
 
 impl Backend {
@@ -337,17 +415,36 @@ fn spawn_rebuild_worker(root: PathBuf, bind: Arc<BindState>) {
             let root = root.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 let mut cache = bind.cache.lock().unwrap();
-                let overrides: HashMap<PathBuf, String> = bind
-                    .documents
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|(uri, text)| uri.to_file_path().ok().map(|path| (path, text.clone())))
-                    .collect();
+                // `version` and `texts` come from the same lock
+                // acquisition -- see `BindState::documents`'s doc comment
+                // for why that pairing has to be atomic: this is the only
+                // thing that lets `bound_version` (published below)
+                // honestly describe what `program` covers.
+                let (version, overrides) = {
+                    let documents = bind.documents.lock().unwrap();
+                    let overrides: HashMap<PathBuf, String> = documents
+                        .texts
+                        .iter()
+                        .filter_map(|(uri, text)| uri.to_file_path().ok().map(|path| (path, text.clone())))
+                        .collect();
+                    (documents.version, overrides)
+                };
                 let program = BoundProgram::from_files_cached(&root, &overrides, &mut cache);
                 drop(cache);
                 let file_count = program.file_count();
                 *bind.program.write().unwrap() = Some(program);
+                // Published only after the swap above, so any request
+                // woken by `wait_for_rebuild` observing this new value is
+                // guaranteed to also observe the fresh `program`. `send_replace`,
+                // not `send`: `send` silently no-ops (doesn't even store the
+                // value) whenever the channel has zero active receivers --
+                // and since every `wait_for_rebuild` caller's `subscribe()`d
+                // `Receiver` is transient (dropped the moment its wait
+                // resolves), the receiver count is back to zero between
+                // requests far more often than not. `send_replace` updates
+                // the value unconditionally, exactly the "publish state for
+                // whoever looks next" semantics this needs.
+                bind.bound_version.send_replace(version);
                 info!(file_count, "rebuild complete");
             })
             .await;
@@ -420,6 +517,16 @@ impl LanguageServer for Backend {
                     definition_provider: Some(OneOf::Left(true)),
                     references_provider: Some(OneOf::Left(true)),
                     document_highlight_provider: Some(OneOf::Left(true)),
+                    // `prepare_provider: true` -- the client always sends
+                    // `textDocument/prepareRename` first to get a range/
+                    // validity check before showing its rename input box,
+                    // rather than only finding out a target was refused
+                    // (an ambiguous overload, an override-chain method,
+                    // ...) after the user already typed a new name.
+                    rename_provider: Some(OneOf::Right(RenameOptions {
+                        prepare_provider: Some(true),
+                        work_done_progress_options: Default::default(),
+                    })),
                     document_symbol_provider: Some(OneOf::Left(true)),
                     workspace_symbol_provider: Some(OneOf::Left(true)),
                     folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
@@ -446,6 +553,13 @@ impl LanguageServer for Backend {
     fn initialized(&mut self, _: InitializedParams) -> Self::NotifyResult {
         info!("initialized");
         if let Some(root) = self.root.as_ref().and_then(|url| url.to_file_path().ok()) {
+            // Set before spawning, not after: `wait_for_rebuild` needs to
+            // see this as `true` for every request dispatched from here
+            // on, and `initialized` (a notification) is guaranteed to
+            // finish before any later request is even dispatched -- see
+            // this module's own doc comment on notification-before-
+            // request ordering.
+            self.bind.worker_active.store(true, Ordering::SeqCst);
             spawn_rebuild_worker(root.clone(), Arc::clone(&self.bind));
             Backend::start_watcher(root, Arc::clone(&self.bind));
         }
@@ -461,11 +575,10 @@ impl LanguageServer for Backend {
     fn did_open(&mut self, params: DidOpenTextDocumentParams) -> Self::NotifyResult {
         let uri = params.text_document.uri;
         info!(%uri, "did_open");
-        self.bind
-            .documents
-            .lock()
-            .unwrap()
-            .insert(uri, params.text_document.text);
+        let mut documents = self.bind.documents.lock().unwrap();
+        documents.texts.insert(uri, params.text_document.text);
+        documents.version += 1;
+        drop(documents);
         self.schedule_rebuild();
         ControlFlow::Continue(())
     }
@@ -480,7 +593,10 @@ impl LanguageServer for Backend {
             return ControlFlow::Continue(());
         };
         info!(%uri, len = change.text.len(), "did_change");
-        self.bind.documents.lock().unwrap().insert(uri, change.text);
+        let mut documents = self.bind.documents.lock().unwrap();
+        documents.texts.insert(uri, change.text);
+        documents.version += 1;
+        drop(documents);
         self.schedule_rebuild();
         ControlFlow::Continue(())
     }
@@ -488,7 +604,10 @@ impl LanguageServer for Backend {
     fn did_close(&mut self, params: DidCloseTextDocumentParams) -> Self::NotifyResult {
         let uri = params.text_document.uri;
         info!(%uri, "did_close");
-        self.bind.documents.lock().unwrap().remove(&uri);
+        let mut documents = self.bind.documents.lock().unwrap();
+        documents.texts.remove(&uri);
+        documents.version += 1;
+        drop(documents);
         self.schedule_rebuild();
         ControlFlow::Continue(())
     }
@@ -516,8 +635,10 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
             let program_guard = bind.program.read().unwrap();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
@@ -568,8 +689,10 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
             let program_guard = bind.program.read().unwrap();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
@@ -614,8 +737,10 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
         let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
             let program_guard = bind.program.read().unwrap();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
@@ -641,8 +766,10 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
             let program_guard = bind.program.read().unwrap();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
@@ -658,6 +785,76 @@ impl LanguageServer for Backend {
         })
     }
 
+    /// `capabilities::prepare_rename_range`, gated by `capabilities::rename_target`'s
+    /// full eligibility check (ambiguous resolution, an override-chain
+    /// method, a trigger, ...) -- refuses with a `ResponseError` rather
+    /// than silently returning `None`, so the client shows the user
+    /// *why* rename isn't offered here instead of just not offering it.
+    fn prepare_rename(
+        &mut self,
+        params: TextDocumentPositionParams,
+    ) -> BoxFuture<'static, Result<Option<PrepareRenameResponse>, Self::Error>> {
+        let uri = params.text_document.uri;
+        let position = params.position;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some((file, offset)) =
+                capabilities::resolve_position(program, &uri, position, encoding)
+            else {
+                return Ok(None);
+            };
+
+            if let Err(refusal) = capabilities::rename_target(program, file, offset) {
+                return Err(ResponseError::new(ErrorCode::REQUEST_FAILED, refusal.message()));
+            }
+            let range = capabilities::prepare_rename_range(program, file, offset, encoding);
+            Ok(range.map(PrepareRenameResponse::Range))
+        })
+    }
+
+    /// `capabilities::rename_edits`: a project-wide `WorkspaceEdit`
+    /// renaming the symbol at the cursor, built from exactly the same
+    /// `references_to`/`highlight_range` data `references` already uses.
+    /// Refuses (a `ResponseError`, never a silent empty edit) for
+    /// anything `capabilities::rename_target`'s eligibility check
+    /// wouldn't have offered via `prepareRename` either, since a client
+    /// is allowed to skip `prepareRename` and call this directly.
+    fn rename(
+        &mut self,
+        params: RenameParams,
+    ) -> BoxFuture<'static, Result<Option<WorkspaceEdit>, Self::Error>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some((file, offset)) =
+                capabilities::resolve_position(program, &uri, position, encoding)
+            else {
+                return Ok(None);
+            };
+
+            match capabilities::rename_edits(program, file, offset, &new_name, encoding) {
+                Ok(edit) => Ok(Some(edit)),
+                Err(refusal) => Err(ResponseError::new(ErrorCode::REQUEST_FAILED, refusal.message())),
+            }
+        })
+    }
+
     /// The outline view: `capabilities::document_symbols` nests every
     /// declaration-shaped symbol in `file` by `Symbol::container`.
     fn document_symbol(
@@ -666,8 +863,10 @@ impl LanguageServer for Backend {
     ) -> BoxFuture<'static, Result<Option<DocumentSymbolResponse>, Self::Error>> {
         let uri = params.text_document.uri;
         let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
             let program_guard = bind.program.read().unwrap();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
@@ -691,8 +890,10 @@ impl LanguageServer for Backend {
         params: WorkspaceSymbolParams,
     ) -> BoxFuture<'static, Result<Option<WorkspaceSymbolResponse>, Self::Error>> {
         let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
             let program_guard = bind.program.read().unwrap();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
@@ -710,8 +911,10 @@ impl LanguageServer for Backend {
         params: FoldingRangeParams,
     ) -> BoxFuture<'static, Result<Option<Vec<FoldingRange>>, Self::Error>> {
         let uri = params.text_document.uri;
+        let target_version = self.bind.documents.lock().unwrap().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
             let program_guard = bind.program.read().unwrap();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
@@ -739,8 +942,10 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let positions = params.positions;
         let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
             let program_guard = bind.program.read().unwrap();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
