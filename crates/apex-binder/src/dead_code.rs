@@ -42,7 +42,9 @@
 use crate::file_id::FileId;
 use crate::symbol::{Symbol, SymbolId, SymbolKind, Visibility};
 use crate::BoundProgram;
-use apex_syntax::ast::decl::{FieldDecl, HasModifiers, MethodDecl, PropertyDecl, VarDeclarator};
+use apex_syntax::ast::decl::{
+    Annotation, ConstructorDecl, FieldDecl, HasModifiers, MethodDecl, PropertyDecl, VarDeclarator,
+};
 use apex_syntax::ast::stmt::LocalVarDeclStmt;
 use rowan::ast::AstNode;
 use rowan::{TextRange, TextSize};
@@ -118,21 +120,32 @@ fn is_platform_invoked_test_method(program: &BoundProgram, symbol: &Symbol) -> b
     })
 }
 
-/// True for a `public` `Method`/`Field`/`Property` carrying one of
-/// `PLATFORM_INVOCATION_ANNOTATIONS` -- see this module's own doc
-/// comment and that constant's for why each one matters. Reads
-/// annotations straight off the declaration node via `HasModifiers`
-/// (`apex_syntax`'s structural parse already exposes them; nothing in
-/// `apex-binder` modeled annotations onto `Symbol`/`ModifierSet` itself,
-/// and this is deliberately the only place that needs to).
-fn has_platform_invocation_annotation(program: &BoundProgram, symbol: &Symbol) -> bool {
+/// `symbol`'s own `@`-annotations, straight off its declaration node via
+/// `HasModifiers` (`apex_syntax`'s structural parse already exposes them;
+/// nothing in `apex-binder` modeled annotations onto `Symbol`/`ModifierSet`
+/// itself, and this is deliberately the only place that needs to). Shared
+/// by every annotation-driven exemption below (`PLATFORM_INVOCATION_ANNOTATIONS`,
+/// `@TestVisible`) rather than each re-deriving the same per-`SymbolKind`
+/// node cast.
+fn annotations_of(program: &BoundProgram, symbol: &Symbol) -> Vec<Annotation> {
+    // A `LocalVar` (this module's other, by-far-most-common candidate
+    // kind) can never carry an annotation at all -- checked before
+    // touching the syntax tree so the common case skips `to_node`
+    // entirely rather than just falling through the match below.
+    if !matches!(
+        symbol.kind,
+        SymbolKind::Method | SymbolKind::Property | SymbolKind::Constructor | SymbolKind::Field
+    ) {
+        return Vec::new();
+    }
     let root = program.syntax(symbol.file);
     let Some(node) = symbol.ptr.to_node(&root) else {
-        return false;
+        return Vec::new();
     };
     let annotated = match symbol.kind {
         SymbolKind::Method => MethodDecl::cast(node).map(|m| m.annotations().collect::<Vec<_>>()),
         SymbolKind::Property => PropertyDecl::cast(node).map(|p| p.annotations().collect::<Vec<_>>()),
+        SymbolKind::Constructor => ConstructorDecl::cast(node).map(|c| c.annotations().collect::<Vec<_>>()),
         SymbolKind::Field => {
             // `symbol.ptr` for a `Field` is the `VarDeclarator`, not the
             // whole `FieldDecl` -- annotations live on the parent
@@ -141,12 +154,22 @@ fn has_platform_invocation_annotation(program: &BoundProgram, symbol: &Symbol) -
                 .and_then(FieldDecl::cast)
                 .map(|f| f.annotations().collect::<Vec<_>>())
         }
-        _ => return false,
+        _ => return Vec::new(),
     };
-    let Some(annotations) = annotated else {
-        return false;
-    };
-    annotations.into_iter().any(|a| {
+    annotated.unwrap_or_default()
+}
+
+fn has_annotation(program: &BoundProgram, symbol: &Symbol, name: &str) -> bool {
+    annotations_of(program, symbol)
+        .into_iter()
+        .any(|a| a.name().is_some_and(|tok| tok.text().eq_ignore_ascii_case(name)))
+}
+
+/// True for a `public` `Method`/`Field`/`Property` carrying one of
+/// `PLATFORM_INVOCATION_ANNOTATIONS` -- see this module's own doc
+/// comment and that constant's for why each one matters.
+fn has_platform_invocation_annotation(program: &BoundProgram, symbol: &Symbol) -> bool {
+    annotations_of(program, symbol).into_iter().any(|a| {
         a.name().is_some_and(|tok| {
             let text = tok.text();
             PLATFORM_INVOCATION_ANNOTATIONS
@@ -154,6 +177,28 @@ fn has_platform_invocation_annotation(program: &BoundProgram, symbol: &Symbol) -
                 .any(|candidate| text.eq_ignore_ascii_case(candidate))
         })
     })
+}
+
+/// True for a `private`/`protected` `Method`/`Field`/`Property`/`Constructor`
+/// carrying `@TestVisible` -- Apex's own way of granting an otherwise
+/// purely file-scoped private member a second, real invocation channel:
+/// any `@isTest` class in the org, in any file, not just this one.
+/// `SymbolTable::is_visible_from` (the resolver's own visibility check,
+/// consulted during member-access resolution) already treats such a
+/// member as visible from anywhere for exactly this reason, so a real
+/// cross-file `@TestVisible` call site does get linked into
+/// `references_to` like any other reference -- but only once this
+/// function also tells the caller *which* candidates need the
+/// project-wide lookup instead of the file-scoped one. Unlike
+/// `PLATFORM_INVOCATION_ANNOTATIONS` (which only ever matters for
+/// `public`, and *exempts* the member outright since platform reflection
+/// has no textual call site to find), `@TestVisible` specifically widens
+/// a *private* candidate's own visibility -- so it must route through the
+/// project-wide `references_to` instead of the file-scoped
+/// `references_to_in_file`, exactly like a `public` candidate already
+/// does, rather than being exempted from the reference check altogether.
+fn is_test_visible(program: &BoundProgram, symbol: &Symbol) -> bool {
+    has_annotation(program, symbol, "TestVisible")
 }
 
 /// Walks `id` up to its outermost enclosing type (mirroring
@@ -232,8 +277,11 @@ pub fn dead_symbols_in_file(program: &BoundProgram, file: FileId) -> Vec<DeadSym
             // can be referenced from any file in the project, so it must
             // use the project-wide lookup instead; reusing the
             // file-scoped one here would silently miss real references
-            // and produce false positives.
-            if s.modifiers.visibility == Visibility::Public {
+            // and produce false positives. A `@TestVisible` private/
+            // protected candidate needs that same project-wide lookup
+            // for the same reason -- see `is_test_visible`'s own doc
+            // comment -- despite still being a `Private` candidate here.
+            if s.modifiers.visibility == Visibility::Public || is_test_visible(program, s) {
                 program.references_to(*id).next().is_none()
             } else {
                 program.references_to_in_file(file, *id).next().is_none()
@@ -676,6 +724,15 @@ mod tests {
             after,
             "public class Foo {\n    public void run() {\n        System.debug('hi');\n    }\n}\n"
         );
+    }
+
+    #[test]
+    fn test_visible_private_static_method_called_from_another_file_is_not_flagged() {
+        let src = "public class Foo {\n    @TestVisible\n    private static void helper() { }\n}\n";
+        let caller = "@isTest\nprivate class Caller {\n    @isTest\n    static void go() { Foo.helper(); }\n}\n";
+        let (_, _, dead) =
+            dead_symbols_with_extra_files("testvisible-cross-file", src, &[("Caller.cls", caller)]);
+        assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
     }
 
     /// Real-corpus smoke test: `dead_symbols_in_file` must run to

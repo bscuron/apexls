@@ -361,30 +361,50 @@ impl SymbolTable {
     /// body). `Public`/`Global` collapse to "always visible": v1 has no
     /// namespace model, the same simplification this binder already
     /// makes everywhere else a namespace boundary would otherwise matter.
-    /// `Private` requires the same top-level type (`Self::top_level_of`);
-    /// `Protected` additionally allows any type that *is*, `extends`, or
-    /// `implements` the member's declaring type
+    /// `@TestVisible` collapses the same way for a `Private`/`Protected`
+    /// candidate, ahead of either's own same-type check: real Apex only
+    /// actually grants that widened access to test-context callers, not
+    /// every `from`, but this binder has no model of "is `from` itself
+    /// test code" to check precisely, and under-widening is the costlier
+    /// mistake here -- it's exactly what silently broke dead-code
+    /// detection for a real `@TestVisible` member called only from a
+    /// `_TEST` class in another file (never linked into
+    /// `BoundProgram::references_to` at all, since resolution rejected
+    /// the reference before it ever got that far). Collapsing to "always
+    /// visible" is the same simplification `Public`/`Global` already make
+    /// here, just narrower in scope (only `@TestVisible`-annotated
+    /// members, not every `Private`/`Protected` one).
+    /// `Private` (without `@TestVisible`) requires the same top-level type
+    /// (`Self::top_level_of`); `Protected` additionally allows any type
+    /// that *is*, `extends`, or `implements` the member's declaring type
     /// (`self.get(candidate).container`, already that type directly --
     /// every `lookup_member` candidate's `container` is its immediately-
     /// enclosing type, never a method/parameter, since only type-owned
     /// declarations are indexed by `members_by_name` at all).
     pub fn is_visible_from(&self, candidate: SymbolId, from: Option<SymbolId>) -> bool {
-        match self.get(candidate).modifiers.visibility {
+        let candidate_symbol = self.get(candidate);
+        match candidate_symbol.modifiers.visibility {
             Visibility::Public | Visibility::Global => true,
             Visibility::Private => {
+                if candidate_symbol.modifiers.is_test_visible {
+                    return true;
+                }
                 let Some(from) = from else {
                     return false;
                 };
                 self.top_level_of(candidate) == self.top_level_of(from)
             }
             Visibility::Protected => {
+                if candidate_symbol.modifiers.is_test_visible {
+                    return true;
+                }
                 let Some(from) = from else {
                     return false;
                 };
                 if self.top_level_of(candidate) == self.top_level_of(from) {
                     return true;
                 }
-                let Some(declaring) = self.get(candidate).container else {
+                let Some(declaring) = candidate_symbol.container else {
                     return false;
                 };
                 from == declaring || self.inherited_chain(from).contains(&declaring)

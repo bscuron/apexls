@@ -341,7 +341,7 @@ fn collect_method(
         return;
     };
     let (type_ref, type_name, type_args) = type_ptr_and_name(file, m.return_type());
-    let mut modifiers = ModifierSet::from_modifiers(m.modifiers());
+    let mut modifiers = ModifierSet::from_modifiers_and_annotations(m.modifiers(), m.annotations());
     if in_interface && modifiers.visibility == Visibility::Private {
         // Apex interface methods can't carry an explicit access modifier
         // at all -- every interface member is implicitly public, unlike
@@ -406,7 +406,7 @@ fn collect_constructor(
             type_ref: None,
             type_name: None,
             type_args: Vec::new(),
-            modifiers: ModifierSet::from_modifiers(c.modifiers()),
+            modifiers: ModifierSet::from_modifiers_and_annotations(c.modifiers(), c.annotations()),
         },
     );
 
@@ -436,7 +436,7 @@ fn collect_field(out: &mut FileCollection, file: FileId, f: &FieldDecl, containe
                 type_ref,
                 type_name: type_name.clone(),
                 type_args: type_args.clone(),
-                modifiers: ModifierSet::from_modifiers(f.modifiers()),
+                modifiers: ModifierSet::from_modifiers_and_annotations(f.modifiers(), f.annotations()),
             },
         );
     }
@@ -462,7 +462,7 @@ fn collect_property(out: &mut FileCollection, file: FileId, p: &PropertyDecl, co
             type_ref,
             type_name,
             type_args,
-            modifiers: ModifierSet::from_modifiers(p.modifiers()),
+            modifiers: ModifierSet::from_modifiers_and_annotations(p.modifiers(), p.annotations()),
         },
     );
 }

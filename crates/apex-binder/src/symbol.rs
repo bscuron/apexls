@@ -6,7 +6,7 @@
 
 use crate::file_id::FileId;
 use crate::ptr::{AstPtr, SyntaxPtr};
-use apex_syntax::ast::decl::Modifier;
+use apex_syntax::ast::decl::{Annotation, Modifier};
 use apex_syntax::ast::Type;
 use apex_syntax::SyntaxKind;
 use rowan::TextRange;
@@ -102,6 +102,20 @@ pub struct ModifierSet {
     pub is_testmethod: bool,
     pub is_transient: bool,
     pub is_webservice: bool,
+    /// Whether `@TestVisible` annotates this declaration -- Apex's own
+    /// way of granting an otherwise `private`/`protected` member a real,
+    /// textual invocation channel from test code in *any* file, not just
+    /// this one. Read off `HasModifiers::annotations` (a distinct node
+    /// kind from a plain `Modifier`, see that trait's own doc comment) by
+    /// `Self::from_modifiers_and_annotations`, not `Self::from_modifiers`
+    /// alone. `SymbolTable::is_visible_from` is this field's one
+    /// consumer: without it, a real cross-file `@TestVisible` reference
+    /// would fail that visibility check, never get linked into
+    /// `BoundProgram::references_to` for the member it actually calls,
+    /// and every reference-driven query -- dead-code detection foremost,
+    /// but also find-references/rename -- would silently treat the
+    /// member as unreferenced from that call site.
+    pub is_test_visible: bool,
     pub sharing: Option<Sharing>,
 }
 
@@ -131,6 +145,25 @@ impl ModifierSet {
                 _ => {}
             }
         }
+        set
+    }
+
+    /// Like [`Self::from_modifiers`], plus reading `@TestVisible` off
+    /// `annotations` into [`Self::is_test_visible`]. Kept as a second
+    /// constructor rather than folding `annotations` into
+    /// `Self::from_modifiers` unconditionally: a `Parameter`/enum-constant
+    /// (neither of which can carry an annotation) has no `annotations()`
+    /// of its own to pass, so those callers keep using the plain
+    /// constructor.
+    pub(crate) fn from_modifiers_and_annotations(
+        modifiers: impl Iterator<Item = Modifier>,
+        annotations: impl Iterator<Item = Annotation>,
+    ) -> Self {
+        let mut set = Self::from_modifiers(modifiers);
+        set.is_test_visible = annotations.into_iter().any(|a| {
+            a.name()
+                .is_some_and(|tok| tok.text().eq_ignore_ascii_case("TestVisible"))
+        });
         set
     }
 }
