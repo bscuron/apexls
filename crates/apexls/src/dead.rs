@@ -16,6 +16,7 @@
 //! partial binding to build this on top of anyway.
 
 use apex_binder::BoundProgram;
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -101,35 +102,60 @@ pub fn run(paths: &[PathBuf]) -> ExitCode {
         col: usize,
         message: String,
     }
-    let mut findings: Vec<Finding> = Vec::new();
 
-    for file in program.files() {
-        let file_path = program.file_path(file);
-        let canon_file_path = file_path.canonicalize().unwrap_or_else(|_| file_path.to_path_buf());
-        if !matches_any(&canon_file_path, &filters) {
-            continue;
-        }
-        let dead = apex_binder::dead_symbols_in_file(&program, file);
-        if dead.is_empty() {
-            continue;
-        }
-        let text = program.syntax(file).text().to_string();
-        let starts = line_starts(&text);
-        let display_path = file_path.strip_prefix(&cwd).unwrap_or(file_path);
-        for d in dead {
-            let (line, col) = line_col(&starts, &text, d.name_range.start().into());
-            findings.push(Finding {
-                path: display_path.to_path_buf(),
-                line,
-                col,
-                message: format!(
-                    "{} '{}' is never used",
-                    apex_binder::kind_label(d.kind, d.visibility),
-                    d.name
-                ),
-            });
-        }
-    }
+    // Each file's report is independent of every other's -- computed
+    // once (per-file `dead_symbols_in_file` result) and read-only from
+    // there, so `program`'s per-file work parallelizes over `rayon`
+    // exactly like the bind that built it already does. The `Vec<Finding>`
+    // -per-file results are flattened and globally sorted below rather
+    // than printed as they land, since `program.files()`'s own order is
+    // hash-set-derived, not path order -- streaming would make output
+    // order vary run to run for no benefit once this loop is already
+    // fast.
+    let files: Vec<apex_binder::FileId> = program.files().collect();
+    let mut findings: Vec<Finding> = files
+        .par_iter()
+        .filter_map(|&file| {
+            let file_path = program.file_path(file);
+            // Skip the syscall entirely when there's nothing to filter
+            // against -- `matches_any` already treats an empty `filters`
+            // as "matches everything" regardless of the canonicalized
+            // path, so canonicalizing every file up front bought nothing
+            // in the (default, no-arguments) whole-project case.
+            if !filters.is_empty() {
+                let canon_file_path =
+                    file_path.canonicalize().unwrap_or_else(|_| file_path.to_path_buf());
+                if !matches_any(&canon_file_path, &filters) {
+                    return None;
+                }
+            }
+            let dead = apex_binder::dead_symbols_in_file(&program, file);
+            if dead.is_empty() {
+                return None;
+            }
+            let text = program.syntax(file).text().to_string();
+            let starts = line_starts(&text);
+            let display_path = file_path.strip_prefix(&cwd).unwrap_or(file_path);
+            Some(
+                dead.into_iter()
+                    .map(|d| {
+                        let (line, col) = line_col(&starts, &text, d.name_range.start().into());
+                        Finding {
+                            path: display_path.to_path_buf(),
+                            line,
+                            col,
+                            message: format!(
+                                "{} '{}' is never used",
+                                apex_binder::kind_label(d.kind, d.visibility),
+                                d.name
+                            ),
+                        }
+                    })
+                    .collect::<Vec<Finding>>(),
+            )
+        })
+        .flatten()
+        .collect();
 
     findings.sort_by(|a, b| (&a.path, a.line, a.col).cmp(&(&b.path, b.line, b.col)));
 

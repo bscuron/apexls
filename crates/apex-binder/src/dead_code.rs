@@ -205,10 +205,19 @@ pub struct DeadSymbol {
 /// protected/global, not loop/catch/switch-binding variables) and why
 /// each exclusion exists.
 pub fn dead_symbols_in_file(program: &BoundProgram, file: FileId) -> Vec<DeadSymbol> {
+    // Materialized once and shared across every candidate below, rather
+    // than letting `compute_deletion_range` re-flatten the same file's
+    // rope into a fresh `String` per candidate -- `symbols_of_file`
+    // scopes everything else here to `file` already, and a file with
+    // many dead candidates (locals especially) was re-paying that
+    // O(file size) flattening once per candidate for no reason.
+    let text = program.syntax(file).text().to_string();
     program
         .symbols
+        .symbols_of_file(file)
         .iter()
-        .filter(|(_, s)| s.file == file)
+        .enumerate()
+        .map(|(local, s)| (SymbolId::new(file, local as u32), s))
         .filter(|(_, s)| is_dead_code_candidate_kind(s))
         .filter(|(_, s)| !is_platform_invoked_test_method(program, s))
         .filter(|(_, s)| {
@@ -231,7 +240,7 @@ pub fn dead_symbols_in_file(program: &BoundProgram, file: FileId) -> Vec<DeadSym
             }
         })
         .filter_map(|(_, s)| {
-            compute_deletion_range(program, s).map(|deletion_range| DeadSymbol {
+            compute_deletion_range(program, &text, s).map(|deletion_range| DeadSymbol {
                 kind: s.kind,
                 visibility: s.modifiers.visibility,
                 name: s.name.to_string(),
@@ -266,20 +275,23 @@ pub fn dead_symbols_in_file(program: &BoundProgram, file: FileId) -> Vec<DeadSym
 /// trailing whitespace past its own line. Rather than chase that per-kind,
 /// `line_aligned_deletion_range` sidesteps it entirely by computing
 /// purely from the raw source text once a real-content anchor is found.
-fn compute_deletion_range(program: &BoundProgram, symbol: &Symbol) -> Option<TextRange> {
+fn compute_deletion_range(
+    program: &BoundProgram,
+    text: &str,
+    symbol: &Symbol,
+) -> Option<TextRange> {
     let root = program.syntax(symbol.file);
     let node = symbol.ptr.to_node(&root)?;
-    let text = root.text().to_string();
     match symbol.kind {
         SymbolKind::Method | SymbolKind::Property | SymbolKind::Constructor => {
-            Some(line_aligned_deletion_range(&text, node.text_range()))
+            Some(line_aligned_deletion_range(text, node.text_range()))
         }
         SymbolKind::Field => {
             let declarator = VarDeclarator::cast(node)?;
             let field_decl = FieldDecl::cast(declarator.syntax().parent()?)?;
             let siblings: Vec<VarDeclarator> = field_decl.declarators().collect();
             if siblings.len() == 1 {
-                Some(line_aligned_deletion_range(&text, field_decl.syntax().text_range()))
+                Some(line_aligned_deletion_range(text, field_decl.syntax().text_range()))
             } else {
                 deletion_range_for_declarator(&declarator, &siblings)
             }
@@ -289,7 +301,7 @@ fn compute_deletion_range(program: &BoundProgram, symbol: &Symbol) -> Option<Tex
             let stmt = LocalVarDeclStmt::cast(declarator.syntax().parent()?)?;
             let siblings: Vec<VarDeclarator> = stmt.declarators().collect();
             if siblings.len() == 1 {
-                Some(line_aligned_deletion_range(&text, stmt.syntax().text_range()))
+                Some(line_aligned_deletion_range(text, stmt.syntax().text_range()))
             } else {
                 deletion_range_for_declarator(&declarator, &siblings)
             }
