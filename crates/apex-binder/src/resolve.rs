@@ -1127,7 +1127,16 @@ impl<'a> BodyBinder<'a> {
             return self.type_of_symbol(local);
         }
 
-        if let Some(container) = self.enclosing_type {
+        // Walks outward through the whole lexical nesting chain, not just
+        // the reference site's immediate enclosing type -- a nested class
+        // referencing its outer class's static field/constant unqualified
+        // (real Apex: nested classes see the enclosing type's members the
+        // same way a qualified reference to it would) otherwise never
+        // resolved past the nested class's own (and inherited) members.
+        // Mirrors `resolve_type_ref`'s and `type_of_symbol`'s identical
+        // climb for the type-reference and declared-type cases.
+        let mut enclosing_chain = self.enclosing_type;
+        while let Some(container) = enclosing_chain {
             // Methods/constructors are excluded from plain-name
             // resolution: a bare `NameExpr` naming a method with no call
             // wouldn't compile in real Apex, and including them here
@@ -1182,7 +1191,7 @@ impl<'a> BodyBinder<'a> {
                 members
             };
             match members.as_slice() {
-                [] => {} // fall through to the type-name check below
+                [] => {} // try the next-outer enclosing level, if any
                 [one] => {
                     self.refs.set(ptr, Resolution::Resolved(*one));
                     return self.type_of_symbol(*one);
@@ -1192,6 +1201,7 @@ impl<'a> BodyBinder<'a> {
                     return None;
                 }
             }
+            enclosing_chain = self.table.get(container).container;
         }
 
         // Neither a local/param nor a member of the enclosing type -- a
@@ -1408,14 +1418,33 @@ impl<'a> BodyBinder<'a> {
                 .collect()
         } else {
             let name = tok.text();
-            self.table
-                .lookup_member(container, name)
-                .into_iter()
-                .filter(|&id| {
-                    self.table.get(id).kind == SymbolKind::Method
-                        && self.table.is_visible_from(id, self.enclosing_type)
-                })
-                .collect()
+            // Walks outward through the whole lexical nesting chain, not
+            // just the call site's immediate enclosing type -- an
+            // unqualified call from a nested class to a method declared
+            // on its outer class (real Apex: a nested class sees the
+            // enclosing type's static members unqualified) otherwise
+            // never resolved past the nested class's own (and inherited)
+            // members. Mirrors the identical climb `bind_name_expr` and
+            // `type_of_symbol` already do for the name and declared-type
+            // cases.
+            let mut candidates = Vec::new();
+            let mut enclosing_chain = Some(container);
+            while let Some(level) = enclosing_chain {
+                candidates = self
+                    .table
+                    .lookup_member(level, name)
+                    .into_iter()
+                    .filter(|&id| {
+                        self.table.get(id).kind == SymbolKind::Method
+                            && self.table.is_visible_from(id, self.enclosing_type)
+                    })
+                    .collect();
+                if !candidates.is_empty() {
+                    break;
+                }
+                enclosing_chain = self.table.get(level).container;
+            }
+            candidates
         };
 
         let resolution = narrow_by_overload(self.table, candidates, &arg_types);
