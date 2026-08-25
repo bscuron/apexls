@@ -38,14 +38,6 @@
 //! cheap future extension (same project-wide reference-counting `Public`
 //! already needs, and VF/annotation exposure doesn't apply to it -- VF
 //! markup can only bind to `public` members) not built yet.
-//!
-//! A method implementing an interface method is excluded from candidacy
-//! too (`implements_interface_method`), for the same "can't rule out a
-//! channel" reason: a call written against the interface type resolves
-//! to the interface's own abstract declaration, never to whichever
-//! concrete class actually implements it, so a genuinely-used
-//! implementation reached only through interface-typed dispatch would
-//! otherwise show zero direct references.
 
 use crate::file_id::FileId;
 use crate::symbol::{Symbol, SymbolId, SymbolKind, Visibility};
@@ -239,52 +231,6 @@ fn is_visualforce_referenced(program: &BoundProgram, symbol: &Symbol) -> bool {
     program.vf_referenced_classes.contains(&name)
 }
 
-/// True for a concrete `Method` whose enclosing type's inherited chain
-/// (`extends`/`implements`, already flattened by `crate::inherit`)
-/// includes an `Interface` directly declaring a method of the same name
-/// (case-insensitive) and arity. A call written against the interface
-/// type -- `SomeInterface v = ...; v.method();`, or any variable/return
-/// value whose *declared* type is the interface, not the concrete class
-/// -- resolves, in this binder's static model, against the interface's
-/// own abstract declaration; it never re-targets whichever concrete
-/// class actually implements it at runtime, since that's a real dynamic-
-/// dispatch decision this binder has no way to make textually. Left
-/// unexempted, a genuinely-used implementation reached only that way
-/// would show zero direct references and be misreported as dead. Purely
-/// structural -- name/arity/chain-membership only, nothing here is tied
-/// to any one project's naming conventions or class shapes -- so it
-/// applies equally to any Apex codebase, not just the one that first
-/// surfaced the gap (NPSP's `UTIL_CurrencyCache`/`Interface_x`).
-/// Deliberately matches on arity alone, not full parameter types (the
-/// same simplification `SymbolTable::lookup_member`'s override-shadowing
-/// already makes): the rare shape this can't tell apart -- an unrelated,
-/// genuinely-dead method that just happens to share the interface
-/// method's name and arity with a different parameter type -- only ever
-/// makes this *too* lenient (a possible false negative), never the false
-/// positive this exists to close, so it's the safe direction to round to.
-fn implements_interface_method(program: &BoundProgram, id: SymbolId, symbol: &Symbol) -> bool {
-    if symbol.kind != SymbolKind::Method {
-        return false;
-    }
-    let Some(container) = symbol.container else {
-        return false;
-    };
-    let arity = program.symbols.params(id).len();
-    program
-        .symbols
-        .inherited_chain(container)
-        .iter()
-        .any(|&ancestor| {
-            program.symbols.get(ancestor).kind == SymbolKind::Interface
-                && program.symbols.members_of(ancestor).iter().any(|&m| {
-                    let member = program.symbols.get(m);
-                    member.kind == SymbolKind::Method
-                        && member.name.eq_ignore_ascii_case(symbol.name.as_str())
-                        && program.symbols.params(m).len() == arity
-                })
-        })
-}
-
 /// One provably-dead declaration in a file: everything both
 /// `apexls-server`'s LSP wrappers and `apexls dead` need, computed once
 /// and shared between them. `visibility` exists specifically so
@@ -319,7 +265,6 @@ pub fn dead_symbols_in_file(program: &BoundProgram, file: FileId) -> Vec<DeadSym
         .map(|(local, s)| (SymbolId::new(file, local as u32), s))
         .filter(|(_, s)| is_dead_code_candidate_kind(s))
         .filter(|(_, s)| !is_platform_invoked_test_method(program, s))
-        .filter(|(id, s)| !implements_interface_method(program, *id, s))
         .filter(|(_, s)| {
             s.modifiers.visibility != Visibility::Public
                 || (!has_platform_invocation_annotation(program, s)
@@ -788,58 +733,6 @@ mod tests {
         let (_, _, dead) =
             dead_symbols_with_extra_files("testvisible-cross-file", src, &[("Caller.cls", caller)]);
         assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
-    }
-
-    /// Regression test for a real user report against the NPSP corpus
-    /// (`UTIL_CurrencyCache`): a `public` method's only call site is
-    /// written against the *interface* type it implements (a singleton
-    /// accessor returning the interface, then a call chained off that),
-    /// never against the concrete class directly. Such a call resolves
-    /// to the interface's own abstract method declaration, not to this
-    /// implementation, so without `implements_interface_method` the
-    /// implementation would show zero direct references and be flagged
-    /// dead despite genuinely being reachable at runtime.
-    #[test]
-    fn a_method_implementing_an_interface_method_is_not_flagged_even_with_no_direct_callers() {
-        let src = "public class Foo implements Foo.Greeter { \
-             public static Greeter instance() { return new Foo(); } \
-             public String greet() { return 'hi'; } \
-             public interface Greeter { String greet(); } \
-             public void run() { String s = instance().greet(); } \
-         }\n";
-        let (_, _, dead) = dead_symbols_with_extra_files(
-            "interface-implementation-not-flagged",
-            src,
-            &[("Caller.cls", CALLER)],
-        );
-        assert!(
-            !dead.iter().any(|d| d.name == "greet"),
-            "greet() implements Greeter.greet and is called via the interface type -- must not \
-             be flagged dead: {:?}",
-            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
-        );
-    }
-
-    /// The same interface-implementation exemption must not blanket-
-    /// exempt every method on a class that happens to implement some
-    /// interface -- only the ones actually named on that interface.
-    #[test]
-    fn an_unrelated_method_on_an_interface_implementing_class_is_still_flagged() {
-        let src = "public class Foo implements Foo.Greeter { \
-             public String greet() { return 'hi'; } \
-             public interface Greeter { String greet(); } \
-             private void unrelatedHelper() { } \
-             public void run() { greet(); } \
-         }\n";
-        let (_, _, dead) = dead_symbols_with_extra_files(
-            "interface-implementation-unrelated-method-still-flagged",
-            src,
-            &[("Caller.cls", CALLER)],
-        );
-        assert_eq!(
-            dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            vec!["unrelatedHelper"]
-        );
     }
 
     /// Real-corpus smoke test: `dead_symbols_in_file` must run to
