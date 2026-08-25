@@ -8,7 +8,7 @@ members = [
     "crates/apex-syntax",
     "crates/apex-parser",
     "crates/apex-printer",
-    "crates/apexls-cli",
+    "crates/apexls",
     "crates/apexls-server",
 ]
 
@@ -25,3 +25,4 @@ apex-metadata = { path = "crates/apex-metadata" }
 apex-syntax = { path = "crates/apex-syntax" }
 apex-parser = { path = "crates/apex-parser" }
 apex-printer = { path = "crates/apex-printer" }
+apexls-server = { path = "crates/apexls-server" }
