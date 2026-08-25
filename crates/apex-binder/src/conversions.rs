@@ -96,7 +96,7 @@ pub(crate) fn type_compatible(
             name: arg_name,
             args: arg_args,
         } => {
-            if table.top_level(param_name).is_some() {
+            if table.resolve_dotted_name(param_name).is_some() {
                 // The parameter is project-local (a user class/interface),
                 // the argument is a system value -- no defined conversion
                 // either direction, and a builtin system type can never be
@@ -109,7 +109,7 @@ pub(crate) fn type_compatible(
 }
 
 fn project_arg_compatible(table: &SymbolTable, param_name: &str, arg_id: SymbolId) -> Option<bool> {
-    if let Some(param_id) = table.top_level(param_name) {
+    if let Some(param_id) = table.resolve_dotted_name(param_name) {
         return Some(arg_id == param_id || table.inherited_chain(arg_id).contains(&param_id));
     }
     // The parameter's declared type isn't project-local. A project class
@@ -217,7 +217,7 @@ pub(crate) fn is_more_specific(
     if let (Some(a_rank), Some(b_rank)) = (numeric_rank(a_name), numeric_rank(b_name)) {
         return a_rank < b_rank;
     }
-    if let (Some(a_id), Some(b_id)) = (table.top_level(a_name), table.top_level(b_name)) {
+    if let (Some(a_id), Some(b_id)) = (table.resolve_dotted_name(a_name), table.resolve_dotted_name(b_name)) {
         return a_id != b_id && table.inherited_chain(a_id).contains(&b_id);
     }
     false

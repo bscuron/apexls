@@ -36,7 +36,7 @@ pub(crate) fn resolve_inheritance(
 ) {
     let direct_super: Vec<(SymbolId, SymbolId)> = raw_super
         .par_iter()
-        .filter_map(|(type_id, name)| resolve_supertype_name(table, name).map(|super_id| (*type_id, super_id)))
+        .filter_map(|(type_id, name)| table.resolve_dotted_name(name).map(|super_id| (*type_id, super_id)))
         .collect();
     for (type_id, super_id) in direct_super {
         table.set_direct_super(type_id, super_id);
@@ -50,7 +50,7 @@ pub(crate) fn resolve_inheritance(
     let direct: FxHashMap<SymbolId, Vec<SymbolId>> = raw_extends
         .par_iter()
         .map(|(type_id, names)| {
-            let resolved = names.iter().filter_map(|n| resolve_supertype_name(table, n)).collect();
+            let resolved = names.iter().filter_map(|n| table.resolve_dotted_name(n)).collect();
             (*type_id, resolved)
         })
         .collect();
@@ -83,27 +83,6 @@ pub(crate) fn resolve_inheritance(
     for (type_id, chain) in subtypes {
         table.set_subtypes(type_id, chain);
     }
-}
-
-/// Resolves one `extends`/`implements` supertype name -- as written,
-/// e.g. a plain `Base` or a dotted `Outer.Inner` -- to the `SymbolId` it
-/// names: the first (and usually only) segment via `SymbolTable::top_level`,
-/// then each further segment as a nested type declared directly on the
-/// previous one via `SymbolTable::nested_type`. Mirrors
-/// `crate::resolve::resolve_dotted_top_level`'s token-based walk, just
-/// over the plain dotted `SmolStr` this module has on hand instead of
-/// `Type::base_name_tokens()` -- needed for real shapes like NPSP's
-/// `UTIL_CurrencyCache implements UTIL_CurrencyCache.Interface_x` (a
-/// class implementing an interface nested inside itself), which a
-/// single `top_level` lookup on the whole dotted string can never match
-/// (`top_level` is keyed by simple declared name only).
-fn resolve_supertype_name(table: &SymbolTable, name: &str) -> Option<SymbolId> {
-    let mut segments = name.split('.');
-    let mut current = table.top_level(segments.next()?)?;
-    for seg in segments {
-        current = table.nested_type(current, seg)?;
-    }
-    Some(current)
 }
 
 /// Every `SymbolId` transitively reachable from `type_id` via `direct`,

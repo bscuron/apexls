@@ -529,4 +529,39 @@ impl SymbolTable {
             .chain(self.inherited_chain(container).iter().copied())
             .find_map(|id| self.nested_type(id, name))
     }
+
+    /// Resolves a plain (already generics/array-suffix-stripped) dotted
+    /// type-name *string* -- e.g. a `Symbol::type_name`, or an
+    /// `extends`/`implements` supertype name as collected in Pass 1 --
+    /// to the `SymbolId` it names: the first segment via [`Self::top_level`],
+    /// then each further segment as a nested type declared directly on
+    /// the previous one via [`Self::nested_type`]. The single-segment
+    /// case (`Account`) is just the one `top_level` lookup, unchanged.
+    ///
+    /// The string counterpart to `crate::resolve::resolve_dotted_top_level`,
+    /// which does the identical walk but over a `Type` node's own
+    /// `base_name_tokens()` (and additionally records each segment's own
+    /// goto-definition resolution as it goes) -- reach for *this* one
+    /// instead whenever the only thing on hand is the plain name as a
+    /// `&str`, with no `Type` AST node to re-derive tokens from and no
+    /// per-segment reference recording to do: a field's/local's/
+    /// parameter's own cached `type_name`, one of its own cached generic
+    /// `type_args`, an overload-narrowing parameter-type comparison
+    /// (`crate::conversions`), or one of Pass 1's collected
+    /// `extends`/`implements` names. Every one of those call sites used
+    /// to call `top_level` directly on the whole dotted string instead,
+    /// which -- `top_level` being keyed by simple declared name only --
+    /// silently failed for a self-referencing or sibling-nested qualified
+    /// name (real NPSP shape: `UTIL_CurrencyCache.CurrencyData currData
+    /// = ...;` inside `UTIL_CurrencyCache` itself, whose `currData.IsoCode
+    /// = ...` assignments then never resolved, wrongly flagging `IsoCode`/
+    /// `defaultRate` as dead despite being genuinely written to).
+    pub fn resolve_dotted_name(&self, name: &str) -> Option<SymbolId> {
+        let mut segments = name.split('.');
+        let mut current = self.top_level(segments.next()?)?;
+        for seg in segments {
+            current = self.nested_type(current, seg)?;
+        }
+        Some(current)
+    }
 }
