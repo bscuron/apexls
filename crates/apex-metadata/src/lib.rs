@@ -26,6 +26,7 @@
 //! it determines whether the tool can ever work fully offline.
 
 mod discover;
+pub mod visualforce;
 mod xml;
 
 pub use discover::{discover_sobjects, sobjects_from_discovery};

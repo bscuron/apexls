@@ -239,7 +239,11 @@ impl Session {
 #[test]
 fn unused_private_method_gets_a_diagnostic_and_a_working_quickfix() {
     let src = "public class Foo {\n    private void helper() { }\n    public void run() { }\n}\n";
-    let dir = write_fixture_dir("dead-code-diagnostics", &[("Foo.cls", src)]);
+    // `run` is `public` and, like any other candidate, needs a genuine
+    // caller to not itself be flagged dead -- `Caller.cls` gives it one,
+    // rather than relying on any kind- or name-based exemption.
+    let caller = "public class Caller {\n    public void go() { new Foo().run(); }\n}\n";
+    let dir = write_fixture_dir("dead-code-diagnostics", &[("Foo.cls", src), ("Caller.cls", caller)]);
     let root_uri = Url::from_file_path(&dir).unwrap();
     let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
 

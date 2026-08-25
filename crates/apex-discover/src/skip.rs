@@ -1,8 +1,9 @@
 //! Directory names that can be pruned outright when searching a
 //! Salesforce repo for `.cls`/`.trigger` files -- or, via
 //! [`should_skip_dir_keep_metadata_dirs`], the same list minus
-//! `objects`/`fields`, for callers that also want
-//! `.object-meta.xml`/`.field-meta.xml` files out of the same walk.
+//! `objects`/`fields`/`pages`, for callers that also want
+//! `.object-meta.xml`/`.field-meta.xml`/`.page` files out of the same
+//! walk.
 //!
 //! Two categories:
 //!
@@ -104,16 +105,20 @@ pub(crate) fn should_skip_dir(name: &str) -> bool {
     is_hidden(name) || in_skip_set(name)
 }
 
-/// Same as [`should_skip_dir`], except `objects`/`fields` are never
-/// pruned -- for callers that also need `.object-meta.xml`/
-/// `.field-meta.xml` files, which is the entire reason those two
-/// directories are in [`SKIP`] in the first place (Apex source can never
-/// live there, but SObject/field metadata only ever lives there).
+/// Same as [`should_skip_dir`], except `objects`/`fields`/`pages` are
+/// never pruned -- for callers that also need `.object-meta.xml`/
+/// `.field-meta.xml`/`.page` files, which is the entire reason those
+/// three directories are in [`SKIP`] in the first place (Apex source can
+/// never live there, but SObject/field metadata and Visualforce markup
+/// only ever live there respectively).
 pub(crate) fn should_skip_dir_keep_metadata_dirs(name: &str) -> bool {
     if is_hidden(name) {
         return true;
     }
-    if name.eq_ignore_ascii_case("objects") || name.eq_ignore_ascii_case("fields") {
+    if name.eq_ignore_ascii_case("objects")
+        || name.eq_ignore_ascii_case("fields")
+        || name.eq_ignore_ascii_case("pages")
+    {
         return false;
     }
     in_skip_set(name)

@@ -21,6 +21,7 @@ use apex_parser::Parse;
 use apex_syntax::ast::Type;
 use rustc_hash::{FxHashMap, FxHasher};
 use smol_str::SmolStr;
+use std::collections::HashSet;
 use std::hash::Hasher;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -101,6 +102,13 @@ pub struct BindCache {
     /// on that limit.
     pub(crate) discovery: Option<Discovery>,
     pub(crate) schema: Option<Arc<SchemaIndex>>,
+    /// Every class name (lowercased) a real `.page` file's `controller`/
+    /// `extensions` attribute names -- rebuilt alongside `schema` on the
+    /// same `need_fresh_discovery` trigger, since it's derived from the
+    /// same directory walk's `Discovery::page_files`. Feeds
+    /// `crate::dead_code`'s Visualforce-exposure check
+    /// (`BoundProgram::vf_referenced_classes`).
+    pub(crate) vf_referenced_classes: Option<Arc<HashSet<String>>>,
     /// Each path's last-seen `(Freshness, Parse)` -- a parse is reused
     /// as-is whenever `Freshness::matches` says nothing changed, skipping
     /// that file's read *and* lex/parse entirely. No separate copy of the

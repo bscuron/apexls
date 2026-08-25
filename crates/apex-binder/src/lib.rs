@@ -35,6 +35,7 @@
 mod ci_key;
 mod collect;
 mod conversions;
+mod dead_code;
 mod file_id;
 mod file_table;
 mod generics;
@@ -50,6 +51,7 @@ mod symbol;
 mod symbol_table;
 mod ty;
 
+pub use dead_code::{kind_label, dead_symbols_in_file, DeadSymbol};
 pub use file_id::FileId;
 pub use incremental::BindCache;
 pub use ptr::{AstPtr, SyntaxPtr};
@@ -108,6 +110,12 @@ pub struct BoundProgram {
     /// not re-parsing every SFDX metadata XML file.
     pub schema: Arc<SchemaIndex>,
     bodies: FxHashMap<FileId, Arc<FileBodies>>,
+    /// Every class name (lowercased) a real `.page` file names as its
+    /// `controller`/`extensions` -- `crate::dead_code`'s Visualforce-
+    /// exposure check. `Arc`-wrapped for the same reason `schema` is:
+    /// rebuilt only alongside it, on the same `need_fresh_discovery`
+    /// trigger, so the common case across calls is a pointer clone.
+    pub vf_referenced_classes: Arc<std::collections::HashSet<String>>,
 }
 
 /// Rayon lazily builds its global thread pool (default stack size, ~1
@@ -219,12 +227,17 @@ impl BoundProgram {
             hotpath::measure_block!("discover_and_build_schema", {
                 let discovery = apex_discover::discover(root);
                 let schema = Arc::new(SchemaIndex::from_discovery(&discovery));
+                let vf_referenced_classes = Arc::new(
+                    apex_metadata::visualforce::referenced_controller_classes(&discovery.page_files),
+                );
                 cache.discovery = Some(discovery);
                 cache.schema = Some(schema);
+                cache.vf_referenced_classes = Some(vf_referenced_classes);
             });
         }
         let discovery = cache.discovery.as_ref().unwrap();
         let schema = Arc::clone(cache.schema.as_ref().unwrap());
+        let vf_referenced_classes = Arc::clone(cache.vf_referenced_classes.as_ref().unwrap());
 
         // Stage 0: resolve every discovered path to a stable `FileId`.
         // This is only a *candidate* list -- Stage 1a below is what
@@ -669,7 +682,23 @@ impl BoundProgram {
             symbols: cache.table.clone(),
             schema,
             bodies,
+            vf_referenced_classes,
         }
+    }
+
+    /// Every file this bind knows about. A `HashSet` dedup over
+    /// `symbols`' own per-symbol `file` field rather than a stored list --
+    /// cheap (one entry per symbol, not per file, but still a tiny
+    /// fraction of a project's total symbol count) and avoids a
+    /// dedicated file-list field nothing else needs; a batch caller
+    /// wanting "every file" (`apexls dead`'s whole-project scan) is the
+    /// only consumer.
+    pub fn files(&self) -> impl Iterator<Item = FileId> + '_ {
+        self.symbols
+            .iter()
+            .map(|(_, s)| s.file)
+            .collect::<rustc_hash::FxHashSet<_>>()
+            .into_iter()
     }
 
     pub fn file_path(&self, file: FileId) -> &Path {

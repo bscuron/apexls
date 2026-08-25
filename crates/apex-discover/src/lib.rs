@@ -72,6 +72,8 @@ pub fn discover(root: impl AsRef<Path>) -> Discovery {
                 found.object_meta_files.push(path.to_path_buf());
             } else if is_field_meta_file(path) {
                 found.field_meta_files.push(path.to_path_buf());
+            } else if is_visualforce_page_file(path) {
+                found.page_files.push(path.to_path_buf());
             }
         },
     )
@@ -80,21 +82,30 @@ pub fn discover(root: impl AsRef<Path>) -> Discovery {
 /// The result of [`discover`]: every interesting file found under a
 /// repo root, categorized by what it is. Empty `Vec`s, not an `Option`
 /// or an error, for a category that has no matches -- an all-standard-
-/// schema repo with no custom objects is a normal, valid input.
+/// schema repo with no custom objects (or no Visualforce pages at all)
+/// is a normal, valid input.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Discovery {
     pub apex_files: Vec<PathBuf>,
     pub object_meta_files: Vec<PathBuf>,
     pub field_meta_files: Vec<PathBuf>,
+    /// Visualforce page markup (`.page`) -- deliberately not
+    /// `.page-meta.xml`, the sidecar metadata file (API version,
+    /// visibility) that never contains the `controller`/`extensions`
+    /// attributes the markup itself carries.
+    pub page_files: Vec<PathBuf>,
 }
 
-/// Whether `path` is one of the four file types [`discover`] indexes
-/// (`.cls`/`.trigger`/`.object-meta.xml`/`.field-meta.xml`) -- the
-/// per-path check a caller reacting to individual filesystem events (a
-/// watcher) needs, without walking a whole directory tree just to
+/// Whether `path` is one of the five file types [`discover`] indexes
+/// (`.cls`/`.trigger`/`.object-meta.xml`/`.field-meta.xml`/`.page`) --
+/// the per-path check a caller reacting to individual filesystem events
+/// (a watcher) needs, without walking a whole directory tree just to
 /// classify one path.
 pub fn is_relevant_path(path: &Path) -> bool {
-    is_apex_file(path) || is_object_meta_file(path) || is_field_meta_file(path)
+    is_apex_file(path)
+        || is_object_meta_file(path)
+        || is_field_meta_file(path)
+        || is_visualforce_page_file(path)
 }
 
 fn is_apex_file(path: &Path) -> bool {
@@ -111,6 +122,17 @@ fn is_object_meta_file(path: &Path) -> bool {
 
 fn is_field_meta_file(path: &Path) -> bool {
     !is_hidden(path) && ends_with_ci(path, ".field-meta.xml")
+}
+
+/// `.page` only -- deliberately not `.page-meta.xml` (`Path::extension()`
+/// splits on the *last* `.`, so that sidecar's own extension is already
+/// just `xml`, never `page`, with no separate exclusion needed).
+fn is_visualforce_page_file(path: &Path) -> bool {
+    !is_hidden(path)
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("page"))
 }
 
 /// Whether `path`'s own file name starts with `.` -- a hidden file on
@@ -166,6 +188,7 @@ fn walk(
         total.apex_files.extend(found.apex_files);
         total.object_meta_files.extend(found.object_meta_files);
         total.field_meta_files.extend(found.field_meta_files);
+        total.page_files.extend(found.page_files);
     }
     total
 }
