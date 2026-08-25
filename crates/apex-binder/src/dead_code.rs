@@ -20,7 +20,10 @@
 //! and Visualforce needs no annotation at all, so a class actually named
 //! as a `.page`'s `controller`/`extensions` is excluded wholesale rather
 //! than trying to prove which specific member a page's markup does or
-//! doesn't call.
+//! doesn't call. A `System.StubProvider` implementation's `handleMethodCall`
+//! is a further such channel: the Apex Stub API framework invokes it
+//! directly, with no textual call site of its own, whenever a method is
+//! called on a `Test.createStub`-created instance (`PLATFORM_INVOKED_INTERFACE_METHODS`).
 //!
 //! `Constructor` is a candidate under the exact same rule as `Method`/
 //! `Field`/`Property`: a `private`/`public` constructor with zero call
@@ -43,7 +46,8 @@ use crate::file_id::FileId;
 use crate::symbol::{Symbol, SymbolId, SymbolKind, Visibility};
 use crate::BoundProgram;
 use apex_syntax::ast::decl::{
-    Annotation, ConstructorDecl, FieldDecl, HasModifiers, MethodDecl, PropertyDecl, VarDeclarator,
+    Annotation, ClassDecl, ConstructorDecl, FieldDecl, HasModifiers, MethodDecl, PropertyDecl,
+    VarDeclarator,
 };
 use apex_syntax::ast::stmt::LocalVarDeclStmt;
 use rowan::ast::AstNode;
@@ -116,6 +120,56 @@ fn is_platform_invoked_test_method(program: &BoundProgram, symbol: &Symbol) -> b
         a.name().is_some_and(|tok| {
             let text = tok.text();
             text.eq_ignore_ascii_case("isTest") || text.eq_ignore_ascii_case("testSetup")
+        })
+    })
+}
+
+/// `(interface base name, required method name)` pairs where the
+/// standard library itself -- not any textual Apex call site -- invokes
+/// the method: the Stub API framework calls a `System.StubProvider`
+/// implementation's `handleMethodCall` for every method invoked on a
+/// `Test.createStub`-created instance. Matched on the declaring class's
+/// bare `implements` clause name (case-insensitive, last dotted segment
+/// only, so both `implements StubProvider` and the fully-qualified
+/// `implements System.StubProvider` match) rather than a resolved
+/// `SymbolId`, since `apex-binder` has no standard-library type model
+/// yet (`BACKLOG.md` §4) -- there is no symbol for `StubProvider` to
+/// resolve `implements` against, unlike a project-local interface. This
+/// is the same "exempt on a structural signal, not a resolved reference"
+/// approach `PLATFORM_INVOCATION_ANNOTATIONS` already takes for
+/// `@AuraEnabled`/`@InvocableMethod`/etc.
+const PLATFORM_INVOKED_INTERFACE_METHODS: &[(&str, &str)] = &[("StubProvider", "handleMethodCall")];
+
+/// True for a `Method` matching one of `PLATFORM_INVOKED_INTERFACE_METHODS`:
+/// its own name is the required one, and its *immediate* declaring class
+/// (which can be a nested class, e.g. a test's own `StubProvider` stub)
+/// names the matching interface somewhere in its `implements` clause.
+fn is_platform_invoked_interface_method(program: &BoundProgram, symbol: &Symbol) -> bool {
+    if symbol.kind != SymbolKind::Method {
+        return false;
+    }
+    let Some(required_interface) = PLATFORM_INVOKED_INTERFACE_METHODS
+        .iter()
+        .find_map(|&(interface, method)| symbol.name.eq_ignore_ascii_case(method).then_some(interface))
+    else {
+        return false;
+    };
+    let Some(container) = symbol.container else {
+        return false;
+    };
+    let class_symbol = program.symbols.get(container);
+    let root = program.syntax(class_symbol.file);
+    let Some(node) = class_symbol.ptr.to_node(&root) else {
+        return false;
+    };
+    let Some(class) = ClassDecl::cast(node) else {
+        return false;
+    };
+    class.implements().is_some_and(|implements| {
+        implements.types().any(|t| {
+            t.base_name_tokens()
+                .last()
+                .is_some_and(|tok| tok.text().eq_ignore_ascii_case(required_interface))
         })
     })
 }
@@ -265,6 +319,7 @@ pub fn dead_symbols_in_file(program: &BoundProgram, file: FileId) -> Vec<DeadSym
         .map(|(local, s)| (SymbolId::new(file, local as u32), s))
         .filter(|(_, s)| is_dead_code_candidate_kind(s))
         .filter(|(_, s)| !is_platform_invoked_test_method(program, s))
+        .filter(|(_, s)| !is_platform_invoked_interface_method(program, s))
         .filter(|(_, s)| {
             s.modifiers.visibility != Visibility::Public
                 || (!has_platform_invocation_annotation(program, s)
@@ -577,6 +632,24 @@ mod tests {
         let (_, _, dead) =
             dead_symbols_with_extra_files("vf-referenced", src, &[("Foo.page", page)]);
         assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn stub_provider_handle_method_call_is_not_flagged() {
+        let src = "public class Foo {\n    private class Stub implements System.StubProvider {\n        public Object handleMethodCall(Object o, String m, Type rt, List<Type> pt, List<String> pn, List<Object> args) {\n            return null;\n        }\n    }\n}\n";
+        assert!(dead_names("stub-provider", src).is_empty());
+    }
+
+    #[test]
+    fn unqualified_stub_provider_handle_method_call_is_not_flagged() {
+        let src = "public class Foo {\n    private class Stub implements StubProvider {\n        public Object handleMethodCall(Object o, String m, Type rt, List<Type> pt, List<String> pn, List<Object> args) {\n            return null;\n        }\n    }\n}\n";
+        assert!(dead_names("stub-provider-unqualified", src).is_empty());
+    }
+
+    #[test]
+    fn a_method_merely_named_handle_method_call_without_implementing_stub_provider_is_still_flagged() {
+        let src = "public class Foo {\n    private Object handleMethodCall() { return null; }\n}\n";
+        assert_eq!(dead_names("handle-method-call-lookalike", src), vec!["handleMethodCall"]);
     }
 
     #[test]
