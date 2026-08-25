@@ -16,23 +16,32 @@ fn send(stdin: &mut impl Write, value: &serde_json::Value) {
 
 /// Reads one `Content-Length`-framed JSON-RPC message from `stdout`.
 fn recv(stdout: &mut impl BufRead) -> serde_json::Value {
-    let mut content_length = None;
     loop {
-        let mut line = String::new();
-        let n = stdout.read_line(&mut line).unwrap();
-        assert!(n > 0, "server closed stdout before sending a full response");
-        let line = line.trim_end();
-        if line.is_empty() {
-            break; // blank line ends the header block
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            let n = stdout.read_line(&mut line).unwrap();
+            assert!(n > 0, "server closed stdout before sending a full response");
+            let line = line.trim_end();
+            if line.is_empty() {
+                break; // blank line ends the header block
+            }
+            if let Some(value) = line.strip_prefix("Content-Length: ") {
+                content_length = Some(value.parse::<usize>().unwrap());
+            }
         }
-        if let Some(value) = line.strip_prefix("Content-Length: ") {
-            content_length = Some(value.parse::<usize>().unwrap());
+        let content_length = content_length.expect("response had no Content-Length header");
+        let mut buf = vec![0u8; content_length];
+        stdout.read_exact(&mut buf).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        // A server-initiated notification (e.g. textDocument/publishDiagnostics,
+        // pushed proactively after every rebuild) has a `method` but no `id` --
+        // skip past it rather than mistaking it for the response a caller is
+        // actually waiting for.
+        if value.get("id").is_some() {
+            return value;
         }
     }
-    let content_length = content_length.expect("response had no Content-Length header");
-    let mut buf = vec![0u8; content_length];
-    stdout.read_exact(&mut buf).unwrap();
-    serde_json::from_slice(&buf).unwrap()
 }
 
 #[test]

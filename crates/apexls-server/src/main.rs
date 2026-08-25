@@ -79,16 +79,17 @@ use async_lsp::tracing::TracingLayer;
 use async_lsp::{ClientSocket, ErrorCode, LanguageServer, ResponseError};
 use futures::future::BoxFuture;
 use lsp_types::{
-    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentHighlight,
-    DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse, FoldingRange,
-    FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams,
+    CodeActionKind, CodeActionOptions, CodeActionParams, CodeActionProviderCapability,
+    CodeActionResponse, DidChangeConfigurationParams, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
+    FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
     InitializeParams, InitializeResult, InitializedParams, Location, MarkupContent, MarkupKind,
-    OneOf, PrepareRenameResponse, ReferenceParams, RenameOptions, RenameParams, SelectionRange,
-    SelectionRangeParams, SelectionRangeProviderCapability, ServerCapabilities, ServerInfo,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
-    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    OneOf, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams, RenameOptions,
+    RenameParams, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
+    ServerCapabilities, ServerInfo, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Url, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
@@ -109,7 +110,6 @@ use line_index::PositionEncoding;
 /// be reachable from the filesystem watcher's own callback thread, which
 /// has no access to `&Backend` (see `BindState`'s doc comment).
 struct Backend {
-    #[allow(dead_code)] // not sent anything yet -- kept for the features this scaffolds toward
     client: ClientSocket,
     /// Resolved once in `initialize` from the first `workspaceFolders`
     /// entry (falling back to the deprecated `rootUri` for older
@@ -407,7 +407,12 @@ impl Backend {
 /// second rebuild for an out-of-order one to race against in the first
 /// place -- correct by construction, not by a debounce timer narrowing
 /// the window enough that the race rarely fires.
-fn spawn_rebuild_worker(root: PathBuf, bind: Arc<BindState>) {
+fn spawn_rebuild_worker(
+    root: PathBuf,
+    bind: Arc<BindState>,
+    client: ClientSocket,
+    encoding: PositionEncoding,
+) {
     tokio::spawn(async move {
         loop {
             bind.rebuild_requested.notified().await;
@@ -466,6 +471,7 @@ fn spawn_rebuild_worker(root: PathBuf, bind: Arc<BindState>) {
                 Ok(file_count) => {
                     bind.bound_version.send_replace(version);
                     info!(file_count, "rebuild complete");
+                    publish_dead_code_diagnostics(&bind, &client, encoding);
                 }
                 Err(join_error) => {
                     bind.bound_version.send_replace(version);
@@ -474,6 +480,41 @@ fn spawn_rebuild_worker(root: PathBuf, bind: Arc<BindState>) {
             }
         }
     });
+}
+
+/// Pushes a fresh `textDocument/publishDiagnostics` notification for
+/// every currently-open document, right after each rebuild completes --
+/// diagnostics are server-initiated (unlike hover/references/etc., which
+/// answer a client request), so they can't be computed lazily behind
+/// `wait_for_rebuild` the way every other capability is. Scoped to open
+/// documents only (`bind.documents`'s own key set): recomputing for
+/// every project file (~1000+ on the real NPSP corpus) on every
+/// keystroke would be wasted work no client displays anyway -- every
+/// real editor only shows diagnostics for buffers it has open. Published
+/// unconditionally for every open file, including an empty
+/// `diagnostics: vec![]` -- otherwise a dead symbol that gets referenced
+/// again would leave its stale warning on screen forever, since nothing
+/// else would ever tell the client to clear it.
+fn publish_dead_code_diagnostics(bind: &BindState, client: &ClientSocket, encoding: PositionEncoding) {
+    let program_guard = bind.program.read().unwrap();
+    let Some(program) = program_guard.as_ref() else {
+        return;
+    };
+    let uris: Vec<Url> = bind.documents.lock().unwrap().texts.keys().cloned().collect();
+    for uri in uris {
+        let Some(path) = uri.to_file_path().ok() else {
+            continue;
+        };
+        let Some(file) = program.file_id(&path) else {
+            continue;
+        };
+        let diagnostics = capabilities::dead_code_diagnostics(program, file, encoding);
+        let _ = client.notify::<lsp_types::notification::PublishDiagnostics>(PublishDiagnosticsParams {
+            uri,
+            diagnostics,
+            version: None,
+        });
+    }
 }
 
 impl LanguageServer for Backend {
@@ -555,6 +596,14 @@ impl LanguageServer for Backend {
                     workspace_symbol_provider: Some(OneOf::Left(true)),
                     folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                     selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                    // Only `QUICKFIX` offered -- the only kind `code_action`
+                    // ever returns today (`capabilities::dead_code_actions`).
+                    code_action_provider: Some(CodeActionProviderCapability::Options(
+                        CodeActionOptions {
+                            code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                            ..Default::default()
+                        },
+                    )),
                     ..ServerCapabilities::default()
                 },
                 server_info: Some(ServerInfo {
@@ -584,7 +633,12 @@ impl LanguageServer for Backend {
             // this module's own doc comment on notification-before-
             // request ordering.
             self.bind.worker_active.store(true, Ordering::SeqCst);
-            spawn_rebuild_worker(root.clone(), Arc::clone(&self.bind));
+            spawn_rebuild_worker(
+                root.clone(),
+                Arc::clone(&self.bind),
+                self.client.clone(),
+                self.position_encoding,
+            );
             Backend::start_watcher(root, Arc::clone(&self.bind));
         }
         self.schedule_rebuild();
@@ -991,6 +1045,40 @@ impl LanguageServer for Backend {
                 })
                 .collect();
             Ok(Some(ranges))
+        })
+    }
+
+    /// `capabilities::dead_code_actions`: a "Remove unused ..." quick-fix
+    /// for every dead-code diagnostic (`capabilities::dead_code_diagnostics`,
+    /// published proactively after each rebuild -- see
+    /// `publish_dead_code_diagnostics`) whose symbol overlaps the
+    /// requested range. Re-derives dead symbols from `program` itself
+    /// rather than trusting `params.context.diagnostics`, so this works
+    /// even for a client that requests code actions without having first
+    /// displayed/round-tripped the diagnostic.
+    fn code_action(
+        &mut self,
+        params: CodeActionParams,
+    ) -> BoxFuture<'static, Result<Option<CodeActionResponse>, Self::Error>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some(path) = uri.to_file_path().ok() else {
+                return Ok(None);
+            };
+            let Some(file) = program.file_id(&path) else {
+                return Ok(None);
+            };
+            let actions = capabilities::dead_code_actions(program, file, range, encoding);
+            Ok((!actions.is_empty()).then_some(actions))
         })
     }
 }

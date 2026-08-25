@@ -29,8 +29,13 @@ too, conservatively scoped (refuses rather than guesses on an ambiguous
 target, an override-chain method, or a colliding name) and preceded by
 a new `crate::conversions` module that narrows most real-world overload
 calls to a single candidate via Apex's actual implicit-conversion rules,
-rather than the old arity-only narrowing. Next up is §3's remaining
-"needs new binder-side work first" list (`signatureHelp`, `completion`,
+rather than the old arity-only narrowing. `textDocument/codeAction` and
+`textDocument/publishDiagnostics` are both started too, via a first,
+deliberately narrow slice: dead-code detection (unreferenced `private`
+methods/fields/properties/locals, conservatively scoped to sidestep both
+the unmodeled-stdlib gap and Apex's platform-reflection surface) paired
+with a "Remove unused ..." quick-fix. Next up is §3's remaining "needs
+new binder-side work first" list (`signatureHelp`, `completion`,
 `semanticTokens`, `callHierarchy`, `inlayHint`), or §4's still-open
 standard-library/schema type-model gap.
 
@@ -737,13 +742,59 @@ supports each one.
 - [ ] `textDocument/formatting` / `rangeFormatting` -- `apex-printer`
       only does verbatim round-trip rendering today, not reformatting.
       A real formatter is a separate, substantial component.
-- [ ] `textDocument/codeAction` -- quick fixes (implement missing
-      interface methods, etc.) -- nothing started; likely low priority
-      until diagnostics (§4) exist to attach actions to.
-- [ ] `textDocument/publishDiagnostics` -- parse errors already exist
-      and are safe to surface now; semantic diagnostics (unresolved
-      symbols, type errors) are **not** safe to ship yet -- see §4,
-      first bullet.
+- [x] `textDocument/codeAction` / `textDocument/publishDiagnostics` --
+      **first slice done**, deliberately narrow: dead-code detection
+      (unreferenced `private` methods/fields/properties, plus plain local
+      variables -- `Constructor` deliberately excluded, see below) plus a
+      paired "Remove unused ..." quick-fix, not the general diagnostics/
+      codeAction plumbing this section used to describe as blocked on
+      each other. Semantic diagnostics in general (unresolved
+      symbols, type errors) are still **not** safe to ship -- see §4,
+      first bullet -- but dead-code detection sidesteps that gap
+      entirely: it's pure reference-counting (`BoundProgram::references_to_in_file`),
+      never dependent on the unmodeled stdlib/schema surface.
+      Deliberately scoped to `Visibility::Private` + `LocalVar` only,
+      for reasons specific to Apex, not just "start conservative":
+      `@InvocableMethod`/`@AuraEnabled`/`@RestResource`/etc. (Flow/LWC/
+      REST can all invoke Apex with zero textual call sites) all require
+      `public`/`global` visibility in real Apex, so restricting to
+      `Private` genuinely excludes that whole channel without needing
+      annotation modeling at all (annotations are parsed at the
+      `apex-syntax` layer -- `HasModifiers::annotations()` -- but were
+      never read by `apex-binder`, and still aren't outside this one
+      check). `apex-discover` also never sees Visualforce/LWC/Flow files,
+      so anything above `Private` could always be referenced from
+      somewhere this binder can't see. The one real gap that scope alone
+      *doesn't* close: `@isTest`/`@TestSetup`/legacy `testMethod` methods
+      are routinely `private` and are still invoked directly by the
+      platform's test runner -- `capabilities::is_platform_invoked_test_method`
+      exempts them explicitly. `Constructor` is excluded from the
+      candidate kinds entirely (not just deferred): a private zero-arg
+      constructor is the standard "block external instantiation of a
+      static utility class" idiom -- it's *supposed* to have zero call
+      sites, and deleting it would silently make the class instantiable
+      again, since Apex synthesizes an implicit public one when none is
+      declared. `ForEachVar`/`CatchVar`/`SwitchBindingVar` are excluded
+      too -- removing one would break the surrounding loop/catch/switch
+      syntax, so there's no safe quick-fix to pair a diagnostic with.
+      Diagnostics are pushed proactively after every rebuild (for
+      currently-open documents only), not computed lazily behind a
+      request the way every other capability is -- new `ClientSocket`
+      threading into `spawn_rebuild_worker` was the one piece of
+      genuinely new wiring this needed. New tests:
+      `crates/apexls-server/src/capabilities.rs`'s own `dead_code_tests`
+      module (fast, in-process, including exact-splice deletion-range
+      checks and a real-NPSP-corpus sweep asserting the detector stays
+      conservative in aggregate) and
+      `crates/apexls-server/tests/dead_code_diagnostics.rs` (protocol-
+      level, the diagnostic-then-codeAction round trip against the real
+      binary). Also fixed, as a prerequisite: every existing protocol
+      test's `recv()` assumed the next stdout frame was always the
+      response it was waiting for -- a proactive `publishDiagnostics`
+      notification landing in between broke that assumption across
+      every test file that opens a document with any dead code in it;
+      `recv()` everywhere now skips past notification frames while
+      waiting for a specific response.
 
 ## 4. Correctness gaps that block features, not just refine them
 

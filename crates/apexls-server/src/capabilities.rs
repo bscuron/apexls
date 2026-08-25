@@ -10,13 +10,16 @@ use apex_binder::{
     Visibility,
 };
 use apex_syntax::ast::decl::{
-    ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, HasDocComment, InterfaceDecl, MethodDecl,
-    PropertyDecl, TriggerUnit,
+    ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, HasDocComment, HasModifiers, InterfaceDecl,
+    MethodDecl, PropertyDecl, TriggerUnit, VarDeclarator,
 };
+use apex_syntax::ast::stmt::LocalVarDeclStmt;
 use lsp_types::{
-    DocumentHighlight, DocumentSymbol, FoldingRange, Location, Position, Range, SelectionRange,
-    SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url, WorkspaceEdit,
+    CodeAction, CodeActionKind, CodeActionOrCommand, Diagnostic, DiagnosticSeverity,
+    DiagnosticTag, DocumentHighlight, DocumentSymbol, FoldingRange, Location, Position, Range,
+    SelectionRange, SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url, WorkspaceEdit,
 };
+use rowan::ast::AstNode;
 use rowan::{TextRange, TextSize};
 use std::collections::HashMap;
 
@@ -848,8 +851,6 @@ pub(crate) fn rename_edits(
 }
 
 fn doc_comment_for(program: &BoundProgram, id: SymbolId) -> Option<String> {
-    use rowan::ast::AstNode;
-
     let symbol = program.symbols.get(id);
     let root = program.syntax(symbol.file);
     let node = symbol.ptr.to_node(&root)?;
@@ -863,5 +864,565 @@ fn doc_comment_for(program: &BoundProgram, id: SymbolId) -> Option<String> {
         SymbolKind::Trigger => TriggerUnit::cast(node)?.doc_comment_text(),
         SymbolKind::Field => FieldDecl::cast(node.parent()?)?.doc_comment_text(),
         _ => None,
+    }
+}
+
+/// Which declaration kinds `dead_symbols_in_file` ever considers, and
+/// under what visibility. Every reflection/platform-invocable annotation
+/// that matters (`@InvocableMethod`, `@AuraEnabled`, `@RestResource`,
+/// `@RemoteAction`, an interface method) requires `public`/`global`
+/// visibility in real Apex -- interface methods can't even be `private`
+/// -- so restricting `Method`/`Field`/`Property` to `Private` genuinely
+/// excludes that whole platform-reflection channel, with no annotation
+/// modeling needed to do it. `Constructor` is deliberately excluded even
+/// though it shares `Method`'s shape: a private zero-arg constructor is
+/// the standard idiom for blocking external instantiation of a static
+/// utility class -- it's *supposed* to have zero call sites, and Apex
+/// synthesizes an implicit public no-arg constructor when none is
+/// declared, so deleting it would silently make the class instantiable
+/// again. `ForEachVar`/`CatchVar`/`SwitchBindingVar` are excluded too:
+/// removing an unused loop/catch/switch-binding variable would break the
+/// surrounding syntax, so there's no safe quick-fix to offer, and a
+/// diagnostic with no available fix isn't worth the noise.
+fn is_dead_code_candidate_kind(symbol: &Symbol) -> bool {
+    match symbol.kind {
+        SymbolKind::Method | SymbolKind::Field | SymbolKind::Property => {
+            symbol.modifiers.visibility == Visibility::Private
+        }
+        SymbolKind::LocalVar => true,
+        _ => false,
+    }
+}
+
+/// True for a private `Method` the Apex test-execution engine invokes
+/// directly with zero textual call sites: `@isTest`/`@TestSetup`, or the
+/// legacy `testMethod` modifier keyword (already modeled via
+/// `ModifierSet::is_testmethod`). Must be checked before trusting a
+/// `Method`'s zero-`references_to_in_file` count as proof of deadness --
+/// unlike `@InvocableMethod`/`@AuraEnabled`/etc. (excluded structurally,
+/// since those require `public`/`global` visibility and so never reach
+/// this check at all), Apex test methods are routinely `private` and are
+/// still invoked directly by the platform's test runner, never by other
+/// Apex.
+fn is_platform_invoked_test_method(program: &BoundProgram, symbol: &Symbol) -> bool {
+    if symbol.kind != SymbolKind::Method {
+        return false;
+    }
+    if symbol.modifiers.is_testmethod {
+        return true;
+    }
+    let root = program.syntax(symbol.file);
+    let Some(node) = symbol.ptr.to_node(&root) else {
+        return false;
+    };
+    let Some(method) = MethodDecl::cast(node) else {
+        return false;
+    };
+    method.annotations().any(|a| {
+        a.name().is_some_and(|tok| {
+            let text = tok.text();
+            text.eq_ignore_ascii_case("isTest") || text.eq_ignore_ascii_case("testSetup")
+        })
+    })
+}
+
+/// One provably-dead declaration in a file: everything both
+/// `dead_code_diagnostics` and `dead_code_actions` need, computed once
+/// and shared between them.
+struct DeadSymbol {
+    kind: SymbolKind,
+    name: String,
+    name_range: TextRange,
+    deletion_range: TextRange,
+}
+
+/// Every declaration in `file` this binder can *prove* is dead: a
+/// private method/field/property, or a plain local variable, with zero
+/// references anywhere `references_to_in_file` can see, and not one of
+/// the platform-invoked exceptions above. Uses the file-scoped
+/// `references_to_in_file`, not the project-wide `references_to`, quite
+/// deliberately -- every symbol reaching this filter is either `Private`
+/// (genuinely file-scoped by Apex's own visibility rules: one top-level
+/// type per file, private members reachable only from that file's own
+/// outer/nested classes) or a `LocalVar` (scope-bounded within its own
+/// file by construction), so the file-scoped lookup isn't just an
+/// optimization here, it's the *correct* one -- a project-wide scan
+/// would cost more for zero additional correctness.
+fn dead_symbols_in_file(program: &BoundProgram, file: FileId) -> Vec<DeadSymbol> {
+    program
+        .symbols
+        .iter()
+        .filter(|(_, s)| s.file == file)
+        .filter(|(_, s)| is_dead_code_candidate_kind(s))
+        .filter(|(_, s)| !is_platform_invoked_test_method(program, s))
+        .filter(|(id, _)| program.references_to_in_file(file, *id).next().is_none())
+        .filter_map(|(_, s)| {
+            compute_deletion_range(program, s).map(|deletion_range| DeadSymbol {
+                kind: s.kind,
+                name: s.name.to_string(),
+                name_range: s.name_range,
+                deletion_range,
+            })
+        })
+        .collect()
+}
+
+/// The exact text range to delete to remove `symbol` cleanly. Not simply
+/// `symbol.ptr`'s range: that only covers the whole declaration for
+/// `Method`/`Property` (see `Symbol::ptr`'s own doc comment) -- for
+/// `Field` it's just the one `VarDeclarator`, and for `LocalVar` just the
+/// `Name` token, since both `FieldDecl`/`LocalVarDeclStmt` support
+/// multiple comma-separated declarators (`private Integer x, y;`) and
+/// `Symbol` is one-per-declarator. "Delete this one" therefore means
+/// either the whole declaration (it's the only declarator -- and, for a
+/// `Field`, this naturally includes any leading doc comment/modifiers,
+/// since `HasDocComment::doc_comment_token` finds the doc comment by
+/// walking the very node whose range this returns) or just this
+/// declarator plus its neighboring comma (siblings exist, so the shared
+/// doc comment/modifiers must stay untouched -- they still document the
+/// remaining declarators).
+///
+/// The whole-declaration case goes through `line_aligned_deletion_range`
+/// rather than trusting the node's own raw boundaries directly: this
+/// parser's trivia attachment at a statement/declaration's edges turned
+/// out not to be trustworthy for this purpose empirically (verified via
+/// `dead_code_tests`' splice checks) -- a `LocalVarDeclStmt`'s range, for
+/// one, excludes its own leading indentation but can still include
+/// trailing whitespace past its own line. Rather than chase that per-kind,
+/// `line_aligned_deletion_range` sidesteps it entirely by computing
+/// purely from the raw source text once a real-content anchor is found.
+fn compute_deletion_range(program: &BoundProgram, symbol: &Symbol) -> Option<TextRange> {
+    let root = program.syntax(symbol.file);
+    let node = symbol.ptr.to_node(&root)?;
+    let text = root.text().to_string();
+    match symbol.kind {
+        SymbolKind::Method | SymbolKind::Property => {
+            Some(line_aligned_deletion_range(&text, node.text_range()))
+        }
+        SymbolKind::Field => {
+            let declarator = VarDeclarator::cast(node)?;
+            let field_decl = FieldDecl::cast(declarator.syntax().parent()?)?;
+            let siblings: Vec<VarDeclarator> = field_decl.declarators().collect();
+            if siblings.len() == 1 {
+                Some(line_aligned_deletion_range(&text, field_decl.syntax().text_range()))
+            } else {
+                deletion_range_for_declarator(&declarator, &siblings)
+            }
+        }
+        SymbolKind::LocalVar => {
+            let declarator = VarDeclarator::cast(node.parent()?)?;
+            let stmt = LocalVarDeclStmt::cast(declarator.syntax().parent()?)?;
+            let siblings: Vec<VarDeclarator> = stmt.declarators().collect();
+            if siblings.len() == 1 {
+                Some(line_aligned_deletion_range(&text, stmt.syntax().text_range()))
+            } else {
+                deletion_range_for_declarator(&declarator, &siblings)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Shared by the `Field`/`LocalVar` arms above, for the case that has
+/// *other* declarators to leave untouched: `declarator`'s own range plus
+/// whichever neighboring comma separates it from the rest of `siblings`
+/// (every declarator of the same `FieldDecl`/`LocalVarDeclStmt`, in
+/// source order) -- the *following* comma if this isn't the last
+/// declarator, otherwise the *preceding* one -- so deleting the middle
+/// of `x, y, z` leaves `x, z`, not `x, , z` or a trailing `x, y,`. Not
+/// line-aligned: a non-last declarator never owns its own line, so the
+/// line-based reasoning `line_aligned_deletion_range` uses doesn't apply
+/// here, only mid-line comma-splicing does.
+fn deletion_range_for_declarator(
+    declarator: &VarDeclarator,
+    siblings: &[VarDeclarator],
+) -> Option<TextRange> {
+    let target = declarator.syntax().text_range();
+    let index = siblings.iter().position(|d| d.syntax().text_range() == target)?;
+    if index + 1 < siblings.len() {
+        Some(TextRange::new(
+            siblings[index].syntax().text_range().start(),
+            siblings[index + 1].syntax().text_range().start(),
+        ))
+    } else {
+        Some(TextRange::new(
+            siblings[index - 1].syntax().text_range().end(),
+            siblings[index].syntax().text_range().end(),
+        ))
+    }
+}
+
+/// Computes a deletion range that removes exactly the whole source
+/// line(s) `range`'s *real* content occupies -- neither a leftover blank
+/// line nor an orphaned indent -- without trusting `range`'s own
+/// leading/trailing edges to already be whitespace-free or line-aligned
+/// (this parser's trivia attachment varies by node kind: a statement's
+/// range can exclude its own leading indentation yet still include
+/// trailing whitespace reaching into the next line, as `compute_deletion_range`'s
+/// doc comment explains). Three steps, all directly on the raw source
+/// text rather than the syntax tree: (1) trim `range` down to its real
+/// (non-whitespace) content on both edges, discarding whatever
+/// whitespace it happened to include; (2) if only spaces/tabs sit
+/// between that content's start and the start of its own line, extend
+/// the start back to the line's start, so the declaration's own
+/// indentation goes with it; (3) extend the end forward past exactly one
+/// trailing line terminator (and any same-line trailing whitespace
+/// before it), so the line itself -- not just its content -- disappears.
+/// Deliberately never reaches into the *previous* line's own trailing
+/// newline (that would merge the previous line into whatever now follows
+/// instead of just closing this line's own gap).
+fn line_aligned_deletion_range(text: &str, range: TextRange) -> TextRange {
+    let bytes = text.as_bytes();
+    let mut start = usize::from(range.start());
+    let mut end = usize::from(range.end());
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+
+    let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    if text.as_bytes()[line_start..start]
+        .iter()
+        .all(|&b| b == b' ' || b == b'\t')
+    {
+        start = line_start;
+    }
+
+    let mut i = end;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'\r' {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'\n' {
+        i += 1;
+    }
+    TextRange::new(TextSize::from(start as u32), TextSize::from(i as u32))
+}
+
+fn kind_label(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Method => "private method",
+        SymbolKind::Field => "private field",
+        SymbolKind::Property => "private property",
+        SymbolKind::LocalVar => "local variable",
+        _ => "declaration",
+    }
+}
+
+/// `textDocument/publishDiagnostics`: one `WARNING`-severity diagnostic
+/// per symbol `dead_symbols_in_file` proves is dead, tagged
+/// `DiagnosticTag::UNNECESSARY` -- the standard LSP tag for "safe to
+/// remove," which clients render faded/strikethrough independent of the
+/// warning squiggle (rust-analyzer's own `dead_code` diagnostics use the
+/// same tag).
+pub(crate) fn dead_code_diagnostics(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<Diagnostic> {
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+    dead_symbols_in_file(program, file)
+        .into_iter()
+        .map(|dead| {
+            let range = Range {
+                start: index.to_position(&text, dead.name_range.start().into(), encoding),
+                end: index.to_position(&text, dead.name_range.end().into(), encoding),
+            };
+            Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::WARNING),
+                source: Some("apexls".to_string()),
+                message: format!("{} '{}' is never used", kind_label(dead.kind), dead.name),
+                tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+fn ranges_overlap(a: Range, b: Range) -> bool {
+    fn le(x: Position, y: Position) -> bool {
+        (x.line, x.character) <= (y.line, y.character)
+    }
+    le(a.start, b.end) && le(b.start, a.end)
+}
+
+/// `textDocument/codeAction`: a "Remove unused ..." quick-fix for every
+/// dead symbol (`dead_symbols_in_file`) whose own name overlaps the
+/// requested `range`. Deliberately re-derives dead symbols from
+/// `program` rather than trusting `params.context.diagnostics` echoed
+/// back by the client -- self-contained, and works even if the client
+/// never displayed/requested `dead_code_diagnostics` first. Computes the
+/// `WorkspaceEdit` eagerly rather than deferring to `codeAction/resolve`
+/// (unimplemented): cheap, one symbol, `program` already loaded in
+/// memory -- the same eager-computation choice `rename_edits` already
+/// makes.
+pub(crate) fn dead_code_actions(
+    program: &BoundProgram,
+    file: FileId,
+    range: Range,
+    encoding: PositionEncoding,
+) -> Vec<CodeActionOrCommand> {
+    let Ok(uri) = Url::from_file_path(program.file_path(file)) else {
+        return Vec::new();
+    };
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+    dead_symbols_in_file(program, file)
+        .into_iter()
+        .filter(|dead| {
+            let name_range = Range {
+                start: index.to_position(&text, dead.name_range.start().into(), encoding),
+                end: index.to_position(&text, dead.name_range.end().into(), encoding),
+            };
+            ranges_overlap(name_range, range)
+        })
+        .map(|dead| {
+            let deletion_range = Range {
+                start: index.to_position(&text, dead.deletion_range.start().into(), encoding),
+                end: index.to_position(&text, dead.deletion_range.end().into(), encoding),
+            };
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Remove unused {} '{}'", kind_label(dead.kind), dead.name),
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(HashMap::from([(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: deletion_range,
+                            new_text: String::new(),
+                        }],
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod dead_code_tests {
+    use super::*;
+
+    /// Writes `src` as `Foo.cls` under a fresh, uniquely-named temp
+    /// directory (`test_name` keeps directories from colliding across
+    /// tests running in parallel in the same process -- matching
+    /// `crates/apex-binder/tests/*.rs`'s own `write_fixture_dir`
+    /// convention).
+    fn write_fixture(test_name: &str, src: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "apexls-server-capabilities-dead-code-{test_name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Foo.cls"), src).unwrap();
+        dir
+    }
+
+    fn dead_symbols(test_name: &str, src: &str) -> (BoundProgram, FileId, Vec<DeadSymbol>) {
+        let dir = write_fixture(test_name, src);
+        let program = BoundProgram::from_files(&dir);
+        let file = program.file_id(&dir.join("Foo.cls")).unwrap();
+        let dead = dead_symbols_in_file(&program, file);
+        std::fs::remove_dir_all(&dir).ok();
+        (program, file, dead)
+    }
+
+    fn dead_names(test_name: &str, src: &str) -> Vec<String> {
+        dead_symbols(test_name, src).2.into_iter().map(|d| d.name).collect()
+    }
+
+    fn apply_deletion(text: &str, range: TextRange) -> String {
+        let start = usize::from(range.start());
+        let end = usize::from(range.end());
+        format!("{}{}", &text[..start], &text[end..])
+    }
+
+    #[test]
+    fn unused_private_method_is_flagged() {
+        let src = "public class Foo {\n    private void helper() { }\n}\n";
+        assert_eq!(dead_names("unused-private-method", src), vec!["helper"]);
+    }
+
+    #[test]
+    fn used_private_method_is_not_flagged() {
+        let src = "public class Foo {\n    private void helper() { }\n    public void run() { helper(); }\n}\n";
+        assert!(dead_names("used-private-method", src).is_empty());
+    }
+
+    #[test]
+    fn public_method_with_zero_callers_is_not_flagged() {
+        // Out of scope for v1 -- apex-discover can't see Visualforce/LWC/
+        // Flow, so a public member could always be called from somewhere
+        // this binder never parses.
+        let src = "public class Foo {\n    public void helper() { }\n}\n";
+        assert!(dead_names("public-zero-callers", src).is_empty());
+    }
+
+    #[test]
+    fn private_zero_arg_constructor_is_not_flagged() {
+        // The standard "block external instantiation" idiom -- deleting
+        // it would silently make the class instantiable again.
+        let src = "public class Foo {\n    private Foo() { }\n}\n";
+        assert!(dead_names("private-ctor", src).is_empty());
+    }
+
+    #[test]
+    fn is_test_annotated_private_method_is_not_flagged() {
+        let src = "public class Foo {\n    @isTest\n    private static void testSomething() { }\n}\n";
+        assert!(dead_names("isTest-annotation", src).is_empty());
+    }
+
+    #[test]
+    fn legacy_testmethod_modifier_is_not_flagged() {
+        let src = "public class Foo {\n    private static testMethod void testSomething() { }\n}\n";
+        assert!(dead_names("legacy-testmethod", src).is_empty());
+    }
+
+    #[test]
+    fn unused_foreach_variable_is_not_flagged() {
+        let src = "public class Foo {\n    public void run(List<Integer> xs) {\n        for (Integer x : xs) { }\n    }\n}\n";
+        assert!(dead_names("unused-foreach-var", src).is_empty());
+    }
+
+    #[test]
+    fn unused_private_field_with_doc_comment_deletes_the_whole_declaration() {
+        let src = "public class Foo {\n    /** unused */\n    private Integer x;\n    public void run() { }\n}\n";
+        let (_, _, dead) = dead_symbols("field-with-doc-comment", src);
+        assert_eq!(dead.len(), 1);
+        let after = apply_deletion(src, dead[0].deletion_range);
+        assert_eq!(after, "public class Foo {\n    public void run() { }\n}\n");
+    }
+
+    #[test]
+    fn unused_middle_declarator_among_siblings_deletes_only_that_one() {
+        let src = "public class Foo {\n    private Integer x, y, z;\n    public void run() { System.debug(x); System.debug(z); }\n}\n";
+        let (_, _, dead) = dead_symbols("middle-declarator", src);
+        assert_eq!(dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["y"]);
+        let after = apply_deletion(src, dead[0].deletion_range);
+        assert_eq!(
+            after,
+            "public class Foo {\n    private Integer x, z;\n    public void run() { System.debug(x); System.debug(z); }\n}\n"
+        );
+    }
+
+    #[test]
+    fn unused_last_declarator_deletes_the_preceding_comma() {
+        let src = "public class Foo {\n    private Integer x, y;\n    public void run() { System.debug(x); }\n}\n";
+        let (_, _, dead) = dead_symbols("last-declarator", src);
+        assert_eq!(dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["y"]);
+        let after = apply_deletion(src, dead[0].deletion_range);
+        assert_eq!(
+            after,
+            "public class Foo {\n    private Integer x;\n    public void run() { System.debug(x); }\n}\n"
+        );
+    }
+
+    #[test]
+    fn unused_local_variable_is_flagged_and_deletes_cleanly() {
+        let src = "public class Foo {\n    public void run() {\n        Integer unused = 5;\n        System.debug('hi');\n    }\n}\n";
+        let (_, _, dead) = dead_symbols("unused-local", src);
+        assert_eq!(dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["unused"]);
+        let after = apply_deletion(src, dead[0].deletion_range);
+        assert_eq!(
+            after,
+            "public class Foo {\n    public void run() {\n        System.debug('hi');\n    }\n}\n"
+        );
+    }
+
+    /// The boundary case `compute_deletion_range`'s own doc comment flags
+    /// as needing an empirical check: deleting the *last* statement in a
+    /// method body, immediately before the closing `}`, must not leave a
+    /// blank line behind.
+    #[test]
+    fn unused_local_variable_as_the_last_statement_leaves_no_blank_line() {
+        let src = "public class Foo {\n    public void run() {\n        System.debug('hi');\n        Integer unused = 5;\n    }\n}\n";
+        let (_, _, dead) = dead_symbols("unused-local-last-stmt", src);
+        assert_eq!(dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["unused"]);
+        let after = apply_deletion(src, dead[0].deletion_range);
+        assert_eq!(
+            after,
+            "public class Foo {\n    public void run() {\n        System.debug('hi');\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn dead_code_actions_returns_a_quickfix_that_applies_cleanly() {
+        let src = "public class Foo {\n    private void helper() { }\n}\n";
+        let dir = write_fixture("code-action-quickfix", src);
+        let program = BoundProgram::from_files(&dir);
+        let file = program.file_id(&dir.join("Foo.cls")).unwrap();
+        let text = program.syntax(file).text().to_string();
+        let index = LineIndex::new(&text);
+        // A range covering `helper`'s own name (line 1, "private void
+        // helper() { }") -- anywhere overlapping the declaration's name
+        // should surface its quick-fix.
+        let point = Range {
+            start: index.to_position(&text, 0, PositionEncoding::Utf16),
+            end: index.to_position(&text, text.len() as u32, PositionEncoding::Utf16),
+        };
+        let actions = dead_code_actions(&program, file, point, PositionEncoding::Utf16);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected a CodeAction, not a Command");
+        };
+        assert!(action.title.contains("helper"));
+        let edits = action
+            .edit
+            .as_ref()
+            .and_then(|e| e.changes.as_ref())
+            .and_then(|c| c.values().next())
+            .expect("expected exactly one file's worth of edits");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "");
+    }
+
+    /// Real-corpus smoke test: `dead_symbols_in_file` must run to
+    /// completion, without panicking, across every file in the real NPSP
+    /// checkout (the scale that's actually exposed real bugs in this
+    /// codebase before -- see `crates/apexls-server/tests/rename_then_body_edits.rs`),
+    /// and it must stay conservative in aggregate -- a wildly overzealous
+    /// detector flagging a large share of private members would be a
+    /// real regression worth catching here rather than discovering it
+    /// live against a real project.
+    #[test]
+    fn npsp_corpus_dead_symbol_sweep_stays_conservative() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("corpus")
+            .join("npsp");
+        let Ok(root) = root.canonicalize() else {
+            eprintln!("skipping: real NPSP corpus checkout not present at {root:?}");
+            return;
+        };
+        let program = BoundProgram::from_files(&root);
+        let candidate_count = program
+            .symbols
+            .iter()
+            .filter(|(_, s)| is_dead_code_candidate_kind(s))
+            .count();
+        let files: std::collections::HashSet<FileId> =
+            program.symbols.iter().map(|(_, s)| s.file).collect();
+        let dead_count: usize = files.iter().map(|&file| dead_symbols_in_file(&program, file).len()).sum();
+        assert!(
+            candidate_count > 0,
+            "expected at least some private methods/fields/properties/locals in a real corpus this size"
+        );
+        let ratio = dead_count as f64 / candidate_count as f64;
+        assert!(
+            ratio < 0.5,
+            "flagged {dead_count}/{candidate_count} ({:.0}%) of eligible private members/locals as \
+             dead -- suspiciously high, likely an overzealous detector rather than a real finding",
+            ratio * 100.0
+        );
     }
 }
