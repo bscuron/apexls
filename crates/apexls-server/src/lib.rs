@@ -753,6 +753,7 @@ impl LanguageServer for Backend {
                         }
                         text
                     }),
+                    Some(Resolution::StdlibMember(r)) => capabilities::describe_stdlib_member(program, r),
                     _ => None,
                 }
             };

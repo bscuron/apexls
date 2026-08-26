@@ -889,16 +889,44 @@ These were flagged as deliberate, documented v1 scope cuts while
 building `apex-binder`, but they're not just "nice to have more
 precision" -- they directly block shipping certain features honestly.
 
-- [ ] **No standard-library type model** (`String`, `List`/`Map`/`Set`
-      built-in methods, `Database`, `Test`, `System`, `Schema`,
-      `Exception` hierarchy, ...). This is why a large share of
-      real-world references currently resolve to `Unresolved` -- and
-      why semantic diagnostics can't ship yet: flagging "unresolved
-      symbol" on every `String.isBlank(...)` call would drown any real
-      signal in false positives. Options: hand-author a stub library
-      (large, ongoing maintenance burden as Salesforce ships new
-      System-namespace APIs 3x/year), or generate one from a connected
-      org's Tooling API/Apex reflection.
+- [x] **No standard-library type model -- done, via the same bundled-
+      snapshot approach as the SObject/field gap below.** `apex_stdlib`
+      additionally embeds a class/method/property snapshot scraped from
+      Salesforce's own Apex Reference Guide (673 real classes/
+      interfaces, 4,638 methods, 919 properties), indexed by
+      `crates/apex-binder/src/stdlib_index.rs::StdlibIndex` and consulted
+      from `crate::resolve`'s `Ty::System` arms. A new `Resolution`
+      variant, `StdlibMember(Box<StdlibMemberRef>)` -- no `SymbolId`
+      needed after all, it turned out: it slots in exactly like
+      `SchemaObject` already does for schema (boxed, no real declaration
+      to jump to, but a real, known outcome distinct from `Unresolved`)
+      -- so `String.isBlank(...)`/`Database.query(...)` now resolve
+      `StdlibMember` instead of unconditionally `Unresolved`, with real
+      hover text (signature + scraped description) via
+      `capabilities::describe_stdlib_member`. `crate::generics`'s
+      existing `List`/`Map`/`Set` type-argument substitution is
+      untouched and still tried first (the one case needing real
+      substitution, which no raw scraped signature alone can do); the
+      new lookup is purely the fallback for everything else, including
+      filling `List`/`Map`/`Set` gaps `generics.rs` never modeled
+      (`sort`, `addAll`, ...). Fixed a real, necessary gap found along
+      the way: `bind_name_expr` had no fallback at all for a bare class
+      name used as a *static-call receiver* (only a project-local-type
+      check and an SObject check) -- without also fixing that, `String`
+      itself bound straight to `Unresolved` before ever reaching the new
+      `Ty::System` lookup, so no static stdlib call could ever resolve.
+      Confirmed on the real NPSP corpus: `resolution_regression_baseline.rs`'s
+      `Unresolved` count dropped by 65,080 in total (149,289 -> 84,209,
+      most of it from the `bind_name_expr` fix specifically -- static
+      stdlib calls are extremely common in real Apex), `Resolved` rose
+      by 3 as a side effect (a project-local overloaded call's argument
+      type, previously unknown, is now known well enough for the
+      existing `narrow_by_overload` to disambiguate it). **What this
+      doesn't do:** model enum constant/static-value access (a different
+      access pattern, not a method call) -- and this closes the
+      *blocking* gap for semantic diagnostics without itself building a
+      diagnostics pass; "flag unresolved symbol" as a real, shippable
+      feature is separate, unstarted follow-on work.
 - [x] **No standard SObject/field schema -- done, via a bundled
       snapshot.** New `crates/apex-stdlib` crate embeds a schema
       snapshot scraped directly from Salesforce's own Object Reference
@@ -919,9 +947,7 @@ precision" -- they directly block shipping certain features honestly.
       by 3,250 (152,539 -> 149,289) with zero change to `Resolved`
       (`SchemaObject` isn't tallied either way). **What this doesn't
       do:** model standard-library *classes/methods* (`String`,
-      `Database`, ...) -- that's the separate, still-open gap below,
-      confirmed to need a different design (no `SymbolId`-based
-      resolution path exists for a method call today).
+      `Database`, ...) -- that's the separate item below, now also done.
 - [x] **Real type inference beyond one-hop chaining -- done, honestly
       bounded.** A new `Ty` value (`crates/apex-binder/src/ty.rs`,
       walker-internal only, never stored on `BoundProgram`/`Resolution`)
@@ -934,10 +960,10 @@ precision" -- they directly block shipping certain features honestly.
       Literal kinds (`Integer`/`Long`/`Decimal`/`String`/`Boolean`) get
       their real system type; comparison/logical operators always produce
       `Boolean`; arithmetic/bitwise/shift/assignment operators propagate
-      an operand's type. **What this doesn't do:** cover the rest of the
-      standard library's real method surface (still the separate,
-      still-unmodeled stdlib-model gap below) or attempt common-supertype
-      inference for a ternary's two branches beyond exact `Ty` equality.
+      an operand's type. **What this doesn't do:** attempt common-
+      supertype inference for a ternary's two branches beyond exact `Ty`
+      equality (covering the rest of the standard library's real method
+      surface was the separate stdlib-model gap above, now also done).
 - [x] **Generics-aware resolution for `List`/`Map`/`Set` -- done.** Apex
       has no user-defined generics at all, so a small, hand-written,
       case-insensitive table (`crates/apex-binder/src/generics.rs`)
@@ -951,9 +977,12 @@ precision" -- they directly block shipping certain features honestly.
       `Account` is project-local, even though `l.get(0)` itself has no
       real declaration to resolve to (stays `Resolution::Unresolved`,
       correctly -- only the *type* flows onward, not a fabricated
-      resolution). Not exhaustive: `sort`/`addAll`/`retainAll`/`clone`/
-      `iterator`/... fall through to today's `Unresolved`, same as any
-      other unmodeled system method, no regression.
+      resolution). Not exhaustive on its own: `sort`/`addAll`/`retainAll`/
+      `clone`/`iterator`/... aren't in this hand-written table -- they
+      now fall through to the bundled stdlib lookup (the standard-library
+      type model gap above, now also done) instead of staying
+      `Unresolved`, since none of them need type-argument substitution
+      this table exists for in the first place.
 - [x] **Override-matching semantics -- done.** `SymbolTable::lookup_member`
       now tracks which arities an `override` candidate has already
       claimed at a more-derived level of the `extends`/`implements` chain
@@ -974,11 +1003,6 @@ precision" -- they directly block shipping certain features honestly.
       constructor-lookup branches, now filters through it, so a private
       member of an unrelated class can no longer surface as a resolution
       candidate from outside its own type.
-- [ ] **No standard-library type model** carries forward unchanged (see
-      above) -- `Ty::System` can *name* an unmodeled type now, but still
-      can't resolve members of one beyond the `List`/`Map`/`Set` table
-      just added.
-
 **Performance, measured (`cargo bench -p apex-binder`, real NPSP corpus,
 ~1070 files):** `corpus/bind_npsp_full` (cold): ~440-459ms across two
 consecutive clean runs, within this machine's already-established noise

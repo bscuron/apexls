@@ -6,11 +6,14 @@
 //! 10%, but 10% is still nonzero so the floor still passes." A fixed,
 //! narrow numeric target would be too brittle (any grammar/AST change
 //! shifts these counts), so the ceiling is set well above the current
-//! observed ratio (~45%, down from ~54% once `bind_name_expr` gained a
-//! fallback for a bare name that's itself a project-local type used as
-//! a static-access receiver, e.g. `UtilClass.staticMethod(...)` --
-//! common enough in real Apex to move the whole-corpus ratio by ~9
-//! points) rather than pinned to it.
+//! observed ratio (~20%, down from ~45% once `apex_stdlib`'s bundled
+//! standard-library class/method/property schema was wired into
+//! `crate::resolve`'s `Ty::System` arms -- both the method-call/field-
+//! access lookup itself and `bind_name_expr`'s previously-missing
+//! fallback for a bare class name used as a static-call receiver, e.g.
+//! `String.isBlank(...)`/`Database.query(...)` -- common enough in real
+//! Apex to move the whole-corpus ratio by more than half) rather than
+//! pinned to it.
 
 use apex_binder::{BoundProgram, Resolution};
 use std::path::{Path, PathBuf};
@@ -25,6 +28,7 @@ struct Counts {
     candidates: usize,
     schema_object: usize,
     unknown_schema: usize,
+    stdlib_member: usize,
     unresolved: usize,
 }
 
@@ -45,6 +49,7 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
             Resolution::Candidates(_) => counts.candidates += 1,
             Resolution::SchemaObject(_) => counts.schema_object += 1,
             Resolution::UnknownSchema(_) => counts.unknown_schema += 1,
+            Resolution::StdlibMember(_) => counts.stdlib_member += 1,
             Resolution::Unresolved => counts.unresolved += 1,
         }
     }
@@ -53,6 +58,7 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
         + counts.candidates
         + counts.schema_object
         + counts.unknown_schema
+        + counts.stdlib_member
         + counts.unresolved;
     assert!(
         total > 200_000,
@@ -86,6 +92,12 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
         counts.unknown_schema > 2_000,
         "expected >2,000 UnknownSchema references, got {}: {counts:?}",
         counts.unknown_schema
+    );
+
+    assert!(
+        counts.stdlib_member > 60_000,
+        "expected >60,000 StdlibMember references, got {}: {counts:?}",
+        counts.stdlib_member
     );
 
     let unresolved_ratio = counts.unresolved as f64 / total as f64;

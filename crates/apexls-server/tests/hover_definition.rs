@@ -247,6 +247,56 @@ fn hover_on_a_field_reference_shows_its_declared_type() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `public class Foo {` / `    public void run() {` /
+/// `        Boolean b = String.isBlank('x');` / `    }` / `}` -- "isBlank"
+/// spans characters 27-33 on line 2, so character 30 lands squarely
+/// inside it.
+const STDLIB_CALL_SRC: &str =
+    "public class Foo {\n    public void run() {\n        Boolean b = String.isBlank('x');\n    }\n}\n";
+const STDLIB_CALL_POSITION: (u32, u32) = (2, 30);
+
+/// End-to-end confirmation that `apex_stdlib`'s bundled standard-library
+/// schema (wired into `crate::resolve`'s `Ty::System` arms, then
+/// `capabilities::describe_stdlib_member`) actually reaches a real
+/// `textDocument/hover` response -- not just the underlying
+/// `Resolution::StdlibMember` outcome `standard_library_resolution.rs`
+/// (in `apex-binder`) already covers.
+#[test]
+fn hover_on_a_real_stdlib_method_call_shows_its_signature_and_description() {
+    let dir = write_fixture_dir("hover-stdlib", &[("Foo.cls", STDLIB_CALL_SRC)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+
+    let mut session = Session::start_with_text(&foo_uri, &root_uri, STDLIB_CALL_SRC);
+
+    let response = session.request(
+        2,
+        "textDocument/hover",
+        serde_json::json!({
+            "textDocument": { "uri": foo_uri },
+            "position": { "line": STDLIB_CALL_POSITION.0, "character": STDLIB_CALL_POSITION.1 },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "hover returned an error: {response:?}"
+    );
+    let contents = response["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected hover contents.value, got {response:?}"));
+    assert!(
+        contents.contains("isBlank"),
+        "hover text should mention `isBlank`: {contents}"
+    );
+    assert!(
+        contents.contains("Boolean"),
+        "hover text should mention the real return type `Boolean`: {contents}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn definition_on_a_field_reference_points_back_at_its_declaration() {
     let dir = write_fixture_dir("definition", &[("Foo.cls", FOO_SRC)]);

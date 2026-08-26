@@ -68,10 +68,45 @@ fn corpus_root() -> PathBuf {
 /// correctly land in `Resolution::SchemaObject` instead -- which this
 /// test deliberately doesn't tally either way (see this module's own
 /// doc comment on why `SchemaObject`/`UnknownSchema`/`Candidates` are
-/// excluded from both counts), so `BASELINE_RESOLVED` itself is
-/// unaffected.
-const BASELINE_RESOLVED: usize = 204_984;
-const BASELINE_UNRESOLVED: usize = 149_289;
+/// excluded from both counts), so `BASELINE_RESOLVED` itself was
+/// unaffected *then*.
+///
+/// Both constants moved again when `apex_stdlib`'s bundled standard-
+/// library class/method/property schema was wired into
+/// `crate::resolve`'s `Ty::System` method-call/field-access arms, in two
+/// steps:
+///
+/// 1. Wiring `StdlibIndex` into the existing `Ty::System` arms alone
+///    moved `BASELINE_UNRESOLVED` by exactly -15,171 (`149_289` ->
+///    `134_118`) -- the same 15,171 references that now land in the
+///    (also untallied) `Resolution::StdlibMember` instead -- plus
+///    `BASELINE_RESOLVED` +1 (`204_984` -> `204_985`), confirmed via
+///    direct bisection (reverted just this change, re-ran, got exactly
+///    the old `204_984` back) to be a real, legitimate side effect: a
+///    project-local overloaded call somewhere in NPSP takes a stdlib
+///    method call's result as one of its own arguments, and that
+///    argument's type used to be unknown (`None`), so
+///    `narrow_by_overload`'s type-compatibility elimination couldn't use
+///    it to disambiguate and the call stayed `Resolution::Candidates`
+///    (untallied). Knowing the argument's real type now lets that same
+///    existing overload logic eliminate every candidate but one.
+/// 2. `bind_name_expr` turned out to have no fallback at all for a bare
+///    class name used as a *static-call receiver* (`String` in
+///    `String.isBlank(...)`, `Database` in `Database.query(...)`) --
+///    only a project-local-type check and an SObject check, so a name
+///    that was neither (every stdlib class) bound straight to `None`/
+///    `Unresolved` without ever reaching the `Ty::System` arms above at
+///    all. Adding the equivalent `StdlibIndex::class` fallback there
+///    (mirroring `SchemaObjectRef`'s existing bare-object-name shape,
+///    hence `StdlibMemberRef::member` becoming `Option<SmolStr>`) is
+///    what actually makes `String.isBlank(...)`/`Database.query(...)`-
+///    style calls resolve at all -- and since static stdlib calls are
+///    extremely common in real Apex, this moved the numbers far more
+///    than step 1 alone: `BASELINE_UNRESOLVED` -49,909 more (`134_118`
+///    -> `84_209`), `BASELINE_RESOLVED` +2 more (`204_985` -> `204_987`,
+///    same further-disambiguation mechanism as step 1).
+const BASELINE_RESOLVED: usize = 204_987;
+const BASELINE_UNRESOLVED: usize = 84_209;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {
@@ -89,7 +124,10 @@ fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {
         match resolution {
             Resolution::Resolved(_) => resolved += 1,
             Resolution::Unresolved => unresolved += 1,
-            Resolution::Candidates(_) | Resolution::SchemaObject(_) | Resolution::UnknownSchema(_) => {}
+            Resolution::Candidates(_)
+            | Resolution::SchemaObject(_)
+            | Resolution::UnknownSchema(_)
+            | Resolution::StdlibMember(_) => {}
         }
     }
 

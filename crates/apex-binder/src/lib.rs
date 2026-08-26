@@ -48,6 +48,7 @@ mod resolve;
 mod schema_index;
 mod scope;
 mod soql;
+mod stdlib_index;
 mod symbol;
 mod symbol_table;
 mod ty;
@@ -57,8 +58,11 @@ pub use dead_code::{kind_label, dead_symbols_in_file, DeadSymbol};
 pub use file_id::FileId;
 pub use incremental::BindCache;
 pub use ptr::{AstPtr, SyntaxPtr};
-pub use reference_table::{ReferenceTable, Resolution, SchemaObjectRef, UnknownSchemaRef};
+pub use reference_table::{
+    ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef, UnknownSchemaRef,
+};
 pub use schema_index::SchemaIndex;
+pub use stdlib_index::StdlibIndex;
 pub use scope::{Scope, ScopeId, ScopeKind, ScopeTree};
 pub use symbol::{ModifierSet, Sharing, Symbol, SymbolId, SymbolKind, Visibility};
 pub use symbol_table::SymbolTable;
@@ -111,6 +115,13 @@ pub struct BoundProgram {
     /// `Self::from_files_cached`), so the common case is a pointer clone,
     /// not re-parsing every SFDX metadata XML file.
     pub schema: Arc<SchemaIndex>,
+    /// Bundled standard-library class/method/property schema
+    /// (`apex_stdlib::standard_classes`) -- unlike `schema`, this has no
+    /// project-specific data at all (never merges with anything
+    /// discovered from `root`), so it's a single process-wide singleton
+    /// (`global_stdlib_index`) rather than something `BindCache` rebuilds
+    /// alongside a fresh directory walk.
+    pub stdlib: Arc<StdlibIndex>,
     bodies: FxHashMap<FileId, Arc<FileBodies>>,
     /// Every class name (lowercased) a real `.page` file names as its
     /// `controller`/`extensions` -- `crate::dead_code`'s Visualforce-
@@ -130,6 +141,15 @@ pub struct BoundProgram {
 /// these workers, whether immediately or much later as part of
 /// `BoundProgram` itself being dropped).
 static ENSURE_LARGE_WORKER_STACKS: std::sync::Once = std::sync::Once::new();
+
+/// The bundled standard-library index, built once per process and
+/// shared (via cheap `Arc` clones) across every `BoundProgram` --
+/// unlike `SchemaIndex`, nothing about it depends on `root`, so there's
+/// no per-project staleness to track the way `BindCache.schema` has.
+fn global_stdlib_index() -> Arc<StdlibIndex> {
+    static STDLIB: std::sync::OnceLock<Arc<StdlibIndex>> = std::sync::OnceLock::new();
+    Arc::clone(STDLIB.get_or_init(|| Arc::new(StdlibIndex::new())))
+}
 
 fn ensure_large_worker_stacks() {
     ENSURE_LARGE_WORKER_STACKS.call_once(|| {
@@ -239,6 +259,7 @@ impl BoundProgram {
         }
         let discovery = cache.discovery.as_ref().unwrap();
         let schema = Arc::clone(cache.schema.as_ref().unwrap());
+        let stdlib = global_stdlib_index();
         let vf_referenced_classes = Arc::clone(cache.vf_referenced_classes.as_ref().unwrap());
 
         // Stage 0: resolve every discovered path to a stable `FileId`.
@@ -562,7 +583,7 @@ impl BoundProgram {
                     .par_iter()
                     .flat_map(|(file, id, symbol)| {
                         let root_node = parse_by_file[file].syntax();
-                        bind_symbol_body(&cache.table, &schema, &root_node, *id, symbol)
+                        bind_symbol_body(&cache.table, &schema, &stdlib, &root_node, *id, symbol)
                             .into_iter()
                             .map(move |(key, body)| (*file, key, body))
                             .collect::<Vec<_>>()
@@ -683,6 +704,7 @@ impl BoundProgram {
             parses,
             symbols: cache.table.clone(),
             schema,
+            stdlib,
             bodies,
             vf_referenced_classes,
         }
@@ -1063,6 +1085,7 @@ pub(crate) fn enclosing_type_of(table: &SymbolTable, symbol: &Symbol) -> Option<
 fn bind_symbol_body(
     table: &SymbolTable,
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     root: &SyntaxNode,
     id: SymbolId,
     symbol: &Symbol,
@@ -1099,6 +1122,7 @@ fn bind_symbol_body(
                 let bound = resolve::bind_body(
                     table,
                     schema,
+                    stdlib,
                     symbol.file,
                     symbol.container,
                     Some(id),
@@ -1121,6 +1145,7 @@ fn bind_symbol_body(
             let bound = resolve::bind_body(
                 table,
                 schema,
+                stdlib,
                 symbol.file,
                 symbol.container,
                 Some(id),
@@ -1139,6 +1164,7 @@ fn bind_symbol_body(
                     let bound = resolve::bind_body(
                         table,
                         schema,
+                        stdlib,
                         symbol.file,
                         symbol.container,
                         None,
@@ -1159,8 +1185,14 @@ fn bind_symbol_body(
                 .and_then(VarDeclarator::cast)
                 .and_then(|decl| decl.init())
             {
-                let bound =
-                    resolve::bind_initializer(table, schema, symbol.file, symbol.container, &init);
+                let bound = resolve::bind_initializer(
+                    table,
+                    schema,
+                    stdlib,
+                    symbol.file,
+                    symbol.container,
+                    &init,
+                );
                 out.push((None, bound));
             }
             out
@@ -1184,7 +1216,7 @@ fn bind_symbol_body(
             if let Some(block) = tu.block() {
                 let key = SyntaxPtr::new(symbol.file, block.syntax());
                 let bound =
-                    resolve::bind_trigger_body(table, schema, symbol.file, Some(id), &block);
+                    resolve::bind_trigger_body(table, schema, stdlib, symbol.file, Some(id), &block);
                 out.push((Some(key), bound));
             }
             out

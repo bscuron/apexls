@@ -6,8 +6,8 @@
 
 use crate::line_index::{LineIndex, PositionEncoding};
 use apex_binder::{
-    BoundProgram, FileId, Resolution, SchemaObjectRef, Symbol, SymbolId, SymbolKind, SyntaxPtr,
-    Visibility,
+    BoundProgram, FileId, Resolution, SchemaObjectRef, StdlibMemberRef, Symbol, SymbolId,
+    SymbolKind, SyntaxPtr, Visibility,
 };
 use apex_syntax::ast::decl::{
     ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, HasDocComment, InterfaceDecl, MethodDecl,
@@ -212,6 +212,68 @@ pub(crate) fn describe_symbol(program: &BoundProgram, id: SymbolId) -> String {
         }
     }
     out
+}
+
+/// Renders a `Resolution::StdlibMember` reference as Markdown hover
+/// text, the bundled-schema equivalent of `describe_symbol` -- there's
+/// no `SymbolId`/declaration to render from, so this looks the class/
+/// member back up through `program.stdlib` instead. `None` when
+/// `program.stdlib` no longer has this exact class/member (shouldn't
+/// happen for a resolution this same snapshot just produced, but the
+/// index is looked up fresh rather than assumed).
+///
+/// A bare class reference (`r.member: None`, e.g. hovering `String` in
+/// `String.isBlank(...)`) renders just the class name/namespace -- there's
+/// no per-class description in the bundled snapshot to show beyond that,
+/// unlike a method/property. A method's every real overload (there's no
+/// single "the" overload once a reference only proves existence, not
+/// which one -- see `crate::resolve::narrow_stdlib_overload_type`'s own
+/// doc comment) gets its own signature line, followed by the first
+/// overload's description (real overloads of the same method
+/// overwhelmingly share one description in the scraped docs).
+pub(crate) fn describe_stdlib_member(program: &BoundProgram, r: &StdlibMemberRef) -> Option<String> {
+    let class = program.stdlib.class(&r.class_name)?;
+    let ns_prefix = class
+        .namespace
+        .as_deref()
+        .map(|ns| format!("{ns}."))
+        .unwrap_or_default();
+
+    let Some(member) = &r.member else {
+        return Some(format!("```apex\n{ns_prefix}{}\n```", class.name));
+    };
+
+    if let Some(prop) = program.stdlib.property(&r.class_name, member) {
+        let modifier = if prop.is_static { "static " } else { "" };
+        let ty = prop.type_name.as_deref().unwrap_or("Object");
+        let mut out = format!("```apex\npublic {modifier}{ty} {ns_prefix}{}\n```", prop.name);
+        if let Some(desc) = &prop.description {
+            out.push_str("\n\n");
+            out.push_str(desc);
+        }
+        return Some(out);
+    }
+
+    let overloads: Vec<_> = program.stdlib.methods(&r.class_name, member).collect();
+    let (first, rest) = overloads.split_first()?;
+    let mut sig = String::from("```apex\n");
+    for m in std::iter::once(first).chain(rest.iter()) {
+        let modifier = if m.is_static { "static " } else { "" };
+        let ret = m.return_type.as_deref().unwrap_or("void");
+        let params = m
+            .params
+            .iter()
+            .map(|p| p.as_deref().unwrap_or("Object"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sig.push_str(&format!("public {modifier}{ret} {ns_prefix}{}({params})\n", m.name));
+    }
+    sig.push_str("```");
+    if let Some(desc) = &first.description {
+        sig.push_str("\n\n");
+        sig.push_str(desc);
+    }
+    Some(sig)
 }
 
 fn push_params(program: &BoundProgram, out: &mut String, method_or_ctor: SymbolId) {

@@ -24,9 +24,16 @@ use smol_str::SmolStr;
 ///   `Contact.Email`, ...) `apex-metadata` has no local metadata for by
 ///   design (see its module doc comment) -- a real, expected, constant
 ///   outcome for any repo that touches standard objects, not an error.
+/// - `StdlibMember` means the reference names a real standard-library
+///   class's method/property (`apex_stdlib::standard_classes`) -- known,
+///   not an error, but (like `SchemaObject`/`UnknownSchema`) backed by
+///   bundled documentation data rather than a `SymbolId`, so there's no
+///   real declaration for goto-definition to point at.
 /// - `Unresolved` is reserved for "looked, found nothing at all" --
-///   likely a genuine error, or a reference to the (currently
-///   unmodeled) Apex standard library.
+///   a genuine error (or, before `StdlibMember` existed, *also* covered
+///   any reference to the then-unmodeled Apex standard library --
+///   that's no longer conflated now that a real stdlib match escapes
+///   into `StdlibMember` instead).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaObjectRef {
     pub object: SmolStr,
@@ -39,8 +46,24 @@ pub struct UnknownSchemaRef {
     pub field: Option<SmolStr>,
 }
 
-/// `SchemaObject`/`UnknownSchema` box their payload so their two
-/// `SmolStr`-carrying fields don't force every other variant -- in
+/// A standard-library class reference, or one of its method/property
+/// members -- `member: None` for a bare class name used as a value in
+/// its own right (a static-call receiver, e.g. the `String` in
+/// `String.isBlank(...)`), mirroring `SchemaObjectRef::field`'s
+/// identical `None`-for-the-bare-object-name shape. `member`'s presence
+/// alone (no method-vs-property flag) is enough identity for a consumer
+/// to look the rest back up via `StdlibIndex`, the same way
+/// `SchemaObjectRef` doesn't distinguish a lookup field from a picklist
+/// field either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StdlibMemberRef {
+    pub namespace: Option<SmolStr>,
+    pub class_name: SmolStr,
+    pub member: Option<SmolStr>,
+}
+
+/// `SchemaObject`/`UnknownSchema`/`StdlibMember` box their payload so
+/// their `SmolStr`-carrying fields don't force every other variant -- in
 /// particular the by-far-most-common `Resolved`/`Unresolved`, one entry
 /// per reference in the whole project -- to pay for the largest
 /// variant's size (a real, measured cost: see `examples/mem_profile.rs`).
@@ -50,6 +73,7 @@ pub enum Resolution {
     Candidates(Vec<SymbolId>),
     SchemaObject(Box<SchemaObjectRef>),
     UnknownSchema(Box<UnknownSchemaRef>),
+    StdlibMember(Box<StdlibMemberRef>),
     Unresolved,
 }
 
@@ -77,9 +101,10 @@ impl Resolution {
         match self {
             Resolution::Resolved(id) => std::slice::from_ref(id),
             Resolution::Candidates(ids) => ids,
-            Resolution::SchemaObject(_) | Resolution::UnknownSchema(_) | Resolution::Unresolved => {
-                &[]
-            }
+            Resolution::SchemaObject(_)
+            | Resolution::UnknownSchema(_)
+            | Resolution::StdlibMember(_)
+            | Resolution::Unresolved => &[],
         }
     }
 }

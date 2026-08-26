@@ -1,27 +1,33 @@
-//! Bundled, offline snapshot of standard Salesforce SObject/field schema
-//! -- the gap `apex_metadata`'s own module doc comment documents as
-//! "deliberately left as an open decision for whoever wires up the
-//! symbol table": standard objects and fields (`Account`, `Contact`,
-//! `Opportunity`, ...) have no local metadata files a real project ever
-//! ships, since they already exist on every org. This crate fills that
-//! gap with a snapshot scraped directly from Salesforce's own Object
-//! Reference documentation (`tools/salesforce-doc-scraper`), embedded
-//! at compile time so `apexls` never makes a network call at runtime.
+//! Bundled, offline snapshot of standard Salesforce schema: SObject/
+//! field schema (`standard_sobjects`) -- the gap `apex_metadata`'s own
+//! module doc comment documents as "deliberately left as an open
+//! decision for whoever wires up the symbol table" -- and standard-
+//! library class/method/property schema (`standard_classes`) -- the
+//! `BACKLOG.md` §4 gap that blocks semantic diagnostics from shipping
+//! at all, since a real `String.isBlank(...)` call is otherwise
+//! indistinguishable from a genuine typo. Standard objects/fields and
+//! standard classes/methods have no local metadata files a real project
+//! ever ships, since they already exist on every org/runtime. This
+//! crate fills both gaps with snapshots scraped directly from
+//! Salesforce's own documentation (`tools/salesforce-doc-scraper`),
+//! embedded at compile time so `apexls` never makes a network call at
+//! runtime.
 //!
-//! Deliberately its own small `serde`-deriving struct shape here
-//! (`RawObject`/`RawField`) rather than depending on the scraper's own
-//! `tools/salesforce-doc-scraper::model` types directly -- a workspace
-//! member depending on a `tools/` binary crate would be backwards, and
-//! the scraper's own `model.rs` doc comment already gives the same
-//! reasoning for not designing its output against `apex-binder`'s types
-//! either: the two sides of this mapping are deliberately decoupled.
+//! Deliberately its own small `serde`-deriving struct shapes here
+//! (`RawObject`/`RawField`, `RawClass`/`RawMethod`/...) rather than
+//! depending on the scraper's own `tools/salesforce-doc-scraper::model`
+//! types directly -- a workspace member depending on a `tools/` binary
+//! crate would be backwards, and the scraper's own `model.rs` doc
+//! comment already gives the same reasoning for not designing its
+//! output against `apex-binder`'s types either: the two sides of this
+//! mapping are deliberately decoupled.
 //!
-//! **Refreshing the snapshot**: re-run
-//! `cargo run -p salesforce-doc-scraper -- scrape-object-reference --out out/standard_objects.json`
-//! (see that crate's own README) and copy the result over
-//! `data/standard_objects.json`. Manual, on a new Apex release -- not
-//! automated, matching the scraper's own "runs once per release, not
-//! once per build" design.
+//! **Refreshing a snapshot**: re-run the scraper (see its own README --
+//! `scrape-object-reference` for `standard_objects.json`,
+//! `scrape-apex-reference` for `apex_reference.json`) and copy the
+//! result over the matching file under `data/`. Manual, on a new Apex
+//! release -- not automated, matching the scraper's own "runs once per
+//! release, not once per build" design.
 
 use apex_metadata::{FieldSchema, SObjectSchema};
 use serde::Deserialize;
@@ -76,6 +82,186 @@ fn to_field_schema(raw: RawField) -> FieldSchema {
     }
 }
 
+/// One standard Apex class/interface's bundled schema.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StdlibClass {
+    /// e.g. `Some("System")`, `Some("ConnectApi")` -- `None` was never
+    /// observed in practice (every real class has one), but the
+    /// scraper's own `ClassModel::namespace` is `Option`, so this stays
+    /// `Option` too rather than defaulting to a sentinel string.
+    pub namespace: Option<SmolStr>,
+    pub name: SmolStr,
+    pub methods: Vec<StdlibMethod>,
+    pub properties: Vec<StdlibProperty>,
+}
+
+/// One method or constructor. Constructors appear in the scraped data
+/// under `methods` with the class's own (possibly generic, e.g.
+/// `"List<T>"`) name rather than as a separate model -- kept as-is
+/// here rather than split out, since nothing in `apex-binder` needs to
+/// tell a constructor apart from a same-named method for lookup
+/// purposes (both are found by matching `name`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StdlibMethod {
+    pub name: SmolStr,
+    pub is_static: bool,
+    /// Normalized (whitespace-collapsed, `[]`-sugar rewritten to
+    /// `List<T>`) but still one opaque string, e.g. `"List<String>"` --
+    /// never pre-split into base+args (see [`split_generic_type`]).
+    pub return_type: Option<SmolStr>,
+    /// Each parameter's type, positional; `None` for the rare case the
+    /// scraper couldn't extract one.
+    pub params: Vec<Option<SmolStr>>,
+    pub description: Option<SmolStr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StdlibProperty {
+    pub name: SmolStr,
+    pub is_static: bool,
+    pub type_name: Option<SmolStr>,
+    pub description: Option<SmolStr>,
+}
+
+#[derive(Deserialize)]
+struct RawClass {
+    namespace: Option<String>,
+    name: String,
+    kind: String,
+    #[serde(default)]
+    methods: Vec<RawMethod>,
+    #[serde(default)]
+    properties: Vec<RawProperty>,
+}
+
+#[derive(Deserialize)]
+struct RawMethod {
+    name: String,
+    is_static: bool,
+    return_type: Option<String>,
+    #[serde(default)]
+    params: Vec<RawParam>,
+    description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawParam {
+    type_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawProperty {
+    name: String,
+    is_static: bool,
+    type_name: Option<String>,
+    description: Option<String>,
+}
+
+const APEX_REFERENCE_JSON: &str = include_str!("../data/apex_reference.json");
+
+/// Every standard Apex class/interface's bundled method/property
+/// schema, parsed once on first use. Excludes both the scraper's own
+/// empty navigation-page entries (`kind` other than `Class`/`Interface`,
+/// or no methods/properties at all -- roughly 1550 of the ~2220 raw
+/// entries, confirmed via direct inspection to be section/index pages
+/// like `"Apex Release Notes"`, not real types) and a handful (~8) of
+/// synthetic "Unknown"-kind doc-section groupings with real content but
+/// an atypical title (e.g. `"Email Class (Base Email Methods)"`) -- an
+/// accepted, tiny, documented gap rather than a bespoke title parser
+/// for a handful of entries, the same tolerance this project's scraper
+/// work has already established for similarly small residuals.
+pub fn standard_classes() -> &'static [StdlibClass] {
+    static CLASSES: OnceLock<Vec<StdlibClass>> = OnceLock::new();
+    CLASSES.get_or_init(|| {
+        let raw: Vec<RawClass> = serde_json::from_str(APEX_REFERENCE_JSON)
+            .expect("bundled data/apex_reference.json failed to parse");
+        raw.into_iter()
+            .filter(|c| {
+                (c.kind == "Class" || c.kind == "Interface")
+                    && (!c.methods.is_empty() || !c.properties.is_empty())
+            })
+            .map(to_stdlib_class)
+            .collect()
+    })
+}
+
+fn to_stdlib_class(raw: RawClass) -> StdlibClass {
+    StdlibClass {
+        namespace: raw.namespace.map(|n| SmolStr::new(&n)),
+        name: SmolStr::new(&raw.name),
+        methods: raw.methods.into_iter().map(to_stdlib_method).collect(),
+        properties: raw.properties.into_iter().map(to_stdlib_property).collect(),
+    }
+}
+
+fn to_stdlib_method(raw: RawMethod) -> StdlibMethod {
+    StdlibMethod {
+        name: SmolStr::new(&raw.name),
+        is_static: raw.is_static,
+        return_type: raw.return_type.as_deref().map(normalize_type_string),
+        params: raw
+            .params
+            .into_iter()
+            .map(|p| p.type_name.as_deref().map(normalize_type_string))
+            .collect(),
+        description: raw.description.map(|d| SmolStr::new(&d)),
+    }
+}
+
+fn to_stdlib_property(raw: RawProperty) -> StdlibProperty {
+    StdlibProperty {
+        name: SmolStr::new(&raw.name),
+        is_static: raw.is_static,
+        type_name: raw.type_name.as_deref().map(normalize_type_string),
+        description: raw.description.map(|d| SmolStr::new(&d)),
+    }
+}
+
+/// Cleans up the real messiness confirmed in the scraped data: embedded
+/// literal `\n`/run-on indentation from the source HTML (collapsed to
+/// single spaces), a stray space before `<`/`,`/`>` in a few entries
+/// (e.g. `"Map <String, Boolean>"`), and legacy `Type[]` array-sugar
+/// rewritten to `List<Type>` so a consumer only ever needs to
+/// understand one generic-collection spelling.
+fn normalize_type_string(raw: &str) -> SmolStr {
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapsed
+        .replace(" <", "<")
+        .replace("< ", "<")
+        .replace(" >", ">")
+        .replace(", ", ",");
+    if let Some(base) = collapsed.strip_suffix("[]") {
+        SmolStr::new(format!("List<{}>", base.trim()))
+    } else {
+        SmolStr::new(collapsed)
+    }
+}
+
+/// Splits a normalized, possibly-generic type string into its base name
+/// and type arguments, e.g. `"List<String>"` -> `("List", ["String"])`,
+/// `"Map<String,Boolean>"` -> `("Map", ["String", "Boolean"])`,
+/// `"Boolean"` -> `("Boolean", [])`. Only ever splits the *outermost*
+/// angle-bracket pair, with a naive (not nesting-depth-aware) top-level
+/// comma split inside it. Confirmed against the whole real corpus: only
+/// one method anywhere has a doubly-nested generic at all
+/// (`Map<String,Set<String>>`), and it happens to split correctly here
+/// only because its inner `Set<String>` has no comma of its own to
+/// confuse the split -- a hypothetical `Map<String,Map<K,V>>` would
+/// come out wrong (three pieces instead of two). Accepted as a real but
+/// currently-unobserved gap rather than a full recursive parser for a
+/// shape that has never actually occurred in this data.
+pub fn split_generic_type(type_str: &str) -> (SmolStr, Vec<SmolStr>) {
+    match type_str.find('<') {
+        Some(open) if type_str.ends_with('>') => {
+            let base = &type_str[..open];
+            let inner = &type_str[open + 1..type_str.len() - 1];
+            let args = inner.split(',').map(SmolStr::new).collect();
+            (SmolStr::new(base), args)
+        }
+        _ => (SmolStr::new(type_str), Vec::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +304,84 @@ mod tests {
             .find(|f| f.api_name == "AccountId")
             .expect("Contact.AccountId should be in the bundled snapshot");
         assert_eq!(account_id.reference_to, vec![SmolStr::new("Account")]);
+    }
+
+    #[test]
+    fn embedded_apex_reference_parses_and_has_string_isblank() {
+        let classes = standard_classes();
+        assert!(
+            classes.len() > 500,
+            "expected hundreds of standard classes, got {}",
+            classes.len()
+        );
+
+        let string_class = classes
+            .iter()
+            .find(|c| c.name == "String" && c.namespace.as_deref() == Some("System"))
+            .expect("String should be in the bundled snapshot");
+        let is_blank = string_class
+            .methods
+            .iter()
+            .find(|m| m.name == "isBlank")
+            .expect("String.isBlank should be in the bundled snapshot");
+        assert!(is_blank.is_static);
+        assert_eq!(is_blank.return_type.as_deref(), Some("Boolean"));
+        assert_eq!(is_blank.params.len(), 1);
+        assert_eq!(is_blank.params[0].as_deref(), Some("String"));
+        assert!(is_blank.description.is_some());
+    }
+
+    /// `Database.query` is genuinely overloaded (1-arg and 2-arg real
+    /// forms) -- confirms both survive into the bundled snapshot rather
+    /// than one silently overwriting the other.
+    #[test]
+    fn an_overloaded_stdlib_method_keeps_every_overload() {
+        let classes = standard_classes();
+        let database = classes
+            .iter()
+            .find(|c| c.name == "Database" && c.namespace.as_deref() == Some("System"))
+            .expect("Database should be in the bundled snapshot");
+        let query_overloads: Vec<_> = database.methods.iter().filter(|m| m.name == "query").collect();
+        assert_eq!(
+            query_overloads.len(),
+            2,
+            "expected exactly 2 real Database.query overloads, got {}",
+            query_overloads.len()
+        );
+    }
+
+    /// `Test` collides between the `Canvas` and `System` namespaces --
+    /// confirms both survive as distinct entries (disambiguation is
+    /// `apex-binder::StdlibIndex`'s job, not this crate's).
+    #[test]
+    fn a_namespace_colliding_class_name_keeps_both_entries() {
+        let classes = standard_classes();
+        let test_classes: Vec<_> = classes.iter().filter(|c| c.name == "Test").collect();
+        assert_eq!(test_classes.len(), 2, "expected both Canvas.Test and System.Test");
+        assert!(test_classes.iter().any(|c| c.namespace.as_deref() == Some("Canvas")));
+        assert!(test_classes.iter().any(|c| c.namespace.as_deref() == Some("System")));
+    }
+
+    #[test]
+    fn normalize_type_string_collapses_whitespace_and_rewrites_array_sugar() {
+        assert_eq!(normalize_type_string("Map <String, Boolean>").as_str(), "Map<String,Boolean>");
+        assert_eq!(normalize_type_string("String\n                    []").as_str(), "List<String>");
+        assert_eq!(
+            normalize_type_string("List<Messaging.RenderEmailTemplateError>").as_str(),
+            "List<Messaging.RenderEmailTemplateError>"
+        );
+    }
+
+    #[test]
+    fn split_generic_type_separates_base_from_args() {
+        assert_eq!(
+            split_generic_type("List<String>"),
+            (SmolStr::new("List"), vec![SmolStr::new("String")])
+        );
+        assert_eq!(
+            split_generic_type("Map<String,Boolean>"),
+            (SmolStr::new("Map"), vec![SmolStr::new("String"), SmolStr::new("Boolean")])
+        );
+        assert_eq!(split_generic_type("Boolean"), (SmolStr::new("Boolean"), vec![]));
     }
 }

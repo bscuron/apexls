@@ -67,11 +67,16 @@ fn a_list_elements_type_substitutes_through_get_so_a_further_field_access_resolv
 
 #[test]
 fn map_keyset_infers_a_set_of_the_key_type() {
-    // Not directly observable through `Resolution` (`Set<String>.` has no
-    // further project-local member to chain into here), but this proves
-    // `bind_method_call_expr` doesn't panic or mis-set the *call's own*
-    // resolution when walking a `Map` target -- the call itself has no
-    // real declaration, so it must stay `Unresolved`, not `Resolved`.
+    // The substituted `Set<String>` element type itself isn't directly
+    // observable through `Resolution` (no further project-local member
+    // to chain into here), but this proves `bind_method_call_expr`
+    // doesn't panic or mis-set the *call's own* resolution when walking
+    // a `Map` target. `Map.keySet` is a real, documented stdlib method
+    // (`apex_stdlib`'s bundled snapshot), so the call itself resolves
+    // `Resolution::StdlibMember` -- no `SymbolId` backs it (same as
+    // `Resolved` would need), but it's no longer indistinguishable from
+    // a genuine typo either, which is exactly what wiring the bundled
+    // stdlib snapshot into `crate::resolve` is for.
     let dir = write_fixture_dir(
         "generics-map-keyset",
         &[(
@@ -97,7 +102,11 @@ fn map_keyset_infers_a_set_of_the_key_type() {
         .expect("byName.keySet() should be a MethodCallExpr");
     assert_eq!(
         program.resolution(call_ptr).cloned(),
-        Some(Resolution::Unresolved),
-        "a built-in generic method call has no real declaration to resolve to"
+        Some(Resolution::StdlibMember(Box::new(apex_binder::StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "Map".into(),
+            member: Some("keySet".into()),
+        }))),
+        "Map.keySet is a real, documented stdlib method"
     );
 }

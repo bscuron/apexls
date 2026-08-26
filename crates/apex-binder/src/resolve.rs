@@ -51,9 +51,13 @@
 use crate::conversions;
 use crate::file_id::FileId;
 use crate::ptr::{AstPtr, SyntaxPtr};
-use crate::reference_table::{ReferenceTable, Resolution, SchemaObjectRef, UnknownSchemaRef};
+use crate::reference_table::{
+    ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef, UnknownSchemaRef,
+};
 use crate::schema_index::{relationship_field_api_name, SchemaIndex};
 use crate::scope::{ScopeId, ScopeKind, ScopeTree};
+use crate::stdlib_index::StdlibIndex;
+use apex_stdlib::StdlibMethod;
 use crate::symbol::{ModifierSet, Symbol, SymbolId, SymbolKind};
 use crate::symbol_table::SymbolTable;
 use crate::ty::Ty;
@@ -139,6 +143,86 @@ fn narrow_by_overload(
             None => Resolution::Candidates(by_type),
         },
     }
+}
+
+/// A `Resolution::StdlibMember` reference for `class_name.member` (or
+/// just `class_name` itself, when `member` is `None` -- a bare class
+/// name used as a static-call receiver), looking `class_name` back up
+/// through `stdlib` just to capture its real (post-collision-tiebreak)
+/// namespace -- shared by every `Ty::System` arm that can produce this
+/// resolution.
+fn stdlib_member_ref(stdlib: &StdlibIndex, class_name: &str, member: Option<&str>) -> StdlibMemberRef {
+    StdlibMemberRef {
+        namespace: stdlib.class(class_name).and_then(|c| c.namespace.clone()),
+        class_name: SmolStr::new(class_name),
+        member: member.map(SmolStr::new),
+    }
+}
+
+/// Best-effort narrows `class_name.member`'s scraped overloads (arity,
+/// then `crate::conversions::type_compatible`) purely to pick a
+/// *propagated type* for continued chaining (`Database.query(soql).size()`)
+/// -- deliberately simpler than [`narrow_by_overload`]'s full three-stage
+/// algorithm, since a stdlib reference's `Resolution` (`StdlibMember` vs.
+/// `Unresolved`) is already decided by mere name-existence before this
+/// ever runs; getting the exact overload right only affects how far a
+/// chained call keeps resolving, never whether this call itself does.
+/// Ambiguous (0 or 2+ survivors) -> `None`, same as the total absence of
+/// this information today -- never a guessed, possibly-wrong type.
+fn narrow_stdlib_overload_type(
+    table: &SymbolTable,
+    stdlib: &StdlibIndex,
+    class_name: &str,
+    member: &str,
+    arg_types: &[Option<Ty>],
+) -> Option<Ty> {
+    let overloads: Vec<&StdlibMethod> = stdlib.methods(class_name, member).collect();
+    let by_arity: Vec<&StdlibMethod> = overloads
+        .iter()
+        .copied()
+        .filter(|m| m.params.len() == arg_types.len())
+        .collect();
+    let pool: &[&StdlibMethod] = if by_arity.is_empty() { &overloads } else { &by_arity };
+
+    let winner = match pool {
+        [one] => Some(*one),
+        _ => {
+            let by_type: Vec<&StdlibMethod> = pool
+                .iter()
+                .copied()
+                .filter(|m| stdlib_args_compatible(table, m, arg_types))
+                .collect();
+            match by_type.as_slice() {
+                [one] => Some(*one),
+                _ => None,
+            }
+        }
+    };
+
+    let return_type = winner?.return_type.as_deref()?;
+    let (base, args) = apex_stdlib::split_generic_type(return_type);
+    Some(Ty::system_owned(
+        base,
+        args.into_iter().map(|a| Ty::system_owned(a, Vec::new())).collect(),
+    ))
+}
+
+/// Mirrors [`is_argument_type_compatible`], but against a scraped
+/// [`StdlibMethod`]'s string-typed params instead of a `SymbolId`'s
+/// declared ones -- an argument or parameter type this crate can't even
+/// name never eliminates (same "can't prove wrong beats assume wrong"
+/// rule `crate::conversions::type_compatible` itself already applies).
+fn stdlib_args_compatible(table: &SymbolTable, method: &StdlibMethod, arg_types: &[Option<Ty>]) -> bool {
+    for (param_type, arg_type) in method.params.iter().zip(arg_types.iter()) {
+        let (Some(param_type), Some(arg_type)) = (param_type, arg_type) else {
+            continue;
+        };
+        let (param_name, param_args) = apex_stdlib::split_generic_type(param_type);
+        if conversions::type_compatible(table, &param_name, &param_args, arg_type) == Some(false) {
+            return false;
+        }
+    }
+    true
 }
 
 /// True for a `Method` symbol Apex could dispatch dynamically at
@@ -357,6 +441,7 @@ pub(crate) struct BoundBody {
 pub(crate) struct BodyBinder<'a> {
     pub(crate) table: &'a SymbolTable,
     pub(crate) schema: &'a SchemaIndex,
+    pub(crate) stdlib: &'a StdlibIndex,
     pub(crate) refs: ReferenceTable,
     pub(crate) scopes: ScopeTree,
     pending_locals: Vec<Symbol>,
@@ -382,6 +467,7 @@ pub(crate) struct BodyBinder<'a> {
 pub(crate) fn bind_body(
     table: &SymbolTable,
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     enclosing_member: Option<SymbolId>,
@@ -392,6 +478,7 @@ pub(crate) fn bind_body(
     let mut binder = BodyBinder {
         table,
         schema,
+        stdlib,
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
@@ -416,6 +503,7 @@ pub(crate) fn bind_body(
 pub(crate) fn bind_trigger_body(
     table: &SymbolTable,
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     block: &TriggerBlock,
@@ -424,6 +512,7 @@ pub(crate) fn bind_trigger_body(
     let mut binder = BodyBinder {
         table,
         schema,
+        stdlib,
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
@@ -446,6 +535,7 @@ pub(crate) fn bind_trigger_body(
 pub(crate) fn bind_initializer(
     table: &SymbolTable,
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     expr: &Expr,
@@ -454,6 +544,7 @@ pub(crate) fn bind_initializer(
     let mut binder = BodyBinder {
         table,
         schema,
+        stdlib,
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
@@ -1399,6 +1490,24 @@ impl<'a> BodyBinder<'a> {
             );
             return Some(Ty::system_owned(SmolStr::new(name), Vec::new()));
         }
+        // Or a real stdlib class used as a static-call receiver
+        // (`String.isBlank(...)`, `Database.query(...)`, `Math.max(...)`)
+        // -- without this, `String` itself bound to `None` here (an
+        // unrecognized bare name, no SObject match either), so the call
+        // hanging off it never even reached the `Ty::System` arms below
+        // that actually know how to look a stdlib member up; every
+        // static stdlib call stayed `Unresolved` regardless of how real
+        // the method name was. A stdlib class used only as a *type*
+        // (`String s;`) already worked before this -- `resolve_type_ref`
+        // returns `Ty::system_owned` unconditionally for any unresolved
+        // name, this is specifically the *expression*-position gap.
+        if self.stdlib.class(name).is_some() {
+            self.refs.set(
+                ptr,
+                Resolution::StdlibMember(Box::new(stdlib_member_ref(self.stdlib, name, None))),
+            );
+            return Some(Ty::system_owned(SmolStr::new(name), Vec::new()));
+        }
 
         self.refs.set(ptr, Resolution::Unresolved);
         None
@@ -1429,23 +1538,42 @@ impl<'a> BodyBinder<'a> {
             Some(Ty::System { name: object, .. }) => {
                 let real_field_name = relationship_field_api_name(name);
                 let field_schema = self.schema.field(&object, &real_field_name);
-                let resolution = match &field_schema {
-                    Some(_) => Resolution::SchemaObject(Box::new(SchemaObjectRef {
-                        object: object.clone(),
-                        field: Some(SmolStr::new(&real_field_name)),
-                    })),
-                    None if self.schema.object(&object).is_some() => {
-                        Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
+                if field_schema.is_some() || self.schema.object(&object).is_some() {
+                    let resolution = match &field_schema {
+                        Some(_) => Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                            object: object.clone(),
+                            field: Some(SmolStr::new(&real_field_name)),
+                        })),
+                        None => Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
                             object: Some(object.clone()),
                             field: Some(SmolStr::new(&real_field_name)),
-                        }))
-                    }
+                        })),
+                    };
+                    self.refs.set_with_highlight(ptr, highlight, resolution);
+                    return field_schema
+                        .and_then(|f| f.reference_to.first())
+                        .map(|next| Ty::system_owned(next.clone(), Vec::new()));
+                }
+                // Not a known SObject/field at all (real or standard) --
+                // try a stdlib class property before finally giving up
+                // (e.g. accessing a documented static/instance property
+                // on `String`/`Database`/... -- properties have no
+                // overloads, so this is a plain existence-plus-type
+                // lookup, unlike the method-call arm's narrowing).
+                let property = self.stdlib.property(&object, name);
+                let resolution = match property {
+                    Some(_) => Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                        self.stdlib,
+                        &object,
+                        Some(name),
+                    ))),
                     None => Resolution::Unresolved,
                 };
                 self.refs.set_with_highlight(ptr, highlight, resolution);
-                return field_schema
-                    .and_then(|f| f.reference_to.first())
-                    .map(|next| Ty::system_owned(next.clone(), Vec::new()));
+                return property.and_then(|p| p.type_name.as_deref()).map(|type_name| {
+                    let (base, args) = apex_stdlib::split_generic_type(type_name);
+                    Ty::system_owned(base, args.into_iter().map(|a| Ty::system_owned(a, Vec::new())).collect())
+                });
             }
             // `target_type` is entirely unknown -- honestly `Unresolved`
             // rather than a guess.
@@ -1521,17 +1649,33 @@ impl<'a> BodyBinder<'a> {
                 result_type
             }
             Some(Ty::System { name: base, args }) => {
-                // No `SymbolId` backs a built-in generic method -- there's
-                // no real declaration for goto-definition to point at --
-                // so the *reference* stays honestly `Unresolved` even
-                // when the *type* it returns is known (see
-                // `crate::generics`'s module doc comment). The returned
-                // `Ty` still flows upward for further chaining, e.g.
-                // `myList.get(0).Name` resolving `Name` when the list's
-                // element type is project-local.
-                self.refs
-                    .set_with_highlight(ptr, highlight, Resolution::Unresolved);
-                crate::generics::builtin_generic_member_type(&base, &args, name)
+                // No `SymbolId` backs either a built-in generic method or
+                // a scraped stdlib one -- there's no real declaration for
+                // goto-definition to point at -- but a *real, documented*
+                // stdlib member (checked via `self.stdlib`, independent
+                // of whichever `Ty` ends up propagating) still escapes
+                // `Unresolved` into `Resolution::StdlibMember`, so a
+                // genuine typo stays distinguishable from a real call --
+                // see `crate::reference_table::Resolution`'s own doc
+                // comment on why that distinction exists at all.
+                let resolution = match self.stdlib.method(&base, name) {
+                    Some(_) => {
+                        Resolution::StdlibMember(Box::new(stdlib_member_ref(self.stdlib, &base, Some(name))))
+                    }
+                    None => Resolution::Unresolved,
+                };
+                self.refs.set_with_highlight(ptr, highlight, resolution);
+                // `generics.rs` handles type-*argument substitution*
+                // (`List<Account>.get(0)` returning `Account`, not
+                // whatever a raw scraped signature says) -- tried first,
+                // and always wins when it applies. Only when it doesn't
+                // (a non-generic class entirely, or a `List`/`Map`/`Set`
+                // member `generics.rs` doesn't model, like `sort`/
+                // `addAll`, which need no substitution anyway) does the
+                // scraped, best-effort-narrowed return type get used.
+                crate::generics::builtin_generic_member_type(&base, &args, name).or_else(|| {
+                    narrow_stdlib_overload_type(self.table, self.stdlib, &base, name, &arg_types)
+                })
             }
             None => {
                 self.refs
