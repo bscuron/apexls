@@ -26,7 +26,7 @@ pub(crate) fn parse_field_meta(xml: &str, source_path: PathBuf) -> Option<FieldS
         api_name,
         field_type,
         reference_to,
-        source_path,
+        source_path: Some(source_path),
     })
 }
 

@@ -117,6 +117,7 @@ dependencies = [
  "apex-discover",
  "apex-metadata",
  "apex-parser",
+ "apex-stdlib",
  "apex-syntax",
  "criterion",
  "dhat",
@@ -180,6 +181,16 @@ version = "0.1.0"
 dependencies = [
  "apex-parser",
  "apex-syntax",
+]
+
+[[package]]
+name = "apex-stdlib"
+version = "0.1.0"
+dependencies = [
+ "apex-metadata",
+ "serde",
+ "serde_json",
+ "smol_str",
 ]
 
 [[package]]

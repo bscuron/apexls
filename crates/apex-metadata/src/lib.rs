@@ -72,16 +72,18 @@ pub struct FieldSchema {
     /// lossless operation layered on top of this.
     pub field_type: Option<SmolStr>,
     /// The target object(s) of a `Lookup`/`MasterDetail` field -- more
-    /// than one only for a polymorphic lookup (e.g. `Task.WhoId`, which
-    /// itself is a standard field and so never appears here, but custom
-    /// polymorphic lookups follow the same shape).
+    /// than one only for a polymorphic lookup (e.g. a custom polymorphic
+    /// lookup declared locally; a *standard* polymorphic lookup like
+    /// `Task.WhoId` instead comes from `apex_stdlib`'s bundled schema,
+    /// not this crate's own file-based discovery).
     pub reference_to: Vec<SmolStr>,
-    /// The path to this field's own `.field-meta.xml` -- always present
-    /// (unlike `SObjectSchema::object_path`), since every `FieldSchema`
-    /// is, by construction, parsed from a real file. A goto-definition
-    /// target for a field reference (`Account.My_Field__c`, a SOQL
-    /// relationship-field chain segment, ...).
-    pub source_path: PathBuf,
+    /// The path to this field's own `.field-meta.xml`, when parsed from
+    /// a real local file (every `FieldSchema` this crate itself
+    /// constructs has one). `None` for a field that came from a bundled
+    /// standard-schema snapshot instead (`apex_stdlib`) -- there's no
+    /// local file to jump to, matching `SObjectSchema::object_path`'s
+    /// existing `None` case for the same reason.
+    pub source_path: Option<PathBuf>,
 }
 
 #[cfg(test)]

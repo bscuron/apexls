@@ -37,6 +37,17 @@
 //! same span class, e.g. "Used with `BillingLongitude` to specify...",
 //! which would be wrongly swept in by a whole-row search) and emits one
 //! [`FieldModel`] per name, all sharing that row's one details block.
+//!
+//! A lookup/master-detail field additionally has `Relationship Name`/
+//! `Relationship Type`/`Refers To` `<dt>`/`<dd>` pairs after `Type`/
+//! `Properties`/`Description`; `Refers To` (captured into
+//! `FieldModel::reference_to`) is comma-separated for a polymorphic
+//! field (e.g. `Task.OwnerId` -> `"Group, User"`). Pairing each `<dt>`
+//! with *every* `<dd>` up to the next `<dt>` (not a positional 1:1 zip)
+//! is what makes this reliable: a multi-paragraph `Description` really
+//! does have more than one `<dd>` for real (confirmed:
+//! `Task.AccountId`'s page has 6 `<dt>`s but 7 `<dd>`s), and a
+//! positional zip would silently shift every label after it.
 
 use crate::model::{FieldModel, ObjectModel};
 use scraper::{ElementRef, Html, Selector};
@@ -86,31 +97,52 @@ fn parse_field_row(
             .collect();
     };
 
-    let dt_sel = selector("dt");
-    let dd_sel = selector("dd");
-    let dts: Vec<String> = details
-        .select(&dt_sel)
-        .map(|dt| dt.text().collect::<String>().trim().to_string())
-        .collect();
-    let dds: Vec<String> = details
-        .select(&dd_sel)
-        .map(|dd| dd.text().collect::<String>().trim().to_string())
-        .collect();
+    // A `<dt>` can be followed by *more than one* `<dd>` -- confirmed
+    // real, not hypothetical: a multi-paragraph `Description` routinely
+    // has a second, unlabeled `<dd>` (e.g. `Task.AccountId`'s real page
+    // has 6 `<dt>`s but 7 `<dd>`s, the extra one being a bare "This is a
+    // relationship field." sentence tacked onto `Description`). Pairing
+    // `dt`s and `dd`s positionally (`zip`) silently misaligns every
+    // label *after* the first multi-`<dd>` one -- `Relationship Name`
+    // would wrongly get that stray sentence's text, cascading through
+    // `Relationship Type` and `Refers To` and dropping the real, final
+    // `Refers To` value off the end entirely. Selecting `dt, dd` in one
+    // pass preserves true document order, so each `<dt>` can correctly
+    // claim every `<dd>` up to the next `<dt>` instead.
+    let dt_dd_sel = selector("dt, dd");
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    for el in details.select(&dt_dd_sel) {
+        let text = el.text().collect::<String>().trim().to_string();
+        if el.value().name() == "dt" {
+            sections.push((text, Vec::new()));
+        } else if let Some((_, values)) = sections.last_mut() {
+            values.push(text);
+        }
+    }
 
     let mut field_type = None;
     let mut properties = Vec::new();
     let mut description = None;
-    for (label, value) in dts.iter().zip(dds.iter()) {
+    let mut reference_to = Vec::new();
+    for (label, values) in &sections {
+        let joined = values.join(" ");
         match label.as_str() {
-            "Type" => field_type = Some(value.clone()),
+            "Type" => field_type = Some(joined),
             "Properties" => {
-                properties = value
+                properties = joined
                     .split(',')
                     .map(|p| p.trim().to_string())
                     .filter(|p| !p.is_empty())
                     .collect()
             }
-            "Description" => description = Some(value.clone()),
+            "Description" => description = Some(joined),
+            "Refers To" => {
+                reference_to = joined
+                    .split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            }
             _ => {}
         }
     }
@@ -122,6 +154,7 @@ fn parse_field_row(
             field_type: field_type.clone(),
             properties: properties.clone(),
             description: description.clone(),
+            reference_to: reference_to.clone(),
         })
         .collect()
 }
@@ -198,6 +231,7 @@ mod tests {
         assert_eq!(account_id.field_type.as_deref(), Some("reference"));
         assert!(account_id.properties.contains(&"Nillable".to_string()));
         assert!(account_id.description.is_some());
+        assert_eq!(account_id.reference_to, vec!["Account".to_string()]);
     }
 
     /// `ListView` uses `data-title="Name"` for its field-name column --
@@ -254,6 +288,49 @@ mod tests {
             .expect("ChildProductId should have been parsed");
         assert_eq!(child_product_id.field_type.as_deref(), Some("reference"));
         assert!(child_product_id.properties.contains(&"Create".to_string()));
+        assert_eq!(child_product_id.reference_to, vec!["Product2".to_string()]);
+    }
+
+    /// Real, confirmed bug this fix closes: a `<dt>` can be followed by
+    /// *more than one* `<dd>` (a multi-paragraph `Description`, e.g. a
+    /// bare "This is a relationship field." sentence tacked on after the
+    /// real description text) -- `Task.AccountId`'s real page has 6
+    /// `<dt>`s but 7 `<dd>`s. Pairing them positionally (the original
+    /// implementation) silently shifts every label after the first
+    /// multi-`<dd>` one: `Relationship Name` would wrongly get that
+    /// stray sentence, cascading through `Relationship Type` and
+    /// `Refers To`, dropping the real `Refers To` value off the end
+    /// entirely. `Task.OwnerId` additionally confirms a *polymorphic*
+    /// lookup's `Refers To` is comma-separated (`"Group, User"`), not a
+    /// single value.
+    #[test]
+    fn pairs_multi_paragraph_descriptions_correctly_and_splits_polymorphic_refers_to() {
+        let fixture = load_fixture("sforce_api_objects_task.json");
+        let title = fixture["title"].as_str().unwrap();
+        let content = fixture["content"].as_str().unwrap();
+        let object = parse_object_page("sforce_api_objects_task", title, content);
+
+        let account_id = object
+            .fields
+            .iter()
+            .find(|f| f.name == "AccountId")
+            .expect("AccountId should have been parsed");
+        assert_eq!(account_id.reference_to, vec!["Account".to_string()]);
+        assert!(
+            account_id.description.as_deref().unwrap_or_default().contains("relationship field"),
+            "the second, unlabeled Description <dd> should still be captured, got {:?}",
+            account_id.description
+        );
+
+        let owner_id = object
+            .fields
+            .iter()
+            .find(|f| f.name == "OwnerId")
+            .expect("OwnerId should have been parsed");
+        assert_eq!(
+            owner_id.reference_to,
+            vec!["Group".to_string(), "User".to_string()]
+        );
     }
 
     /// Some rows document several fields against one shared

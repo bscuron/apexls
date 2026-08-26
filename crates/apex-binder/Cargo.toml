@@ -8,6 +8,7 @@ license.workspace = true
 apex-syntax.workspace = true
 apex-parser.workspace = true
 apex-metadata.workspace = true
+apex-stdlib.workspace = true
 apex-discover.workspace = true
 rowan = "0.17.0"
 rayon = "1.12.0"

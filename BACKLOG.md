@@ -899,14 +899,29 @@ precision" -- they directly block shipping certain features honestly.
       (large, ongoing maintenance burden as Salesforce ships new
       System-namespace APIs 3x/year), or generate one from a connected
       org's Tooling API/Apex reflection.
-- [ ] **No standard SObject/field schema** (`Account`, `Contact`,
-      `Opportunity`, ...) locally -- `apex-metadata`'s documented gap.
-      Same two options as above: bundled snapshot (goes stale) or a
-      live org describe call (the same `sf`/Tooling API oracle already
-      used to verify grammar questions against a real org earlier in
-      this project). This is the more tractable of the two "unmodeled
-      Salesforce surface" gaps, since describe calls are a solved,
-      already-integrated pattern for this project.
+- [x] **No standard SObject/field schema -- done, via a bundled
+      snapshot.** New `crates/apex-stdlib` crate embeds a schema
+      snapshot scraped directly from Salesforce's own Object Reference
+      documentation (`tools/salesforce-doc-scraper`, offline, run once
+      per Apex release -- never a runtime network call), converted into
+      `apex_metadata::SObjectSchema`/`FieldSchema` values and merged
+      into `SchemaIndex` (`schema_index::merge_sobjects`) alongside a
+      project's own locally-discovered custom objects/fields, local
+      taking precedence on a name collision. No `crate::resolve` code
+      changed at all: `bind_field_expr`'s existing `schema.field(...)`/
+      `schema.object(...)` branch just started finding real data, so
+      `Account.Name` now resolves `Resolution::SchemaObject` instead of
+      `UnknownSchema`, and a standard lookup field's `reference_to`
+      (also newly captured by the scraper) continues the type chain
+      through multi-hop field access the same way a local custom
+      lookup's already did. Confirmed on the real NPSP corpus:
+      `resolution_regression_baseline.rs`'s `Unresolved` count dropped
+      by 3,250 (152,539 -> 149,289) with zero change to `Resolved`
+      (`SchemaObject` isn't tallied either way). **What this doesn't
+      do:** model standard-library *classes/methods* (`String`,
+      `Database`, ...) -- that's the separate, still-open gap below,
+      confirmed to need a different design (no `SymbolId`-based
+      resolution path exists for a method call today).
 - [x] **Real type inference beyond one-hop chaining -- done, honestly
       bounded.** A new `Ty` value (`crates/apex-binder/src/ty.rs`,
       walker-internal only, never stored on `BoundProgram`/`Resolution`)

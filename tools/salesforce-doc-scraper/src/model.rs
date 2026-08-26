@@ -81,4 +81,10 @@ pub struct FieldModel {
     /// documents for itself (forward-compatible, lossless).
     pub properties: Vec<String>,
     pub description: Option<String>,
+    /// The doc's own `Refers To` row for a lookup/master-detail field --
+    /// the target object(s) it can point at, e.g. `["Account"]` or, for
+    /// a polymorphic field like `Task.OwnerId`, `["Group", "User"]`
+    /// (confirmed comma-separated in the real `<dd>` text). Empty for a
+    /// non-relationship field.
+    pub reference_to: Vec<String>,
 }

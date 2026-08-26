@@ -59,8 +59,19 @@ fn corpus_root() -> PathBuf {
 /// (after the dotted-nested-type, dynamic-dispatch, and ambiguous-
 /// overload-chaining fixes). Update alongside any change that
 /// legitimately moves them -- see this module's own doc comment.
+///
+/// `BASELINE_UNRESOLVED` was tightened from `152_539` to `149_289` when
+/// `apex_stdlib`'s bundled standard SObject/field schema was wired into
+/// `SchemaIndex` (`crates/apex-binder/src/schema_index.rs::merge_sobjects`):
+/// 3,250 real standard-field accesses (`Account.Name` and the like) that
+/// used to fall all the way through to `Resolution::Unresolved` now
+/// correctly land in `Resolution::SchemaObject` instead -- which this
+/// test deliberately doesn't tally either way (see this module's own
+/// doc comment on why `SchemaObject`/`UnknownSchema`/`Candidates` are
+/// excluded from both counts), so `BASELINE_RESOLVED` itself is
+/// unaffected.
 const BASELINE_RESOLVED: usize = 204_984;
-const BASELINE_UNRESOLVED: usize = 152_539;
+const BASELINE_UNRESOLVED: usize = 149_289;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

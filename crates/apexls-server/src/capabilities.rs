@@ -106,7 +106,7 @@ pub(crate) fn ptr_location(
 /// still far more useful than no goto-definition support at all.
 pub(crate) fn schema_location(program: &BoundProgram, r: &SchemaObjectRef) -> Option<Location> {
     let path: &std::path::Path = match &r.field {
-        Some(field) => &program.schema.field(&r.object, field)?.source_path,
+        Some(field) => program.schema.field(&r.object, field)?.source_path.as_deref()?,
         None => program.schema.object(&r.object)?.object_path.as_deref()?,
     };
     let uri = Url::from_file_path(path).ok()?;

@@ -5,6 +5,7 @@ members = [
     "crates/apex-discover",
     "crates/apex-lexer",
     "crates/apex-metadata",
+    "crates/apex-stdlib",
     "crates/apex-syntax",
     "crates/apex-parser",
     "crates/apex-printer",
@@ -23,6 +24,7 @@ apex-binder = { path = "crates/apex-binder" }
 apex-discover = { path = "crates/apex-discover" }
 apex-lexer = { path = "crates/apex-lexer" }
 apex-metadata = { path = "crates/apex-metadata" }
+apex-stdlib = { path = "crates/apex-stdlib" }
 apex-syntax = { path = "crates/apex-syntax" }
 apex-parser = { path = "crates/apex-parser" }
 apex-printer = { path = "crates/apex-printer" }
