@@ -10,6 +10,7 @@ members = [
     "crates/apex-printer",
     "crates/apexls",
     "crates/apexls-server",
+    "tools/salesforce-doc-scraper",
 ]
 
 [workspace.package]
