@@ -91,6 +91,43 @@ pub enum Resolution {
     Unresolved,
 }
 
+/// A stable identity key for a reference that names something real but
+/// has no `SymbolId` to key by -- a Salesforce object/field
+/// (`SchemaObject`/`UnknownSchema`) or a stdlib class/member
+/// (`StdlibMember`). The exact non-`SymbolId` counterpart of
+/// `ReferenceTable::by_symbol`'s `SymbolId` key: built once by
+/// `Resolution::external_key` and used identically at both insert time
+/// (`ReferenceTable::set`) and query time
+/// (`BoundProgram::references_to_external`), so the two always agree by
+/// construction. `SchemaObject` and `UnknownSchema` deliberately share
+/// `Schema`'s shape -- the same real Salesforce field can resolve as
+/// either depending only on whether `apex-metadata` happens to have
+/// local schema for it, and "every reference to `Account.Name`" should
+/// find both kinds together, not split by that implementation detail.
+///
+/// Every string component is lowercased on construction rather than
+/// kept case-preserving the way `crate::ci_key::CiKey`/`CiMap` are
+/// elsewhere in this crate -- those exist to make a *hot-path* lookup
+/// (run once per reference during every bind, over the whole corpus)
+/// allocation-free; this key is built at most once per reference at
+/// bind time and once per `textDocument/references`/`documentHighlight`
+/// request, so there's no case to make for that extra complexity here.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExternalKey {
+    Schema {
+        object: SmolStr,
+        field: Option<SmolStr>,
+    },
+    Stdlib {
+        class_name: SmolStr,
+        member: Option<SmolStr>,
+    },
+}
+
+fn lower(s: &str) -> SmolStr {
+    SmolStr::new(s.to_ascii_lowercase())
+}
+
 impl Resolution {
     /// Applies `f` to every `SymbolId` this resolution references --
     /// used to translate a Pass-2 body's local sentinel ids
@@ -121,6 +158,31 @@ impl Resolution {
             | Resolution::Unresolved => &[],
         }
     }
+
+    /// This resolution's key in `ReferenceTable::by_external`, for every
+    /// variant that names something real but isn't `SymbolId`-backed --
+    /// `None` for `Resolved`/`Candidates` (already keyed by `symbol_ids`
+    /// instead), `Unresolved` (nothing to key), and an `UnknownSchema`
+    /// with no object name at all (`UnknownSchemaRef { object: None, .. }`,
+    /// never actually produced by any real construction site today, but
+    /// there's nothing to group by if it were).
+    pub fn external_key(&self) -> Option<ExternalKey> {
+        match self {
+            Resolution::SchemaObject(r) => Some(ExternalKey::Schema {
+                object: lower(&r.object),
+                field: r.field.as_deref().map(lower),
+            }),
+            Resolution::UnknownSchema(r) => Some(ExternalKey::Schema {
+                object: lower(r.object.as_deref()?),
+                field: r.field.as_deref().map(lower),
+            }),
+            Resolution::StdlibMember(r) => Some(ExternalKey::Stdlib {
+                class_name: lower(&r.class_name),
+                member: r.member.as_deref().map(lower),
+            }),
+            Resolution::Resolved(_) | Resolution::Candidates(_) | Resolution::Unresolved => None,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -138,6 +200,13 @@ pub struct ReferenceTable {
     /// comment) -- there's no persistent-across-rebuilds mutation or
     /// stale-entry cleanup to reason about, same as `resolutions` itself.
     by_symbol: FxHashMap<SymbolId, Vec<SyntaxPtr>>,
+    /// Reverse of `resolutions`, the `ExternalKey` counterpart of
+    /// `by_symbol` -- every `SyntaxPtr` whose `Resolution` names the same
+    /// real Salesforce object/field or stdlib class/member, for the
+    /// three `Resolution` variants that have no `SymbolId` to key by
+    /// (`SchemaObject`/`UnknownSchema`/`StdlibMember`). Maintained
+    /// incrementally the same way and for the same reason as `by_symbol`.
+    by_external: FxHashMap<ExternalKey, Vec<SyntaxPtr>>,
     /// Narrower highlight range for a reference whose own `SyntaxPtr::range()`
     /// spans more than just its identifying token -- a method/constructor
     /// call node's range covers target-through-closing-paren, a
@@ -157,6 +226,9 @@ impl ReferenceTable {
     pub(crate) fn set(&mut self, reference: SyntaxPtr, resolution: Resolution) {
         for &id in resolution.symbol_ids() {
             self.by_symbol.entry(id).or_default().push(reference);
+        }
+        if let Some(key) = resolution.external_key() {
+            self.by_external.entry(key).or_default().push(reference);
         }
         self.resolutions.insert(reference, resolution);
     }
@@ -213,6 +285,12 @@ impl ReferenceTable {
         self.by_symbol.get(&id).map_or(&[], |v| v.as_slice())
     }
 
+    /// Every `SyntaxPtr` whose `Resolution` shares `key` -- the
+    /// `ExternalKey` counterpart of `Self::references_to`.
+    pub fn references_to_external(&self, key: &ExternalKey) -> &[SyntaxPtr] {
+        self.by_external.get(key).map_or(&[], |v| v.as_slice())
+    }
+
     /// Consumes this table, applying `f` to every `SymbolId` any entry
     /// references (the whole-table counterpart to `Resolution::map_ids`),
     /// and folds the result directly into `target` -- used to merge one
@@ -237,6 +315,9 @@ impl ReferenceTable {
             let remapped = res.map_ids(f);
             for &id in remapped.symbol_ids() {
                 target.by_symbol.entry(id).or_default().push(ptr);
+            }
+            if let Some(key) = remapped.external_key() {
+                target.by_external.entry(key).or_default().push(ptr);
             }
             target.resolutions.insert(ptr, remapped);
         }

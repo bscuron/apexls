@@ -30,7 +30,10 @@ needed" list is checked off: `textDocument/hover`, `textDocument/definition`,
 `textDocument/documentSymbol`, `workspace/symbol`, `textDocument/foldingRange`,
 `textDocument/selectionRange`. `textDocument/references`/`textDocument/documentHighlight`
 are also now done, backed by a new incrementally-maintained reverse
-index on `ReferenceTable` (`by_symbol`). `textDocument/rename` is done
+index on `ReferenceTable` (`by_symbol`, plus a second `by_external`
+index keyed by a new `ExternalKey` so a real stdlib method/property or
+Salesforce schema field -- neither of which has a `SymbolId` -- is also
+found). `textDocument/rename` is done
 too, conservatively scoped (refuses rather than guesses on an ambiguous
 target, an override-chain method, or a colliding name) and preceded by
 a new `crate::conversions` module that narrows most real-world overload
@@ -608,6 +611,32 @@ supports each one.
       protocol-level, spawns the real binary, proves the project-wide
       index actually crosses file boundaries and that
       `includeDeclaration` behaves correctly).
+
+      **Follow-up, closed:** the `by_symbol` index above only ever keys
+      by `SymbolId`, so a reference to a real Salesforce field
+      (`SchemaObject`/`UnknownSchema`) or a real stdlib class/method/
+      enum value (`StdlibMember`) had nowhere to be indexed at all --
+      `references`/`documentHighlight` on `String.isBlank(...)` or a
+      SOQL `FROM My_Object__c` silently reported zero results, no matter
+      how many other call sites existed. Fixed with a second, parallel
+      reverse index, `ReferenceTable::by_external`, keyed by a new
+      `ExternalKey` (`reference_table.rs`) built from `Resolution::external_key`
+      -- `SchemaObject`/`UnknownSchema` share one `ExternalKey::Schema`
+      shape (the same real field can resolve as either depending only on
+      whether `apex-metadata` has local schema for it, and a lookup
+      should find both together), `StdlibMember` gets `ExternalKey::Stdlib`.
+      Maintained by the same `set`/`map_ids_into` call sites as
+      `by_symbol`, queried via new `BoundProgram::references_to_external`/
+      `references_to_external_in_file`. Unlike `by_symbol`'s case-preserving
+      `CiKey`, `ExternalKey`'s string components are plain lowercased
+      `SmolStr`s -- this index is built/queried at human-interaction
+      rates (once per reference at bind time, once per LSP request), not
+      the per-reference-during-every-resolution hot path `CiKey` exists
+      for, so there's no case to make for that extra complexity here.
+      Verified via `crates/apexls-server/tests/references_highlight.rs`
+      (a stdlib method call site across two files, and a SOQL object
+      reference across two files plus its `.object-meta.xml` declaration
+      via `includeDeclaration`).
 - [x] `textDocument/rename` (+ `prepareRename`) -- **done, deliberately
       scoped conservatively.** Two pieces landed together, in this order:
       1. **Overload-narrowing precision, first** (the actual blocker this
@@ -792,6 +821,25 @@ supports each one.
       and `crates/apexls-server/tests/call_hierarchy.rs` (protocol-level,
       the full prepare-then-incoming/outgoing round trip against the real
       binary).
+
+      **Known gap, not yet closed:** `outgoing_calls` matches a call
+      site's `Resolution` against `Resolved`/`Candidates` only --
+      `_ => continue` silently drops a call to a real stdlib method
+      (`String.isBlank(...)`) or a schema-backed reference, the exact
+      same `SymbolId`-only blind spot `references`/`documentHighlight`
+      used to have before `ExternalKey`/`by_external` (see this section's
+      `textDocument/references` item above) fixed it for those two.
+      Closing this one is a strictly bigger lift than that fix was,
+      though, not a copy of it: `OutgoingCall`/`CallHierarchyItem` are
+      built around a `SymbolId` end-to-end (a real declaration to build a
+      `selection_range`/`uri` from), and a stdlib method has no location
+      to build one from at all -- `prepareCallHierarchy` couldn't
+      construct an item to *root* a hierarchy at a stdlib method either,
+      even before `outgoingCalls`/`incomingCalls` get involved.
+      `incoming_calls` doesn't have a symmetric version of this gap:
+      nothing project-local ever *calls into* something external in a
+      way this analysis could observe (`by_external`'s consumer is
+      always the reference itself, not a caller of it).
 - [ ] `textDocument/inlayHint` -- e.g. inferred local types; blocked on
       the same type-inference limits as §4.
 

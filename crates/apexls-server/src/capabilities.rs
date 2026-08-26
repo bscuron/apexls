@@ -475,6 +475,17 @@ fn targets_at(program: &BoundProgram, file: FileId, offset: TextSize) -> Vec<Sym
 /// the symbol at `file`/`offset`, via `BoundProgram::references_to`'s
 /// reverse-index lookup (`BACKLOG.md` §3) -- not a scan. `include_declaration`
 /// additionally prepends each target's own declaration site.
+///
+/// Also handles a cursor on a `SchemaObject`/`UnknownSchema`/`StdlibMember`
+/// reference (a real Salesforce field or stdlib class/member, neither of
+/// which has a `SymbolId` for `targets_at`/`references_to` to key on) via
+/// `Resolution::external_key`/`BoundProgram::references_to_external`'s
+/// parallel reverse index -- see that type's own doc comment for why
+/// this needs a second index rather than reusing `by_symbol`.
+/// `include_declaration` only ever adds something for `SchemaObject`
+/// (`schema_location`'s `.object-meta.xml` target) -- `UnknownSchema`/
+/// `StdlibMember` are both, by construction, real things with no local
+/// declaration site at all (see `Resolution`'s own doc comment).
 pub(crate) fn references(
     program: &BoundProgram,
     file: FileId,
@@ -496,6 +507,22 @@ pub(crate) fn references(
             .references_to(id)
             .filter_map(|ptr| ptr_location(program, ptr, encoding))
     }));
+
+    if let Some(resolution) = program.resolution_at(file, offset) {
+        if let Some(key) = resolution.external_key() {
+            if include_declaration {
+                if let Resolution::SchemaObject(r) = resolution {
+                    locations.extend(schema_location(program, r));
+                }
+            }
+            locations.extend(
+                program
+                    .references_to_external(&key)
+                    .filter_map(|ptr| ptr_location(program, ptr, encoding)),
+            );
+        }
+    }
+
     locations
 }
 
@@ -509,6 +536,11 @@ pub(crate) fn references(
 /// has no assignment-target tracking to base one on, so every highlight
 /// stays the LSP-default `Text` kind (`kind: None`) rather than inventing
 /// a distinction the resolver doesn't actually make.
+///
+/// Also covers a `SchemaObject`/`UnknownSchema`/`StdlibMember` reference
+/// via `BoundProgram::references_to_external_in_file` -- see `references`'s
+/// own doc comment above for why that needs a separate, non-`SymbolId`
+/// lookup.
 pub(crate) fn document_highlights(
     program: &BoundProgram,
     file: FileId,
@@ -532,6 +564,18 @@ pub(crate) fn document_highlights(
             }
         }
     }
+
+    if let Some(key) = program
+        .resolution_at(file, offset)
+        .and_then(Resolution::external_key)
+    {
+        for ptr in program.references_to_external_in_file(file, &key) {
+            if let Some(loc) = ptr_location(program, ptr, encoding) {
+                ranges.push(loc.range);
+            }
+        }
+    }
+
     ranges
         .into_iter()
         .map(|range| DocumentHighlight { range, kind: None })

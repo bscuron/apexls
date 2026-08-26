@@ -3,6 +3,13 @@
 //! `hover_definition.rs`'s exact pattern (spawn the real binary, drive
 //! it over real stdio, wait for the background rebuild's "rebuild
 //! complete" stderr line before sending a position-based request).
+//!
+//! Also covers the `ExternalKey`-backed lookup (`SchemaObject`/
+//! `StdlibMember` references, which have no `SymbolId` for the
+//! original `SymbolId`-only reverse index to key on) -- before that was
+//! added, a real stdlib method call or SOQL object reference always
+//! reported zero references/highlights, regardless of how many other
+//! call sites existed.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -50,7 +57,9 @@ fn write_fixture_dir(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("apexls-server-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for (file_name, src) in files {
-        std::fs::write(dir.join(file_name), src).unwrap();
+        let path = dir.join(file_name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, src).unwrap();
     }
     dir
 }
@@ -365,6 +374,129 @@ fn references_reports_only_the_method_name_range_not_the_whole_call() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `Resolution::StdlibMember` used to be a dead end for `references`:
+/// `targets_at` only ever produced `SymbolId`s (from `symbol_at` or a
+/// `Resolved`/`Candidates` resolution), so a real stdlib method like
+/// `String.isBlank` had no reverse index to look itself up in at all --
+/// confirms `ExternalKey`/`references_to_external` now finds every call
+/// site project-wide, the same way a project-local method's `SymbolId`
+/// already did.
+#[test]
+fn references_finds_every_call_site_of_a_real_stdlib_method() {
+    const CALLER_A_SRC: &str =
+        "public class CallerA {\n    public void run() { Boolean b = String.isBlank('x'); }\n}\n";
+    const CALLER_B_SRC: &str =
+        "public class CallerB {\n    public void run() { Boolean b = String.isBlank('y'); }\n}\n";
+
+    let dir = write_fixture_dir(
+        "references-stdlib-method",
+        &[("CallerA.cls", CALLER_A_SRC), ("CallerB.cls", CALLER_B_SRC)],
+    );
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let caller_a_uri = Url::from_file_path(dir.join("CallerA.cls")).unwrap();
+    let caller_b_uri = Url::from_file_path(dir.join("CallerB.cls")).unwrap();
+
+    let mut session = Session::start(&root_uri, &caller_a_uri, CALLER_A_SRC);
+
+    let (line, character) = position_of(CALLER_A_SRC, "isBlank");
+    let response = session.request(
+        2,
+        "textDocument/references",
+        serde_json::json!({
+            "textDocument": { "uri": caller_a_uri },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": true },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "references returned an error: {response:?}"
+    );
+    let result = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a Location array, got {response:?}"));
+    // No declaration site to add (a stdlib method has no local file), so
+    // `includeDeclaration: true` shouldn't add anything beyond the two
+    // real call sites -- CallerA's own and CallerB's.
+    assert_eq!(
+        result.len(),
+        2,
+        "expected both call sites, no phantom declaration: {result:?}"
+    );
+    let uris: Vec<&str> = result.iter().map(|l| l["uri"].as_str().unwrap()).collect();
+    assert!(uris.contains(&caller_a_uri.as_str()));
+    assert!(uris.contains(&caller_b_uri.as_str()));
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `SchemaObject` counterpart of the stdlib test above: a SOQL
+/// `FROM My_Object__c` in two files should find each other, and
+/// `includeDeclaration: true` should additionally surface the object's
+/// own `.object-meta.xml` (`schema_location`, already exercised by
+/// `schema_goto_definition.rs`'s `definition` test -- this confirms the
+/// same lookup is now also wired into `references`).
+#[test]
+fn references_finds_every_soql_reference_to_a_local_custom_object_and_its_declaration() {
+    const QUERY_A_SRC: &str = "public class QueryA {\n    public void run() { List<SObject> rows = [SELECT Id FROM My_Object__c]; }\n}\n";
+    const QUERY_B_SRC: &str = "public class QueryB {\n    public void run() { List<SObject> rows = [SELECT Id FROM My_Object__c]; }\n}\n";
+    let object_meta = r#"<?xml version="1.0" encoding="UTF-8"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>My Object</label>
+</CustomObject>"#;
+
+    let dir = write_fixture_dir(
+        "references-schema-object",
+        &[
+            ("QueryA.cls", QUERY_A_SRC),
+            ("QueryB.cls", QUERY_B_SRC),
+            (
+                "objects/My_Object__c/My_Object__c.object-meta.xml",
+                object_meta,
+            ),
+        ],
+    );
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let query_a_uri = Url::from_file_path(dir.join("QueryA.cls")).unwrap();
+    let query_b_uri = Url::from_file_path(dir.join("QueryB.cls")).unwrap();
+    let object_meta_uri =
+        Url::from_file_path(dir.join("objects/My_Object__c/My_Object__c.object-meta.xml"))
+            .unwrap();
+
+    let mut session = Session::start(&root_uri, &query_a_uri, QUERY_A_SRC);
+
+    let (line, character) = position_of(QUERY_A_SRC, "My_Object__c");
+    let response = session.request(
+        2,
+        "textDocument/references",
+        serde_json::json!({
+            "textDocument": { "uri": query_a_uri },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": true },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "references returned an error: {response:?}"
+    );
+    let result = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a Location array, got {response:?}"));
+    assert_eq!(
+        result.len(),
+        3,
+        "expected the object-meta.xml declaration plus both queries: {result:?}"
+    );
+    let uris: Vec<&str> = result.iter().map(|l| l["uri"].as_str().unwrap()).collect();
+    assert!(uris.contains(&query_a_uri.as_str()));
+    assert!(uris.contains(&query_b_uri.as_str()));
+    assert!(uris.contains(&object_meta_uri.as_str()));
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn document_highlight_finds_every_occurrence_of_a_local_in_one_file() {
     const SRC: &str = "public class Widget {\n    \
@@ -400,6 +532,49 @@ fn document_highlight_finds_every_occurrence_of_a_local_in_one_file() {
         result.len(),
         3,
         "expected the declaration plus both occurrences on the next line: {result:?}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `document_highlight`'s own `ExternalKey` counterpart of the
+/// `references` stdlib test above -- two calls to the same stdlib
+/// method in one file should both highlight, scoped to that file via
+/// `BoundProgram::references_to_external_in_file`.
+#[test]
+fn document_highlight_finds_every_call_site_of_a_real_stdlib_method_in_one_file() {
+    const SRC: &str = "public class Widget {\n    \
+         public void run() {\n        \
+         Boolean a = String.isBlank('x');\n        \
+         Boolean b = String.isBlank('y');\n    \
+     }\n}\n";
+    let dir = write_fixture_dir("highlight-stdlib-method", &[("Widget.cls", SRC)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let widget_uri = Url::from_file_path(dir.join("Widget.cls")).unwrap();
+
+    let mut session = Session::start(&root_uri, &widget_uri, SRC);
+
+    let (line, character) = position_of(SRC, "isBlank('x')");
+    let response = session.request(
+        2,
+        "textDocument/documentHighlight",
+        serde_json::json!({
+            "textDocument": { "uri": widget_uri },
+            "position": { "line": line, "character": character },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "documentHighlight returned an error: {response:?}"
+    );
+    let result = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a DocumentHighlight array, got {response:?}"));
+    assert_eq!(
+        result.len(),
+        2,
+        "expected both isBlank call sites to highlight: {result:?}"
     );
 
     session.shutdown();

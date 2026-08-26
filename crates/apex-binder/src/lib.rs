@@ -59,7 +59,7 @@ pub use file_id::FileId;
 pub use incremental::BindCache;
 pub use ptr::{AstPtr, SyntaxPtr};
 pub use reference_table::{
-    ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef, UnknownSchemaRef,
+    ExternalKey, ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef, UnknownSchemaRef,
 };
 pub use schema_index::SchemaIndex;
 pub use stdlib_index::StdlibIndex;
@@ -960,6 +960,32 @@ impl BoundProgram {
             .get(&file)
             .into_iter()
             .flat_map(move |fb| fb.refs.references_to(id).iter().copied())
+    }
+
+    /// Every reference (project-wide) whose `Resolution` shares `key` --
+    /// the `ExternalKey` counterpart of `Self::references_to`, for a
+    /// `SchemaObject`/`UnknownSchema`/`StdlibMember` reference, none of
+    /// which have a `SymbolId` to look up by instead.
+    pub fn references_to_external<'a>(
+        &'a self,
+        key: &'a ExternalKey,
+    ) -> impl Iterator<Item = SyntaxPtr> + 'a {
+        self.bodies
+            .values()
+            .flat_map(move |fb| fb.refs.references_to_external(key).iter().copied())
+    }
+
+    /// Like [`Self::references_to_external`], scoped to one file -- the
+    /// cheaper path `textDocument/documentHighlight` uses.
+    pub fn references_to_external_in_file<'a>(
+        &'a self,
+        file: FileId,
+        key: &'a ExternalKey,
+    ) -> impl Iterator<Item = SyntaxPtr> + 'a {
+        self.bodies
+            .get(&file)
+            .into_iter()
+            .flat_map(move |fb| fb.refs.references_to_external(key).iter().copied())
     }
 
     pub fn scope_tree(&self, block: SyntaxPtr) -> Option<&ScopeTree> {
