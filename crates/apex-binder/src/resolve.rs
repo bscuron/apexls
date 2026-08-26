@@ -58,7 +58,7 @@ use crate::reference_table::{
 use crate::schema_index::{relationship_field_api_name, SchemaIndex};
 use crate::scope::{ScopeId, ScopeKind, ScopeTree};
 use crate::stdlib_index::StdlibIndex;
-use apex_stdlib::StdlibMethod;
+use apex_stdlib::{StdlibClass, StdlibMethod};
 use crate::symbol::{ModifierSet, Symbol, SymbolId, SymbolKind};
 use crate::symbol_table::SymbolTable;
 use crate::ty::Ty;
@@ -149,66 +149,79 @@ fn narrow_by_overload(
 
 /// A `Resolution::StdlibMember` reference for `class_name.member` (or
 /// just `class_name` itself, when `member` is `None` -- a bare class
-/// name used as a static-call receiver), looking `class_name` back up
-/// through `stdlib` just to capture its real (post-collision-tiebreak)
-/// namespace -- shared by every `Ty::System` arm that can produce this
-/// resolution.
+/// name used as a static-call receiver). `namespace` is the real (post-
+/// collision-tiebreak) namespace of `class_name`'s `StdlibClass`, which
+/// every call site already has in hand from its own `stdlib.class(...)`
+/// lookup (needed there to decide the `Resolution` in the first place),
+/// so this takes it directly instead of re-deriving it by name -- shared
+/// by every `Ty::System` arm that can produce this resolution.
 fn stdlib_member_ref(
-    stdlib: &StdlibIndex,
+    namespace: Option<SmolStr>,
     class_name: &str,
     member: Option<&str>,
     arg_count: Option<usize>,
 ) -> StdlibMemberRef {
     StdlibMemberRef {
-        namespace: stdlib.class(class_name).and_then(|c| c.namespace.clone()),
+        namespace,
         class_name: SmolStr::new(class_name),
         member: member.map(SmolStr::new),
         arg_count,
     }
 }
 
-/// Best-effort narrows `class_name.member`'s scraped overloads (arity,
-/// then `crate::conversions::type_compatible`) purely to pick a
-/// *propagated type* for continued chaining (`Database.query(soql).size()`)
-/// -- deliberately simpler than [`narrow_by_overload`]'s full three-stage
+/// Best-effort narrows `class.member`'s scraped overloads (arity, then
+/// `crate::conversions::type_compatible`) purely to pick a *propagated
+/// type* for continued chaining (`Database.query(soql).size()`) --
+/// deliberately simpler than [`narrow_by_overload`]'s full three-stage
 /// algorithm, since a stdlib reference's `Resolution` (`StdlibMember` vs.
 /// `Unresolved`) is already decided by mere name-existence before this
 /// ever runs; getting the exact overload right only affects how far a
 /// chained call keeps resolving, never whether this call itself does.
 /// Ambiguous (0 or 2+ survivors) -> `None`, same as the total absence of
 /// this information today -- never a guessed, possibly-wrong type.
+/// Takes an already-looked-up `class` (the caller needs it anyway, to
+/// decide the call's own `Resolution`) rather than a `stdlib`/
+/// `class_name` pair, and only collects the overloads into a `Vec` once
+/// it's confirmed there's more than one -- `member` overwhelmingly has
+/// just a single overload, and that common case returns without
+/// allocating at all.
 fn narrow_stdlib_overload_type(
     schema: &SchemaIndex,
     table: &SymbolTable,
-    stdlib: &StdlibIndex,
-    class_name: &str,
+    class: &'static StdlibClass,
     member: &str,
     arg_types: &[Option<Ty>],
 ) -> Option<Ty> {
-    let overloads: Vec<&StdlibMethod> = stdlib.methods(class_name, member).collect();
-    let by_arity: Vec<&StdlibMethod> = overloads
-        .iter()
-        .copied()
-        .filter(|m| m.params.len() == arg_types.len())
-        .collect();
-    let pool: &[&StdlibMethod] = if by_arity.is_empty() { &overloads } else { &by_arity };
+    let mut overloads = StdlibIndex::methods_of(class, member).peekable();
+    let first = overloads.next()?;
+    let winner = if overloads.peek().is_none() {
+        first
+    } else {
+        let overloads: Vec<&StdlibMethod> = std::iter::once(first).chain(overloads).collect();
+        let by_arity: Vec<&StdlibMethod> = overloads
+            .iter()
+            .copied()
+            .filter(|m| m.params.len() == arg_types.len())
+            .collect();
+        let pool: &[&StdlibMethod] = if by_arity.is_empty() { &overloads } else { &by_arity };
 
-    let winner = match pool {
-        [one] => Some(*one),
-        _ => {
-            let by_type: Vec<&StdlibMethod> = pool
-                .iter()
-                .copied()
-                .filter(|m| stdlib_args_compatible(schema, table, m, arg_types))
-                .collect();
-            match by_type.as_slice() {
-                [one] => Some(*one),
-                _ => None,
+        match pool {
+            [one] => *one,
+            _ => {
+                let by_type: Vec<&StdlibMethod> = pool
+                    .iter()
+                    .copied()
+                    .filter(|m| stdlib_args_compatible(schema, table, m, arg_types))
+                    .collect();
+                match by_type.as_slice() {
+                    [one] => *one,
+                    _ => return None,
+                }
             }
         }
     };
 
-    let return_type = winner?.return_type.as_deref()?;
+    let return_type = winner.return_type.as_deref()?;
     let (base, args) = apex_stdlib::split_generic_type(return_type);
     Some(Ty::system_owned(
         base,
@@ -1534,10 +1547,15 @@ impl<'a> BodyBinder<'a> {
         // (`String s;`) already worked before this -- `resolve_type_ref`
         // returns `Ty::system_owned` unconditionally for any unresolved
         // name, this is specifically the *expression*-position gap.
-        if self.stdlib.class(name).is_some() {
+        if let Some(class) = self.stdlib.class(name) {
             self.refs.set(
                 ptr,
-                Resolution::StdlibMember(Box::new(stdlib_member_ref(self.stdlib, name, None, None))),
+                Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                    class.namespace.clone(),
+                    name,
+                    None,
+                    None,
+                ))),
             );
             return Some(Ty::system_owned(SmolStr::new(name), Vec::new()));
         }
@@ -1593,10 +1611,11 @@ impl<'a> BodyBinder<'a> {
                 // on `String`/`Database`/... -- properties have no
                 // overloads, so this is a plain existence-plus-type
                 // lookup, unlike the method-call arm's narrowing).
-                let property = self.stdlib.property(&object, name);
+                let class = self.stdlib.class(&object);
+                let property = class.and_then(|c| StdlibIndex::property_of(c, name));
                 let resolution = match property {
                     Some(_) => Resolution::StdlibMember(Box::new(stdlib_member_ref(
-                        self.stdlib,
+                        class.and_then(|c| c.namespace.clone()),
                         &object,
                         Some(name),
                         None,
@@ -1692,9 +1711,10 @@ impl<'a> BodyBinder<'a> {
                 // genuine typo stays distinguishable from a real call --
                 // see `crate::reference_table::Resolution`'s own doc
                 // comment on why that distinction exists at all.
-                let resolution = match self.stdlib.method(&base, name) {
+                let class = self.stdlib.class(&base);
+                let resolution = match class.and_then(|c| StdlibIndex::methods_of(c, name).next()) {
                     Some(_) => Resolution::StdlibMember(Box::new(stdlib_member_ref(
-                        self.stdlib,
+                        class.and_then(|c| c.namespace.clone()),
                         &base,
                         Some(name),
                         Some(arg_types.len()),
@@ -1711,14 +1731,9 @@ impl<'a> BodyBinder<'a> {
                 // `addAll`, which need no substitution anyway) does the
                 // scraped, best-effort-narrowed return type get used.
                 crate::generics::builtin_generic_member_type(&base, &args, name).or_else(|| {
-                    narrow_stdlib_overload_type(
-                        self.schema,
-                        self.table,
-                        self.stdlib,
-                        &base,
-                        name,
-                        &arg_types,
-                    )
+                    class.and_then(|c| {
+                        narrow_stdlib_overload_type(self.schema, self.table, c, name, &arg_types)
+                    })
                 })
             }
             None => {

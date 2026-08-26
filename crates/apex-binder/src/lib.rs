@@ -248,7 +248,19 @@ impl BoundProgram {
         if need_fresh_discovery {
             hotpath::measure_block!("discover_and_build_schema", {
                 let discovery = apex_discover::discover(root);
-                let schema = Arc::new(SchemaIndex::from_discovery(&discovery));
+                // `SchemaIndex::from_discovery` and `global_stdlib_index`
+                // each trigger their own bundled JSON snapshot's one-time
+                // parse (`standard_objects.json`/`apex_reference.json`,
+                // hundreds of thousands of lines combined) the first time
+                // either runs in this process, and neither depends on the
+                // other's output -- running them via `rayon::join` instead
+                // of back-to-back roughly halves that one-time cold-start
+                // cost. `global_stdlib_index`'s own `OnceLock` makes the
+                // unconditional call below free once this has run.
+                let (schema, _) = rayon::join(
+                    || Arc::new(SchemaIndex::from_discovery(&discovery)),
+                    global_stdlib_index,
+                );
                 let vf_referenced_classes = Arc::new(
                     apex_metadata::visualforce::referenced_controller_classes(&discovery.page_files),
                 );

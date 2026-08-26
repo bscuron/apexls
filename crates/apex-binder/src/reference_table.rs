@@ -141,8 +141,20 @@ pub enum ExternalKey {
     },
 }
 
+/// `external_key()` calls this for every `SchemaObject`/`UnknownSchema`/
+/// `StdlibMember` reference in the whole project -- by far the majority
+/// of those, standard-library call sites, are already spelled in their
+/// canonical (already-lowercase-where-it-matters) case in real code, so
+/// checking first avoids `str::to_ascii_lowercase`'s unconditional
+/// `String` allocation (paid even when the input needs no case change
+/// at all) on the common path; `SmolStr::new` itself is allocation-free
+/// for the short class/member names this always deals with.
 fn lower(s: &str) -> SmolStr {
-    SmolStr::new(s.to_ascii_lowercase())
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        SmolStr::new(s.to_ascii_lowercase())
+    } else {
+        SmolStr::new(s)
+    }
 }
 
 impl Resolution {

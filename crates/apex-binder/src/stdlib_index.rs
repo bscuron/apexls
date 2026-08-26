@@ -59,17 +59,28 @@ impl StdlibIndex {
         class_name: &str,
         member: &'a str,
     ) -> impl Iterator<Item = &'static StdlibMethod> + 'a {
-        self.class(class_name)
-            .into_iter()
-            .flat_map(|c| c.methods.iter())
-            .filter(move |m| m.name.eq_ignore_ascii_case(member))
+        self.class(class_name).into_iter().flat_map(move |c| Self::methods_of(c, member))
+    }
+
+    /// Like [`Self::methods`], but against a `class` the caller already
+    /// looked up (e.g. to also read its `namespace`), so resolving a
+    /// method call's overloads doesn't repeat the by-name class lookup a
+    /// second time.
+    pub fn methods_of<'a>(
+        class: &'static StdlibClass,
+        member: &'a str,
+    ) -> impl Iterator<Item = &'static StdlibMethod> + 'a {
+        class.methods.iter().filter(move |m| m.name.eq_ignore_ascii_case(member))
     }
 
     pub fn property(&self, class_name: &str, member: &str) -> Option<&'static StdlibProperty> {
-        self.class(class_name)?
-            .properties
-            .iter()
-            .find(|p| p.name.eq_ignore_ascii_case(member))
+        Self::property_of(self.class(class_name)?, member)
+    }
+
+    /// Like [`Self::property`], but against a `class` the caller already
+    /// looked up -- see [`Self::methods_of`].
+    pub fn property_of(class: &'static StdlibClass, member: &str) -> Option<&'static StdlibProperty> {
+        class.properties.iter().find(|p| p.name.eq_ignore_ascii_case(member))
     }
 }
 

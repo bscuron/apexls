@@ -8,6 +8,7 @@ use crate::ci_key::{CiKey, CiMap, CiQuery};
 use crate::ptr::SyntaxPtr;
 use crate::reference_table::{ReferenceTable, Resolution, SchemaObjectRef, UnknownSchemaRef};
 use apex_metadata::{FieldSchema, SObjectSchema};
+use std::borrow::Cow;
 use std::path::Path;
 
 pub struct SchemaIndex {
@@ -15,7 +16,13 @@ pub struct SchemaIndex {
 }
 
 struct ObjectEntry {
-    schema: SObjectSchema,
+    /// Borrowed straight from `apex_stdlib::standard_sobjects()`'s
+    /// `'static` slice for the (overwhelming majority of) objects the
+    /// project doesn't override, so rebuilding the index doesn't
+    /// deep-clone the whole bundled snapshot -- only objects actually
+    /// merged with (or wholly defined by) project-local metadata own
+    /// their `SObjectSchema`.
+    schema: Cow<'static, SObjectSchema>,
     /// Field API name -> index into `schema.fields`, case-insensitively
     /// keyed via [`CiKey`]/[`CiQuery`] the same way `objects` itself is.
     fields: CiMap<usize>,
@@ -31,22 +38,20 @@ impl SchemaIndex {
     /// `crate::BoundProgram::from_files_cached`, which also needs it for
     /// `apex_files`), so the directory tree isn't walked twice.
     pub fn build(root: impl AsRef<Path>) -> Self {
-        Self::from_sobjects(merge_sobjects(
-            apex_stdlib::standard_sobjects().to_vec(),
-            apex_metadata::discover_sobjects(root),
-        ))
+        Self::from_cow_sobjects(merge_sobjects(apex_metadata::discover_sobjects(root)))
     }
 
     /// Like [`Self::build`], but parses an already-computed
     /// `apex_discover::Discovery` instead of walking `root` itself.
     pub fn from_discovery(discovery: &apex_discover::Discovery) -> Self {
-        Self::from_sobjects(merge_sobjects(
-            apex_stdlib::standard_sobjects().to_vec(),
-            apex_metadata::sobjects_from_discovery(discovery),
-        ))
+        Self::from_cow_sobjects(merge_sobjects(apex_metadata::sobjects_from_discovery(discovery)))
     }
 
     pub fn from_sobjects(sobjects: Vec<SObjectSchema>) -> Self {
+        Self::from_cow_sobjects(sobjects.into_iter().map(Cow::Owned).collect())
+    }
+
+    fn from_cow_sobjects(sobjects: Vec<Cow<'static, SObjectSchema>>) -> Self {
         let objects = sobjects
             .into_iter()
             .map(|schema| {
@@ -66,7 +71,7 @@ impl SchemaIndex {
     }
 
     pub fn object(&self, api_name: &str) -> Option<&SObjectSchema> {
-        self.objects.get(&CiQuery(api_name)).map(|e| &e.schema)
+        self.objects.get(&CiQuery(api_name)).map(|e| e.schema.as_ref())
     }
 
     pub fn field(&self, object_api_name: &str, field_api_name: &str) -> Option<&FieldSchema> {
@@ -84,8 +89,8 @@ impl SchemaIndex {
     }
 }
 
-/// Unions `stdlib` (the bundled standard-object snapshot,
-/// `apex_stdlib::standard_sobjects`) with `local` (this project's own
+/// Unions the bundled standard-object snapshot
+/// (`apex_stdlib::standard_sobjects`) with `local` (this project's own
 /// XML-discovered custom objects/fields), keyed case-insensitively by
 /// `api_name`. `SchemaIndex::from_sobjects` alone has no such merge
 /// behavior -- it's a flat `Vec` -> map build, so feeding it both a
@@ -93,33 +98,38 @@ impl SchemaIndex {
 /// object with a custom field added) directly would let whichever is
 /// later in the `Vec` win outright, silently losing the other's fields.
 ///
-/// An object present in only one list passes through unchanged. An
-/// object in both gets its field lists unioned by the field's own
+/// An object present in only one list passes through unchanged -- a
+/// bundled object `local` doesn't touch is returned as a `Cow::Borrowed`
+/// straight into the `'static` snapshot, with no clone at all, since
+/// that's true of nearly every standard object on nearly every rebuild.
+/// An object in both gets its field lists unioned by the field's own
 /// case-insensitive `api_name`, with `local`'s field winning on a
 /// collision (a project's own declaration is more authoritative than
 /// the bundled generic snapshot) -- and `local`'s `is_custom`/
 /// `object_path` used for the merged entry too, for the same reason
 /// (only a genuinely project-declared custom object ever has either set
 /// to something other than `apex_stdlib`'s own `false`/`None`).
-fn merge_sobjects(stdlib: Vec<SObjectSchema>, local: Vec<SObjectSchema>) -> Vec<SObjectSchema> {
-    let mut by_name: CiMap<SObjectSchema> = stdlib
+fn merge_sobjects(local: Vec<SObjectSchema>) -> Vec<Cow<'static, SObjectSchema>> {
+    let mut local_by_name: CiMap<SObjectSchema> = local
         .into_iter()
         .map(|s| (CiKey::from(s.api_name.as_str()), s))
         .collect();
 
-    for local_object in local {
-        let key = CiKey::from(local_object.api_name.as_str());
-        match by_name.remove(&key) {
-            Some(stdlib_object) => {
-                by_name.insert(key, merge_fields(stdlib_object, local_object));
+    let stdlib = apex_stdlib::standard_sobjects();
+    let mut merged = Vec::with_capacity(stdlib.len() + local_by_name.len());
+
+    for stdlib_object in stdlib {
+        let key = CiKey::from(stdlib_object.api_name.as_str());
+        match local_by_name.remove(&key) {
+            Some(local_object) => {
+                merged.push(Cow::Owned(merge_fields(stdlib_object.clone(), local_object)));
             }
-            None => {
-                by_name.insert(key, local_object);
-            }
+            None => merged.push(Cow::Borrowed(stdlib_object)),
         }
     }
 
-    by_name.into_values().collect()
+    merged.extend(local_by_name.into_values().map(Cow::Owned));
+    merged
 }
 
 fn merge_fields(stdlib_object: SObjectSchema, local_object: SObjectSchema) -> SObjectSchema {
