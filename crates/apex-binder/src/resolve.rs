@@ -39,8 +39,9 @@
 //!   is authoritative, not a heuristic), then elimination by argument
 //!   type (`crate::conversions::type_compatible` -- project-local
 //!   subtyping *and* Apex's implicit-conversion rules for a curated set
-//!   of system types: numeric widening, `Object`, `List`/`Set`/`Map`),
-//!   then a most-specific tiebreak (`crate::conversions::is_more_specific`)
+//!   of system types: numeric widening, `Object`, `List`/`Set`/`Map`,
+//!   `Id`, `Date`/`Datetime`/`Time`, `Blob`, and schema-verified
+//!   `SObject` widening), then a most-specific tiebreak (`crate::conversions::is_more_specific`)
 //!   among whatever still survives. A call resolves to a single
 //!   `Resolved` symbol when exactly one candidate survives elimination,
 //!   or when the tiebreak finds a unique most-specific one; otherwise
@@ -104,6 +105,7 @@ use smol_str::SmolStr;
 /// position; otherwise the set stays genuinely `Candidates` (real
 /// ambiguity, rare in code that actually compiles).
 fn narrow_by_overload(
+    schema: &SchemaIndex,
     table: &SymbolTable,
     candidates: Vec<SymbolId>,
     arg_types: &[Option<Ty>],
@@ -129,7 +131,7 @@ fn narrow_by_overload(
     let by_type: Vec<SymbolId> = pool
         .iter()
         .copied()
-        .filter(|&id| is_argument_type_compatible(table, id, arg_types))
+        .filter(|&id| is_argument_type_compatible(schema, table, id, arg_types))
         .collect();
     match by_type.len() {
         1 => Resolution::Resolved(by_type[0]),
@@ -138,7 +140,7 @@ fn narrow_by_overload(
         // itself was already empty -- defensive, not expected) or still
         // ambiguous: report the honest pre-type-filter pool either way.
         0 => Resolution::Candidates(pool),
-        _ => match most_specific_candidate(table, &by_type) {
+        _ => match most_specific_candidate(schema, table, &by_type) {
             Some(winner) => Resolution::Resolved(winner),
             None => Resolution::Candidates(by_type),
         },
@@ -176,6 +178,7 @@ fn stdlib_member_ref(
 /// Ambiguous (0 or 2+ survivors) -> `None`, same as the total absence of
 /// this information today -- never a guessed, possibly-wrong type.
 fn narrow_stdlib_overload_type(
+    schema: &SchemaIndex,
     table: &SymbolTable,
     stdlib: &StdlibIndex,
     class_name: &str,
@@ -196,7 +199,7 @@ fn narrow_stdlib_overload_type(
             let by_type: Vec<&StdlibMethod> = pool
                 .iter()
                 .copied()
-                .filter(|m| stdlib_args_compatible(table, m, arg_types))
+                .filter(|m| stdlib_args_compatible(schema, table, m, arg_types))
                 .collect();
             match by_type.as_slice() {
                 [one] => Some(*one),
@@ -218,13 +221,20 @@ fn narrow_stdlib_overload_type(
 /// declared ones -- an argument or parameter type this crate can't even
 /// name never eliminates (same "can't prove wrong beats assume wrong"
 /// rule `crate::conversions::type_compatible` itself already applies).
-fn stdlib_args_compatible(table: &SymbolTable, method: &StdlibMethod, arg_types: &[Option<Ty>]) -> bool {
+fn stdlib_args_compatible(
+    schema: &SchemaIndex,
+    table: &SymbolTable,
+    method: &StdlibMethod,
+    arg_types: &[Option<Ty>],
+) -> bool {
     for (param_type, arg_type) in method.params.iter().zip(arg_types.iter()) {
         let (Some(param_type), Some(arg_type)) = (param_type, arg_type) else {
             continue;
         };
         let (param_name, param_args) = apex_stdlib::split_generic_type(param_type);
-        if conversions::type_compatible(table, &param_name, &param_args, arg_type) == Some(false) {
+        if conversions::type_compatible(schema, table, &param_name, &param_args, arg_type)
+            == Some(false)
+        {
             return false;
         }
     }
@@ -326,6 +336,7 @@ fn widen_for_dynamic_dispatch(table: &SymbolTable, resolution: Resolution) -> Re
 }
 
 fn is_argument_type_compatible(
+    schema: &SchemaIndex,
     table: &SymbolTable,
     candidate: SymbolId,
     arg_types: &[Option<Ty>],
@@ -338,8 +349,13 @@ fn is_argument_type_compatible(
         let Some(param_type_name) = param_symbol.type_name.as_deref() else {
             continue;
         };
-        if conversions::type_compatible(table, param_type_name, &param_symbol.type_args, arg_type)
-            == Some(false)
+        if conversions::type_compatible(
+            schema,
+            table,
+            param_type_name,
+            &param_symbol.type_args,
+            arg_type,
+        ) == Some(false)
         {
             return false;
         }
@@ -353,14 +369,18 @@ fn is_argument_type_compatible(
 /// exists (a real ambiguity between two candidates neither more specific
 /// than the other, or -- shouldn't arise once arity is already equal
 /// across `candidates` -- a parameter-count mismatch).
-fn most_specific_candidate(table: &SymbolTable, candidates: &[SymbolId]) -> Option<SymbolId> {
+fn most_specific_candidate(
+    schema: &SchemaIndex,
+    table: &SymbolTable,
+    candidates: &[SymbolId],
+) -> Option<SymbolId> {
     candidates
         .iter()
         .copied()
         .find(|&c| {
             candidates
                 .iter()
-                .all(|&d| d == c || dominates(table, c, d))
+                .all(|&d| d == c || dominates(schema, table, c, d))
         })
 }
 
@@ -368,7 +388,7 @@ fn most_specific_candidate(table: &SymbolTable, candidates: &[SymbolId]) -> Opti
 /// in every position, with a strict improvement in at least one --
 /// compares only the two candidates' own declared signatures, independent
 /// of the actual call's arguments (both are already known-applicable).
-fn dominates(table: &SymbolTable, a: SymbolId, b: SymbolId) -> bool {
+fn dominates(schema: &SchemaIndex, table: &SymbolTable, a: SymbolId, b: SymbolId) -> bool {
     let a_params = table.params(a);
     let b_params = table.params(b);
     if a_params.len() != b_params.len() {
@@ -392,7 +412,14 @@ fn dominates(table: &SymbolTable, a: SymbolId, b: SymbolId) -> bool {
         if same_position {
             continue;
         }
-        if conversions::is_more_specific(table, a_name, &a_sym.type_args, b_name, &b_sym.type_args) {
+        if conversions::is_more_specific(
+            schema,
+            table,
+            a_name,
+            &a_sym.type_args,
+            b_name,
+            &b_sym.type_args,
+        ) {
             any_strict = true;
         } else {
             return false;
@@ -1649,7 +1676,7 @@ impl<'a> BodyBinder<'a> {
                     .collect();
                 let resolution = widen_for_dynamic_dispatch(
                     self.table,
-                    narrow_by_overload(self.table, methods, &arg_types),
+                    narrow_by_overload(self.schema, self.table, methods, &arg_types),
                 );
                 let result_type = self.result_type_of(&resolution);
                 self.refs.set_with_highlight(ptr, highlight, resolution);
@@ -1684,7 +1711,14 @@ impl<'a> BodyBinder<'a> {
                 // `addAll`, which need no substitution anyway) does the
                 // scraped, best-effort-narrowed return type get used.
                 crate::generics::builtin_generic_member_type(&base, &args, name).or_else(|| {
-                    narrow_stdlib_overload_type(self.table, self.stdlib, &base, name, &arg_types)
+                    narrow_stdlib_overload_type(
+                        self.schema,
+                        self.table,
+                        self.stdlib,
+                        &base,
+                        name,
+                        &arg_types,
+                    )
                 })
             }
             None => {
@@ -1765,7 +1799,7 @@ impl<'a> BodyBinder<'a> {
             candidates
         };
 
-        let resolution = narrow_by_overload(self.table, candidates, &arg_types);
+        let resolution = narrow_by_overload(self.schema, self.table, candidates, &arg_types);
         // Never widened for `want_ctor`: a constructor call always
         // instantiates the exact named type, so there's no dynamic
         // dispatch to expand across (see `widen_for_dynamic_dispatch`'s
@@ -1803,7 +1837,7 @@ impl<'a> BodyBinder<'a> {
                     })
                     .collect();
                 if !ctors.is_empty() {
-                    let resolution = narrow_by_overload(self.table, ctors, &arg_types);
+                    let resolution = narrow_by_overload(self.schema, self.table, ctors, &arg_types);
                     // `new Outer.Inner(...)` names its constructor after
                     // the *last* segment (`Inner`) -- the type's own
                     // constructor, never `Outer`'s -- so this narrows to

@@ -118,8 +118,23 @@ fn corpus_root() -> PathBuf {
 ///    `BASELINE_UNRESOLVED` -250 more (`84_209` -> `83_959`);
 ///    `BASELINE_RESOLVED` unaffected (enum constant access never
 ///    produces a `SymbolId`-backed outcome either way).
-const BASELINE_RESOLVED: usize = 204_987;
-const BASELINE_UNRESOLVED: usize = 83_959;
+/// 4. Widening `crate::conversions`'s curated type set (`Id`, `Date`/
+///    `Datetime`/`Time`, `Blob`, and schema-verified `SObject`
+///    widening, each confirmed against a real org the same way the
+///    original numeric/`Object`/collection rules were) moved
+///    `BASELINE_RESOLVED` +318 (`204_987` -> `205_305`) -- the same
+///    "argument type newly known well enough to disambiguate" mechanism
+///    documented in step 1 above, just against a much larger curated
+///    surface. `BASELINE_UNRESOLVED` also dropped, by -5 (`83_959` ->
+///    `83_954`): a stdlib method call chained onto a further reference
+///    (`someCall(x).next()`) that previously couldn't narrow its own
+///    overloaded return type (every overload survived elimination, so
+///    `narrow_stdlib_overload_type` gave up with `None`) now narrows to
+///    exactly one, giving the chained `.next()` a real base type to
+///    resolve against instead of hitting `bind_field_expr`'s "target
+///    type entirely unknown" `Unresolved` fallback.
+const BASELINE_RESOLVED: usize = 205_305;
+const BASELINE_UNRESOLVED: usize = 83_954;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

@@ -692,9 +692,56 @@ supports each one.
          `crates/apex-binder/src/conversions.rs`'s own unit tests, and
          `crates/apex-binder/tests/overload_narrowing_conversions.rs`
          (real overload calls through `narrow_by_overload`, including a
-         confirmation that anything outside the curated set -- `Id` vs
-         `Blob`, say -- still stays honestly `Candidates` rather than a
-         guessed elimination).
+         confirmation that anything outside the curated set stays
+         honestly `Candidates` rather than a guessed elimination).
+
+         **Follow-up, also closed:** the original curated set's gaps
+         weren't just theoretical -- `Id`, `Date`/`Datetime`/`Time`,
+         `Blob`, and any Salesforce object type (`Account`, custom
+         objects, ...) were all real, common types that stayed
+         permanently `Candidates` against each other with no way to
+         narrow. Widened `is_curated`/`system_type_compatible`/
+         `is_more_specific` to cover all of them, each rule verified
+         against a real org first, per this project's established
+         practice, before trusting it:
+         `Id`/`String` are bidirectionally compatible, but -- a genuine
+         surprise the verification caught -- a real org resolves *every*
+         `describe(Id)`/`describe(String)` overload call to the `String`
+         overload, even one whose argument's own declared type is `Id`
+         (normally the exact-match winner). Rather than guess whether
+         that generalizes, no specificity order was added between them
+         at all, so a real project with both overloads stays honestly
+         `Candidates` instead of risking a confidently wrong `Resolved`.
+         `Date` widens to `Datetime` one-directionally (exact match still
+         wins when both apply, confirmed the same way numeric widening
+         already was); `Time` has no relationship with either; `Blob` has
+         none with `String`. `SObject` needed a real, not heuristic,
+         notion of "is this actually a Salesforce object" -- the universe
+         of real object names is dynamic, unlike every other curated
+         type here -- so `crate::conversions` now also takes a
+         `&SchemaIndex` (threaded through `narrow_by_overload`/
+         `is_argument_type_compatible`/`most_specific_candidate`/
+         `dominates`/`narrow_stdlib_overload_type`/`stdlib_args_compatible`,
+         all three real call sites in `resolve.rs` already had `self.schema`
+         in scope): a real object type upcasts to `SObject` (never the
+         reverse), and two *different* concrete object types are never
+         mutually compatible either -- unlike a project-local `extends`
+         chain, Apex has no SObject-to-SObject subtyping at all. The
+         nested-collection case (`List<Account>` satisfying a
+         `List<SObject>`-only parameter) needed no new code at all --
+         `collection_args_compatible` already recurses through
+         `type_compatible` for exactly this reason. Confirmed on the real
+         NPSP corpus: `resolution_regression_baseline.rs`'s `Resolved`
+         count rose by 318 (`204,987` -> `205,305`), `Unresolved` dropped
+         by 5 more (`83,959` -> `83,954`, a stdlib call's own overloaded
+         return type narrowing to one instead of none let a further
+         chained reference resolve too). New tests:
+         `conversions.rs`'s own unit tests (one per newly-curated type
+         pair) and four new `overload_narrowing_conversions.rs` cases
+         (`Id` vs `Blob` now disambiguating, `Date`/`Datetime` both
+         directions, `Account` vs `SObject`); the original `Id`-vs-`Blob`
+         "stays ambiguous" case was repointed at `Exception`/`PageReference`,
+         a pairing still genuinely outside the curated set.
       2. **Rename itself**, built entirely on already-shipped, already-
          tested infrastructure (`symbol_at`/`resolution_at`,
          `references_to`, `ReferenceTable::highlight_range`, the

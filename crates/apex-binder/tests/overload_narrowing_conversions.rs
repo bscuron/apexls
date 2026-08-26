@@ -232,14 +232,43 @@ fn a_list_of_a_project_local_subtype_eliminates_a_mismatched_element_leaf_type()
 
 #[test]
 fn argument_and_parameter_types_outside_the_curated_set_stay_ambiguous() {
-    // `Id`/`Blob` are real Apex system types, but neither is in
-    // `crate::conversions`'s curated set -- an `Id`-typed argument must
-    // never eliminate a `Blob` overload (or vice versa), even though a
-    // real compiler would reject this call. "Can't prove wrong" must keep
-    // winning outside the curated rules, exactly as it did before this
-    // work for every system type.
+    // `Exception`/`PageReference` are real Apex system types, but neither
+    // is in `crate::conversions`'s curated set -- an `Exception`-typed
+    // argument must never eliminate a `PageReference` overload (or vice
+    // versa), even though a real compiler would reject this call. "Can't
+    // prove wrong" must keep winning outside the curated rules, exactly
+    // as it did before this work for every system type.
     let dir = write_fixture_dir(
         "uncurated-stays-ambiguous",
+        &[(
+            "Toolbox.cls",
+            "public class Toolbox { \
+             public void pick(Exception x) { } \
+             public void pick(PageReference x) { } \
+             public void run() { Exception anEx; pick(anEx); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let Some(Resolution::Candidates(remaining)) = the_call_resolution(&program, file, "pick") else {
+        panic!("expected pick(anEx) to stay Candidates when both overloads are uncurated system types");
+    };
+    assert_eq!(remaining.len(), 2);
+}
+
+#[test]
+fn id_and_blob_are_now_curated_and_correctly_disambiguate() {
+    // `Id`/`Blob` used to be the exact pairing the test above used to
+    // demonstrate "stays ambiguous outside the curated set" -- both are
+    // curated now (see `crate::conversions`'s widened set, verified
+    // against a real org), and are positively incompatible with each
+    // other, so an `Id`-typed argument now correctly eliminates the
+    // `Blob` overload instead of leaving both as candidates.
+    let dir = write_fixture_dir(
+        "id-blob-now-curated",
         &[(
             "Toolbox.cls",
             "public class Toolbox { \
@@ -253,8 +282,97 @@ fn argument_and_parameter_types_outside_the_curated_set_stay_ambiguous() {
     std::fs::remove_dir_all(&dir).ok();
 
     let file = file_for(&program, SymbolKind::Class, "Toolbox");
-    let Some(Resolution::Candidates(remaining)) = the_call_resolution(&program, file, "pick") else {
-        panic!("expected pick(anId) to stay Candidates when both overloads are uncurated system types");
-    };
-    assert_eq!(remaining.len(), 2);
+    let id_overload = pick_overload_with_param_type(&program, "Id");
+    assert_eq!(
+        the_call_resolution(&program, file, "pick"),
+        Some(Resolution::Resolved(id_overload))
+    );
+}
+
+#[test]
+fn a_date_argument_prefers_the_exact_overload_over_datetime() {
+    // `Date` widens to `Datetime` (verified against a real org), so both
+    // overloads are individually applicable to a `Date` argument -- the
+    // most-specific tiebreak must still prefer the exact `Date` overload,
+    // the same "exact beats widened" shape numeric widening already has.
+    let dir = write_fixture_dir(
+        "date-exact-over-datetime",
+        &[(
+            "Toolbox.cls",
+            "public class Toolbox { \
+             public void pick(Date x) { } \
+             public void pick(Datetime x) { } \
+             public void run() { Date d = Date.today(); pick(d); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let date_overload = pick_overload_with_param_type(&program, "Date");
+
+    assert_eq!(
+        the_call_resolution(&program, file, "pick"),
+        Some(Resolution::Resolved(date_overload))
+    );
+}
+
+#[test]
+fn a_datetime_argument_eliminates_the_date_only_overload() {
+    // The reverse direction: `Datetime` does not widen to `Date`
+    // (a real `Illegal assignment from Datetime to Date` compile error),
+    // so a `Datetime` argument must positively eliminate `pick(Date)`
+    // and resolve straight to `pick(Datetime)`.
+    let dir = write_fixture_dir(
+        "datetime-eliminates-date",
+        &[(
+            "Toolbox.cls",
+            "public class Toolbox { \
+             public void pick(Date x) { } \
+             public void pick(Datetime x) { } \
+             public void run() { Datetime dt = Datetime.now(); pick(dt); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let datetime_overload = pick_overload_with_param_type(&program, "Datetime");
+
+    assert_eq!(
+        the_call_resolution(&program, file, "pick"),
+        Some(Resolution::Resolved(datetime_overload))
+    );
+}
+
+#[test]
+fn a_real_object_typed_argument_prefers_its_exact_overload_over_sobject() {
+    // Mirrors `a_list_of_a_project_local_subtype_eliminates_a_mismatched_element_leaf_type`'s
+    // shape, but for the schema-verified `SObject` rule instead of a
+    // project-local `extends` chain: `Account` widens to `SObject`
+    // (confirmed real), but the exact-match `Account` overload must
+    // still win over the wider `SObject` one.
+    let dir = write_fixture_dir(
+        "account-exact-over-sobject",
+        &[(
+            "Toolbox.cls",
+            "public class Toolbox { \
+             public void pick(SObject x) { } \
+             public void pick(Account x) { } \
+             public void run() { Account a = new Account(); pick(a); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let account_overload = pick_overload_with_param_type(&program, "Account");
+
+    assert_eq!(
+        the_call_resolution(&program, file, "pick"),
+        Some(Resolution::Resolved(account_overload))
+    );
 }

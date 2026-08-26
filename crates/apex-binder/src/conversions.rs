@@ -1,7 +1,8 @@
 //! Apex's implicit-conversion and overload-specificity rules for a small,
 //! fixed set of "curated" system types: the numeric family (`Integer`/
-//! `Long`/`Double`/`Decimal`), `Boolean`, `String`, `Object`, and the three
-//! built-in generic collections (`List`/`Set`/`Map`).
+//! `Long`/`Double`/`Decimal`), `Boolean`, `String`, `Id`, `Date`/`Datetime`/
+//! `Time`, `Blob`, `Object`, `SObject`, and the three built-in generic
+//! collections (`List`/`Set`/`Map`).
 //!
 //! Deliberately bounded, and a different gap from `BACKLOG.md`'s still-open
 //! "no standard-library type model" item: this isn't about modeling what
@@ -31,7 +32,55 @@
 //!   stricter exact-match-only rule -- which is why [`type_compatible`]
 //!   recurses into itself for a collection's type argument instead of
 //!   using a separate, narrower comparison.
+//!
+//! A second round of org verification, widening the original curated set,
+//! turned up a third surprise even less intuitive than the first two:
+//! when both `describe(Id)` and `describe(String)` overloads exist, a
+//! real org resolves *every* call to the `describe(String)` overload --
+//! including a call whose argument's declared type is `Id` itself, which
+//! would normally be the exact-match winner the way `Integer` beats
+//! `Object` for an `Integer` argument. `Id`/`String` are still recorded
+//! as mutually compatible (an `Id` argument must not eliminate a
+//! `String`-only candidate, and vice versa -- confirmed real by both
+//! directions of `Id`<->`String` assignment compiling and running
+//! successfully against a real org), but deliberately *no* specificity
+//! rule is added between them: one org data point isn't enough to trust
+//! generalizing "`String` always wins," and guessing wrong here would
+//! hand back a confident, wrong `Resolved` answer instead of an honest
+//! `Candidates` -- exactly the failure mode [`is_more_specific`]'s own
+//! doc comment already calls out as worse than an unresolved tie.
+//!
+//! `Date` widens to `Datetime` (one-directional, confirmed by both a
+//! successful `Date`->`Datetime` assignment and a real
+//! `Illegal assignment from Datetime to Date` compile error for the
+//! reverse) -- modeled with the exact same rank-table shape
+//! [`numeric_rank`] already uses for `Integer`/`Long`/`Double`/`Decimal`,
+//! including the same "exact match beats widened match" specificity
+//! result confirmed for both argument directions. `Time` has no
+//! confirmed relationship with either (`Illegal assignment from Datetime
+//! to Time`) and `Blob` has none with `String` in either direction
+//! (`Illegal assignment from String to Blob` / `... from Blob to
+//! String`) -- both are curated purely so a mismatch against a
+//! *different* curated type is a positive, provable elimination instead
+//! of the "can't prove wrong" `None` an uncurated type always got before.
+//!
+//! `SObject` widening needed a real, not heuristic, notion of "is this
+//! system type name actually a Salesforce object" -- unlike every other
+//! curated type, the universe of real SObject names is dynamic (every
+//! standard and custom object in the org/project), not a small fixed
+//! list, so this module now also takes a `&SchemaIndex` to ask. A real
+//! object type upcasts to `SObject` (confirmed: `Account` assigns to an
+//! `SObject`-typed variable, and `List<Account>` satisfies a
+//! `List<SObject>`-only parameter the same nested-nesting way numeric/
+//! `extends` widening already does), never the reverse (`Illegal
+//! assignment from SObject to Account`), and two different concrete
+//! object types are never mutually compatible either (`Illegal
+//! assignment from Account to Contact`) -- unlike a project-local
+//! `extends` chain, Apex has no SObject-to-SObject subtyping at all, so
+//! "different real object names" is *always* a definite mismatch, not
+//! just an unmodeled one.
 
+use crate::schema_index::SchemaIndex;
 use crate::symbol::SymbolId;
 use crate::symbol_table::SymbolTable;
 use crate::ty::Ty;
@@ -59,13 +108,36 @@ fn collection_kind(name: &str) -> Option<&'static str> {
         .find(|k| k.eq_ignore_ascii_case(name))
 }
 
+/// `Date`(0) < `Datetime`(1) -- `Date` widens implicitly to `Datetime`,
+/// never the reverse. Verified against a real org exactly like
+/// [`numeric_rank`]: a `Date` argument assigns to a `Datetime`-typed
+/// variable and a `Date`/`Datetime` overload pair called with a `Date`
+/// argument picks the exact-match `Date` overload, while the reverse
+/// assignment (`Datetime` -> `Date`) is a real `Illegal assignment`
+/// compile error. `Time` is deliberately not part of this table -- a
+/// `Datetime` argument does not assign to a `Time`-typed variable either
+/// (also a confirmed real compile error), so it has no widening
+/// relationship with either of these, only with itself.
+fn date_rank(name: &str) -> Option<u8> {
+    const ORDER: [&str; 2] = ["Date", "Datetime"];
+    ORDER
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(name))
+        .map(|i| i as u8)
+}
+
 /// Every name this module has a rule for -- used only to decide whether
 /// two *differing* names are a known, definite mismatch (`Some(false)`) or
 /// genuinely uncharted territory (`None`, never eliminate).
 fn is_curated(name: &str) -> bool {
     name.eq_ignore_ascii_case("String")
         || name.eq_ignore_ascii_case("Boolean")
+        || name.eq_ignore_ascii_case("Id")
+        || name.eq_ignore_ascii_case("Time")
+        || name.eq_ignore_ascii_case("Blob")
+        || name.eq_ignore_ascii_case("SObject")
         || numeric_rank(name).is_some()
+        || date_rank(name).is_some()
         || collection_kind(name).is_some()
 }
 
@@ -82,6 +154,7 @@ fn is_curated(name: &str) -> bool {
 /// the argument's type `extends`/`implements` the parameter's) as one
 /// branch, so callers no longer need a separate check for it.
 pub(crate) fn type_compatible(
+    schema: &SchemaIndex,
     table: &SymbolTable,
     param_name: &str,
     param_args: &[SmolStr],
@@ -103,7 +176,7 @@ pub(crate) fn type_compatible(
                 // made to implement a user-defined interface either.
                 return Some(false);
             }
-            system_type_compatible(table, param_name, param_args, arg_name, arg_args)
+            system_type_compatible(schema, table, param_name, param_args, arg_name, arg_args)
         }
     }
 }
@@ -128,6 +201,7 @@ fn project_arg_compatible(table: &SymbolTable, param_name: &str, arg_id: SymbolI
 }
 
 fn system_type_compatible(
+    schema: &SchemaIndex,
     table: &SymbolTable,
     param_name: &str,
     param_args: &[SmolStr],
@@ -136,13 +210,43 @@ fn system_type_compatible(
 ) -> Option<bool> {
     if param_name.eq_ignore_ascii_case(arg_name) {
         return if collection_kind(param_name).is_some() {
-            collection_args_compatible(table, param_args, arg_args)
+            collection_args_compatible(schema, table, param_args, arg_args)
         } else {
             Some(true)
         };
     }
     if let (Some(arg_rank), Some(param_rank)) = (numeric_rank(arg_name), numeric_rank(param_name)) {
         return Some(arg_rank <= param_rank);
+    }
+    if let (Some(arg_rank), Some(param_rank)) = (date_rank(arg_name), date_rank(param_name)) {
+        return Some(arg_rank <= param_rank);
+    }
+    // `Id`/`String` are bidirectionally compatible (confirmed: both
+    // assignment directions compile and run successfully against a real
+    // org) -- deliberately no specificity claim between them, see this
+    // module's own doc comment on the org's surprising `String`-always-
+    // wins overload result.
+    if (param_name.eq_ignore_ascii_case("Id") && arg_name.eq_ignore_ascii_case("String"))
+        || (param_name.eq_ignore_ascii_case("String") && arg_name.eq_ignore_ascii_case("Id"))
+    {
+        return Some(true);
+    }
+    // `SObject` accepts any real object type -- confirmed via
+    // `schema.object`, not a name guess, since the universe of real
+    // object names is dynamic (unlike every other curated type here).
+    // Never the reverse (an `SObject`-typed value doesn't implicitly
+    // downcast to a concrete object type), and two *different* concrete
+    // object types are never mutually compatible either -- unlike a
+    // project-local `extends` chain, Apex has no SObject-to-SObject
+    // subtyping at all, both confirmed by real `Illegal assignment`
+    // compile errors.
+    if param_name.eq_ignore_ascii_case("SObject") && schema.object(arg_name).is_some() {
+        return Some(true);
+    }
+    if schema.object(param_name).is_some()
+        && (arg_name.eq_ignore_ascii_case("SObject") || schema.object(arg_name).is_some())
+    {
+        return Some(false);
     }
     if is_curated(param_name) && is_curated(arg_name) {
         // Different curated families with no widening relationship
@@ -162,6 +266,7 @@ fn system_type_compatible(
 /// "some positions unknown" must never look identical to "fully verified
 /// compatible" to a caller deciding whether to *select* this candidate.
 fn collection_args_compatible(
+    schema: &SchemaIndex,
     table: &SymbolTable,
     param_args: &[SmolStr],
     arg_args: &[Ty],
@@ -171,7 +276,7 @@ fn collection_args_compatible(
     }
     let mut all_confirmed = true;
     for (p, a) in param_args.iter().zip(arg_args.iter()) {
-        match type_compatible(table, p, &[], a) {
+        match type_compatible(schema, table, p, &[], a) {
             Some(false) => return Some(false),
             Some(true) => {}
             None => all_confirmed = false,
@@ -191,6 +296,7 @@ fn collection_args_compatible(
 /// default: an unresolved ordering just leaves the tie unresolved
 /// (`Resolution::Candidates`), never a guess.
 pub(crate) fn is_more_specific(
+    schema: &SchemaIndex,
     table: &SymbolTable,
     a_name: &str,
     a_args: &[SmolStr],
@@ -202,12 +308,11 @@ pub(crate) fn is_more_specific(
             && a_args.len() == b_args.len()
             && !a_args.is_empty()
             && a_args.iter().zip(b_args.iter()).all(|(x, y)| {
-                x.eq_ignore_ascii_case(y) || is_more_specific(table, x, &[], y, &[])
+                x.eq_ignore_ascii_case(y) || is_more_specific(schema, table, x, &[], y, &[])
             })
-            && a_args
-                .iter()
-                .zip(b_args.iter())
-                .any(|(x, y)| !x.eq_ignore_ascii_case(y) && is_more_specific(table, x, &[], y, &[]));
+            && a_args.iter().zip(b_args.iter()).any(|(x, y)| {
+                !x.eq_ignore_ascii_case(y) && is_more_specific(schema, table, x, &[], y, &[])
+            });
     }
     if b_name.eq_ignore_ascii_case("Object") {
         // Anything -- curated system type or project-local -- is strictly
@@ -216,6 +321,16 @@ pub(crate) fn is_more_specific(
     }
     if let (Some(a_rank), Some(b_rank)) = (numeric_rank(a_name), numeric_rank(b_name)) {
         return a_rank < b_rank;
+    }
+    if let (Some(a_rank), Some(b_rank)) = (date_rank(a_name), date_rank(b_name)) {
+        return a_rank < b_rank;
+    }
+    // A real object type is strictly more specific than the universal
+    // `SObject`, the same "narrower wins" shape `Object`'s own case
+    // above already uses -- confirmed by the same org evidence backing
+    // `system_type_compatible`'s `SObject` rule.
+    if b_name.eq_ignore_ascii_case("SObject") && schema.object(a_name).is_some() {
+        return true;
     }
     if let (Some(a_id), Some(b_id)) = (table.resolve_dotted_name(a_name), table.resolve_dotted_name(b_name)) {
         return a_id != b_id && table.inherited_chain(a_id).contains(&b_id);
@@ -236,6 +351,17 @@ mod tests {
         SymbolTable::default()
     }
 
+    fn empty_schema() -> SchemaIndex {
+        SchemaIndex::from_sobjects(Vec::new())
+    }
+
+    /// The real bundled standard-object snapshot -- `Account`/`Contact`/...
+    /// actually present, for the `SObject`-widening tests, which need a
+    /// real object name `schema.object` can find.
+    fn standard_schema() -> SchemaIndex {
+        SchemaIndex::from_sobjects(apex_stdlib::standard_sobjects().to_vec())
+    }
+
     fn sys(name: &'static str) -> Ty {
         Ty::system(name)
     }
@@ -246,70 +372,186 @@ mod tests {
 
     #[test]
     fn object_param_accepts_anything() {
+        let schema = empty_schema();
         let table = empty_table();
         assert_eq!(
-            type_compatible(&table, "Object", &[], &sys("String")),
+            type_compatible(&schema, &table, "Object", &[], &sys("String")),
             Some(true)
         );
         assert_eq!(
-            type_compatible(&table, "Object", &[], &Ty::Project(sid(0))),
+            type_compatible(&schema, &table, "Object", &[], &Ty::Project(sid(0))),
             Some(true)
         );
     }
 
     #[test]
     fn numeric_widening_is_one_directional() {
+        let schema = empty_schema();
         let table = empty_table();
         assert_eq!(
-            type_compatible(&table, "Long", &[], &sys("Integer")),
+            type_compatible(&schema, &table, "Long", &[], &sys("Integer")),
             Some(true)
         );
         assert_eq!(
-            type_compatible(&table, "Integer", &[], &sys("Long")),
+            type_compatible(&schema, &table, "Integer", &[], &sys("Long")),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&table, "Decimal", &[], &sys("Double")),
+            type_compatible(&schema, &table, "Decimal", &[], &sys("Double")),
             Some(true)
         );
     }
 
     #[test]
     fn string_and_boolean_are_exact_only() {
+        let schema = empty_schema();
         let table = empty_table();
         assert_eq!(
-            type_compatible(&table, "String", &[], &sys("Boolean")),
+            type_compatible(&schema, &table, "String", &[], &sys("Boolean")),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&table, "Boolean", &[], &sys("String")),
+            type_compatible(&schema, &table, "Boolean", &[], &sys("String")),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&table, "String", &[], &sys("String")),
+            type_compatible(&schema, &table, "String", &[], &sys("String")),
             Some(true)
         );
     }
 
     #[test]
     fn uncurated_system_types_are_never_eliminated() {
+        let schema = empty_schema();
         let table = empty_table();
         assert_eq!(
-            type_compatible(&table, "Id", &[], &sys("String")),
+            type_compatible(&schema, &table, "Comparable", &[], &Ty::Project(sid(0))),
             None
         );
         assert_eq!(
-            type_compatible(&table, "Comparable", &[], &Ty::Project(sid(0))),
+            type_compatible(&schema, &table, "Iterable", &[], &sys("Integer")),
             None
+        );
+    }
+
+    /// `Id`/`String` are bidirectionally compatible -- confirmed real
+    /// against a real org (both assignment directions compile and run),
+    /// unlike the surprising overload-preference result this module's
+    /// own doc comment covers, which is deliberately *not* encoded here.
+    #[test]
+    fn id_and_string_are_mutually_compatible_with_no_specificity_order() {
+        let schema = empty_schema();
+        let table = empty_table();
+        assert_eq!(
+            type_compatible(&schema, &table, "Id", &[], &sys("String")),
+            Some(true)
+        );
+        assert_eq!(
+            type_compatible(&schema, &table, "String", &[], &sys("Id")),
+            Some(true)
+        );
+        assert!(!is_more_specific(&schema, &table, "Id", &[], "String", &[]));
+        assert!(!is_more_specific(&schema, &table, "String", &[], "Id", &[]));
+    }
+
+    /// `Date` widens to `Datetime`, never the reverse -- confirmed real
+    /// (a real `Illegal assignment from Datetime to Date` compile error
+    /// for the reverse direction). `Time` has no relationship with
+    /// either.
+    #[test]
+    fn date_widens_to_datetime_but_not_the_reverse() {
+        let schema = empty_schema();
+        let table = empty_table();
+        assert_eq!(
+            type_compatible(&schema, &table, "Datetime", &[], &sys("Date")),
+            Some(true)
+        );
+        assert_eq!(
+            type_compatible(&schema, &table, "Date", &[], &sys("Datetime")),
+            Some(false)
+        );
+        assert_eq!(
+            type_compatible(&schema, &table, "Time", &[], &sys("Datetime")),
+            Some(false)
+        );
+        assert_eq!(
+            type_compatible(&schema, &table, "Time", &[], &sys("Date")),
+            Some(false)
+        );
+        assert!(is_more_specific(&schema, &table, "Date", &[], "Datetime", &[]));
+        assert!(!is_more_specific(&schema, &table, "Datetime", &[], "Date", &[]));
+    }
+
+    /// `Blob` has no implicit conversion with `String` in either
+    /// direction -- confirmed real (`Illegal assignment` compile errors
+    /// both ways).
+    #[test]
+    fn blob_has_no_relationship_with_string() {
+        let schema = empty_schema();
+        let table = empty_table();
+        assert_eq!(
+            type_compatible(&schema, &table, "Blob", &[], &sys("String")),
+            Some(false)
+        );
+        assert_eq!(
+            type_compatible(&schema, &table, "String", &[], &sys("Blob")),
+            Some(false)
+        );
+    }
+
+    /// A real object type widens to `SObject` (upcast), never the
+    /// reverse, and two *different* concrete object types are never
+    /// mutually compatible -- all three confirmed real against a real
+    /// org (`Account` assigns to `SObject`; `Illegal assignment from
+    /// SObject to Account`; `Illegal assignment from Account to
+    /// Contact`).
+    #[test]
+    fn a_real_object_type_widens_to_sobject_but_not_across_object_types() {
+        let schema = standard_schema();
+        let table = empty_table();
+        assert_eq!(
+            type_compatible(&schema, &table, "SObject", &[], &sys("Account")),
+            Some(true)
+        );
+        assert_eq!(
+            type_compatible(&schema, &table, "Account", &[], &sys("SObject")),
+            Some(false)
+        );
+        assert_eq!(
+            type_compatible(&schema, &table, "Contact", &[], &sys("Account")),
+            Some(false)
+        );
+        assert!(is_more_specific(&schema, &table, "Account", &[], "SObject", &[]));
+        assert!(!is_more_specific(&schema, &table, "SObject", &[], "Account", &[]));
+    }
+
+    /// `List<Account>` satisfies a `List<SObject>`-only parameter, the
+    /// same nested-widening shape numeric/`extends` widening already
+    /// have -- confirmed real against a real org.
+    #[test]
+    fn list_of_a_real_object_type_widens_to_list_of_sobject() {
+        let schema = standard_schema();
+        let table = empty_table();
+        assert_eq!(
+            type_compatible(
+                &schema,
+                &table,
+                "List",
+                &[SmolStr::new_static("SObject")],
+                &sys_args("List", vec![sys("Account")]),
+            ),
+            Some(true)
         );
     }
 
     #[test]
     fn collection_element_type_recurses_with_the_same_rules() {
+        let schema = empty_schema();
         let table = empty_table();
         // List<Object> accepts any element type, same as a bare `Object`.
         assert_eq!(
             type_compatible(
+                &schema,
                 &table,
                 "List",
                 &[SmolStr::new_static("Object")],
@@ -320,6 +562,7 @@ mod tests {
         // List<Long> accepts a List<Integer> argument (widening nests).
         assert_eq!(
             type_compatible(
+                &schema,
                 &table,
                 "List",
                 &[SmolStr::new_static("Long")],
@@ -330,6 +573,7 @@ mod tests {
         // List<Integer> does not accept a List<Long> argument (the reverse).
         assert_eq!(
             type_compatible(
+                &schema,
                 &table,
                 "List",
                 &[SmolStr::new_static("Integer")],
@@ -340,6 +584,7 @@ mod tests {
         // Different collection kinds never convert.
         assert_eq!(
             type_compatible(
+                &schema,
                 &table,
                 "Set",
                 &[SmolStr::new_static("Integer")],
@@ -351,12 +596,14 @@ mod tests {
 
     #[test]
     fn specificity_prefers_the_exact_and_narrower_type() {
+        let schema = empty_schema();
         let table = empty_table();
-        assert!(is_more_specific(&table, "Integer", &[], "Object", &[]));
-        assert!(!is_more_specific(&table, "Object", &[], "Integer", &[]));
-        assert!(is_more_specific(&table, "Integer", &[], "Long", &[]));
-        assert!(!is_more_specific(&table, "Long", &[], "Integer", &[]));
+        assert!(is_more_specific(&schema, &table, "Integer", &[], "Object", &[]));
+        assert!(!is_more_specific(&schema, &table, "Object", &[], "Integer", &[]));
+        assert!(is_more_specific(&schema, &table, "Integer", &[], "Long", &[]));
+        assert!(!is_more_specific(&schema, &table, "Long", &[], "Integer", &[]));
         assert!(is_more_specific(
+            &schema,
             &table,
             "List",
             &[SmolStr::new_static("Integer")],
