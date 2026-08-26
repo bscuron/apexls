@@ -431,6 +431,60 @@ fn references_finds_every_call_site_of_a_real_stdlib_method() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Regression test: `ExternalKey::Stdlib` used to key purely by
+/// `(class_name, member)`, so `references` on `System.debug(message)`
+/// (the one-arg overload) also pulled in every `System.debug(level,
+/// message)` (the two-arg overload) call site -- and vice versa --
+/// since both share the same name. `arg_count` is now part of the key,
+/// so each overload's call sites stay separate, the same way two
+/// project-local overloads never conflate their `SymbolId`s either.
+#[test]
+fn references_on_an_overloaded_stdlib_call_does_not_pull_in_a_different_arity_overload() {
+    const SRC: &str = "public class Widget {\n    \
+         public void oneArg() { System.debug('hi'); }\n    \
+         public void alsoOneArg() { System.debug('bye'); }\n    \
+         public void twoArg() { System.debug(LoggingLevel.INFO, 'hi'); }\n\
+     }\n";
+    let dir = write_fixture_dir("references-stdlib-overload-arity", &[("Widget.cls", SRC)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let widget_uri = Url::from_file_path(dir.join("Widget.cls")).unwrap();
+
+    let mut session = Session::start(&root_uri, &widget_uri, SRC);
+
+    let (line, character) = position_of(SRC, "debug('hi')");
+    let response = session.request(
+        2,
+        "textDocument/references",
+        serde_json::json!({
+            "textDocument": { "uri": widget_uri },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": true },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "references returned an error: {response:?}"
+    );
+    let result = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a Location array, got {response:?}"));
+    assert_eq!(
+        result.len(),
+        2,
+        "expected only the two one-arg debug(...) call sites, not the two-arg overload too: {result:?}"
+    );
+    for loc in result {
+        let start_line = loc["range"]["start"]["line"].as_u64().unwrap();
+        assert_ne!(
+            start_line, 3,
+            "the two-arg debug(LoggingLevel.INFO, ...) call site must not be included: {result:?}"
+        );
+    }
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The `SchemaObject` counterpart of the stdlib test above: a SOQL
 /// `FROM My_Object__c` in two files should find each other, and
 /// `includeDeclaration: true` should additionally surface the object's

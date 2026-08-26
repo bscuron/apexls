@@ -637,6 +637,23 @@ supports each one.
       (a stdlib method call site across two files, and a SOQL object
       reference across two files plus its `.object-meta.xml` declaration
       via `includeDeclaration`).
+
+      **Second follow-up, also closed:** `ExternalKey::Stdlib` originally
+      keyed only by `(class_name, member)`, so `references` on
+      `System.debug(message)` (the one-arg overload) also pulled in every
+      `System.debug(level, message)` (the two-arg overload) call site --
+      the opposite mistake from the gap above, over-*widening* rather
+      than missing entirely, but still wrong: a project-local overloaded
+      method never conflates its overloads this way, since each has its
+      own `SymbolId`. `StdlibMemberRef::arg_count` (already carried on
+      every `Resolution::StdlibMember`, originally added only to narrow
+      *hover* text to the matching-arity overload) is now also part of
+      the key, so each overload's call sites stay in their own group --
+      the same arity-first best effort `describe_stdlib_member`'s hover
+      narrowing already uses, not a new heuristic invented here. Doesn't
+      split a same-arity-different-parameter-type overload set (a rarer
+      shape in the scraped data), an honest, documented residual gap
+      matching hover's own.
 - [x] `textDocument/rename` (+ `prepareRename`) -- **done, deliberately
       scoped conservatively.** Two pieces landed together, in this order:
       1. **Overload-narrowing precision, first** (the actual blocker this

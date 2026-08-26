@@ -112,6 +112,22 @@ pub enum Resolution {
 /// allocation-free; this key is built at most once per reference at
 /// bind time and once per `textDocument/references`/`documentHighlight`
 /// request, so there's no case to make for that extra complexity here.
+///
+/// `Stdlib`'s `arg_count` deliberately *is* part of the key, even though
+/// `StdlibMemberRef::arg_count` itself only exists to narrow *hover*
+/// text (see that field's own doc comment: "existence, not overload-
+/// exactness, decides the `Resolution`") -- that reasoning is specific
+/// to whether a call resolves at all, not to what "every reference to
+/// this method" should mean. Collapsing `System.debug(message)` and
+/// `System.debug(level, message)` into one group the way a plain
+/// `(class_name, member)` key would is the wrong answer for
+/// `references`/`documentHighlight`: a project-local overloaded method
+/// never conflates its overloads this way either (each has its own
+/// `SymbolId`, so `by_symbol` already keeps them separate). Arity alone
+/// won't split every real overload set perfectly (same-arity,
+/// different-parameter-type overloads exist too), but it's the same
+/// honest, arity-first best effort `describe_stdlib_member`'s hover
+/// narrowing already settled for, not a new tradeoff invented here.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExternalKey {
     Schema {
@@ -121,6 +137,7 @@ pub enum ExternalKey {
     Stdlib {
         class_name: SmolStr,
         member: Option<SmolStr>,
+        arg_count: Option<usize>,
     },
 }
 
@@ -179,6 +196,7 @@ impl Resolution {
             Resolution::StdlibMember(r) => Some(ExternalKey::Stdlib {
                 class_name: lower(&r.class_name),
                 member: r.member.as_deref().map(lower),
+                arg_count: r.arg_count,
             }),
             Resolution::Resolved(_) | Resolution::Candidates(_) | Resolution::Unresolved => None,
         }
