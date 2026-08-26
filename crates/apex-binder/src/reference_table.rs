@@ -55,11 +55,25 @@ pub struct UnknownSchemaRef {
 /// to look the rest back up via `StdlibIndex`, the same way
 /// `SchemaObjectRef` doesn't distinguish a lookup field from a picklist
 /// field either.
+///
+/// `arg_count` is the call site's own argument count for a method call
+/// (`None` for a property access or a bare class-name reference, which
+/// aren't calls at all) -- carried here specifically so a hover renderer
+/// can narrow an overloaded method down to the arity-matching
+/// overload(s) instead of always showing every one, the same arity-first
+/// signal `crate::resolve::narrow_by_overload`/`narrow_stdlib_overload_type`
+/// already use to narrow the *propagated type*. Deliberately just the
+/// count, not the argument types themselves: unlike `Ty`, a `usize` is
+/// cheap to carry on every `Resolution` and never goes stale relative to
+/// the reference it describes, and arity alone already disambiguates the
+/// overwhelming majority of real overload sets (different-arity is far
+/// more common in the scraped data than same-arity-different-type).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StdlibMemberRef {
     pub namespace: Option<SmolStr>,
     pub class_name: SmolStr,
     pub member: Option<SmolStr>,
+    pub arg_count: Option<usize>,
 }
 
 /// `SchemaObject`/`UnknownSchema`/`StdlibMember` box their payload so

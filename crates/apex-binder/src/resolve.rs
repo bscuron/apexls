@@ -151,11 +151,17 @@ fn narrow_by_overload(
 /// through `stdlib` just to capture its real (post-collision-tiebreak)
 /// namespace -- shared by every `Ty::System` arm that can produce this
 /// resolution.
-fn stdlib_member_ref(stdlib: &StdlibIndex, class_name: &str, member: Option<&str>) -> StdlibMemberRef {
+fn stdlib_member_ref(
+    stdlib: &StdlibIndex,
+    class_name: &str,
+    member: Option<&str>,
+    arg_count: Option<usize>,
+) -> StdlibMemberRef {
     StdlibMemberRef {
         namespace: stdlib.class(class_name).and_then(|c| c.namespace.clone()),
         class_name: SmolStr::new(class_name),
         member: member.map(SmolStr::new),
+        arg_count,
     }
 }
 
@@ -1504,7 +1510,7 @@ impl<'a> BodyBinder<'a> {
         if self.stdlib.class(name).is_some() {
             self.refs.set(
                 ptr,
-                Resolution::StdlibMember(Box::new(stdlib_member_ref(self.stdlib, name, None))),
+                Resolution::StdlibMember(Box::new(stdlib_member_ref(self.stdlib, name, None, None))),
             );
             return Some(Ty::system_owned(SmolStr::new(name), Vec::new()));
         }
@@ -1566,6 +1572,7 @@ impl<'a> BodyBinder<'a> {
                         self.stdlib,
                         &object,
                         Some(name),
+                        None,
                     ))),
                     None => Resolution::Unresolved,
                 };
@@ -1659,9 +1666,12 @@ impl<'a> BodyBinder<'a> {
                 // see `crate::reference_table::Resolution`'s own doc
                 // comment on why that distinction exists at all.
                 let resolution = match self.stdlib.method(&base, name) {
-                    Some(_) => {
-                        Resolution::StdlibMember(Box::new(stdlib_member_ref(self.stdlib, &base, Some(name))))
-                    }
+                    Some(_) => Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                        self.stdlib,
+                        &base,
+                        Some(name),
+                        Some(arg_types.len()),
+                    ))),
                     None => Resolution::Unresolved,
                 };
                 self.refs.set_with_highlight(ptr, highlight, resolution);

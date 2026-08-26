@@ -106,6 +106,7 @@ fn map_keyset_infers_a_set_of_the_key_type() {
             namespace: Some("System".into()),
             class_name: "Map".into(),
             member: Some("keySet".into()),
+            arg_count: Some(0),
         }))),
         "Map.keySet is a real, documented stdlib method"
     );

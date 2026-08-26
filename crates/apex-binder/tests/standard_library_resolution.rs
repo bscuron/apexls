@@ -70,6 +70,7 @@ fn a_real_static_stdlib_method_call_resolves_to_stdlib_member() {
             namespace: Some("System".into()),
             class_name: "String".into(),
             member: Some("isBlank".into()),
+            arg_count: Some(1),
         }))),
         "String.isBlank is a real, documented stdlib method"
     );
@@ -93,6 +94,7 @@ fn an_overloaded_stdlib_method_call_also_resolves() {
             namespace: Some("System".into()),
             class_name: "Database".into(),
             member: Some("query".into()),
+            arg_count: Some(1),
         }))),
         "Database.query is real and overloaded -- existence, not overload-exactness, decides the Resolution"
     );
@@ -123,6 +125,7 @@ fn a_stdlib_property_access_resolves_to_stdlib_member() {
             namespace: Some("System".into()),
             class_name: "ApexPages".into(),
             member: Some("currentPage".into()),
+            arg_count: Some(0),
         })))
     );
     assert_eq!(
@@ -131,6 +134,7 @@ fn a_stdlib_property_access_resolves_to_stdlib_member() {
             namespace: Some("System".into()),
             class_name: "PageReference".into(),
             member: Some("getParameters".into()),
+            arg_count: Some(0),
         }))),
         "chaining off Database/ApexPages's stdlib return type should still resolve the next call"
     );
@@ -216,6 +220,7 @@ fn list_sort_falls_through_to_the_stdlib_lookup() {
             namespace: Some("System".into()),
             class_name: "List".into(),
             member: Some("sort".into()),
+            arg_count: Some(0),
         })))
     );
 }

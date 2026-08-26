@@ -297,6 +297,68 @@ fn hover_on_a_real_stdlib_method_call_shows_its_signature_and_description() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `public class Foo {` / `    public void run() {` /
+/// `        System.debug(LoggingLevel.INFO, 'hi');` / `    }` / `}` --
+/// "debug" spans characters 15-19 on line 2, so character 17 lands
+/// inside it. `System.debug` is a real, confirmed 2-way overload
+/// (`debug(Object)` and `debug(LoggingLevel, Object)`) -- a 2-argument
+/// call should narrow hover to just the 2-arg overload's own signature
+/// and description, not show both indiscriminately.
+const STDLIB_OVERLOADED_CALL_SRC: &str =
+    "public class Foo {\n    public void run() {\n        System.debug(LoggingLevel.INFO, 'hi');\n    }\n}\n";
+const STDLIB_OVERLOADED_CALL_POSITION: (u32, u32) = (2, 17);
+
+#[test]
+fn hover_on_an_overloaded_stdlib_call_narrows_to_the_matching_arity() {
+    let dir = write_fixture_dir("hover-stdlib-overload", &[("Foo.cls", STDLIB_OVERLOADED_CALL_SRC)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+
+    let mut session = Session::start_with_text(&foo_uri, &root_uri, STDLIB_OVERLOADED_CALL_SRC);
+
+    let response = session.request(
+        2,
+        "textDocument/hover",
+        serde_json::json!({
+            "textDocument": { "uri": foo_uri },
+            "position": { "line": STDLIB_OVERLOADED_CALL_POSITION.0, "character": STDLIB_OVERLOADED_CALL_POSITION.1 },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "hover returned an error: {response:?}"
+    );
+    let contents = response["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected hover contents.value, got {response:?}"));
+
+    // Narrowed to the 2-arg overload only: its own signature (with the
+    // `LoggingLevel` parameter) and its own description ("...with the
+    // specified log level.") should appear, but the 1-arg overload's
+    // signature/description should not.
+    assert!(
+        contents.contains("LoggingLevel"),
+        "hover should show the 2-arg overload's LoggingLevel parameter: {contents}"
+    );
+    assert!(
+        !contents.contains("LoggingLevel Enum"),
+        "the scraped \"LoggingLevel Enum\" cross-reference artifact should be stripped to just \
+         \"LoggingLevel\": {contents}"
+    );
+    assert!(
+        contents.contains("specified log level"),
+        "hover should show the 2-arg overload's own description: {contents}"
+    );
+    assert!(
+        !contents.contains("debug(Object"),
+        "hover should NOT also show the 1-arg overload's signature once arity narrows to one \
+         match: {contents}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn definition_on_a_field_reference_points_back_at_its_declaration() {
     let dir = write_fixture_dir("definition", &[("Foo.cls", FOO_SRC)]);

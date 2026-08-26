@@ -220,9 +220,18 @@ fn to_stdlib_property(raw: RawProperty) -> StdlibProperty {
 /// Cleans up the real messiness confirmed in the scraped data: embedded
 /// literal `\n`/run-on indentation from the source HTML (collapsed to
 /// single spaces), a stray space before `<`/`,`/`>` in a few entries
-/// (e.g. `"Map <String, Boolean>"`), and legacy `Type[]` array-sugar
+/// (e.g. `"Map <String, Boolean>"`), legacy `Type[]` array-sugar
 /// rewritten to `List<Type>` so a consumer only ever needs to
-/// understand one generic-collection spelling.
+/// understand one generic-collection spelling, and a trailing
+/// `" Class"`/`" Interface"`/`" Enum"` -- confirmed present on 33 real
+/// param/return/property types across the whole corpus (e.g.
+/// `System.debug`'s second overload's own `logLevel` parameter comes
+/// through as `"LoggingLevel Enum"`, not `"LoggingLevel"`): a
+/// cross-reference link's own visible text in the source HTML carries
+/// its target's kind suffix baked in, the exact same pattern
+/// `tools/salesforce-doc-scraper`'s own `split_title` already strips
+/// from a *page title* -- this is that same artifact showing up in a
+/// type reference instead.
 fn normalize_type_string(raw: &str) -> SmolStr {
     let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let collapsed = collapsed
@@ -230,6 +239,11 @@ fn normalize_type_string(raw: &str) -> SmolStr {
         .replace("< ", "<")
         .replace(" >", ">")
         .replace(", ", ",");
+    let collapsed = ["Class", "Interface", "Enum"]
+        .iter()
+        .find_map(|kind| collapsed.strip_suffix(&format!(" {kind}")))
+        .map(str::to_string)
+        .unwrap_or(collapsed);
     if let Some(base) = collapsed.strip_suffix("[]") {
         SmolStr::new(format!("List<{}>", base.trim()))
     } else {
@@ -369,6 +383,29 @@ mod tests {
         assert_eq!(
             normalize_type_string("List<Messaging.RenderEmailTemplateError>").as_str(),
             "List<Messaging.RenderEmailTemplateError>"
+        );
+    }
+
+    /// Real, confirmed bug: a cross-reference link's own visible text in
+    /// the scraped source HTML carries its target's kind suffix baked in
+    /// (`System.debug`'s second overload's `logLevel` parameter comes
+    /// through as literally `"LoggingLevel Enum"`, not `"LoggingLevel"`)
+    /// -- the same artifact `tools/salesforce-doc-scraper`'s own
+    /// `split_title` already strips from a *page title*, showing up here
+    /// in a type reference instead. Confirmed via a direct corpus scan
+    /// (33 real occurrences) that every real case ends in exactly one of
+    /// these three suffixes.
+    #[test]
+    fn normalize_type_string_strips_a_trailing_kind_suffix_from_a_cross_reference_link() {
+        assert_eq!(normalize_type_string("LoggingLevel Enum").as_str(), "LoggingLevel");
+        assert_eq!(normalize_type_string("QueueableDuplicateSignature Class").as_str(), "QueueableDuplicateSignature");
+        assert_eq!(normalize_type_string("EventPublishFailureCallback Interface").as_str(), "EventPublishFailureCallback");
+        // A real class name never contains a space of its own -- only the
+        // known kind-suffix artifact does -- so this is safe even for a
+        // dotted/namespaced name.
+        assert_eq!(
+            normalize_type_string("commercepayments.RequestType Enum").as_str(),
+            "commercepayments.RequestType"
         );
     }
 

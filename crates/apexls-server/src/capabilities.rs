@@ -225,11 +225,15 @@ pub(crate) fn describe_symbol(program: &BoundProgram, id: SymbolId) -> String {
 /// A bare class reference (`r.member: None`, e.g. hovering `String` in
 /// `String.isBlank(...)`) renders just the class name/namespace -- there's
 /// no per-class description in the bundled snapshot to show beyond that,
-/// unlike a method/property. A method's every real overload (there's no
-/// single "the" overload once a reference only proves existence, not
-/// which one -- see `crate::resolve::narrow_stdlib_overload_type`'s own
-/// doc comment) gets its own signature line, followed by the first
-/// overload's description (real overloads of the same method
+/// unlike a method/property. A method call narrows to the overload(s)
+/// whose arity matches `r.arg_count` (the same arity-first signal
+/// `crate::resolve::narrow_stdlib_overload_type` already uses to narrow
+/// the *propagated type* -- see its own doc comment for why arity alone,
+/// not full type-based narrowing, is enough here too) -- falling back to
+/// showing every overload only when arity doesn't narrow to at least one
+/// (an unknown arg count, or the arity-matching set is somehow empty).
+/// Each surviving overload gets its own signature line, followed by the
+/// first one's description (real overloads of the same method
 /// overwhelmingly share one description in the scraped docs).
 pub(crate) fn describe_stdlib_member(program: &BoundProgram, r: &StdlibMemberRef) -> Option<String> {
     let class = program.stdlib.class(&r.class_name)?;
@@ -255,6 +259,11 @@ pub(crate) fn describe_stdlib_member(program: &BoundProgram, r: &StdlibMemberRef
     }
 
     let overloads: Vec<_> = program.stdlib.methods(&r.class_name, member).collect();
+    let narrowed: Vec<_> = match r.arg_count {
+        Some(n) => overloads.iter().copied().filter(|m| m.params.len() == n).collect(),
+        None => Vec::new(),
+    };
+    let overloads = if narrowed.is_empty() { &overloads } else { &narrowed };
     let (first, rest) = overloads.split_first()?;
     let mut sig = String::from("```apex\n");
     for m in std::iter::once(first).chain(rest.iter()) {
