@@ -133,8 +133,22 @@ fn corpus_root() -> PathBuf {
 ///    exactly one, giving the chained `.next()` a real base type to
 ///    resolve against instead of hitting `bind_field_expr`'s "target
 ///    type entirely unknown" `Unresolved` fallback.
+/// 5. Ternary common-supertype widening (`crate::conversions::widen`,
+///    verified against a real org before implementation -- see its own
+///    doc comment) plus expanding `crate::generics`'s `List`/`Map`/`Set`
+///    table (`remove`/`put`/`iterator`, plus a data-driven fallback for
+///    `clone`/`deepClone` sourced from `apex_stdlib`'s scraped return
+///    types) left `BASELINE_RESOLVED` unchanged (`205_305`, real NPSP
+///    apparently has no chain shaped like `.remove(...).field`/
+///    `.clone().get(...).field`/a ternary-widened project type that
+///    previously failed) but moved `BASELINE_UNRESOLVED` -4
+///    (`83_954` -> `83_950`): a handful of real ternaries whose branches
+///    now widen to a real common type let a further chained reference
+///    (most likely a stdlib call, since `Resolution::StdlibMember` isn't
+///    tallied by either counter here) resolve instead of hitting the
+///    "target type entirely unknown" fallback.
 const BASELINE_RESOLVED: usize = 205_305;
-const BASELINE_UNRESOLVED: usize = 83_954;
+const BASELINE_UNRESOLVED: usize = 83_950;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

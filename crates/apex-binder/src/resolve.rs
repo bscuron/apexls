@@ -1355,12 +1355,16 @@ impl<'a> BodyBinder<'a> {
                 }
                 let then_ty = t.then_branch().and_then(|e| self.bind_expr(scope, &e));
                 let else_ty = t.else_branch().and_then(|e| self.bind_expr(scope, &e));
-                // No common-supertype inference when both branches are
-                // known but disagree (that needs the same generics/
-                // stdlib depth this step deliberately isn't building) --
-                // just prefer `then`, falling back to `else` only when
-                // `then`'s own type isn't known at all.
-                then_ty.or(else_ty)
+                // When both branches are known but differ, `conversions::widen`
+                // computes their real common type (verified against a real
+                // org -- see its own doc comment); only one side known
+                // still uses that side's type unchanged, never a guess.
+                match (then_ty, else_ty) {
+                    (Some(a), Some(b)) => conversions::widen(self.schema, self.table, &a, &b),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                }
             }
             Expr::Instanceof(i) => {
                 if let Some(o) = i.operand() {
@@ -1730,7 +1734,7 @@ impl<'a> BodyBinder<'a> {
                 // member `generics.rs` doesn't model, like `sort`/
                 // `addAll`, which need no substitution anyway) does the
                 // scraped, best-effort-narrowed return type get used.
-                crate::generics::builtin_generic_member_type(&base, &args, name).or_else(|| {
+                crate::generics::builtin_generic_member_type(class, &base, &args, name).or_else(|| {
                     class.and_then(|c| {
                         narrow_stdlib_overload_type(self.schema, self.table, c, name, &arg_types)
                     })

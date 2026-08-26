@@ -86,10 +86,26 @@ fn bench_warm_single_edit(c: &mut Criterion) {
         "no NPSP corpus found at {}; is the submodule checked out? (git submodule update --init --recursive)",
         root.display()
     );
-    let target = apex_discover::find_apex_files(&root)
-        .into_iter()
-        .next()
-        .expect("corpus has at least one file to simulate editing");
+    // Pinned to a specific real file rather than
+    // `find_apex_files(&root).into_iter().next()` -- confirmed (while
+    // investigating an apparent ~20-27% regression that a clean,
+    // same-file-both-times comparison showed wasn't real) that the
+    // discovery walk's iteration order isn't stable *across separate
+    // process invocations* on this machine, so two `cargo bench` runs
+    // launched independently (e.g. a before/after comparison via `git
+    // stash`) can silently edit two different real files with two
+    // different real costs instead of the same edit both times --
+    // exactly the kind of measurement trap `BACKLOG.md` §2's own
+    // "measurement red herring" precedent warns about. A fixed path
+    // keeps this benchmark's number meaningful to compare across
+    // separate invocations, not just within one criterion run's own
+    // repeated sampling.
+    let target = root.join("force-app/tdtm/triggers/TDTM_User.trigger");
+    assert!(
+        target.exists(),
+        "pinned benchmark target file no longer exists in the corpus: {}",
+        target.display()
+    );
     let original = std::fs::read_to_string(&target).unwrap();
 
     let cache = RefCell::new(apex_binder::BindCache::default());

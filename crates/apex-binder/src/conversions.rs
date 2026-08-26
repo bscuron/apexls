@@ -79,6 +79,16 @@
 //! `extends` chain, Apex has no SObject-to-SObject subtyping at all, so
 //! "different real object names" is *always* a definite mismatch, not
 //! just an unmodeled one.
+//!
+//! [`widen`] answers a related but distinct question on top of the same
+//! curated rules -- not "can this value be passed here," but "what's the
+//! common type of a ternary's two branches" (`crate::resolve`'s
+//! `Expr::Ternary` arm) -- verified against a real org the same way
+//! every rule above was, and confirmed to need no *new* rules at all:
+//! real Apex ternary widening turned out to be exactly this module's
+//! existing directional checks, applied in both directions, not a
+//! separate common-ancestor search. See [`widen`]'s own doc comment for
+//! the specific org evidence.
 
 use crate::schema_index::SchemaIndex;
 use crate::symbol::SymbolId;
@@ -286,6 +296,96 @@ fn collection_args_compatible(
         Some(true)
     } else {
         None
+    }
+}
+
+/// `ty`'s own type name, one level deep (no nested type arguments) --
+/// bridges [`widen`]'s two already-*inferred* `Ty` values into
+/// [`type_compatible`]'s "declared parameter" shape (`&str` name + a
+/// separate `&[SmolStr]` for *its* type arguments), which is the only
+/// asymmetry between the two: `type_compatible`'s `arg` side is a real
+/// `Ty`, but its `param_name`/`param_args` side is always a name captured
+/// from declared-type source text, since a parameter's own type was never
+/// itself inferred. A project-local type's name resolves the same way
+/// `type_compatible`/`is_more_specific` already look one up by string
+/// (`table.resolve_dotted_name`), so handing back its plain `name` here
+/// (not a dotted/qualified path) is exactly what those call sites expect.
+fn ty_arg_name(table: &SymbolTable, ty: &Ty) -> SmolStr {
+    match ty {
+        Ty::Project(id) => table.get(*id).name.clone(),
+        Ty::System { name, .. } => name.clone(),
+    }
+}
+
+/// The common type of a ternary's two branches (`crate::resolve`'s
+/// `Expr::Ternary` arm), verified against a real connected org before
+/// being trusted (`sf apex run` anonymous-Apex probes, this module's own
+/// established practice) rather than assumed from first principles --
+/// real Apex ternaries turned out to use exactly the same *directional*
+/// assignability every other conversion context here already models, not
+/// a general "find the nearest common ancestor" join the way Java's
+/// conditional operator does: `Integer i; Long l; Long ok = flag ? i : l;`
+/// compiles (`Integer` widens into `Long`, confirmed the same direction
+/// [`numeric_rank`] already uses) but `Integer bad = flag ? i : l;` is a
+/// real `Illegal assignment from Long to Integer` compile error -- and,
+/// more surprisingly, two sibling classes with no *direct* relationship
+/// to each other (`Dog`/`Cat`, both merely `extends Animal`) is *also* a
+/// real compile error, `Incompatible types in ternary operator: Cat,
+/// Dog`, even though they share a common ancestor -- while two classes in
+/// a direct `extends` relationship (`Animal`/`Dog`) widen exactly the way
+/// [`project_arg_compatible`]'s existing `inherited_chain` check already
+/// says they should. So this function needs no new common-ancestor
+/// machinery at all: every case reuses an existing directional rule,
+/// applied in both directions, and returns `None` (not a guess) whenever
+/// neither direction succeeds -- which the `String`/`Boolean` probe
+/// confirmed is a real Apex compile error in its own right
+/// (`Incompatible types in ternary operator: Boolean, String`), not just
+/// this module being conservative.
+pub(crate) fn widen(schema: &SchemaIndex, table: &SymbolTable, a: &Ty, b: &Ty) -> Option<Ty> {
+    if a == b {
+        return Some(a.clone());
+    }
+    match (a, b) {
+        (Ty::Project(a_id), Ty::Project(b_id)) => {
+            if table.inherited_chain(*a_id).contains(b_id) {
+                Some(Ty::Project(*b_id))
+            } else if table.inherited_chain(*b_id).contains(a_id) {
+                Some(Ty::Project(*a_id))
+            } else {
+                None
+            }
+        }
+        (
+            Ty::System {
+                name: a_name,
+                args: a_args,
+            },
+            Ty::System {
+                name: b_name,
+                args: b_args,
+            },
+        ) => {
+            let a_arg_names: Vec<SmolStr> = a_args.iter().map(|t| ty_arg_name(table, t)).collect();
+            let b_arg_names: Vec<SmolStr> = b_args.iter().map(|t| ty_arg_name(table, t)).collect();
+            let a_into_b = type_compatible(schema, table, b_name, &b_arg_names, a);
+            let b_into_a = type_compatible(schema, table, a_name, &a_arg_names, b);
+            match (a_into_b, b_into_a) {
+                // Bidirectionally compatible with no established
+                // specificity (`Id`/`String` -- see this module's own
+                // doc comment on the org's surprising overload-preference
+                // result) -- no principled winner, so this stays honestly
+                // unresolved rather than an arbitrary pick.
+                (Some(true), Some(true)) => None,
+                (Some(true), _) => Some(b.clone()),
+                (_, Some(true)) => Some(a.clone()),
+                _ => None,
+            }
+        }
+        // A project-local type and a system/schema type have no defined
+        // relationship either direction -- mirrors `project_arg_compatible`'s
+        // own "a project class is never one of Apex's sealed builtin/
+        // system types" reasoning.
+        _ => None,
     }
 }
 
@@ -610,5 +710,77 @@ mod tests {
             "List",
             &[SmolStr::new_static("Long")],
         ));
+    }
+
+    // `widen`'s `(Ty::Project, Ty::Project)` branch (the `inherited_chain`
+    // case) is covered end-to-end by
+    // `crates/apex-binder/tests/ternary_type_widening.rs` against real
+    // parsed/bound source instead of here, matching this file's existing
+    // convention: no other test in this module hand-builds a `SymbolTable`
+    // with real project-local declarations/inheritance either (see e.g.
+    // `is_more_specific`'s own `inherited_chain` branch above, also
+    // untested at this level) since that setup is more naturally exercised
+    // through the real binder pipeline.
+
+    #[test]
+    fn widen_returns_the_shared_type_unchanged_when_branches_already_match() {
+        let schema = empty_schema();
+        let table = empty_table();
+        assert_eq!(widen(&schema, &table, &sys("Integer"), &sys("Integer")), Some(sys("Integer")));
+    }
+
+    #[test]
+    fn widen_numeric_branches_to_the_wider_type() {
+        let schema = empty_schema();
+        let table = empty_table();
+        assert_eq!(widen(&schema, &table, &sys("Integer"), &sys("Long")), Some(sys("Long")));
+        assert_eq!(widen(&schema, &table, &sys("Long"), &sys("Integer")), Some(sys("Long")));
+    }
+
+    #[test]
+    fn widen_date_branches_to_datetime() {
+        let schema = empty_schema();
+        let table = empty_table();
+        assert_eq!(widen(&schema, &table, &sys("Date"), &sys("Datetime")), Some(sys("Datetime")));
+        assert_eq!(widen(&schema, &table, &sys("Datetime"), &sys("Date")), Some(sys("Datetime")));
+    }
+
+    /// `Id`/`String` are bidirectionally compatible with no established
+    /// specificity (see `type_compatible`'s own doc comment) -- `widen`
+    /// must not arbitrarily pick a winner between them.
+    #[test]
+    fn widen_returns_none_for_bidirectionally_compatible_branches_with_no_specificity() {
+        let schema = empty_schema();
+        let table = empty_table();
+        assert_eq!(widen(&schema, &table, &sys("Id"), &sys("String")), None);
+    }
+
+    #[test]
+    fn widen_a_real_object_type_and_sobject_widens_to_sobject() {
+        let schema = standard_schema();
+        let table = empty_table();
+        assert_eq!(widen(&schema, &table, &sys("Account"), &sys("SObject")), Some(sys("SObject")));
+        assert_eq!(widen(&schema, &table, &sys("SObject"), &sys("Account")), Some(sys("SObject")));
+    }
+
+    #[test]
+    fn widen_returns_none_for_two_different_object_types() {
+        let schema = standard_schema();
+        let table = empty_table();
+        assert_eq!(widen(&schema, &table, &sys("Account"), &sys("Contact")), None);
+    }
+
+    #[test]
+    fn widen_returns_none_for_genuinely_incompatible_branches() {
+        let schema = empty_schema();
+        let table = empty_table();
+        assert_eq!(widen(&schema, &table, &sys("String"), &sys("Boolean")), None);
+    }
+
+    #[test]
+    fn widen_returns_none_for_a_project_and_system_type_mismatch() {
+        let schema = empty_schema();
+        let table = empty_table();
+        assert_eq!(widen(&schema, &table, &Ty::Project(sid(0)), &sys("String")), None);
     }
 }

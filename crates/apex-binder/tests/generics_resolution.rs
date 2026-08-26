@@ -111,3 +111,128 @@ fn map_keyset_infers_a_set_of_the_key_type() {
         "Map.keySet is a real, documented stdlib method"
     );
 }
+
+#[test]
+fn list_remove_substitutes_the_element_type_so_a_further_field_access_resolves() {
+    let dir = write_fixture_dir(
+        "generics-list-remove",
+        &[(
+            "Widget.cls",
+            "public class Widget { \
+             public Integer count; \
+             public void run() { \
+                 List<Widget> items = new List<Widget>(); \
+                 Integer c = items.remove(0).count; \
+             } \
+         }",
+        )],
+    );
+
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let count_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Field && s.name == "count")
+        .map(|(id, _)| id)
+        .expect("Widget.count should have been collected");
+
+    let widget_file = file_for_class(&program, "Widget");
+    let root = program.syntax(widget_file);
+    let field_ptr = root
+        .descendants()
+        .find_map(apex_syntax::ast::expr::FieldExpr::cast)
+        .map(|f| SyntaxPtr::new(widget_file, f.syntax()))
+        .expect("items.remove(0).count should be a FieldExpr");
+    assert_eq!(
+        program.resolution(field_ptr).cloned(),
+        Some(Resolution::Resolved(count_id)),
+        "List<Widget>.remove(0)'s substituted element type should let `.count` resolve"
+    );
+}
+
+#[test]
+fn map_put_substitutes_the_value_type_so_a_further_field_access_resolves() {
+    let dir = write_fixture_dir(
+        "generics-map-put",
+        &[(
+            "Widget.cls",
+            "public class Widget { \
+             public Integer count; \
+             public void run() { \
+                 Map<String, Widget> byName = new Map<String, Widget>(); \
+                 Integer c = byName.put('a', new Widget()).count; \
+             } \
+         }",
+        )],
+    );
+
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let count_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Field && s.name == "count")
+        .map(|(id, _)| id)
+        .expect("Widget.count should have been collected");
+
+    let widget_file = file_for_class(&program, "Widget");
+    let root = program.syntax(widget_file);
+    let field_ptr = root
+        .descendants()
+        .find_map(apex_syntax::ast::expr::FieldExpr::cast)
+        .map(|f| SyntaxPtr::new(widget_file, f.syntax()))
+        .expect("byName.put(...).count should be a FieldExpr");
+    assert_eq!(
+        program.resolution(field_ptr).cloned(),
+        Some(Resolution::Resolved(count_id)),
+        "Map<String, Widget>.put(...)'s substituted value type should let `.count` resolve"
+    );
+}
+
+/// `List.clone`/`Map.clone`/`Set.clone` have no hand-written entry in
+/// `crate::generics`'s table at all -- this proves the data-driven
+/// `same_type_as_receiver` fallback (sourced from `apex_stdlib`'s scraped
+/// `List.clone -> List` signature, not a hardcoded method name) actually
+/// wires through the real resolver, not just its own unit tests.
+#[test]
+fn list_clone_preserves_the_element_type_so_chaining_still_resolves() {
+    let dir = write_fixture_dir(
+        "generics-list-clone",
+        &[(
+            "Widget.cls",
+            "public class Widget { \
+             public Integer count; \
+             public void run() { \
+                 List<Widget> items = new List<Widget>(); \
+                 Integer c = items.clone().get(0).count; \
+             } \
+         }",
+        )],
+    );
+
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let count_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Field && s.name == "count")
+        .map(|(id, _)| id)
+        .expect("Widget.count should have been collected");
+
+    let widget_file = file_for_class(&program, "Widget");
+    let root = program.syntax(widget_file);
+    let field_ptr = root
+        .descendants()
+        .find_map(apex_syntax::ast::expr::FieldExpr::cast)
+        .map(|f| SyntaxPtr::new(widget_file, f.syntax()))
+        .expect("items.clone().get(0).count should be a FieldExpr");
+    assert_eq!(
+        program.resolution(field_ptr).cloned(),
+        Some(Resolution::Resolved(count_id)),
+        "List<Widget>.clone()'s preserved element type should let `.get(0).count` resolve"
+    );
+}
