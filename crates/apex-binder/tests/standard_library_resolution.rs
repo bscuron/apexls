@@ -10,7 +10,7 @@
 //! purely the fallback for everything else.
 
 use apex_binder::{BoundProgram, Resolution, StdlibMemberRef};
-use apex_syntax::ast::expr::{FieldExpr, MethodCallExpr};
+use apex_syntax::ast::expr::{FieldExpr, MethodCallExpr, NameExpr};
 use rowan::ast::AstNode;
 
 fn write_fixture_dir(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
@@ -45,6 +45,21 @@ fn field_expr_resolution(program: &BoundProgram, member: &str) -> Option<Resolut
             let Some(name) = fe.member_token() else { continue };
             if name.text() == member {
                 let ptr = apex_binder::SyntaxPtr::new(file, fe.syntax());
+                return program.resolution(ptr).cloned();
+            }
+        }
+    }
+    None
+}
+
+fn name_expr_resolution(program: &BoundProgram, name: &str) -> Option<Resolution> {
+    for file in program.files() {
+        let root = program.syntax(file);
+        for node in root.descendants() {
+            let Some(ne) = NameExpr::cast(node) else { continue };
+            let Some(tok) = ne.name_token() else { continue };
+            if tok.text() == name {
+                let ptr = apex_binder::SyntaxPtr::new(file, ne.syntax());
                 return program.resolution(ptr).cloned();
             }
         }
@@ -222,5 +237,46 @@ fn list_sort_falls_through_to_the_stdlib_lookup() {
             member: Some("sort".into()),
             arg_count: Some(0),
         })))
+    );
+}
+
+/// `LoggingLevel` is an `Enum`, not a `Class`/`Interface` -- confirms
+/// enum constant access (`LoggingLevel.INFO`) resolves end-to-end: the
+/// bare `LoggingLevel` receiver itself (`bind_name_expr`'s stdlib-class
+/// fallback, `member: None`) and `.INFO` (`bind_field_expr`'s stdlib-
+/// property fallback, since `apex_stdlib`'s scraper models an enum
+/// value as a static property of the enum's own type). Real, motivating
+/// example: `System.debug(LoggingLevel.INFO, 'hi')`.
+#[test]
+fn an_enum_constant_access_resolves_to_stdlib_member() {
+    let dir = write_fixture_dir(
+        "stdlib-enum-constant",
+        &[(
+            "Foo.cls",
+            "public class Foo { public void run() { System.debug(LoggingLevel.INFO, 'hi'); } }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        name_expr_resolution(&program, "LoggingLevel"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: None,
+            class_name: "LoggingLevel".into(),
+            member: None,
+            arg_count: None,
+        }))),
+        "the bare LoggingLevel receiver itself should resolve as a known stdlib class"
+    );
+    assert_eq!(
+        field_expr_resolution(&program, "INFO"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: None,
+            class_name: "LoggingLevel".into(),
+            member: Some("INFO".into()),
+            arg_count: None,
+        }))),
+        "LoggingLevel.INFO should resolve as a known stdlib property (an enum value)"
     );
 }

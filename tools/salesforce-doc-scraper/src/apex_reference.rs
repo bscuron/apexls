@@ -198,6 +198,8 @@ pub fn parse_class_page(page_id: &str, title: &str, content_html: &str) -> Class
             } else {
                 methods.push(parse_method(root, page_id, title));
             }
+        } else if kind == "Enum" {
+            properties = parse_enum_values(&root, page_id, &name);
         }
     } else {
         for el in leaves {
@@ -228,6 +230,94 @@ pub fn parse_class_page(page_id: &str, title: &str, content_html: &str) -> Class
         methods,
         properties,
     }
+}
+
+/// An `Enum` page's own values list -- confirmed a completely different
+/// shape from a Class/Interface page's Methods/Properties/Constructors
+/// sections: no `nested2` leaves, no `Signature` section at all (so the
+/// ordinary whole-page-fallback branch above never fires for one
+/// either). Modeled as [`PropertyModel`]s (`is_static: true`,
+/// `type_name`: the enum's own name, since each value literally *is* an
+/// instance of its own enum type) rather than inventing a separate
+/// enum-value model -- this lets `LoggingLevel.INFO`-style access reuse
+/// every bit of existing property lookup/hover machinery `apex-binder`/
+/// `apexls-server` already have for a stdlib property, with zero new
+/// code needed on that side at all.
+///
+/// Two real, confirmed shapes, tried in order (auditing every real enum
+/// with zero captured values, not just the one fixture the first version
+/// of this function was written against -- 4 of 104 came back empty
+/// against a naive first pass, all for a real, different reason):
+/// 1. A `<table>` -- but *not* reliably `<td data-title="Value">`/
+///    `<td data-title="Description">`: `DisplayType`/`SOAPType`/
+///    `JsonToken` instead use entirely different column labels
+///    (`"Type Field Value"`/`"What the Field Object Contains"`, say),
+///    so this keys off structural position instead (first `<td>` in a
+///    `<tbody>` row is the value, second is the description) --
+///    matching the same lesson `object_reference.rs`'s own parser
+///    already learned from `data-title` varying there too.
+/// 2. No table at all: `TriggerOperation`'s page instead lists its
+///    values as `<ul class="ul bulletList"><li>0: BEFORE_INSERT</li>...`
+///    -- an ordinal, a colon, then the bare value name, no separate
+///    description. Tried only when the table shape finds nothing.
+fn parse_enum_values(root: &ElementRef, page_id: &str, enum_name: &str) -> Vec<PropertyModel> {
+    let from_table = parse_enum_values_table(root, page_id, enum_name);
+    if !from_table.is_empty() {
+        return from_table;
+    }
+    parse_enum_values_bullet_list(root, page_id, enum_name)
+}
+
+fn parse_enum_values_table(root: &ElementRef, page_id: &str, enum_name: &str) -> Vec<PropertyModel> {
+    let row_sel = selector("tbody tr"); // `tbody` specifically excludes the `<thead>` header row.
+    let td_sel = selector("td");
+    root.select(&row_sel)
+        .filter_map(|row| {
+            let mut cells = row.select(&td_sel);
+            let value = cells.next()?.text().collect::<String>().trim().to_string();
+            if value.is_empty() {
+                return None;
+            }
+            let description = cells
+                .next()
+                .map(|d| d.text().collect::<String>().trim().to_string())
+                .filter(|s| !s.is_empty());
+            Some(PropertyModel {
+                anchor_id: format!("{page_id}_{value}"),
+                name: value,
+                is_static: true,
+                visibility: Some("public".to_string()),
+                type_name: Some(enum_name.to_string()),
+                description,
+            })
+        })
+        .collect()
+}
+
+fn parse_enum_values_bullet_list(root: &ElementRef, page_id: &str, enum_name: &str) -> Vec<PropertyModel> {
+    let li_sel = selector("ul.bulletList li");
+    root.select(&li_sel)
+        .filter_map(|li| {
+            let text = li.text().collect::<String>();
+            // "0: BEFORE_INSERT" -> "BEFORE_INSERT" (tolerates a missing
+            // "N: " ordinal prefix too, via `next_back` on a single
+            // no-colon segment). A real value name never contains
+            // whitespace, so this also guards against some unrelated
+            // bullet list elsewhere on the page being swept in.
+            let value = text.rsplit(':').next()?.trim().to_string();
+            if value.is_empty() || value.contains(char::is_whitespace) {
+                return None;
+            }
+            Some(PropertyModel {
+                anchor_id: format!("{page_id}_{value}"),
+                name: value,
+                is_static: true,
+                visibility: Some("public".to_string()),
+                type_name: Some(enum_name.to_string()),
+                description: None,
+            })
+        })
+        .collect()
 }
 
 /// `el` is either a real `nested2` leaf (`header` from its own `<h3>`,
@@ -470,6 +560,40 @@ mod tests {
             .expect("compareTo should have been parsed");
         assert_eq!(compare_to.params.len(), 1);
         assert_eq!(compare_to.return_type.as_deref(), Some("Integer"));
+    }
+
+    /// Real, confirmed bug: an `Enum` page has neither `nested2` leaves
+    /// nor a `Signature` section at all, so before `parse_enum_values`
+    /// existed, every real enum (104 in the whole corpus) silently came
+    /// out with zero methods *and* zero properties -- `LoggingLevel`
+    /// (used by `System.debug`'s own second overload, arguably the most
+    /// common enum in real Apex code) had no way to resolve `.INFO`/
+    /// `.DEBUG`/etc. at all.
+    #[test]
+    fn parses_the_real_logginglevel_enums_values_as_static_properties() {
+        let fixture = load_fixture("apex_enum_System_LoggingLevel.json");
+        let title = fixture["title"].as_str().unwrap();
+        let content = fixture["content"].as_str().unwrap();
+        let class = parse_class_page("apex_enum_System_LoggingLevel", title, content);
+
+        assert_eq!(class.name, "LoggingLevel");
+        assert_eq!(class.kind, "Enum");
+        assert!(class.methods.is_empty(), "an enum has no methods");
+        assert_eq!(
+            class.properties.len(),
+            8,
+            "expected all 8 real LoggingLevel values (NONE/ERROR/WARN/INFO/DEBUG/FINE/FINER/FINEST), got {:?}",
+            class.properties.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+
+        let info = class
+            .properties
+            .iter()
+            .find(|p| p.name == "INFO")
+            .expect("INFO should have been parsed as one of LoggingLevel's values");
+        assert!(info.is_static);
+        assert_eq!(info.type_name.as_deref(), Some("LoggingLevel"));
+        assert_eq!(info.description.as_deref(), Some("Informational logging."));
 
         // Regression guard for the group-wrapper/leaf double-counting
         // bug this module's own doc comment describes: every anchor id
@@ -486,6 +610,67 @@ mod tests {
             total,
             "found duplicate method anchor ids -- the group-wrapper/leaf selector scoping regressed"
         );
+    }
+
+    /// Real, confirmed second table variant: `DisplayType`'s own values
+    /// table uses `data-title="Type Field Value"`/`"What the Field
+    /// Object Contains"`, not `"Value"`/`"Description"` -- found by
+    /// auditing every real enum with zero captured values rather than
+    /// trusting `LoggingLevel`'s own shape was representative of all
+    /// 104. `parse_enum_values_table` keys off structural position
+    /// (first/second `<td>`) specifically so this doesn't matter.
+    #[test]
+    fn parses_the_real_displaytype_enum_using_a_differently_labeled_table() {
+        let fixture = load_fixture("apex_enum_Schema_DisplayType.json");
+        let title = fixture["title"].as_str().unwrap();
+        let content = fixture["content"].as_str().unwrap();
+        let class = parse_class_page("apex_enum_Schema_DisplayType", title, content);
+
+        assert_eq!(class.name, "DisplayType");
+        assert_eq!(class.kind, "Enum");
+        assert_eq!(
+            class.properties.len(),
+            30,
+            "expected all 30 real DisplayType values, got {}",
+            class.properties.len()
+        );
+        let address = class
+            .properties
+            .iter()
+            .find(|p| p.name == "ADDRESS")
+            .expect("ADDRESS should have been parsed");
+        assert_eq!(address.type_name.as_deref(), Some("DisplayType"));
+        assert_eq!(address.description.as_deref(), Some("Address values"));
+    }
+
+    /// Real, confirmed third shape: `TriggerOperation`'s page has no
+    /// table at all -- its values are a bare `<ul class="ul bulletList">`
+    /// of `<li>0: BEFORE_INSERT</li>` (ordinal, colon, value name, no
+    /// description). `parse_enum_values` only tries this fallback when
+    /// the table shape finds nothing.
+    #[test]
+    fn parses_the_real_triggeroperation_enum_from_its_bullet_list_shape() {
+        let fixture = load_fixture("apex_enum_System_TriggerOperation.json");
+        let title = fixture["title"].as_str().unwrap();
+        let content = fixture["content"].as_str().unwrap();
+        let class = parse_class_page("apex_enum_System_TriggerOperation", title, content);
+
+        assert_eq!(class.name, "TriggerOperation");
+        assert_eq!(class.kind, "Enum");
+        assert_eq!(
+            class.properties.len(),
+            7,
+            "expected all 7 real TriggerOperation values, got {:?}",
+            class.properties.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+        let before_insert = class
+            .properties
+            .iter()
+            .find(|p| p.name == "BEFORE_INSERT")
+            .expect("BEFORE_INSERT should have been parsed");
+        assert!(before_insert.is_static);
+        assert_eq!(before_insert.type_name.as_deref(), Some("TriggerOperation"));
+        assert!(before_insert.description.is_none(), "this shape has no per-value description");
     }
 
     /// `ApexPages.Action`'s only constructor: `public Action(String action)`

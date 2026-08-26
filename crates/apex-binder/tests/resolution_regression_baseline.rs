@@ -105,8 +105,21 @@ fn corpus_root() -> PathBuf {
 ///    than step 1 alone: `BASELINE_UNRESOLVED` -49,909 more (`134_118`
 ///    -> `84_209`), `BASELINE_RESOLVED` +2 more (`204_985` -> `204_987`,
 ///    same further-disambiguation mechanism as step 1).
+/// 3. A real stdlib enum (`LoggingLevel`, `TriggerOperation`, ...) had
+///    no way to model its *values* at all until `tools/salesforce-doc-scraper`'s
+///    `apex_reference::parse_enum_values` was added -- an `Enum` page has
+///    neither `nested2` leaves nor a `Signature` section, so every one
+///    of the 104 real stdlib enums silently came out with zero
+///    properties beforehand. Each value is modeled as a static property
+///    of the enum's own type (`LoggingLevel.INFO`'s value `INFO` has
+///    `type_name: "LoggingLevel"`), reusing the exact property-lookup
+///    path a real stdlib property already has -- no new `Resolution`
+///    variant or `crate::resolve` code needed for this step at all.
+///    `BASELINE_UNRESOLVED` -250 more (`84_209` -> `83_959`);
+///    `BASELINE_RESOLVED` unaffected (enum constant access never
+///    produces a `SymbolId`-backed outcome either way).
 const BASELINE_RESOLVED: usize = 204_987;
-const BASELINE_UNRESOLVED: usize = 84_209;
+const BASELINE_UNRESOLVED: usize = 83_959;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

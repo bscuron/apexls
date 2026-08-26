@@ -170,6 +170,13 @@ const APEX_REFERENCE_JSON: &str = include_str!("../data/apex_reference.json");
 /// accepted, tiny, documented gap rather than a bespoke title parser
 /// for a handful of entries, the same tolerance this project's scraper
 /// work has already established for similarly small residuals.
+///
+/// Includes `Enum` (104 in the whole corpus, e.g. `LoggingLevel`) --
+/// each of its values is modeled as one of its `properties` (`is_static:
+/// true`, `type_name`: the enum's own name), so `LoggingLevel.INFO`
+/// resolves through the exact same property-lookup path a real stdlib
+/// property already does, with no separate enum-value concept needed
+/// anywhere in `apex-binder`/`apexls-server`.
 pub fn standard_classes() -> &'static [StdlibClass] {
     static CLASSES: OnceLock<Vec<StdlibClass>> = OnceLock::new();
     CLASSES.get_or_init(|| {
@@ -177,7 +184,7 @@ pub fn standard_classes() -> &'static [StdlibClass] {
             .expect("bundled data/apex_reference.json failed to parse");
         raw.into_iter()
             .filter(|c| {
-                (c.kind == "Class" || c.kind == "Interface")
+                matches!(c.kind.as_str(), "Class" | "Interface" | "Enum")
                     && (!c.methods.is_empty() || !c.properties.is_empty())
             })
             .map(to_stdlib_class)
@@ -362,6 +369,34 @@ mod tests {
             "expected exactly 2 real Database.query overloads, got {}",
             query_overloads.len()
         );
+    }
+
+    /// `LoggingLevel` is an `Enum`, not a `Class`/`Interface` -- confirms
+    /// `standard_classes` includes enum kinds too, and that each of its
+    /// values comes through as a `StdlibProperty` (the scraper's own
+    /// `parse_enum_values` models a value as a static property of the
+    /// enum's own type, deliberately reusing the property shape rather
+    /// than inventing a separate enum-value concept).
+    #[test]
+    fn an_enums_values_come_through_as_static_properties_of_its_own_type() {
+        let classes = standard_classes();
+        let logging_level = classes
+            .iter()
+            .find(|c| c.name == "LoggingLevel")
+            .expect("LoggingLevel should be in the bundled snapshot");
+        assert_eq!(
+            logging_level.properties.len(),
+            8,
+            "expected all 8 real LoggingLevel values, got {}",
+            logging_level.properties.len()
+        );
+        let info = logging_level
+            .properties
+            .iter()
+            .find(|p| p.name == "INFO")
+            .expect("INFO should be one of LoggingLevel's values");
+        assert!(info.is_static);
+        assert_eq!(info.type_name.as_deref(), Some("LoggingLevel"));
     }
 
     /// `Test` collides between the `Canvas` and `System` namespaces --

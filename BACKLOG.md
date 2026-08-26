@@ -921,12 +921,18 @@ precision" -- they directly block shipping certain features honestly.
       stdlib calls are extremely common in real Apex), `Resolved` rose
       by 3 as a side effect (a project-local overloaded call's argument
       type, previously unknown, is now known well enough for the
-      existing `narrow_by_overload` to disambiguate it). **What this
-      doesn't do:** model enum constant/static-value access (a different
-      access pattern, not a method call) -- and this closes the
-      *blocking* gap for semantic diagnostics without itself building a
-      diagnostics pass; "flag unresolved symbol" as a real, shippable
-      feature is separate, unstarted follow-on work.
+      existing `narrow_by_overload` to disambiguate it). Enum constant
+      access (`LoggingLevel.INFO` and similar) is also modeled now, as a
+      static property of the enum's own type -- the scraper's
+      `apex_reference::parse_enum_values` fills in the 104 real stdlib
+      enums that previously came out with zero properties (an `Enum`
+      page has neither `nested2` leaves nor a `Signature` section, so
+      neither of the two existing `parse_class_page` branches ever fired
+      for one), lowering `Unresolved` by a further 250 (`84,209` ->
+      `83,959`). **What this doesn't do:** this closes the *blocking*
+      gap for semantic diagnostics without itself building a diagnostics
+      pass; "flag unresolved symbol" as a real, shippable feature is
+      separate, unstarted follow-on work.
 - [x] **No standard SObject/field schema -- done, via a bundled
       snapshot.** New `crates/apex-stdlib` crate embeds a schema
       snapshot scraped directly from Salesforce's own Object Reference
