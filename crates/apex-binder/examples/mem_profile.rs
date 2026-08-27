@@ -34,6 +34,16 @@ fn main() {
 
     // Keep both alive until after the stats snapshot above -- this is
     // the point of the harness: measure the *retained* shape, not a
-    // transient peak during construction.
-    std::hint::black_box((&cache, &program));
+    // transient peak during construction. Deliberately leaked (not just
+    // `black_box`ed) rather than let normally drop at the end of `main`:
+    // `dhat-heap.json`'s per-allocation-site breakdown is only written
+    // when `_profiler` itself drops, which (declared first) happens
+    // *after* `cache`/`program` (declared later) already dropped -- so
+    // without this, the JSON's own "still live at t-end" breakdown
+    // reflects almost nothing (just process-lifetime statics), making
+    // the interactive per-site view at https://nnethercote.github.io/dh_view/dh_view.html
+    // useless for exactly the question this harness exists to answer.
+    // `curr_bytes`/`max_bytes` above are unaffected either way, since
+    // they were already captured before this point.
+    std::mem::forget((cache, program));
 }

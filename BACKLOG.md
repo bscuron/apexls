@@ -494,6 +494,74 @@ below could be measured against something real instead of guessed at.
       grow-from-empty pattern; `apex_lexer::tokenize`'s `Vec<Token>`
       isn't pre-sized from the source length. Each is a few MB, not the
       dominant cost this item targeted.
+- [x] **Bounded LRU eviction of parsed rowan trees -- investigated,
+      measured, and deliberately rejected.** A follow-up `mem_profile.rs`
+      run (after fixing a `dhat` snapshot-timing bug where `_profiler`
+      dropping last meant the JSON's per-site breakdown reflected almost
+      nothing -- fixed by `std::mem::forget`-ing `cache`/`program` after
+      the stats snapshot instead of letting them drop normally) found
+      157.6 MB retained, of which rowan's parsed trees are the single
+      largest slice (~59.4 MB / 37.7%, ahead of `reference_table` at
+      31.5% and everything else combined). The idea: bound
+      `BindCache`'s parse storage with an LRU (the `lru` crate) instead
+      of retaining every file's `Parse` forever, reparsing on a miss
+      (cheap, and this project's own `NodeCache`-sharing already makes
+      cold parsing fast) -- "full access-recency," per an explicit
+      choice between that and edit-recency-only, so both
+      `BoundProgram::from_files_cached`'s Stage 1a *and* read-only
+      navigation (`BoundProgram::syntax`) would count toward what stays
+      resident.
+      **Two real correctness bugs surfaced during implementation, both
+      fixed before the approach was rejected on performance grounds
+      alone:**
+      1. Sharing one mutable `Arc<LruCache>` between `BindCache` and
+         every `BoundProgram` snapshot is unsound, not just an unwanted
+         coupling: a snapshot's `SyntaxPtr`s are computed against one
+         specific tree's byte offsets, and a later rebind overwriting a
+         *shared* cache entry for the same file silently swaps in a
+         different tree underneath an older, supposedly-frozen snapshot
+         still in use -- corrupting every offset it hands out (a real,
+         reproduced rowan `cursor.rs` panic). Fixed by giving each
+         snapshot its own frozen copy (taken at construction) plus a
+         private, never-shared overflow map for misses during that
+         snapshot's own lifetime.
+      2. Even with per-snapshot isolation, a snapshot's frozen copy still
+         has to force-include every `overrides`-backed (actively edited,
+         unsaved) file regardless of the bounded cache's state: with more
+         live candidates than the cache's capacity, unrelated files
+         processed later in the same Stage 1a round can evict an edited
+         file's just-computed entry before the snapshot is even taken,
+         leaving `syntax()`'s reparse-on-miss fallback as the only
+         source -- and that fallback reads from disk, which is stale
+         (not ground truth) for a file whose real content only lives in
+         `overrides`. Reproduced as the same rowan panic via a real
+         `apexls-server` subprocess test (`rapid_edit_burst.rs`) before
+         being fixed.
+      **Why rejected despite both bugs being fixable**: Stage 1a's
+      warm-rebind fast path (reuse an unchanged file's tree instead of
+      reparsing it) depends on that tree still being resident -- bounding
+      the cache directly undermines the exact mechanism
+      `corpus/warm_rebind_after_one_file_edit` exists to protect,
+      whenever a project's live working set exceeds the cache's
+      capacity. Measured via `cargo bench -p apex-binder` at a capacity
+      of 200 files against the ~1,044-file NPSP corpus: `bind_npsp_full`
+      (cold) unchanged (433ms vs. 443ms baseline, within noise -- Stage
+      1a never reads back through the cache mid-call, so cold bind was
+      never at risk), but `warm_rebind_after_one_file_edit` regressed
+      **+5287% (6.02ms -> 322ms, ~54x slower)** -- by the end of the very
+      first cold bind, insertion order alone has already evicted most of
+      the corpus from a 200-slot cache, so nearly every "unchanged" file
+      on the next edit misses and gets fully reparsed instead of reused,
+      making a warm rebind cost nearly as much as a cold one. A capacity
+      large enough to avoid this for a project NPSP's size would need to
+      approach the project's own file count, at which point the memory
+      win mostly disappears for exactly the projects large enough to
+      need it. No capacity threads that needle for both a small project
+      (where eviction would rarely matter anyway) and a large one (where
+      it would matter, but any workable capacity undoes the memory
+      savings) -- reducing rowan tree memory needs a different approach
+      that doesn't trade against Stage 1a's reuse invariant, not a bound
+      on the same cache that invariant depends on.
 
 ## 3. Feature surface
 
