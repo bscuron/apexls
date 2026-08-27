@@ -226,8 +226,35 @@ fn corpus_root() -> PathBuf {
 ///       counted as `Resolved` before the fix -- just resolved to the
 ///       wrong, arity-mismatched symbol -- and stays `Resolved`,
 ///       correctly, after it).
+/// 9. **The single largest `Unresolved` reduction in this table's whole
+///    history, found by the `examples/unresolved_clusters.rs` diagnostic's
+///    own top-ranked cluster.** `resolve_type_ref` checked
+///    `SchemaIndex::object` for a bare declared-type reference (a field/
+///    property/parameter/method-return type, a generic type argument)
+///    but never consulted the stdlib index at all -- so `String`, `List`,
+///    `Boolean`, `Database`, and every other real stdlib class used as a
+///    *type* (`String s;`, `List<Contact>`, a parameter's own type)
+///    stayed `Unresolved`, even though the identical name in *expression*
+///    position (`String.isBlank(...)`) already resolved as
+///    `StdlibMember` since the standard-library type-model work earlier
+///    in this project's history. Fixed by threading `&StdlibIndex`
+///    through `resolve_type_ref`/`bind_type_ref` and adding a
+///    `stdlib.class(&name)` check mirroring the existing schema check,
+///    right before the final `Unresolved` fallback -- the exact same
+///    `Resolution::StdlibMember`-with-`member: None` shape
+///    `bind_name_expr`'s bare-class-as-value case already used.
+///    `BASELINE_UNRESOLVED` dropped **-46,429** (`75_405` -> `28_976`,
+///    over 60% of the entire prior `Unresolved` count) with
+///    `BASELINE_RESOLVED` unaffected (`StdlibMember` isn't tallied by
+///    either counter). Deliberately does not (and cannot yet) resolve an
+///    `Exception` subtype (`DmlException`, ...) used as a type: the
+///    scraped stdlib snapshot has no entry for `Exception` or its
+///    subtypes at all, since the real Apex Reference Guide only
+///    documents them on grouped, empty-methods "Built-In Exceptions"-
+///    style pages `apex_stdlib::standard_classes` already filters out --
+///    a real, separate, pre-existing gap this fix doesn't touch.
 const BASELINE_RESOLVED: usize = 205_259;
-const BASELINE_UNRESOLVED: usize = 75_405;
+const BASELINE_UNRESOLVED: usize = 28_976;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

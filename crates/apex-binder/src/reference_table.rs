@@ -205,9 +205,28 @@ impl Resolution {
                 object: lower(r.object.as_deref()?),
                 field: r.field.as_deref().map(lower),
             }),
-            Resolution::StdlibMember(r) => Some(ExternalKey::Stdlib {
+            // `None` (not indexed at all) for a *bare* class-name
+            // reference (`member: None` -- a static-call receiver like
+            // the `String` in `String.isBlank(...)`, or, since
+            // `crate::resolve::resolve_type_ref` started consulting the
+            // stdlib index, every declared-type reference to a stdlib
+            // class: `String s;`, `List<Contact>`, a parameter/return
+            // type). Unlike a specific member, "every place `List`/
+            // `String` is used as a bare name" is both a genuinely
+            // low-value find-references target (real Apex code is
+            // saturated with common type names, so the result would be a
+            // huge, unnavigable list) and, precisely because of that same
+            // saturation, the single largest volume of `StdlibMember`
+            // references in a real project -- confirmed a real,
+            // significant cold/warm bind regression (`cargo bench`, ~50%/
+            // ~20%) when this was still indexed unconditionally, entirely
+            // from `lower()`'s allocation and this key's own `Vec` growth
+            // for a handful of extremely hot class names. A specific
+            // member (`String.isBlank`) keeps its existing, real
+            // find-references value and stays indexed.
+            Resolution::StdlibMember(r) => r.member.as_deref().map(|member| ExternalKey::Stdlib {
                 class_name: lower(&r.class_name),
-                member: r.member.as_deref().map(lower),
+                member: Some(lower(member)),
                 arg_count: r.arg_count,
             }),
             Resolution::Resolved(_) | Resolution::Candidates(_) | Resolution::Unresolved => None,

@@ -781,6 +781,7 @@ pub(crate) fn bind_object_ref(schema: &SchemaIndex, ptr: SyntaxPtr, name: &str) 
 pub(crate) fn resolve_type_ref(
     table: &SymbolTable,
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     refs: &mut ReferenceTable,
     file: FileId,
     enclosing_type: Option<SymbolId>,
@@ -844,7 +845,7 @@ pub(crate) fn resolve_type_ref(
         .type_args()
         .map(|list| {
             list.args()
-                .filter_map(|arg| resolve_type_ref(table, schema, refs, file, enclosing_type, &arg))
+                .filter_map(|arg| resolve_type_ref(table, schema, stdlib, refs, file, enclosing_type, &arg))
                 .collect()
         })
         .unwrap_or_default();
@@ -858,13 +859,40 @@ pub(crate) fn resolve_type_ref(
         );
         return Some(Ty::system_owned(name, args));
     }
+    // A real, documented stdlib class (`String`, `List`, `Database`, ...)
+    // used as a declared type (`String s;`, `List<Contact>`, a parameter/
+    // return type) -- mirrors `bind_name_expr`'s identical bare-class-as-
+    // value fallback (the `member: None` shape `stdlib_member_ref`'s own
+    // doc comment already covers) for the *expression*-position case,
+    // which this one was missing entirely: before this, `String` in
+    // `String.isBlank(...)` resolved as `StdlibMember`, but the exact
+    // same name in `String s;` fell all the way through to `Unresolved`
+    // -- confirmed a real, large-volume gap via a whole-corpus
+    // `Unresolved`-clustering sweep (`examples/unresolved_clusters.rs`),
+    // not a rare edge case.
+    if let Some(class) = stdlib.class(&name) {
+        refs.set(
+            ptr,
+            Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                class.namespace.clone(),
+                &name,
+                None,
+                None,
+            ))),
+        );
+        return Some(Ty::system_owned(name, args));
+    }
     // Could be a standard object this repo never locally extended
     // (indistinguishable, using `apex-metadata` alone, from a genuinely
-    // nonexistent name), or an unmodeled system/library type (`String`,
-    // `List`, an `Exception` subtype, ...) -- v1 can't tell these apart,
-    // so both land here as `Unresolved` rather than one of them being
-    // misreported as `UnknownSchema`. The name is still real, though, so
-    // the returned `Ty` keeps it.
+    // nonexistent name), or an unmodeled system/library type (an
+    // `Exception` subtype -- the scraped stdlib snapshot has no entry for
+    // `Exception`/`DmlException`/etc. at all, since the real Apex
+    // Reference Guide only documents them on grouped, empty-methods
+    // "Built-In Exceptions"-style pages `apex_stdlib::standard_classes`
+    // already filters out -- or any other genuinely unmodeled name)  --
+    // v1 can't tell these apart, so both land here as `Unresolved` rather
+    // than one of them being misreported. The name is still real, though,
+    // so the returned `Ty` keeps it.
     refs.set(ptr, Resolution::Unresolved);
     Some(Ty::system_owned(name, args))
 }
@@ -944,12 +972,13 @@ fn record_qualified_segments(
 pub(crate) fn bind_type_ref(
     table: &SymbolTable,
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     ty: &Type,
 ) -> BoundBody {
     let mut refs = ReferenceTable::default();
-    resolve_type_ref(table, schema, &mut refs, file, enclosing_type, ty);
+    resolve_type_ref(table, schema, stdlib, &mut refs, file, enclosing_type, ty);
     let (scopes, _) = ScopeTree::new_root(ScopeKind::Body, rowan::TextRange::empty(0.into()));
     BoundBody {
         scopes,
@@ -1150,6 +1179,7 @@ impl<'a> BodyBinder<'a> {
         resolve_type_ref(
             self.table,
             self.schema,
+            self.stdlib,
             &mut self.refs,
             self.file,
             self.enclosing_type,

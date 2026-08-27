@@ -628,6 +628,7 @@ impl BoundProgram {
                                     resolve::bind_type_ref(
                                         &cache.table,
                                         &schema,
+                                        &stdlib,
                                         *file,
                                         Some(*owner),
                                         &ty,
@@ -1163,7 +1164,7 @@ fn bind_symbol_body(
             .map(|ty| {
                 (
                     None,
-                    resolve::bind_type_ref(table, schema, symbol.file, enclosing_type, &ty),
+                    resolve::bind_type_ref(table, schema, stdlib, symbol.file, enclosing_type, &ty),
                 )
             })
     };

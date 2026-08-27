@@ -358,6 +358,144 @@ fn an_unresolvable_supertype_name_is_recorded_as_unresolved() {
     );
 }
 
+/// A field declared with a real stdlib type (`String`) resolves as
+/// `StdlibMember` -- previously `resolve_type_ref` only ever checked
+/// `SchemaIndex::object`, never the stdlib index, so a declared type's
+/// own reference stayed `Unresolved` even though the *identical* name
+/// used as an expression (`String.isBlank(...)`) already resolved
+/// correctly. Confirmed a real, large-volume gap via a whole-corpus
+/// `Unresolved`-clustering sweep, not a rare edge case.
+#[test]
+fn a_fields_stdlib_declared_type_resolves_as_stdlib_member() {
+    let dir = write_fixture_dir(
+        "decl-type-stdlib-field",
+        &[("Foo.cls", "public class Foo { public String name; }")],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let offset = type_ref_mid_offset(&program, file, "String");
+
+    assert_eq!(
+        program.resolution_at(file, offset).cloned(),
+        Some(Resolution::StdlibMember(Box::new(apex_binder::StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "String".into(),
+            member: None,
+            arg_count: None,
+        }))),
+        "a field declared with a real stdlib type should resolve as StdlibMember"
+    );
+}
+
+/// The generic-collection form of the same fix: `List`'s own `Type` node
+/// resolves as `StdlibMember` even though `Contact` (its type argument)
+/// is a *different* kind of reference (a real schema object) -- proving
+/// the two don't interfere, since both go through the same recursive
+/// `resolve_type_ref` call.
+#[test]
+fn a_local_variables_generic_stdlib_type_resolves_as_stdlib_member() {
+    let dir = write_fixture_dir(
+        "decl-type-stdlib-generic",
+        &[(
+            "Foo.cls",
+            "public class Foo { public void run() { List<Contact> contacts; } }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let list_offset = type_ref_mid_offset(&program, file, "List");
+    let contact_offset = type_ref_mid_offset(&program, file, "Contact");
+
+    assert_eq!(
+        program.resolution_at(file, list_offset).cloned(),
+        Some(Resolution::StdlibMember(Box::new(apex_binder::StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "List".into(),
+            member: None,
+            arg_count: None,
+        }))),
+        "List's own Type node should resolve as StdlibMember"
+    );
+    assert_eq!(
+        program.resolution_at(file, contact_offset).cloned(),
+        Some(Resolution::SchemaObject(Box::new(apex_binder::SchemaObjectRef {
+            object: "Contact".into(),
+            field: None,
+        }))),
+        "List<Contact>'s own type argument should still resolve as a real schema object"
+    );
+}
+
+/// A method's parameter type and return type both go through the same
+/// fix (both are `resolve_type_ref` call sites via `bind_symbol_body`'s
+/// `declared_type` closure in `crates/apex-binder/src/lib.rs`).
+#[test]
+fn a_methods_stdlib_param_and_return_types_both_resolve() {
+    let dir = write_fixture_dir(
+        "decl-type-stdlib-method",
+        &[(
+            "Foo.cls",
+            "public class Foo { public Boolean run(Decimal amount) { return true; } }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let return_offset = type_ref_mid_offset(&program, file, "Boolean");
+    let param_offset = type_ref_mid_offset(&program, file, "Decimal");
+
+    assert_eq!(
+        program.resolution_at(file, return_offset).cloned(),
+        Some(Resolution::StdlibMember(Box::new(apex_binder::StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "Boolean".into(),
+            member: None,
+            arg_count: None,
+        }))),
+        "a method's own return type should resolve as StdlibMember"
+    );
+    assert_eq!(
+        program.resolution_at(file, param_offset).cloned(),
+        Some(Resolution::StdlibMember(Box::new(apex_binder::StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "Decimal".into(),
+            member: None,
+            arg_count: None,
+        }))),
+        "a method's own parameter type should resolve as StdlibMember"
+    );
+}
+
+/// An `Exception` subtype used as a declared type stays honestly
+/// `Unresolved` -- the scraped stdlib snapshot has no entry for
+/// `Exception`/`DmlException`/etc. at all (the real Apex Reference Guide
+/// only documents them on grouped, empty-methods "Built-In Exceptions"
+/// pages `apex_stdlib::standard_classes` already filters out), so this
+/// fix must not silently misreport a genuinely unmodeled name as
+/// `StdlibMember` just because it looks similar in shape.
+#[test]
+fn an_exception_subtype_declared_type_stays_unresolved() {
+    let dir = write_fixture_dir(
+        "decl-type-exception-unresolved",
+        &[("Foo.cls", "public class Foo { public DmlException err; }")],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let offset = type_ref_mid_offset(&program, file, "DmlException");
+
+    assert_eq!(
+        program.resolution_at(file, offset).cloned(),
+        Some(Resolution::Unresolved)
+    );
+}
+
 /// A for-each loop variable referenced multiple times, including inside
 /// a `new List<T>{ ... }` collection-initializer -- every occurrence
 /// (not just the first) resolves back to the same `ForEachVar` symbol.
