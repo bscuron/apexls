@@ -81,6 +81,23 @@ impl SyntaxPtr {
         self.range
     }
 
+    /// A copy of `self` with `range` replacing its own, `file`/`kind`
+    /// unchanged -- lets a caller that already holds a whole-token
+    /// pointer (`Self::for_token`) derive a pointer to an arbitrary
+    /// sub-range *inside* that token's own text without needing the live
+    /// `SyntaxToken` handle a second time. Used for a dynamic-SOQL
+    /// bind-variable reference (`:nameVar`) embedded in a string
+    /// literal's text content, which the lexer never tokenizes as
+    /// anything of its own -- there is no real syntax node/token this
+    /// could ever point at directly. Like [`Self::for_token`], never
+    /// re-resolved via [`Self::to_node`]: `range` is a strict sub-range
+    /// of the original token's own range, so the covering-element climb
+    /// in `to_node` can never find a node/token whose own range equals
+    /// it exactly -- guaranteed by construction, not just convention.
+    pub fn with_range(&self, range: TextRange) -> Self {
+        SyntaxPtr { range, ..*self }
+    }
+
     /// Re-resolves this pointer against `root`. `None` only if `root` is
     /// not (a structurally-identical copy of) the tree this pointer was
     /// built from -- no node at the exact recorded range/kind exists.

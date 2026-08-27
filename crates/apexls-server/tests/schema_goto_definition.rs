@@ -261,3 +261,110 @@ fn definition_on_a_soql_from_object_points_at_its_object_meta_xml() {
     session.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Goto-definition on a dynamic-SOQL bind variable (`:nameVar` inside a
+/// string passed to `Database.query`) jumps to the real local it names --
+/// previously this did nothing at all, since string *content* was never
+/// tokenized into anything the binder could record a reference against.
+#[test]
+fn definition_on_a_dynamic_soql_bind_variable_points_at_its_local_declaration() {
+    let src = "public class Foo {\n    public void run() {\n        String nameVar = 'Acme';\n        String q = 'SELECT Id FROM Account WHERE Name = :nameVar';\n        Database.query(q);\n    }\n}\n";
+
+    let dir = write_fixture_dir("schema-goto-def-dynamic-soql-bind", &[("Foo.cls", src)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+
+    let mut session = Session::start(&foo_uri, src, &root_uri);
+
+    // Land the cursor inside "nameVar", not on the leading colon.
+    let (line, character) = position_of(src, ":nameVar");
+    let response = session.request(
+        2,
+        "textDocument/definition",
+        serde_json::json!({
+            "textDocument": { "uri": foo_uri },
+            "position": { "line": line, "character": character + 1 },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "definition returned an error: {response:?}"
+    );
+    let result = &response["result"];
+    let uri = result["uri"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a scalar Location, got {response:?}"));
+    assert_eq!(uri, foo_uri.as_str());
+
+    // The returned range should cover the *declaration* of `nameVar`
+    // (`String nameVar = 'Acme';`), not the bind site itself.
+    let decl_line = position_of(src, "nameVar = 'Acme'").0;
+    assert_eq!(
+        result["range"]["start"]["line"].as_u64(),
+        Some(decl_line as u64),
+        "expected the declaration's own line, got {response:?}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The bug-report shape: a custom field set via Apex's SObject
+/// constructor field-init sugar (`new Contact(... Primary_Affiliation__c
+/// = acc.id)`), which used to fall through to `Resolution::Unresolved`
+/// (the LHS parses as a plain `Expr::Bin`, indistinguishable from any
+/// other assignment expression, so it never reached a schema lookup at
+/// all) -- goto-definition did nothing. `Primary_Affiliation__c` here is
+/// a custom field declared on the standard `Contact` object, the real
+/// NPSP shape from the original report.
+#[test]
+fn definition_on_a_field_set_via_sobject_constructor_sugar_points_at_its_field_meta_xml() {
+    let src = "public class Foo {\n    public void run(Account acc) {\n        Contact con = new Contact(\n            LastName = 'foo',\n            Primary_Affiliation__c = acc.id\n        );\n    }\n}\n";
+    let field_meta = r#"<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Primary_Affiliation__c</fullName>
+    <type>Lookup</type>
+    <referenceTo>Account</referenceTo>
+</CustomField>"#;
+
+    let dir = write_fixture_dir(
+        "schema-goto-def-ctor-field-init",
+        &[
+            ("Foo.cls", src),
+            (
+                "objects/Contact/fields/Primary_Affiliation__c.field-meta.xml",
+                field_meta,
+            ),
+        ],
+    );
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+    let field_meta_uri = Url::from_file_path(
+        dir.join("objects/Contact/fields/Primary_Affiliation__c.field-meta.xml"),
+    )
+    .unwrap();
+
+    let mut session = Session::start(&foo_uri, src, &root_uri);
+
+    let (line, character) = position_of(src, "Primary_Affiliation__c");
+    let response = session.request(
+        2,
+        "textDocument/definition",
+        serde_json::json!({
+            "textDocument": { "uri": foo_uri },
+            "position": { "line": line, "character": character },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "definition returned an error: {response:?}"
+    );
+    let result = &response["result"];
+    let uri = result["uri"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a scalar Location, got {response:?}"));
+    assert_eq!(uri, field_meta_uri.as_str());
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

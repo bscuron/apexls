@@ -250,6 +250,19 @@ pub struct ReferenceTable {
     /// `map_ids_into` can carry it over with a plain merge -- no
     /// `SymbolId` remapping needed, since nothing here is keyed by one.
     highlight_ranges: FxHashMap<SyntaxPtr, TextRange>,
+    /// Every dynamic-SOQL bind-variable (`:nameVar`) sub-range recorded
+    /// inside a given string-literal token (`crate::resolve::bind_dynamic_soql_binds`),
+    /// keyed by that token's own whole-token `SyntaxPtr` (`SyntaxPtr::for_token`).
+    /// `resolutions` alone can't answer "does a click landing inside this
+    /// string literal land on one of its recorded binds" -- it's an
+    /// exact-range lookup, and a click offset is essentially never a
+    /// recorded sub-range's exact start -- so `BoundProgram::resolution_at`
+    /// consults this instead when the clicked token is a string literal.
+    /// A plain `Vec`, not sorted/binary-searched: a single dynamic-SOQL
+    /// string binding more than a handful of variables is already an
+    /// extreme outlier in real Apex, so a linear scan over this list costs
+    /// nothing worth optimizing away.
+    bind_var_spans: FxHashMap<SyntaxPtr, Vec<TextRange>>,
 }
 
 impl ReferenceTable {
@@ -297,6 +310,37 @@ impl ReferenceTable {
         self.highlight_ranges.get(&reference).copied()
     }
 
+    /// Records a dynamic-SOQL bind-variable reference -- layers on top of
+    /// [`Self::set`] for the same by_symbol/by_external/resolutions
+    /// bookkeeping every other reference gets, plus indexes `sub_ptr`'s
+    /// own range under `container_token` (its whole enclosing string-
+    /// literal token's own pointer) so [`Self::dynamic_soql_bind_at`] can
+    /// later answer a click landing inside that token. `sub_ptr` must be
+    /// `container_token.with_range(...)` of some sub-range inside it --
+    /// this doesn't verify that itself (it has no live token to check
+    /// against), the caller (`crate::resolve::bind_dynamic_soql_binds`)
+    /// is the one place that constructs both together.
+    pub(crate) fn set_dynamic_soql_bind(
+        &mut self,
+        container_token: SyntaxPtr,
+        sub_ptr: SyntaxPtr,
+        resolution: Resolution,
+    ) {
+        self.bind_var_spans.entry(container_token).or_default().push(sub_ptr.range());
+        self.set(sub_ptr, resolution);
+    }
+
+    /// The `Resolution` recorded for whichever dynamic-SOQL bind-variable
+    /// span (if any) inside `container_token` contains `offset` -- the
+    /// query-time counterpart of [`Self::set_dynamic_soql_bind`], used by
+    /// `BoundProgram::resolution_at` when a click lands inside a string
+    /// literal token.
+    pub fn dynamic_soql_bind_at(&self, container_token: SyntaxPtr, offset: rowan::TextSize) -> Option<&Resolution> {
+        let spans = self.bind_var_spans.get(&container_token)?;
+        let range = spans.iter().copied().find(|r| r.contains(offset))?;
+        self.resolutions.get(&container_token.with_range(range))
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&SyntaxPtr, &Resolution)> {
         self.resolutions.iter()
     }
@@ -341,6 +385,7 @@ impl ReferenceTable {
     ) {
         target.resolutions.reserve(self.resolutions.len());
         target.highlight_ranges.extend(self.highlight_ranges);
+        target.bind_var_spans.extend(self.bind_var_spans);
         for (ptr, res) in self.resolutions {
             let remapped = res.map_ids(f);
             for &id in remapped.symbol_ids() {

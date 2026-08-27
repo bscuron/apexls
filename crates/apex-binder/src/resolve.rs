@@ -62,7 +62,7 @@ use apex_stdlib::{StdlibClass, StdlibMethod};
 use crate::symbol::{ModifierSet, Symbol, SymbolId, SymbolKind};
 use crate::symbol_table::SymbolTable;
 use crate::ty::Ty;
-use apex_syntax::ast::decl::TriggerBlock;
+use apex_syntax::ast::decl::{TriggerBlock, VarDeclarator};
 use apex_syntax::ast::expr::{CallExpr, FieldExpr, Initializer, MethodCallExpr, NameExpr, NewExpr};
 use apex_syntax::ast::stmt::Block;
 use apex_syntax::ast::{Expr, Name, Stmt, Type};
@@ -463,6 +463,137 @@ pub(crate) fn remap_local_id(id: SymbolId, base: u32) -> SymbolId {
         SymbolId::new(id.file, base + (id.local - LOCAL_SENTINEL_BASE))
     } else {
         id
+    }
+}
+
+/// Recognizes `arg` as an SObject constructor field-init pair (`field =
+/// value`, e.g. `Primary_Affiliation__c = acc.id` inside `new
+/// Contact(...)`) -- `Some((field_name, value))` only for a plain `=`
+/// (never a compound assignment like `+=`, which Apex's own constructor
+/// sugar doesn't accept here anyway) with a bare identifier LHS, `None`
+/// for anything else (an ordinary positional argument, or any other
+/// shape `arg_list`'s generic grammar happens to also accept there --
+/// see `crate::resolve::BodyBinder::bind_new_expr`'s own doc comment on
+/// why the grammar can't tell these apart itself). A bare identifier is
+/// the only LHS shape Apex's real syntax allows here -- a dotted
+/// relationship path (`Account.Name = ...`) is not valid inside this
+/// constructor sugar -- so `Expr::Name` is the only case worth matching.
+fn sobject_field_init(arg: &Expr) -> Option<(NameExpr, Expr)> {
+    let Expr::Bin(b) = arg else { return None };
+    let op_text: String = b.operator_tokens().iter().map(|t| t.text()).collect();
+    if op_text != "=" {
+        return None;
+    }
+    let Expr::Name(field_name) = b.lhs()? else {
+        return None;
+    };
+    Some((field_name, b.rhs()?))
+}
+
+/// Cheap, non-allocating guard against treating an unrelated string's
+/// incidental `:word` pattern (a URL like `'http://host:8080'`, or the
+/// name of a config key) as a real dynamic-SOQL bind: only a string that
+/// itself looks like a SOQL query is ever scanned for binds at all. Real
+/// SOQL always contains `SELECT` (case-insensitive; Apex is
+/// case-insensitive for keywords) -- `Database.query`/`countQuery`/
+/// `getQueryLocator` are exclusively SOQL, never SOSL, so `FIND` doesn't
+/// need checking here.
+fn looks_like_soql(text: &str) -> bool {
+    text.as_bytes()
+        .windows(6)
+        .any(|w| w.eq_ignore_ascii_case(b"select"))
+}
+
+/// Every `:identifier` bind-variable occurrence inside `token`'s own raw
+/// text (quotes and all), as `(name, absolute_text_range)` pairs. Scans
+/// the raw token text directly rather than unescaping it first -- Apex
+/// string escapes can never produce a literal `:` or identifier
+/// character, so there's nothing an escape sequence could hide here.
+/// Deliberately matches only a bare identifier (ASCII letters/digits/
+/// underscore, not starting with a digit) immediately after `:`: a
+/// dotted bind expression (`:obj.field`) is legal grammar for *inline*
+/// SOQL's own `SoqlBoundExpr` (`crate::soql::bind_bound_expr`, which
+/// binds a real parsed `Expr`), but dynamic SOQL's string-embedded form
+/// has no such node to parse -- only the leading identifier segment
+/// could ever match a real local/parameter name in scope, so that's all
+/// this looks for.
+fn find_bind_vars(token: &apex_syntax::SyntaxToken) -> Vec<(&str, rowan::TextRange)> {
+    let text = token.text();
+    let bytes = text.as_bytes();
+    let base = token.text_range().start();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b':' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end > start && !bytes[start].is_ascii_digit() {
+            let range = rowan::TextRange::new(
+                base + rowan::TextSize::from(start as u32),
+                base + rowan::TextSize::from(end as u32),
+            );
+            result.push((&text[start..end], range));
+        }
+        i = end.max(start);
+    }
+    result
+}
+
+/// Finds the nearest earlier statement, in the same straight-line
+/// sequence of enclosing blocks as `anchor` (never a sibling `if`/`else`
+/// branch, a loop body, or another method entirely -- deliberately a
+/// bounded, branch-free approximation, not a real control-flow
+/// analysis), that declares-with-initializer or plainly reassigns
+/// (`name = expr;`, never a compound assignment like `+=`, which would
+/// need the *prior* value to evaluate and so can't be treated as a fresh
+/// source) a local named `name`. Returns that statement's initializer/
+/// RHS expression -- the most recent one found, since scanning proceeds
+/// forward through each block (oldest to newest) and keeps overwriting
+/// the candidate, so whatever's left standing after a block is legally
+/// its last write before `anchor`.
+fn last_assignment_to_local(anchor: &apex_syntax::SyntaxNode, name: &str) -> Option<Expr> {
+    let mut boundary = anchor.clone();
+    loop {
+        let block = boundary.parent()?.ancestors().find_map(Block::cast)?;
+        let boundary_start = boundary.text_range().start();
+        let mut candidate = None;
+        for stmt in block.statements() {
+            if stmt.syntax().text_range().start() >= boundary_start {
+                break;
+            }
+            match &stmt {
+                Stmt::LocalVarDecl(decl) => {
+                    for d in decl.declarators() {
+                        if d.name().and_then(|n| n.text()).is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+                            candidate = d.init();
+                        }
+                    }
+                }
+                Stmt::Expr(e) => {
+                    if let Some(Expr::Bin(b)) = e.expr() {
+                        let op: String = b.operator_tokens().iter().map(|t| t.text()).collect();
+                        if op == "=" {
+                            if let Some(Expr::Name(n)) = b.lhs() {
+                                if n.name_token().is_some_and(|t| t.text().eq_ignore_ascii_case(name)) {
+                                    candidate = b.rhs();
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(c) = candidate {
+            return Some(c);
+        }
+        boundary = block.syntax().clone();
     }
 }
 
@@ -1673,6 +1804,199 @@ impl<'a> BodyBinder<'a> {
         }
     }
 
+    /// A conservative, ambiguity-averse name lookup used only for
+    /// dynamic-SOQL data-flow tracing (`dynamic_soql_source_tokens`):
+    /// local/parameter scope, then a plain field/property lookup on the
+    /// *immediately* enclosing type only (not `bind_name_expr`'s full
+    /// outward nested-class climb, and no same-name type-vs-value
+    /// shadowing resolution). Getting this wrong only means "the query
+    /// text isn't found, so no binds get marked used" -- a missed
+    /// opportunity, never a wrong goto-definition target -- so this
+    /// deliberately doesn't replicate `bind_name_expr`'s full precision;
+    /// see that function's own doc comment for what real name resolution
+    /// actually requires.
+    fn resolve_query_variable(&self, scope: ScopeId, name: &str) -> Option<SymbolId> {
+        if let Some(local) = self.scopes.resolve_local(scope, name) {
+            return Some(local);
+        }
+        let container = self.enclosing_type?;
+        let mut fields = self
+            .table
+            .lookup_member(container, name)
+            .into_iter()
+            .filter(|&id| self.table.get(id).kind == SymbolKind::Field);
+        let first = fields.next()?;
+        if fields.next().is_some() {
+            return None; // ambiguous -- never guess which one
+        }
+        Some(first)
+    }
+
+    /// Every string-literal token reachable while tracing `expr`'s
+    /// possible value(s), for the purpose of scanning it for dynamic-SOQL
+    /// bind variables (`bind_dynamic_soql_binds`). `+`-concatenation
+    /// collects from both sides; a parenthesized expression recurses
+    /// through; a bare name (a local or a field of the immediately
+    /// enclosing type, via `resolve_query_variable`) resolves one hop
+    /// back to whatever it was last assigned from -- a local uses
+    /// `last_assignment_to_local` (straight-line/branch-free: the
+    /// nearest textually-preceding declaration-with-initializer or plain
+    /// reassignment in the same enclosing-block chain as `anchor`, the
+    /// call site itself), a field uses its own declared initializer only
+    /// (`crate::symbol::Symbol::ptr` points at the specific `VarDeclarator`
+    /// a field's `SymbolId` names -- see `collect::collect_field` --
+    /// re-resolved against this file's current tree the same way any
+    /// other `SyntaxPtr` is). Anything else (a method call's result, a
+    /// ternary, a ` += `-style compound reassignment, ...) contributes
+    /// nothing. Deliberately *not* a general data-flow analysis -- only
+    /// the bounded, common "declare/assign a query string in this method,
+    /// then pass it to `Database.query`" pattern; `depth` guards against
+    /// a pathological concatenation/self-referential chain rather than
+    /// assuming real Apex code never gets deep enough to matter.
+    fn dynamic_soql_source_tokens(
+        &self,
+        scope: ScopeId,
+        anchor: &apex_syntax::SyntaxNode,
+        expr: &Expr,
+        depth: u32,
+    ) -> Vec<apex_syntax::SyntaxToken> {
+        const MAX_DEPTH: u32 = 8;
+        if depth > MAX_DEPTH {
+            return Vec::new();
+        }
+        match expr {
+            Expr::Literal(lit) => match lit.token() {
+                Some(tok)
+                    if matches!(
+                        tok.kind(),
+                        SyntaxKind::StringLiteral | SyntaxKind::MultilineStringLiteral
+                    ) =>
+                {
+                    vec![tok]
+                }
+                _ => Vec::new(),
+            },
+            Expr::Paren(p) => p
+                .inner()
+                .map(|inner| self.dynamic_soql_source_tokens(scope, anchor, &inner, depth + 1))
+                .unwrap_or_default(),
+            Expr::Bin(b) => {
+                let op: String = b.operator_tokens().iter().map(|t| t.text()).collect();
+                if op != "+" {
+                    return Vec::new();
+                }
+                let mut tokens = b
+                    .lhs()
+                    .map(|l| self.dynamic_soql_source_tokens(scope, anchor, &l, depth + 1))
+                    .unwrap_or_default();
+                if let Some(r) = b.rhs() {
+                    tokens.extend(self.dynamic_soql_source_tokens(scope, anchor, &r, depth + 1));
+                }
+                tokens
+            }
+            Expr::Name(n) => {
+                let Some(name_tok) = n.name_token() else {
+                    return Vec::new();
+                };
+                let name = name_tok.text();
+                let Some(id) = self.resolve_query_variable(scope, name) else {
+                    return Vec::new();
+                };
+                let source = match self.get_symbol(id).kind {
+                    SymbolKind::LocalVar => last_assignment_to_local(anchor, name),
+                    SymbolKind::Field => {
+                        let root = anchor.ancestors().last().unwrap_or_else(|| anchor.clone());
+                        self.get_symbol(id)
+                            .ptr
+                            .to_node(&root)
+                            .and_then(VarDeclarator::cast)
+                            .and_then(|d| d.init())
+                    }
+                    _ => None,
+                };
+                match source {
+                    Some(e) => self.dynamic_soql_source_tokens(scope, anchor, &e, depth + 1),
+                    None => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Handles `Database.query`/`countQuery`/`getQueryLocator`'s dynamic-
+    /// SOQL string argument: finds every string literal that could reach
+    /// it (`dynamic_soql_source_tokens`), and for each one that looks
+    /// like a real SOQL query (`looks_like_soql` -- a cheap guard against
+    /// treating an unrelated string's incidental `:word` pattern as a
+    /// real bind), scans it for `:identifier` bind variables
+    /// (`find_bind_vars`) and records each one that resolves against the
+    /// call site's own local/parameter scope. This is the fix for two
+    /// real, related problems: goto-definition on a `:nameVar` bind
+    /// previously did nothing (there was no reference recorded for it at
+    /// all -- string content isn't tokenized into anything the binder
+    /// ever walks), and `apex_binder::dead_code` incorrectly flagged the
+    /// bound variable as unused (its only real "use" was invisible to
+    /// `ReferenceTable`, which only ever sees real AST-node references).
+    ///
+    /// Deliberately conservative in scope, matching this project's "never
+    /// guess" posture: only a bind name that resolves unambiguously
+    /// against local/parameter scope gets recorded (a field bind is not
+    /// resolved here -- see `resolve_query_variable`'s doc comment on why
+    /// that's a wider, riskier lookup than tracing *which* string to scan
+    /// in the first place); an unresolved bind name is silently skipped,
+    /// never recorded as `Unresolved` (a scan over arbitrary string text
+    /// finding a plausible-looking identifier that happens not to exist
+    /// is meaningfully weaker evidence than a real unresolved reference
+    /// elsewhere, and this project's diagnostics don't want that noise).
+    ///
+    /// **Known, deliberate gap: no interprocedural tracing.**
+    /// `dynamic_soql_source_tokens` only ever looks within the current
+    /// method body (a literal, a `+`-concatenation, or one hop back
+    /// through a local's own last straight-line assignment / a field's
+    /// own declared initializer). A query string assembled in a
+    /// *different* method -- most commonly the fflib-apex-common
+    /// `QueryFactory` fluent-builder idiom,
+    /// `newQueryFactory().setCondition('id in :idSet').toSOQL()`, where
+    /// `setCondition`'s argument is stored into a field by one method and
+    /// read back by a different one, possibly in another file entirely --
+    /// is not traced, so a bind reachable only that way neither escapes
+    /// `dead_code`'s false-positive nor gets a goto-definition target.
+    /// This was scoped out deliberately (see `BACKLOG.md` §4's own entry
+    /// for the full reasoning) rather than built speculatively: real
+    /// cross-method tracing needs fetching another method's body
+    /// (architecturally cheap -- `crate::BoundProgram::from_files_cached`
+    /// already builds a project-wide `FxHashMap<FileId, Parse>` before
+    /// Pass 2 runs, `parse_by_file`, just not yet threaded into
+    /// `BodyBinder`) plus recognizing a fluent setter's `return this;`
+    /// shape to track builder state across a call chain -- meaningfully
+    /// more surface and risk than this same-method version, for a
+    /// narrower payoff. The current behavior is a false negative only (a
+    /// missed reference/goto-target), never a wrong one.
+    fn bind_dynamic_soql_binds(&mut self, scope: ScopeId, call_node: &apex_syntax::SyntaxNode, arg: &Expr) {
+        let tokens = self.dynamic_soql_source_tokens(scope, call_node, arg, 0);
+        // The SOQL-shape guard applies to the *whole* reconstructed query,
+        // not each collected token individually -- a concatenated query
+        // (`'SELECT Id FROM Account ' + 'WHERE Name = :nameVar'`) commonly
+        // splits "SELECT ... FROM ..." into one piece and its `WHERE
+        // ... :bind` clause into another, so requiring every single piece
+        // to independently look SOQL-shaped would silently drop binds
+        // living in a piece that happens not to contain "select" itself.
+        if !tokens.iter().any(|t| looks_like_soql(t.text())) {
+            return;
+        }
+        for token in &tokens {
+            let container = SyntaxPtr::for_token(self.file, token);
+            for (name, range) in find_bind_vars(token) {
+                let Some(id) = self.scopes.resolve_local(scope, name) else {
+                    continue;
+                };
+                let sub_ptr = container.with_range(range);
+                self.refs
+                    .set_dynamic_soql_bind(container, sub_ptr, Resolution::Resolved(id));
+            }
+        }
+    }
+
     fn bind_method_call_expr(&mut self, scope: ScopeId, mc: &MethodCallExpr) -> Option<Ty> {
         let target_type = mc.target().and_then(|t| self.bind_expr(scope, &t));
         let mut arg_types = Vec::new();
@@ -1726,6 +2050,22 @@ impl<'a> BodyBinder<'a> {
                     None => Resolution::Unresolved,
                 };
                 self.refs.set_with_highlight(ptr, highlight, resolution);
+                // Dynamic SOQL: `Database.query`/`countQuery`/`getQueryLocator`'s
+                // first argument is a plain `String`, not a real parsed SOQL
+                // expression -- unlike `queryWithBinds`/`countQueryWithBinds`/
+                // `getQueryLocatorWithBinds`, deliberately excluded here since
+                // their bind names are looked up as *keys in an explicit
+                // `Map<String, Object>` argument*, not against lexical scope
+                // at all, so resolving them the same way here would be
+                // outright wrong, not just unhelpful. See `bind_dynamic_soql_binds`'s
+                // own doc comment for what this actually does.
+                if base.eq_ignore_ascii_case("Database")
+                    && matches!(name.to_ascii_lowercase().as_str(), "query" | "countquery" | "getquerylocator")
+                {
+                    if let Some(first_arg) = mc.args().and_then(|a| a.args().next()) {
+                        self.bind_dynamic_soql_binds(scope, mc.syntax(), &first_arg);
+                    }
+                }
                 // `generics.rs` handles type-*argument substitution*
                 // (`List<Account>.get(0)` returning `Account`, not
                 // whatever a raw scraped signature says) -- tried first,
@@ -1839,10 +2179,35 @@ impl<'a> BodyBinder<'a> {
 
     fn bind_new_expr(&mut self, scope: ScopeId, ne: &NewExpr) -> Option<Ty> {
         let resolved_type = ne.type_ref().and_then(|t| self.resolve_type_ref(&t));
+        // `new Contact(LastName = 'foo', Primary_Affiliation__c = acc.id)`
+        // -- Apex's SObject constructor sugar for setting fields by name
+        // -- parses as a perfectly ordinary `Expr::Bin` (`=` is just the
+        // normal assignment operator, `arg_list`'s grammar has no special
+        // case for it: `crates/apex-parser/src/grammar/expressions.rs`'s
+        // `arg_list` is shared verbatim by `CallExpr`/`MethodCallExpr`/
+        // `NewExpr`). Without this, each `LastName`/`Primary_Affiliation__c`
+        // LHS fell through `bind_name_expr`'s ordinary local/member/type
+        // lookups (none of which a bare field name ever matches) straight
+        // to `Resolution::Unresolved`, so goto-definition on it did
+        // nothing -- only meaningful for a real schema object target
+        // (`self.schema.object` confirms it, not just any `Ty::System`:
+        // `new List<Integer>()`'s target is `Ty::System` too, but never
+        // takes `field = value` args).
+        let sobject_name = match &resolved_type {
+            Some(Ty::System { name, .. }) if self.schema.object(name).is_some() => Some(name.clone()),
+            _ => None,
+        };
         if let Some(args) = ne.args() {
             let mut arg_types = Vec::new();
             for a in args.args() {
-                arg_types.push(self.bind_expr(scope, &a));
+                let bound = match (&sobject_name, sobject_field_init(&a)) {
+                    (Some(object), Some((field_name, rhs))) => {
+                        self.bind_sobject_field_init(object, &field_name);
+                        self.bind_expr(scope, &rhs)
+                    }
+                    _ => self.bind_expr(scope, &a),
+                };
+                arg_types.push(bound);
             }
             if let Some(&Ty::Project(container)) = resolved_type.as_ref() {
                 let ctors: Vec<SymbolId> = self
@@ -1882,6 +2247,36 @@ impl<'a> BodyBinder<'a> {
             self.bind_initializer_expr(scope, &init);
         }
         resolved_type
+    }
+
+    /// Resolves `field_name` (an SObject constructor field-init's LHS,
+    /// e.g. `Primary_Affiliation__c` in `new Contact(Primary_Affiliation__c
+    /// = acc.id)`) against `object`'s schema, mirroring `bind_field_expr`'s
+    /// `Ty::System` arm -- `Resolution::SchemaObject` for a real field,
+    /// `Resolution::UnknownSchema` otherwise, so a genuine typo stays
+    /// distinguishable from a real (if locally-unmodeled) field the same
+    /// way every other schema reference already does. No `set_with_highlight`
+    /// call needed: unlike `FieldExpr`, `field_name`'s own `NameExpr` node
+    /// range already *is* just the identifier (see `bind_name_expr`'s own
+    /// doc comment on why `NameExpr` deliberately never narrows its range
+    /// this way either).
+    fn bind_sobject_field_init(&mut self, object: &str, field_name: &NameExpr) {
+        let Some(tok) = field_name.name_token() else {
+            return;
+        };
+        let name = tok.text();
+        let ptr = SyntaxPtr::new(self.file, field_name.syntax());
+        let resolution = match self.schema.field(object, name) {
+            Some(_) => Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                object: SmolStr::new(object),
+                field: Some(SmolStr::new(name)),
+            })),
+            None => Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
+                object: Some(SmolStr::new(object)),
+                field: Some(SmolStr::new(name)),
+            })),
+        };
+        self.refs.set(ptr, resolution);
     }
 
     fn bind_initializer_expr(&mut self, scope: ScopeId, init: &Initializer) {

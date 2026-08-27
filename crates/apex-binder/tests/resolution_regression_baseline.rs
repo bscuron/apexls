@@ -147,8 +147,53 @@ fn corpus_root() -> PathBuf {
 ///    (most likely a stdlib call, since `Resolution::StdlibMember` isn't
 ///    tallied by either counter here) resolve instead of hitting the
 ///    "target type entirely unknown" fallback.
-const BASELINE_RESOLVED: usize = 205_305;
-const BASELINE_UNRESOLVED: usize = 83_950;
+/// 6. **A real misresolution bug fix, not just a gap closed.** Apex's
+///    SObject constructor field-init sugar (`new Contact(LastName =
+///    'foo', Primary_Affiliation__c = acc.id)`) parses each `field =
+///    value` pair as a perfectly ordinary `Expr::Bin` -- `arg_list`'s
+///    grammar has no special case for it -- so `bind_new_expr` never
+///    consulted the target SObject's schema at all for its arguments; the
+///    LHS just fell through `bind_name_expr`'s ordinary local/member/type
+///    lookups like any other identifier *read*. `BASELINE_RESOLVED`
+///    dropped -80 (`205_305` -> `205_225`) as a direct result of fixing
+///    this, not a regression: confirmed via a real-corpus diagnostic that
+///    exactly 81 such field names (`CloseDate`, `AccountId`, `LastName`,
+///    `Amount`, `Id`, `Name`, ...) were coincidentally resolving as
+///    `Resolution::Resolved` against an unrelated same-named local/
+///    parameter/field in the *enclosing* class purely because that name
+///    happened to also exist in scope -- a real, silent misresolution
+///    (goto-definition on `CloseDate` would jump to some unrelated local
+///    variable, not `Opportunity.CloseDate`), not a correct result this
+///    change took away. `bind_new_expr` now recognizes this shape (only
+///    for a real schema-object constructor target, via
+///    `crate::resolve::sobject_field_init`) and resolves the LHS against
+///    `SchemaIndex` instead, the same way `bind_field_expr` already does
+///    for `object.field` access -- of those 81, 80 now correctly land in
+///    `Resolution::SchemaObject`/`UnknownSchema` (untallied) and 1 was a
+///    genuine project-local constructor call incidentally sharing the
+///    same LHS-name shape, confirmed still `Resolved` correctly.
+///    `BASELINE_UNRESOLVED` dropped far more dramatically, -8,545
+///    (`83_950` -> `75_405`): the overwhelming majority of real
+///    `new SObject(field = value, ...)` field names in NPSP had no
+///    coincidentally-matching local/field to misresolve against, so they
+///    were landing in the honest but wrong `Resolution::Unresolved`
+///    instead -- this is the exact user-reported bug ("goto-definition on
+///    a field set via `new Contact(...)` does nothing").
+/// 7. Dynamic-SOQL bind-variable resolution (`crate::resolve::bind_dynamic_soql_binds`):
+///    `Database.query`/`countQuery`/`getQueryLocator`'s string argument
+///    is scanned for `:identifier` bind variables (tracing a variable
+///    argument one hop back to its own literal/concatenation source, in
+///    the same enclosing-block chain as the call site), each resolved
+///    against local/parameter scope. Moved `BASELINE_RESOLVED` +37
+///    (`205_225` -> `205_262`) -- real bind-variable references in NPSP
+///    that previously had no reference recorded at all (string *content*
+///    was never tokenized into anything the binder walked, so these
+///    weren't even `Unresolved` -- they simply didn't exist as
+///    references). `BASELINE_UNRESOLVED` unaffected, consistent with
+///    that: nothing moved *out* of `Unresolved` here, since nothing was
+///    ever recorded there for these in the first place.
+const BASELINE_RESOLVED: usize = 205_262;
+const BASELINE_UNRESOLVED: usize = 75_405;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

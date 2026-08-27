@@ -1121,6 +1121,43 @@ precision" -- they directly block shipping certain features honestly.
       constructor-lookup branches, now filters through it, so a private
       member of an unrelated class can no longer surface as a resolution
       candidate from outside its own type.
+- [x] **Dynamic-SOQL bind-variable resolution -- done, deliberately bounded
+      to the same-method case.** `Database.query`/`countQuery`/
+      `getQueryLocator`'s string argument (`crate::resolve::bind_dynamic_soql_binds`)
+      is scanned for `:identifier` bind variables, each resolved against
+      the call site's own local/parameter scope -- fixes both a real
+      dead-code false positive (a variable bound only inside a dynamic-SOQL
+      string had no reference recorded for it at all, since string
+      *content* was never tokenized into anything the binder walked) and
+      goto-definition on the bind itself (a new synthetic sub-token
+      `SyntaxPtr` plus a small per-token span index in `ReferenceTable`
+      let `resolution_at` answer a click landing inside a string literal's
+      text, which the architecture couldn't represent before). Traces a
+      variable argument one hop back to its own literal/`+`-concatenation
+      source -- a local's last straight-line assignment in the same
+      enclosing-block chain as the call site, or a field's own declared
+      initializer -- deliberately excludes `queryWithBinds`/
+      `countQueryWithBinds`/`getQueryLocatorWithBinds`, whose bind names
+      are `Map` keys, not lexically-scoped variables at all.
+      **What this doesn't do, on purpose:** any interprocedural case --
+      a query string assembled in one method and only reaching
+      `Database.query` after being returned to (or built by) another
+      method, most commonly the fflib-apex-common `QueryFactory` fluent-
+      builder idiom (`newQueryFactory().setCondition('id in :idSet').toSOQL()`,
+      where `setCondition`'s argument is stored into a field by one
+      method and read back by a different one, possibly in another file
+      entirely). Closing that gap is architecturally feasible -- Pass 2
+      already builds a project-wide `FxHashMap<FileId, Parse>` before
+      dispatching bodies (`crate::BoundProgram::from_files_cached`'s
+      `parse_by_file`), it just isn't threaded into `BodyBinder` today --
+      but real cross-method tracing (parameter/field substitution across
+      a call, plus recognizing a fluent-setter's `return this;` shape to
+      track builder state across a chain) is a substantially bigger,
+      riskier undertaking than the same-method case, so it was
+      deliberately deferred rather than built speculatively. The current
+      behavior is a false negative only (a missed reference/goto-target),
+      never a wrong one -- safe to leave open until a real need justifies
+      the added surface.
 **Performance, measured (`cargo bench -p apex-binder`, real NPSP corpus,
 ~1070 files):** `corpus/bind_npsp_full` (cold): ~440-459ms across two
 consecutive clean runs, within this machine's already-established noise

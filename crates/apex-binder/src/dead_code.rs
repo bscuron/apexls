@@ -726,6 +726,36 @@ mod tests {
         );
     }
 
+    /// The reported bug this fixes: a local bound only inside a dynamic-
+    /// SOQL string (`:nameVar`, resolved via `crate::resolve::bind_dynamic_soql_binds`)
+    /// used to have no reference recorded for it at all -- `ReferenceTable`
+    /// only ever sees real AST-node references, and string *content* was
+    /// never scanned for anything. `q` itself is traced one hop back from
+    /// `Database.query(q)` to its own literal assignment.
+    #[test]
+    fn a_local_bound_only_in_a_dynamic_soql_string_reaching_database_query_is_not_flagged() {
+        let src = "public class Foo {\n    public void run() {\n        String nameVar = 'Acme';\n        String q = 'SELECT Id FROM Account WHERE Name = :nameVar';\n        Database.query(q);\n    }\n}\n";
+        let (_, _, dead) =
+            dead_symbols_with_extra_files("dynamic-soql-bind-used", src, &[("Caller.cls", CALLER)]);
+        assert!(
+            dead.iter().all(|d| d.name != "nameVar"),
+            "nameVar is bound in a dynamic SOQL string reaching Database.query, it must not be flagged dead: {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// A local that looks similarly named but is never actually bound
+    /// anywhere (no `:otherVar` in any string) must still be flagged --
+    /// the fix must not become "any local in a method that calls
+    /// Database.query is exempt."
+    #[test]
+    fn a_local_not_bound_in_any_dynamic_soql_string_is_still_flagged() {
+        let src = "public class Foo {\n    public void run() {\n        Integer otherVar = 5;\n        String q = 'SELECT Id FROM Account';\n        Database.query(q);\n    }\n}\n";
+        let (_, _, dead) =
+            dead_symbols_with_extra_files("dynamic-soql-unrelated-local", src, &[("Caller.cls", CALLER)]);
+        assert_eq!(dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["otherVar"]);
+    }
+
     #[test]
     fn test_visible_private_static_method_called_from_another_file_is_not_flagged() {
         let src = "public class Foo {\n    @TestVisible\n    private static void helper() { }\n}\n";

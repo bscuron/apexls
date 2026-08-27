@@ -897,6 +897,28 @@ impl BoundProgram {
                 }
             }
         };
+        // A dynamic-SOQL bind variable (`:nameVar`) embedded in a string
+        // literal's own *text content* (`resolve::bind_dynamic_soql_binds`)
+        // has no real syntax node/token of its own -- the lexer never
+        // tokenizes anything inside a string literal's body -- so a click
+        // landing inside one can never be found via the node-climbing walk
+        // below (which only ever matches a whole token or node's exact
+        // range). Checked first, cheaply gated on the clicked token
+        // actually being a string literal (true for none of the many
+        // other tokens a click can land on), against the small per-token
+        // span index `ReferenceTable::dynamic_soql_bind_at` builds, rather
+        // than re-scanning the token's text here.
+        if matches!(
+            token.kind(),
+            apex_syntax::SyntaxKind::StringLiteral | apex_syntax::SyntaxKind::MultilineStringLiteral
+        ) {
+            if let Some(fb) = self.bodies.get(&file) {
+                let container = SyntaxPtr::for_token(file, &token);
+                if let Some(res) = fb.refs.dynamic_soql_bind_at(container, offset) {
+                    return Some(res);
+                }
+            }
+        }
         // A qualified `Outer.Inner` type reference (`resolve::record_qualified_segments`)
         // is the one case a bare *token* -- not just a node -- can have
         // its own recorded `Resolution`: the whole dotted path is a
