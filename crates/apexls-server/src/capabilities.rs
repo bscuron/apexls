@@ -13,11 +13,14 @@ use apex_syntax::ast::decl::{
     ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, HasDocComment, InterfaceDecl, MethodDecl,
     PropertyDecl, TriggerUnit,
 };
+use apex_syntax::ast::expr::{ArgList, CallExpr, Expr, MethodCallExpr, NameExpr, NewExpr};
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall, CodeAction,
     CodeActionKind, CodeActionOrCommand, Diagnostic, DiagnosticSeverity, DiagnosticTag,
-    DocumentHighlight, DocumentSymbol, FoldingRange, Location, Position, Range, SelectionRange,
-    SymbolInformation, SymbolKind as LspSymbolKind, TextEdit, Url, WorkspaceEdit,
+    Documentation, DocumentHighlight, DocumentSymbol, FoldingRange, InlayHint, InlayHintKind,
+    InlayHintLabel, Location, ParameterInformation, ParameterLabel, Position, Range,
+    SelectionRange, SignatureHelp, SignatureInformation, SymbolInformation,
+    SymbolKind as LspSymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 use rowan::ast::AstNode;
 use rowan::{TextRange, TextSize};
@@ -272,7 +275,7 @@ pub(crate) fn describe_stdlib_member(program: &BoundProgram, r: &StdlibMemberRef
         let params = m
             .params
             .iter()
-            .map(|p| p.as_deref().unwrap_or("Object"))
+            .map(stdlib_param_label)
             .collect::<Vec<_>>()
             .join(", ");
         sig.push_str(&format!("public {modifier}{ret} {ns_prefix}{}({params})\n", m.name));
@@ -297,6 +300,19 @@ fn push_params(program: &BoundProgram, out: &mut String, method_or_ctor: SymbolI
             out.push(' ');
         }
         out.push_str(&param.name);
+    }
+}
+
+/// A scraped stdlib parameter's own `"Type name"` label, mirroring
+/// `push_params`'s declared-parameter formatting -- falls back to just
+/// the type (or `"Object"` if even that's missing) when the scraper
+/// couldn't extract a name for this particular parameter (see
+/// `apex_stdlib::StdlibParam`'s own doc comment for why that happens).
+fn stdlib_param_label(p: &apex_stdlib::StdlibParam) -> String {
+    let ty = p.type_name.as_deref().unwrap_or("Object");
+    match &p.name {
+        Some(name) => format!("{ty} {name}"),
+        None => ty.to_string(),
     }
 }
 
@@ -1237,5 +1253,357 @@ pub(crate) fn outgoing_calls(
             })
             .collect(),
     )
+}
+
+/// `textDocument/signatureHelp`: which overload(s) the call the cursor
+/// sits inside could resolve to, and which parameter position the
+/// cursor is currently in. Deliberately does *not* start from
+/// `BoundProgram::resolution_at` the way every other position-based
+/// capability here does -- `resolution_at`'s own doc comment explains it
+/// stops climbing at the *first* reference-kind ancestor, which for a
+/// cursor sitting on an argument that's itself a name/field/call
+/// (`foo(bar)`'s `bar`) would return `bar`'s own resolution, not the
+/// enclosing call `foo(...)`'s -- exactly backwards for this feature.
+/// Instead this climbs to the nearest enclosing `ArgList` first
+/// (unambiguous: an `ArgList` only ever has one immediate parent, a
+/// `MethodCallExpr`/`CallExpr`/`NewExpr`, and nested calls nest their
+/// own `ArgList`s the same way their calls nest), then looks up *that*
+/// node's own recorded `Resolution` directly via `resolution`.
+///
+/// The active parameter is the count of `Comma` *tokens* (not resolved
+/// argument nodes) preceding the cursor, so a trailing comma with
+/// nothing typed after it yet (`foo(1, |)`) still advances to the next
+/// parameter slot -- `apex-parser`'s `arg_list` grammar
+/// (`crates/apex-parser/src/grammar/expressions.rs`) completes the
+/// `ArgList` node even with a missing closing paren or a dangling
+/// trailing comma, so this needs no recovery logic of its own.
+///
+/// The candidate overload set is always recomputed fresh from
+/// `container`/`name` (`SymbolTable::lookup_member`/`members_of`) rather
+/// than read back from the stored `Resolution`: `narrow_by_overload`
+/// already collapsed that down to a single winner (or an arity-narrowed
+/// ambiguous set) by the time binding recorded it, so the *other*
+/// overloads a real signature-help popup needs to show are never in the
+/// stored value at all.
+pub(crate) fn signature_help(
+    program: &BoundProgram,
+    file: FileId,
+    offset: TextSize,
+) -> Option<SignatureHelp> {
+    let root = program.syntax(file);
+    let token = match root.token_at_offset(offset) {
+        rowan::TokenAtOffset::None => return None,
+        rowan::TokenAtOffset::Single(t) => t,
+        rowan::TokenAtOffset::Between(left, right) => {
+            if left.kind().is_trivia() {
+                right
+            } else {
+                left
+            }
+        }
+    };
+
+    let mut node = token.parent()?;
+    let arg_list = loop {
+        if let Some(arg_list) = ArgList::cast(node.clone()) {
+            break arg_list;
+        }
+        node = node.parent()?;
+    };
+    let call_node = arg_list.syntax().parent()?;
+    let resolution = program.resolution(SyntaxPtr::new(file, &call_node))?;
+
+    let active_param = arg_list
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .filter(|t| t.kind() == apex_syntax::SyntaxKind::Comma && t.text_range().end() <= offset)
+        .count();
+    let typed_args = arg_list.args().count();
+
+    let (signatures, param_counts): (Vec<SignatureInformation>, Vec<usize>) = match resolution {
+        Resolution::Resolved(id) => member_candidates(program, *id, file, offset)?,
+        Resolution::Candidates(ids) => member_candidates(program, *ids.first()?, file, offset)?,
+        Resolution::StdlibMember(r) => stdlib_candidates(program, r)?,
+        _ => return None,
+    };
+
+    let active_signature = pick_active_signature(&param_counts, active_param, typed_args);
+    let active_parameter = param_counts
+        .get(active_signature)
+        .map_or(active_param, |&n| active_param.min(n.saturating_sub(1)));
+
+    Some(SignatureHelp {
+        signatures,
+        active_signature: Some(active_signature as u32),
+        active_parameter: Some(active_parameter as u32),
+    })
+}
+
+/// Every visible same-named `Method`/`Constructor` overload sharing
+/// `first_id`'s own `container`/`name` -- the full candidate set
+/// `signature_help` needs, reconstructed the same way
+/// `resolve::bind_method_call_expr`/`bind_new_expr` originally built it
+/// before `narrow_by_overload` collapsed it down to `first_id` alone.
+/// Visibility is only checked when `file`/`offset` actually has an
+/// enclosing method/constructor to check it *from* (a call in a field/
+/// property initializer doesn't) -- unfiltered rather than
+/// wrongly-filtered in that case, matching this codebase's general
+/// "don't guess, but don't silently drop it either" posture.
+fn member_candidates(
+    program: &BoundProgram,
+    first_id: SymbolId,
+    file: FileId,
+    offset: TextSize,
+) -> Option<(Vec<SignatureInformation>, Vec<usize>)> {
+    let symbol = program.symbols.get(first_id);
+    let container = symbol.container?;
+    let enclosing_type = program
+        .enclosing_callable(file, offset)
+        .and_then(|m| program.symbols.get(m).container);
+    let visible = |&id: &SymbolId| {
+        enclosing_type.is_none() || program.symbols.is_visible_from(id, enclosing_type)
+    };
+    let candidates: Vec<SymbolId> = match symbol.kind {
+        SymbolKind::Method => program
+            .symbols
+            .lookup_member(container, &symbol.name)
+            .into_iter()
+            .filter(|&id| program.symbols.get(id).kind == SymbolKind::Method)
+            .filter(visible)
+            .collect(),
+        SymbolKind::Constructor => program
+            .symbols
+            .members_of(container)
+            .iter()
+            .copied()
+            .filter(|&id| program.symbols.get(id).kind == SymbolKind::Constructor)
+            .filter(visible)
+            .collect(),
+        _ => return None,
+    };
+    if candidates.is_empty() {
+        return None;
+    }
+    let param_counts = candidates.iter().map(|&id| program.symbols.params(id).len()).collect();
+    let signatures = candidates
+        .iter()
+        .map(|&id| method_signature_information(program, id))
+        .collect();
+    Some((signatures, param_counts))
+}
+
+/// The stdlib counterpart to [`member_candidates`]: every overload of
+/// `r.member` on `r.class_name` from `program.stdlib`, rendered straight
+/// from the bundled scraped schema (no `SymbolId`/declaration backs a
+/// stdlib member at all, the same reason `describe_stdlib_member` looks
+/// it up the same way).
+fn stdlib_candidates(
+    program: &BoundProgram,
+    r: &StdlibMemberRef,
+) -> Option<(Vec<SignatureInformation>, Vec<usize>)> {
+    let member = r.member.as_deref()?;
+    let overloads: Vec<_> = program.stdlib.methods(&r.class_name, member).collect();
+    if overloads.is_empty() {
+        return None;
+    }
+    let param_counts = overloads.iter().map(|m| m.params.len()).collect();
+    let signatures = overloads
+        .iter()
+        .map(|m| {
+            let param_labels: Vec<String> = m.params.iter().map(stdlib_param_label).collect();
+            let ret = m.return_type.as_deref().unwrap_or("void");
+            SignatureInformation {
+                label: format!("{ret} {}({})", m.name, param_labels.join(", ")),
+                documentation: m
+                    .description
+                    .as_ref()
+                    .map(|d| Documentation::String(d.to_string())),
+                parameters: Some(parameter_information(param_labels)),
+                active_parameter: None,
+            }
+        })
+        .collect();
+    Some((signatures, param_counts))
+}
+
+fn method_signature_information(program: &BoundProgram, id: SymbolId) -> SignatureInformation {
+    let symbol = program.symbols.get(id);
+    let param_labels: Vec<String> = program
+        .symbols
+        .params(id)
+        .iter()
+        .map(|&param_id| {
+            let param = program.symbols.get(param_id);
+            match &param.type_name {
+                Some(t) => format!("{t} {}", param.name),
+                None => param.name.to_string(),
+            }
+        })
+        .collect();
+    let label = if symbol.kind == SymbolKind::Method {
+        format!(
+            "{} {}({})",
+            symbol.type_name.as_deref().unwrap_or("void"),
+            symbol.name,
+            param_labels.join(", ")
+        )
+    } else {
+        format!("{}({})", symbol.name, param_labels.join(", "))
+    };
+    SignatureInformation {
+        label,
+        documentation: None,
+        parameters: Some(parameter_information(param_labels)),
+        active_parameter: None,
+    }
+}
+
+fn parameter_information(labels: Vec<String>) -> Vec<ParameterInformation> {
+    labels
+        .into_iter()
+        .map(|label| ParameterInformation {
+            label: ParameterLabel::Simple(label),
+            documentation: None,
+        })
+        .collect()
+}
+
+/// Picks which overload should show as "active" given how many parameter
+/// slots the cursor implies (`active_param + 1`, since a cursor sitting
+/// in the Nth slot means at least N+1 parameters) and how many arguments
+/// are actually typed so far (`typed_args`, which can be smaller than
+/// `active_param + 1` when a trailing comma has nothing after it yet).
+/// Prefers an exact match on `typed_args` (the call exactly as it stands
+/// right now), then falls back to the first overload with a parameter
+/// slot at `active_param` at all, then just the first overload -- never
+/// `None` once `param_counts` is non-empty.
+fn pick_active_signature(param_counts: &[usize], active_param: usize, typed_args: usize) -> usize {
+    param_counts
+        .iter()
+        .position(|&n| n == typed_args)
+        .or_else(|| param_counts.iter().position(|&n| n > active_param))
+        .unwrap_or(0)
+}
+
+/// `textDocument/inlayHint`: a `paramName:` label before each call
+/// argument, mirroring rust-analyzer's/clangd's default inlay-hint
+/// behavior for call sites. Built from `BoundProgram::call_sites_in_range`
+/// (the same on-demand, no-precomputed-index primitive
+/// `call_hierarchy::outgoing_calls` already uses), so this costs nothing
+/// beyond whatever range the client actually asked to render.
+///
+/// Only emitted for an unambiguous call -- a project call resolved to
+/// exactly one `Resolution::Resolved` `Method`/`Constructor`, or a
+/// stdlib call (`Resolution::StdlibMember`) whose overload set narrows
+/// to exactly one candidate by the number of arguments actually typed.
+/// An ambiguous `Resolution::Candidates` call, or a stdlib call whose
+/// arity doesn't narrow to one overload, is skipped rather than
+/// guessing: unlike a hover tooltip, an inlay hint is baked directly
+/// into the editor's rendering of the line, so a wrong guess would be
+/// far more visible/misleading than an honest absence. A stdlib
+/// parameter the scraper couldn't extract a name for (`StdlibParam::name`
+/// is `None` -- see its own doc comment) is skipped individually rather
+/// than dropping the whole call's hints over one missing name.
+///
+/// Suppressed when the argument is itself a bare identifier that
+/// already spells the parameter's own name (`foo(accountId)` for a
+/// `foo(Id accountId)` parameter) -- the hint would be pure noise
+/// repeating text already on the line, the same suppression
+/// rust-analyzer/clangd both apply by default.
+pub(crate) fn inlay_hints(
+    program: &BoundProgram,
+    uri: &Url,
+    range: Range,
+    encoding: PositionEncoding,
+) -> Option<Vec<InlayHint>> {
+    let (file, start) = resolve_position(program, uri, range.start, encoding)?;
+    let (_, end) = resolve_position(program, uri, range.end, encoding)?;
+    let byte_range = TextRange::new(start, end);
+
+    let root = program.syntax(file);
+    let text = root.text().to_string();
+    let index = LineIndex::new(&text);
+    let make_hint = |arg: &Expr, name: &str| -> Option<InlayHint> {
+        if argument_repeats_param_name(arg, name) {
+            return None;
+        }
+        let pos = arg.syntax().text_range().start();
+        Some(InlayHint {
+            position: index.to_position(&text, pos.into(), encoding),
+            label: InlayHintLabel::String(format!("{name}:")),
+            kind: Some(InlayHintKind::PARAMETER),
+            text_edits: None,
+            tooltip: None,
+            padding_left: None,
+            padding_right: Some(true),
+            data: None,
+        })
+    };
+
+    Some(
+        program
+            .call_sites_in_range(file, byte_range)
+            .into_iter()
+            .filter_map(|(ptr, resolution)| {
+                let node = ptr.to_node(&root)?;
+                let args: Vec<Expr> = call_arg_list(&node)?.args().collect();
+                match resolution {
+                    Resolution::Resolved(id) => {
+                        let symbol = program.symbols.get(id);
+                        if !matches!(symbol.kind, SymbolKind::Method | SymbolKind::Constructor) {
+                            return None;
+                        }
+                        let params = program.symbols.params(id);
+                        Some(
+                            params
+                                .into_iter()
+                                .zip(args)
+                                .filter_map(|(param_id, arg)| {
+                                    make_hint(&arg, &program.symbols.get(param_id).name)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                    Resolution::StdlibMember(r) => {
+                        let member = r.member.as_deref()?;
+                        let overloads: Vec<_> = program.stdlib.methods(&r.class_name, member).collect();
+                        let narrowed: Vec<_> =
+                            overloads.iter().filter(|m| m.params.len() == args.len()).collect();
+                        let [winner] = narrowed.as_slice() else {
+                            return None;
+                        };
+                        Some(
+                            winner
+                                .params
+                                .iter()
+                                .zip(args)
+                                .filter_map(|(param, arg)| make_hint(&arg, param.name.as_deref()?))
+                                .collect::<Vec<_>>(),
+                        )
+                    }
+                    _ => None,
+                }
+            })
+            .flatten()
+            .collect(),
+    )
+}
+
+/// The `ArgList` of a call node already known to be one of the three
+/// kinds `BoundProgram::call_sites_in_range` ever returns
+/// (`MethodCallExpr`/`CallExpr`/`NewExpr`) -- tries each in turn since
+/// there's no common supertype to cast through directly.
+fn call_arg_list(node: &apex_syntax::SyntaxNode) -> Option<ArgList> {
+    MethodCallExpr::cast(node.clone())
+        .and_then(|m| m.args())
+        .or_else(|| CallExpr::cast(node.clone()).and_then(|c| c.args()))
+        .or_else(|| NewExpr::cast(node.clone()).and_then(|n| n.args()))
+}
+
+fn argument_repeats_param_name(arg: &Expr, param_name: &str) -> bool {
+    NameExpr::cast(arg.syntax().clone())
+        .and_then(|n| n.name_token())
+        .is_some_and(|tok| tok.text().eq_ignore_ascii_case(param_name))
 }
 

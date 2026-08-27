@@ -17,7 +17,11 @@ fn write_fixture_dir(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("apex-binder-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for (file_name, src) in files {
-        std::fs::write(dir.join(file_name), src).unwrap();
+        let path = dir.join(file_name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, src).unwrap();
     }
     dir
 }
@@ -278,5 +282,81 @@ fn an_enum_constant_access_resolves_to_stdlib_member() {
             arg_count: None,
         }))),
         "LoggingLevel.INFO should resolve as a known stdlib property (an enum value)"
+    );
+}
+
+/// A real object's *own* generic instance methods (`get`/`put`/
+/// `getSObjectType`/`clone`/`addError`/`getErrors`/...) are declared
+/// once on the scraped `SObject` class, not repeated per concrete object
+/// type -- `Account.put(...)` used to fall to `Resolution::Unresolved`
+/// unconditionally, since `stdlib.class("Account")` finds nothing (a
+/// standard *object* is never itself a stdlib *class*). Uses the
+/// bundled standard `Account` object, no `.object-meta.xml` fixture
+/// needed.
+#[test]
+fn a_real_objects_generic_sobject_method_resolves_via_the_sobject_fallback() {
+    let dir = write_fixture_dir(
+        "stdlib-sobject-generic-method",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             public void run() { \
+                 Account a = new Account(); \
+                 a.put('Name', 'test'); \
+             } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        method_call_resolution(&program, "put"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "SObject".into(),
+            member: Some("put".into()),
+            arg_count: Some(2),
+        }))),
+        "Account.put should fall back to the generic SObject.put method"
+    );
+}
+
+/// The exact user-reported bug: the same `SObject`-fallback rule, but
+/// against a real *custom* object (`.object-meta.xml` fixture, like real
+/// NPSP's `DataImport__c`) rather than a bundled standard one --
+/// confirms the fallback checks `self.schema.object` (every real
+/// object), not just the bundled standard-schema snapshot.
+#[test]
+fn a_custom_objects_generic_sobject_method_resolves_via_the_sobject_fallback() {
+    let dir = write_fixture_dir(
+        "stdlib-sobject-generic-method-custom",
+        &[
+            (
+                "Foo.cls",
+                "public class Foo { \
+                 public void run(Custom__c c) { \
+                     Schema.SObjectType t = c.getSObjectType(); \
+                 } \
+             }",
+            ),
+            (
+                "objects/Custom__c/Custom__c.object-meta.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomObject xmlns=\"http://soap.sforce.com/2006/04/metadata\"><label>Custom</label></CustomObject>",
+            ),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        method_call_resolution(&program, "getSObjectType"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "SObject".into(),
+            member: Some("getSObjectType".into()),
+            arg_count: Some(0),
+        }))),
+        "a real custom object's getSObjectType() should fall back to the generic SObject method"
     );
 }

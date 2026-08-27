@@ -224,6 +224,7 @@ dependencies = [
  "apex-binder",
  "apex-discover",
  "apex-lexer",
+ "apex-stdlib",
  "apex-syntax",
  "async-lsp",
  "futures",

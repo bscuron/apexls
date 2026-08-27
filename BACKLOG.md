@@ -47,10 +47,17 @@ public members are exempted, see below) paired with a "Remove unused
 `textDocument/prepareCallHierarchy`/`callHierarchy/incomingCalls`/
 `callHierarchy/outgoingCalls` are also done now, computed entirely on
 demand per request rather than needing any precomputed whole-project
-call graph. Next up is §3's remaining "needs
-new binder-side work first" list (`signatureHelp`, `completion`,
-`semanticTokens`, `inlayHint`), or §4's still-open
-standard-library/schema type-model gap.
+call graph. `textDocument/signatureHelp` is done too, also on demand:
+the candidate overload set is recomputed fresh from the resolved call's
+`container`/`name` (not read back from the narrowed `Resolution`), and
+the active parameter is tracked by counting `Comma` tokens rather than
+resolved argument nodes, so a dangling trailing comma with nothing typed
+after it yet still advances to the next parameter slot.
+`textDocument/inlayHint` is done too (a `paramName:` label per call
+argument, same on-demand posture, skipped for any ambiguous or stdlib
+call). Next up is §3's remaining "needs new binder-side work first" list
+(`completion`, `semanticTokens`), or §4's still-open standard-library/
+schema type-model gap.
 
 ## 1. Protocol / server layer
 
@@ -890,9 +897,11 @@ supports each one.
       (`renaming_a_local_variable_to_a_short_name_does_not_corrupt_the_file`)
       and exact post-apply text assertions added to the other rename
       tests that previously only checked edit count/`newText`.
-- [ ] `textDocument/signatureHelp` -- have `narrow_by_overload`'s
-      candidate set; needs argument-position tracking (which parameter
-      is the cursor currently in) layered on top.
+- [x] `textDocument/signatureHelp` -- done: reuses `narrow_by_overload`'s
+      candidate set (recomputed unnarrowed from the resolved call's
+      `container`/`name`), with argument-position tracking (which
+      parameter the cursor is currently in) layered on top via a
+      `Comma`-token count, not resolved-argument-node count.
 - [ ] `textDocument/completion` -- needs scope-aware +
       member-aware suggestion (have the data via `ScopeTree`/
       `SymbolTable`), but also needs the parser's error recovery to
@@ -972,8 +981,24 @@ supports each one.
       nothing project-local ever *calls into* something external in a
       way this analysis could observe (`by_external`'s consumer is
       always the reference itself, not a caller of it).
-- [ ] `textDocument/inlayHint` -- e.g. inferred local types; blocked on
-      the same type-inference limits as §4.
+- [x] `textDocument/inlayHint` -- done for the standard cross-language
+      default (a `paramName:` label before each call argument, via
+      `BoundProgram::call_sites_in_range`, the same on-demand primitive
+      `outgoingCalls` uses), not the "inferred local types" idea
+      originally sketched here -- Apex has no `var`/implicit-typed local
+      at all, so there's no real analogue of that specific rust-analyzer-
+      style hint to build. Only emitted for an unambiguous call -- a
+      project call resolved to exactly one `Resolution::Resolved`
+      `Method`/`Constructor`, or a stdlib call whose overload set
+      narrows to exactly one candidate by arity (an inlay hint is baked
+      into the editor's rendering of the line, so a wrong guess would be
+      far more visible/misleading than a hover's honest "+N more").
+      Stdlib calls get real parameter-name hints too, not just types:
+      `apex_stdlib::StdlibMethod::params` was originally scraped as
+      type-only (`RawParam` had no `name` field), but the scraper's own
+      output already carries a `name` per parameter -- that field was
+      just never read. Fixed by adding `StdlibParam{name, type_name}` in
+      place of the old `Vec<Option<SmolStr>>`.
 
 **Needs work outside the binder entirely:**
 - [ ] `textDocument/formatting` / `rangeFormatting` -- `apex-printer`

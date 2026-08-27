@@ -109,10 +109,20 @@ pub struct StdlibMethod {
     /// `List<T>`) but still one opaque string, e.g. `"List<String>"` --
     /// never pre-split into base+args (see [`split_generic_type`]).
     pub return_type: Option<SmolStr>,
-    /// Each parameter's type, positional; `None` for the rare case the
-    /// scraper couldn't extract one.
-    pub params: Vec<Option<SmolStr>>,
+    /// Each parameter, positional.
+    pub params: Vec<StdlibParam>,
     pub description: Option<SmolStr>,
+}
+
+/// One scraped method/constructor parameter. Either field can be `None`
+/// when the scraper couldn't extract it -- confirmed common for both
+/// (roughly 1,800 of ~4,900 real scraped params have no `name`, ~2,100
+/// no `type_name`), so a caller needs to handle either going missing
+/// independently, not just one or the other.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StdlibParam {
+    pub name: Option<SmolStr>,
+    pub type_name: Option<SmolStr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -146,6 +156,7 @@ struct RawMethod {
 
 #[derive(Deserialize)]
 struct RawParam {
+    name: Option<String>,
     type_name: Option<String>,
 }
 
@@ -209,7 +220,10 @@ fn to_stdlib_method(raw: RawMethod) -> StdlibMethod {
         params: raw
             .params
             .into_iter()
-            .map(|p| p.type_name.as_deref().map(normalize_type_string))
+            .map(|p| StdlibParam {
+                name: p.name.as_deref().map(SmolStr::new),
+                type_name: p.type_name.as_deref().map(normalize_type_string),
+            })
             .collect(),
         description: raw.description.map(|d| SmolStr::new(&d)),
     }
@@ -348,7 +362,8 @@ mod tests {
         assert!(is_blank.is_static);
         assert_eq!(is_blank.return_type.as_deref(), Some("Boolean"));
         assert_eq!(is_blank.params.len(), 1);
-        assert_eq!(is_blank.params[0].as_deref(), Some("String"));
+        assert_eq!(is_blank.params[0].type_name.as_deref(), Some("String"));
+        assert_eq!(is_blank.params[0].name.as_deref(), Some("inputString"));
         assert!(is_blank.description.is_some());
     }
 

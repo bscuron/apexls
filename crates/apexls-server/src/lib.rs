@@ -91,12 +91,14 @@ use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
     FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, Location, MarkupContent, MarkupKind,
-    OneOf, PrepareRenameResponse, PublishDiagnosticsParams, ReferenceParams, RenameOptions,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, InlayHint,
+    InlayHintParams, InitializeParams, InitializeResult, InitializedParams, Location,
+    MarkupContent, MarkupKind, OneOf, PrepareRenameResponse, PublishDiagnosticsParams,
+    ReferenceParams, RenameOptions,
     RenameParams, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
-    ServerCapabilities, ServerInfo, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url, WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
@@ -586,6 +588,13 @@ impl LanguageServer for Backend {
                     // response never has to know that default by heart.
                     position_encoding: Some(position_encoding.into()),
                     hover_provider: Some(HoverProviderCapability::Simple(true)),
+                    // `,` re-triggers signature help on every new argument,
+                    // not just `(` on the call's opening paren.
+                    signature_help_provider: Some(SignatureHelpOptions {
+                        trigger_characters: Some(vec!["(".into(), ",".into()]),
+                        retrigger_characters: None,
+                        work_done_progress_options: Default::default(),
+                    }),
                     definition_provider: Some(OneOf::Left(true)),
                     references_provider: Some(OneOf::Left(true)),
                     document_highlight_provider: Some(OneOf::Left(true)),
@@ -616,6 +625,7 @@ impl LanguageServer for Backend {
                             work_done_progress_options: Default::default(),
                         },
                     )),
+                    inlay_hint_provider: Some(OneOf::Left(true)),
                     ..ServerCapabilities::default()
                 },
                 server_info: Some(ServerInfo {
@@ -765,6 +775,62 @@ impl LanguageServer for Backend {
                 }),
                 range: None,
             }))
+        })
+    }
+
+    /// `capabilities::signature_help`: which overload(s) of the call the
+    /// cursor sits inside of could apply, and which parameter position
+    /// it's currently in. `params.context` (which trigger character
+    /// fired, whether a signature help popup was already open) isn't
+    /// consulted -- every trigger recomputes the same on-demand answer
+    /// from scratch, cheap enough (a handful of `SymbolTable` lookups)
+    /// that there's no real benefit to threading the previous popup's
+    /// state through.
+    fn signature_help(
+        &mut self,
+        params: SignatureHelpParams,
+    ) -> BoxFuture<'static, Result<Option<SignatureHelp>, Self::Error>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some((file, offset)) =
+                capabilities::resolve_position(program, &uri, position, encoding)
+            else {
+                return Ok(None);
+            };
+
+            Ok(capabilities::signature_help(program, file, offset))
+        })
+    }
+
+    /// `capabilities::inlay_hints`: a `paramName:` label before each
+    /// call argument visible in `params.range` -- see that function's
+    /// own doc comment for exactly which calls get a label and which
+    /// don't.
+    fn inlay_hint(
+        &mut self,
+        params: InlayHintParams,
+    ) -> BoxFuture<'static, Result<Option<Vec<InlayHint>>, Self::Error>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            Ok(capabilities::inlay_hints(program, &uri, range, encoding))
         })
     }
 

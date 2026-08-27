@@ -80,6 +80,20 @@
 //! "different real object names" is *always* a definite mismatch, not
 //! just an unmodeled one.
 //!
+//! A real object is also never compatible with a curated *scalar*
+//! (confirmed: `Id someId = aContactRecord;` and `String s =
+//! aContactRecord;` are both real `Illegal assignment` compile errors),
+//! including nested one level inside a collection -- a same-arity
+//! `pick(Id)`/`pick(Contact)` pair (and, separately, `pick(List<Id>)`/
+//! `pick(List<Contact>)`) called with a real `Contact` value
+//! unambiguously resolves to the `Contact` overload in both shapes, i.e.
+//! the real compiler never even treats the `Id`/`List<Id>` candidate as
+//! viable. Before this was added, that specific pairing fell through
+//! `system_type_compatible` all the way to `None` (`Contact` isn't
+//! itself one of the curated names `is_curated` recognizes), so a real
+//! `List<Id>`/`List<CustomObject__c>` overload pair stayed a
+//! `Resolution::Candidates` tie no argument could ever break.
+//!
 //! [`widen`] answers a related but distinct question on top of the same
 //! curated rules -- not "can this value be passed here," but "what's the
 //! common type of a ternary's two branches" (`crate::resolve`'s
@@ -256,6 +270,23 @@ fn system_type_compatible(
     if schema.object(param_name).is_some()
         && (arg_name.eq_ignore_ascii_case("SObject") || schema.object(arg_name).is_some())
     {
+        return Some(false);
+    }
+    // A concrete SObject value is never compatible with a curated
+    // *scalar* (`Id`/`String`/`Boolean`/numeric/`Date`/`Datetime`/`Time`/
+    // `Blob`) -- confirmed against a real org: `Id someId =
+    // aContactRecord;` and `String s = aContactRecord;` are both real
+    // `Illegal assignment` compile errors, and a same-arity
+    // `pick(Id)`/`pick(Contact)` (also confirmed nested one level, via
+    // `pick(List<Id>)`/`pick(List<Contact>)`) overload pair called with a
+    // real `Contact` value unambiguously resolves to the `Contact`
+    // overload -- the real compiler never even treats the `Id`/`List<Id>`
+    // candidate as viable, matching this returning a definite `Some(false)`
+    // rather than the `None` that would leave both candidates alive.
+    // `param_name` here is never `SObject` itself or another real object
+    // (both already handled above), so this only ever fires for a
+    // genuine scalar-vs-object mismatch.
+    if is_curated(param_name) && schema.object(arg_name).is_some() {
         return Some(false);
     }
     if is_curated(param_name) && is_curated(arg_name) {
@@ -641,6 +672,37 @@ mod tests {
                 &sys_args("List", vec![sys("Account")]),
             ),
             Some(true)
+        );
+    }
+
+    /// A real object type is never compatible with a curated *scalar*,
+    /// nested one level inside a collection or not -- confirmed real
+    /// against a real org (`Id someId = aContactRecord;`/`String s =
+    /// aContactRecord;` are both `Illegal assignment` compile errors, and
+    /// a same-arity `pick(Id)`/`pick(Contact)` -- also confirmed nested,
+    /// `pick(List<Id>)`/`pick(List<Contact>)` -- called with a real
+    /// `Contact` value unambiguously resolves to the `Contact` overload
+    /// in both shapes). Before this rule existed, `Contact` (a name
+    /// `is_curated` doesn't recognize) made this fall through to `None`,
+    /// leaving a real `List<Id>`/`List<CustomObject__c>` overload pair an
+    /// unbreakable `Resolution::Candidates` tie -- the exact user-reported
+    /// bug (`BDI_DataImport_API.processDataImportRecords`'s
+    /// `List<DataImport__c>`/`List<Id>` overloads in real NPSP).
+    #[test]
+    fn a_real_object_type_is_never_compatible_with_a_curated_scalar() {
+        let schema = standard_schema();
+        let table = empty_table();
+        assert_eq!(type_compatible(&schema, &table, "Id", &[], &sys("Contact")), Some(false));
+        assert_eq!(type_compatible(&schema, &table, "String", &[], &sys("Contact")), Some(false));
+        assert_eq!(
+            type_compatible(
+                &schema,
+                &table,
+                "List",
+                &[SmolStr::new_static("Id")],
+                &sys_args("List", vec![sys("Contact")]),
+            ),
+            Some(false)
         );
     }
 

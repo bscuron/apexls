@@ -253,8 +253,48 @@ fn corpus_root() -> PathBuf {
 ///    documents them on grouped, empty-methods "Built-In Exceptions"-
 ///    style pages `apex_stdlib::standard_classes` already filters out --
 ///    a real, separate, pre-existing gap this fix doesn't touch.
-const BASELINE_RESOLVED: usize = 205_259;
-const BASELINE_UNRESOLVED: usize = 28_976;
+/// 10. `crate::conversions::system_type_compatible` never checked "param
+///     is a curated *scalar* (`Id`/`String`/...), argument is a real
+///     schema object" -- only the reverse direction (param is an
+///     object) and the `SObject`-accepts-any-object case were modeled,
+///     so that specific pairing fell all the way through to `None`.
+///     Confirmed against a real org before fixing: `Id someId =
+///     aContactRecord;`/`String s = aContactRecord;` are both real
+///     `Illegal assignment` compile errors, and a same-arity
+///     `pick(Id)`/`pick(Contact)` pair (also confirmed nested one level,
+///     via `pick(List<Id>)`/`pick(List<Contact>)`) called with a real
+///     `Contact` value unambiguously resolves to the `Contact` overload
+///     in both shapes. This is exactly the user-reported bug (a real
+///     NPSP call, `BDI_DataImport_API.processDataImportRecords(diSettings,
+///     new List<DataImport__c>{...}, isDryRun)`, stayed
+///     `Resolution::Candidates` forever between its `List<DataImport__c>`-
+///     and `List<Id>`-typed overloads, since nothing could ever
+///     eliminate the `List<Id>` one). `BASELINE_RESOLVED` rose +252
+///     (`205_259` -> `205_511`); `BASELINE_UNRESOLVED` unaffected
+///     (`Candidates` isn't tallied by either counter, so a
+///     `Candidates` -> `Resolved` move only ever changes this side).
+/// 11. `resolve::bind_method_call_expr`'s `Ty::System` arm only ever
+///     looked up a receiver's *exact* type name in `apex_stdlib`
+///     (`stdlib.class("DataImport__c")` -> nothing, since a real object
+///     is never itself a stdlib *class*), so it never found the generic
+///     instance methods every real object actually has --
+///     `get`/`put`/`getSObjectType`/`clone`/`addError`/`getErrors`/...
+///     are all declared once on the scraped `SObject` class itself
+///     (`apex_stdlib::standard_classes()` really does have a
+///     `"SObject"`/`"System"` entry with these, confirmed by direct
+///     inspection of `data/apex_reference.json` -- the data was already
+///     there, just never consulted for anything but a literal `SObject`-
+///     typed receiver). Fixed by falling back to `stdlib.class("SObject")`
+///     whenever the receiver is confirmed to actually be a real object
+///     (`self.schema.object`, not a name guess) and its own exact-name
+///     lookup didn't already have the member. `BASELINE_UNRESOLVED`
+///     dropped -804 (`28_976` -> `28_172`), all of it calls (confirmed
+///     via a direct count: 6,097 -> 5,293 `Unresolved` `MethodCallExpr`/
+///     `CallExpr`/`NewExpr` references specifically); `BASELINE_RESOLVED`
+///     rose +8 (`205_511` -> `205_519`) from the same "argument/chain
+///     type newly known" ripple effect documented in step 1.
+const BASELINE_RESOLVED: usize = 205_519;
+const BASELINE_UNRESOLVED: usize = 28_172;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

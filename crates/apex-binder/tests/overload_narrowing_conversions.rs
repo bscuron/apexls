@@ -376,3 +376,37 @@ fn a_real_object_typed_argument_prefers_its_exact_overload_over_sobject() {
         Some(Resolution::Resolved(account_overload))
     );
 }
+
+/// The exact user-reported bug: a real NPSP call
+/// (`BDI_DataImport_API.processDataImportRecords`) between a
+/// `List<Id>`-typed overload and a `List<CustomObject__c>`-typed one
+/// stayed an unbreakable `Resolution::Candidates` tie forever, since
+/// nothing eliminated a real object argument against a curated scalar
+/// like `Id` (see `conversions::system_type_compatible`'s own doc
+/// comment on the org verification for this rule). Uses the bundled
+/// standard `Contact` object rather than a custom-object fixture --
+/// same underlying rule, no `.object-meta.xml` fixture needed.
+#[test]
+fn a_list_of_a_real_object_type_eliminates_a_list_of_id_overload() {
+    let dir = write_fixture_dir(
+        "list-of-object-vs-list-of-id",
+        &[(
+            "Toolbox.cls",
+            "public class Toolbox { \
+             public void pick(List<Id> ids) { } \
+             public void pick(List<Contact> contacts) { } \
+             public void run() { pick(new List<Contact>{ new Contact() }); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let contact_list_overload = pick_overload_with_collection_param(&program, "List", "Contact");
+
+    assert_eq!(
+        the_call_resolution(&program, file, "pick"),
+        Some(Resolution::Resolved(contact_list_overload))
+    );
+}

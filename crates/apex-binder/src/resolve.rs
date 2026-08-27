@@ -251,8 +251,8 @@ fn stdlib_args_compatible(
     method: &StdlibMethod,
     arg_types: &[Option<Ty>],
 ) -> bool {
-    for (param_type, arg_type) in method.params.iter().zip(arg_types.iter()) {
-        let (Some(param_type), Some(arg_type)) = (param_type, arg_type) else {
+    for (param, arg_type) in method.params.iter().zip(arg_types.iter()) {
+        let (Some(param_type), Some(arg_type)) = (&param.type_name, arg_type) else {
             continue;
         };
         let (param_name, param_args) = apex_stdlib::split_generic_type(param_type);
@@ -2081,10 +2081,36 @@ impl<'a> BodyBinder<'a> {
                 // see `crate::reference_table::Resolution`'s own doc
                 // comment on why that distinction exists at all.
                 let class = self.stdlib.class(&base);
-                let resolution = match class.and_then(|c| StdlibIndex::methods_of(c, name).next()) {
-                    Some(_) => Resolution::StdlibMember(Box::new(stdlib_member_ref(
-                        class.and_then(|c| c.namespace.clone()),
-                        &base,
+                // A real object (standard or custom) is never itself a
+                // stdlib class by that exact name (`self.stdlib.class`
+                // only ever indexes `apex_stdlib::standard_classes`), so
+                // `class` alone never accounts for the generic instance
+                // methods every real object actually has -- `get`/`put`/
+                // `getSObjectType`/`clone`/`addError`/`getErrors`/... are
+                // all declared once on the scraped `SObject` class itself
+                // (`apex_stdlib::standard_classes()` really does have a
+                // `"SObject"`/`"System"` entry with these, confirmed by
+                // direct inspection of `data/apex_reference.json`), not
+                // repeated per concrete object type. Falls back to it only
+                // when `base` is confirmed to actually *be* a real object
+                // (`self.schema.object`, not a name guess) -- otherwise an
+                // unrelated `Ty::System` name that merely happens to share
+                // a method name with `SObject` (there are none today, but
+                // nothing guarantees that forever) would wrongly resolve.
+                let method_class = class
+                    .filter(|c| StdlibIndex::methods_of(c, name).next().is_some())
+                    .or_else(|| {
+                        self.schema
+                            .object(&base)
+                            .is_some()
+                            .then(|| self.stdlib.class("SObject"))
+                            .flatten()
+                            .filter(|c| StdlibIndex::methods_of(c, name).next().is_some())
+                    });
+                let resolution = match method_class {
+                    Some(c) => Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                        c.namespace.clone(),
+                        &c.name,
                         Some(name),
                         Some(arg_types.len()),
                     ))),
@@ -2116,7 +2142,7 @@ impl<'a> BodyBinder<'a> {
                 // `addAll`, which need no substitution anyway) does the
                 // scraped, best-effort-narrowed return type get used.
                 crate::generics::builtin_generic_member_type(class, &base, &args, name).or_else(|| {
-                    class.and_then(|c| {
+                    method_class.and_then(|c| {
                         narrow_stdlib_overload_type(self.schema, self.table, c, name, &arg_types)
                     })
                 })
