@@ -79,8 +79,20 @@ use smol_str::SmolStr;
 /// candidate whose parameter count doesn't equal `arg_types.len()`
 /// genuinely cannot be the one called -- this is exact, not a
 /// heuristic. If nothing survives arity filtering at all (a real
-/// compile error, or a gap in this binder's own counting), the original
-/// full candidate set is reported rather than claiming nothing matched.
+/// compile error, an unmodeled overload, or a class extending
+/// `Exception` -- Apex implicitly synthesizes four constructors for
+/// every such class regardless of what it declares itself, which this
+/// binder doesn't model -- see `BACKLOG.md`), the original full
+/// candidate set is reported as `Candidates`, **never** `Resolved`, even
+/// when it happens to contain exactly one same-named symbol: a lone
+/// candidate with the wrong arity still isn't the one actually being
+/// called, so confidently resolving to it would be a wrong answer, not
+/// just an imprecise one. Confirmed a real bug via
+/// `crates/apex-binder/tests/resolution_consistency.rs`'s whole-corpus
+/// arity/name self-check before this fix: `pool.len() == 1` used to fire
+/// on this exact fallback case too, since it didn't distinguish "the one
+/// candidate genuinely matches this call's arity" from "there's only one
+/// same-named candidate at all, and it doesn't."
 ///
 /// Second, among same-arity survivors, elimination by argument type via
 /// `crate::conversions::type_compatible`: project-local exact-match-or-
@@ -119,11 +131,10 @@ fn narrow_by_overload(
         .copied()
         .filter(|&id| table.params(id).len() == arg_types.len())
         .collect();
-    let pool = if by_arity.is_empty() {
-        candidates
-    } else {
-        by_arity
-    };
+    if by_arity.is_empty() {
+        return Resolution::Candidates(candidates);
+    }
+    let pool = by_arity;
     if pool.len() == 1 {
         return Resolution::Resolved(pool[0]);
     }
@@ -2137,11 +2148,26 @@ impl<'a> BodyBinder<'a> {
             // never resolved past the nested class's own (and inherited)
             // members. Mirrors the identical climb `bind_name_expr` and
             // `type_of_symbol` already do for the name and declared-type
-            // cases.
+            // cases, but with one real difference a plain field/type
+            // lookup doesn't need: a method name can be *overloaded*, so
+            // finding *any* same-named method at a level isn't enough
+            // reason to stop there -- only a same-named method that also
+            // matches this call's own arity shadows the outer scope.
+            // Confirmed against a real org: a nested class's own single
+            // 1-arg `meetsCriteria` did **not** shadow its outer class's
+            // unrelated 2-arg static `meetsCriteria` for a 2-arg
+            // unqualified call from inside the nested class -- that
+            // deploys and runs successfully in real Apex, which the
+            // original "stop at the first non-empty level" version of
+            // this climb got wrong (found only the inner 1-arg method,
+            // never reaching the real 2-arg target at all). Confirmed via
+            // `crates/apex-binder/tests/resolution_consistency.rs`'s
+            // whole-corpus arity/name self-check, which caught this
+            // exact shape live in NPSP's `UTIL_Where.cls`.
             let mut candidates = Vec::new();
             let mut enclosing_chain = Some(container);
             while let Some(level) = enclosing_chain {
-                candidates = self
+                let level_candidates: Vec<SymbolId> = self
                     .table
                     .lookup_member(level, name)
                     .into_iter()
@@ -2150,8 +2176,14 @@ impl<'a> BodyBinder<'a> {
                             && self.table.is_visible_from(id, self.enclosing_type)
                     })
                     .collect();
-                if !candidates.is_empty() {
-                    break;
+                if !level_candidates.is_empty() {
+                    let arity_matches_here = level_candidates
+                        .iter()
+                        .any(|&id| self.table.params(id).len() == arg_types.len());
+                    candidates = level_candidates;
+                    if arity_matches_here {
+                        break;
+                    }
                 }
                 enclosing_chain = self.table.get(level).container;
             }

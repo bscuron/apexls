@@ -192,7 +192,41 @@ fn corpus_root() -> PathBuf {
 ///    references). `BASELINE_UNRESOLVED` unaffected, consistent with
 ///    that: nothing moved *out* of `Unresolved` here, since nothing was
 ///    ever recorded there for these in the first place.
-const BASELINE_RESOLVED: usize = 205_262;
+/// 8. **Two real resolver bugs fixed, found by a new automated
+///    consistency guard** (`crates/apex-binder/tests/resolution_consistency.rs`,
+///    which independently re-derives a call-shaped `Resolved` reference's
+///    actual arity/callee-name from the AST and checks them against the
+///    resolved symbol's own declaration -- distinct from this file's own
+///    "how many resolve" counts, this one asks "did the ones that
+///    resolved resolve to something real"):
+///    a. `narrow_by_overload`'s `pool.len() == 1` fast path used to fire
+///       whenever exactly one same-named candidate existed at all, even
+///       when that candidate's own arity didn't match the call -- e.g. a
+///       class extending `Exception` (which implicitly gets four
+///       synthesized constructors this binder doesn't model) declaring
+///       its own single explicit 2-arg constructor confidently
+///       "resolved" a 0-arg or 1-arg `new` call to that unrelated 2-arg
+///       one. Fixed by only taking the fast path when the single
+///       candidate came from the *arity-filtered* pool, not the
+///       unfiltered fallback; an arity-empty pool now honestly reports
+///       `Candidates` instead. Moved `BASELINE_RESOLVED` -3 (three real
+///       `fflib_QueryFactory.InvalidFieldException` call sites in NPSP
+///       were confidently wrong before this).
+///    b. `bind_call_expr`'s outward lexical-nesting climb (for an
+///       unqualified call from a nested class to a method on its outer
+///       class) stopped at the first level with *any* same-named method,
+///       never considering arity -- confirmed via a live deploy that
+///       real Apex does *not* work this way (a nested class's own
+///       single-arity overload does not shadow an unrelated-arity
+///       same-name method on its outer class; the real compiler still
+///       finds the outer one). Fixed to keep climbing past a level
+///       unless that level has an arity-*matching* same-named method.
+///       This one didn't move either baseline count (NPSP's one real
+///       occurrence, `UTIL_Where.cls`'s `meetsCriteria`, was already
+///       counted as `Resolved` before the fix -- just resolved to the
+///       wrong, arity-mismatched symbol -- and stays `Resolved`,
+///       correctly, after it).
+const BASELINE_RESOLVED: usize = 205_259;
 const BASELINE_UNRESOLVED: usize = 75_405;
 
 #[test]
