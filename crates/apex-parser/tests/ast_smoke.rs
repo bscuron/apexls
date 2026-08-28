@@ -19,7 +19,7 @@ use apex_syntax::ast::decl::{
     CompilationUnit, ConstructorDecl, FieldDecl, HasDocComment, Member, MethodDecl, PropertyDecl,
     TriggerUnit, TypeDecl,
 };
-use apex_syntax::ast::expr::Expr;
+use apex_syntax::ast::expr::{Expr, FieldExpr, MethodCallExpr};
 use apex_syntax::ast::soql::{
     SoqlCondition, SoqlExpr, SoqlLogicalExpr, SoqlSelectEntry, SoqlSubQuery, SoqlValue, SoslExpr,
 };
@@ -845,4 +845,61 @@ fn walk_sosl(path: &std::path::Path, sosl: &SoslExpr, counts: &mut Counts) {
             }
         }
     }
+}
+
+/// Regression guard for the `member_token`/`method_name_token` fix: these
+/// accessors used to blindly return the node's last direct token
+/// regardless of kind, so a dangling `.`/`?.` with no member typed yet
+/// (real mid-edit input, not just syntactically-invalid-but-complete
+/// input) was misreported as a member named `"."`. The whole-corpus walk
+/// above only ever exercises complete real files, so it can't catch this
+/// -- these are deliberately hand-written incomplete snippets instead.
+#[test]
+fn dangling_field_access_has_no_member_token() {
+    let parse = apex_parser::parse_expression("foo.");
+    let field = parse
+        .syntax()
+        .descendants()
+        .find_map(FieldExpr::cast)
+        .expect("`foo.` should still parse to a FieldExpr node");
+    assert!(
+        field.member_token().is_none(),
+        "a dangling dot must not be reported as the member token"
+    );
+}
+
+#[test]
+fn partial_field_access_still_resolves_its_member_token() {
+    let parse = apex_parser::parse_expression("foo.b");
+    let field = parse
+        .syntax()
+        .descendants()
+        .find_map(FieldExpr::cast)
+        .expect("`foo.b` should parse to a FieldExpr node");
+    assert_eq!(field.member_token().unwrap().text(), "b");
+}
+
+#[test]
+fn keyword_shaped_member_access_still_resolves() {
+    let parse = apex_parser::parse_expression("foo.new");
+    let field = parse
+        .syntax()
+        .descendants()
+        .find_map(FieldExpr::cast)
+        .expect("`foo.new` should parse to a FieldExpr node (`new` is anyId-shaped)");
+    assert_eq!(field.member_token().unwrap().text(), "new");
+}
+
+#[test]
+fn dangling_method_call_has_no_method_name_token() {
+    let parse = apex_parser::parse_expression("foo.(");
+    let call = parse
+        .syntax()
+        .descendants()
+        .find_map(MethodCallExpr::cast)
+        .expect("`foo.(` should still parse to a MethodCallExpr node");
+    assert!(
+        call.method_name_token().is_none(),
+        "a dangling dot must not be reported as the method name token"
+    );
 }

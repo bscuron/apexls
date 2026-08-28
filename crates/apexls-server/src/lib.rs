@@ -87,7 +87,8 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOptions, CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
     CallHierarchyPrepareParams, CallHierarchyServerCapability, CodeActionKind, CodeActionOptions, CodeActionParams, CodeActionProviderCapability,
-    CodeActionResponse, DidChangeConfigurationParams, DidChangeTextDocumentParams,
+    CodeActionResponse, CompletionOptions, CompletionParams, CompletionResponse,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
     FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams,
@@ -626,6 +627,16 @@ impl LanguageServer for Backend {
                         },
                     )),
                     inlay_hint_provider: Some(OneOf::Left(true)),
+                    // `.` triggers completion for a member access; a bare
+                    // identifier needs no trigger character at all -- every
+                    // real client already invokes completion as the user
+                    // types ordinary word characters regardless of what's
+                    // listed here.
+                    completion_provider: Some(CompletionOptions {
+                        trigger_characters: Some(vec![".".into()]),
+                        resolve_provider: Some(false),
+                        ..Default::default()
+                    }),
                     ..ServerCapabilities::default()
                 },
                 server_info: Some(ServerInfo {
@@ -808,6 +819,36 @@ impl LanguageServer for Backend {
             };
 
             Ok(capabilities::signature_help(program, file, offset))
+        })
+    }
+
+    /// `capabilities::completion`: every candidate for whatever context
+    /// (member-access after a `.`, or a bare identifier) the cursor sits
+    /// in. `params.context` (which trigger character fired, if any)
+    /// isn't consulted -- same on-demand posture as `signature_help`,
+    /// nothing here is expensive enough to need it.
+    fn completion(
+        &mut self,
+        params: CompletionParams,
+    ) -> BoxFuture<'static, Result<Option<CompletionResponse>, Self::Error>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().unwrap().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read().unwrap();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some((file, offset)) =
+                capabilities::resolve_position(program, &uri, position, encoding)
+            else {
+                return Ok(None);
+            };
+
+            Ok(capabilities::completion(program, file, offset, encoding))
         })
     }
 

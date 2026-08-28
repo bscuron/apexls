@@ -1,0 +1,27 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/malformed/04_dangling_field_access.cls
+---
+# source
+a = foo.
+
+
+# tree
+StmtRoot@0..9
+  ExprStmt@0..9
+    BinExpr@0..9
+      NameExpr@0..2
+        Identifier@0..1 "a"
+        Whitespace@1..2 " "
+      Assign@2..3 "="
+      Whitespace@3..4 " "
+      FieldExpr@4..9
+        NameExpr@4..7
+          Identifier@4..7 "foo"
+        Dot@7..8 "."
+        Whitespace@8..9 "\n"
+
+# errors
+ParseError { message: "expected a member name, found Eof", offset: 9 }
+ParseError { message: "expected Semi, found Eof", offset: 9 }

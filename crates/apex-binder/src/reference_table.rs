@@ -61,19 +61,38 @@ pub struct UnknownSchemaRef {
 /// aren't calls at all) -- carried here specifically so a hover renderer
 /// can narrow an overloaded method down to the arity-matching
 /// overload(s) instead of always showing every one, the same arity-first
-/// signal `crate::resolve::narrow_by_overload`/`narrow_stdlib_overload_type`
+/// signal `crate::resolve::narrow_by_overload`/`narrow_stdlib_overload`
 /// already use to narrow the *propagated type*. Deliberately just the
 /// count, not the argument types themselves: unlike `Ty`, a `usize` is
 /// cheap to carry on every `Resolution` and never goes stale relative to
 /// the reference it describes, and arity alone already disambiguates the
 /// overwhelming majority of real overload sets (different-arity is far
 /// more common in the scraped data than same-arity-different-type).
+///
+/// `narrowed_param_types` fills the gap arity alone can't: a genuine
+/// same-arity overload pair (`List.addAll(List)` vs. `addAll(Set)`, both
+/// one parameter -- List/Set aren't implicitly convertible, so showing
+/// both on hover was actively misleading, not just imprecise). Set only
+/// when `crate::resolve::narrow_stdlib_overload`'s full arity-then-type
+/// narrowing (`crate::conversions::type_compatible`, run once at bind
+/// time where the real argument `Ty`s are already in hand -- reusing
+/// that result instead of re-inferring types from scratch on every
+/// hover request) picks a *unique* winning method whose every parameter
+/// has a known scraped type name; `None` in every other case (a single
+/// overload to begin with, genuine ambiguity, or an incompletely-scraped
+/// winner), same as `arg_count`'s own "can't narrow further" signal.
+/// Each entry is one parameter's own declared type name, positional --
+/// deliberately not the fuller `Ty` shape `arg_count`'s own doc comment
+/// above explains staying away from, since this is the *parameter*
+/// side's declared type (fixed, scraped text), never the argument side's
+/// inferred one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StdlibMemberRef {
     pub namespace: Option<SmolStr>,
     pub class_name: SmolStr,
     pub member: Option<SmolStr>,
     pub arg_count: Option<usize>,
+    pub narrowed_param_types: Option<Vec<SmolStr>>,
 }
 
 /// `SchemaObject`/`UnknownSchema`/`StdlibMember` box their payload so

@@ -410,3 +410,120 @@ fn a_list_of_a_real_object_type_eliminates_a_list_of_id_overload() {
         Some(Resolution::Resolved(contact_list_overload))
     );
 }
+
+/// The exact user-reported bug: fflib's real `checkFieldIsUpdateable`
+/// three-way overload (`SObjectType,String` / `SObjectType,SObjectField`
+/// / `SObjectType,DescribeFieldResult`), called with a `String`-typed
+/// second argument, stayed a three-way `Resolution::Candidates` tie
+/// forever -- goto-definition on the call showed all three overloads --
+/// since neither `SObjectField` nor `DescribeFieldResult` is in
+/// `crate::conversions`'s curated set, so a `String` argument couldn't
+/// eliminate either one. Fixed by `conversions::system_type_compatible`'s
+/// new rule that a curated *scalar* (`String` here) is never compatible
+/// with a differently-named system type regardless of whether that other
+/// name is itself curated (verified against a real org -- see that
+/// function's own doc comment).
+#[test]
+fn a_string_argument_eliminates_sobjectfield_and_describefieldresult_overloads() {
+    let dir = write_fixture_dir(
+        "checkfieldisupdateable-string-vs-sobjectfield",
+        &[(
+            "fflib_SecurityUtils.cls",
+            "public class fflib_SecurityUtils { \
+             public static void checkFieldIsUpdateable(SObjectType objType, String fieldName) { } \
+             public static void checkFieldIsUpdateable(SObjectType objType, SObjectField fieldToken) { } \
+             public static void checkFieldIsUpdateable(SObjectType objType, DescribeFieldResult fieldDescribe) { } \
+             public static void checkUpdate(SObjectType objType, List<String> fieldNames) { \
+                 for (String fieldName : fieldNames) { \
+                     checkFieldIsUpdateable(objType, fieldName); \
+                 } \
+             } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "fflib_SecurityUtils");
+    let string_overload = program
+        .symbols
+        .iter()
+        .filter(|(_, s)| s.kind == SymbolKind::Method && s.name == "checkFieldIsUpdateable")
+        .find(|(id, _)| {
+            program
+                .symbols
+                .get(program.symbols.params(*id)[1])
+                .type_name
+                .as_deref()
+                == Some("String")
+        })
+        .map(|(id, _)| id)
+        .expect("checkFieldIsUpdateable(SObjectType, String) should exist");
+
+    assert_eq!(
+        the_call_resolution(&program, file, "checkFieldIsUpdateable"),
+        Some(Resolution::Resolved(string_overload))
+    );
+}
+
+/// A second, related real-reported shape off the same `checkFieldIsUpdateable`
+/// overload trio: `fflib_SObjectDescribe.getDescribe(objType).getField(fieldName)`
+/// -- a real `fflib_SObjectDescribe.getField` call, whose own declared
+/// return type is spelled with its namespace (`Schema.SObjectField`),
+/// resolving to the `SObjectField` overload, not `DescribeFieldResult`.
+/// Needed two independent fixes to get here: `Schema.SObjectField` as a
+/// declared/return type resolving to the real stdlib class at all (a
+/// namespace-qualified-reference gap fixed earlier -- see
+/// `crate::stdlib_index::StdlibIndex::class_in_namespace`), and then
+/// `conversions::system_type_compatible`'s new "two different, both
+/// real, uncurated stdlib classes are never compatible" rule to actually
+/// eliminate the `DescribeFieldResult` overload once the argument's type
+/// correctly propagated as `SObjectField`.
+#[test]
+fn a_resolved_sobjectfield_return_value_eliminates_the_describefieldresult_overload() {
+    let dir = write_fixture_dir(
+        "checkfieldisupdateable-sobjectfield-vs-describefieldresult",
+        &[
+            (
+                "fflib_SecurityUtils.cls",
+                "public class fflib_SecurityUtils { \
+                 public static void checkFieldIsUpdateable(SObjectType objType, SObjectField fieldToken) { } \
+                 public static void checkFieldIsUpdateable(SObjectType objType, DescribeFieldResult fieldDescribe) { } \
+                 public static void run(SObjectType objType, String fieldName) { \
+                     checkFieldIsUpdateable(objType, fflib_SObjectDescribe.getDescribe(objType).getField(fieldName)); \
+                 } \
+             }",
+            ),
+            (
+                "fflib_SObjectDescribe.cls",
+                "public class fflib_SObjectDescribe { \
+                 public static fflib_SObjectDescribe getDescribe(SObjectType objType) { return null; } \
+                 public Schema.SObjectField getField(String fieldName) { return null; } \
+             }",
+            ),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "fflib_SecurityUtils");
+    let sobjectfield_overload = program
+        .symbols
+        .iter()
+        .filter(|(_, s)| s.kind == SymbolKind::Method && s.name == "checkFieldIsUpdateable")
+        .find(|(id, _)| {
+            program
+                .symbols
+                .get(program.symbols.params(*id)[1])
+                .type_name
+                .as_deref()
+                == Some("SObjectField")
+        })
+        .map(|(id, _)| id)
+        .expect("checkFieldIsUpdateable(SObjectType, SObjectField) should exist");
+
+    assert_eq!(
+        the_call_resolution(&program, file, "checkFieldIsUpdateable"),
+        Some(Resolution::Resolved(sobjectfield_overload))
+    );
+}

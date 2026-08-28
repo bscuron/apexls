@@ -1,0 +1,31 @@
+---
+source: crates/apex-parser/tests/golden.rs
+expression: "snapshot_text(&src, &parse)"
+input_file: tests/golden/malformed/05_dangling_method_call.cls
+---
+# source
+a = foo.bar(
+
+
+# tree
+StmtRoot@0..13
+  ExprStmt@0..13
+    BinExpr@0..13
+      NameExpr@0..2
+        Identifier@0..1 "a"
+        Whitespace@1..2 " "
+      Assign@2..3 "="
+      Whitespace@3..4 " "
+      MethodCallExpr@4..13
+        NameExpr@4..7
+          Identifier@4..7 "foo"
+        Dot@7..8 "."
+        Identifier@8..11 "bar"
+        ArgList@11..13
+          LParen@11..12 "("
+          Whitespace@12..13 "\n"
+
+# errors
+ParseError { message: "expected expression, found Eof", offset: 13 }
+ParseError { message: "expected RParen, found Eof", offset: 13 }
+ParseError { message: "expected Semi, found Eof", offset: 13 }

@@ -105,6 +105,7 @@
 //! the specific org evidence.
 
 use crate::schema_index::SchemaIndex;
+use crate::stdlib_index::StdlibIndex;
 use crate::symbol::SymbolId;
 use crate::symbol_table::SymbolTable;
 use crate::ty::Ty;
@@ -179,6 +180,7 @@ fn is_curated(name: &str) -> bool {
 /// branch, so callers no longer need a separate check for it.
 pub(crate) fn type_compatible(
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     table: &SymbolTable,
     param_name: &str,
     param_args: &[SmolStr],
@@ -200,7 +202,7 @@ pub(crate) fn type_compatible(
                 // made to implement a user-defined interface either.
                 return Some(false);
             }
-            system_type_compatible(schema, table, param_name, param_args, arg_name, arg_args)
+            system_type_compatible(schema, stdlib, table, param_name, param_args, arg_name, arg_args)
         }
     }
 }
@@ -226,6 +228,7 @@ fn project_arg_compatible(table: &SymbolTable, param_name: &str, arg_id: SymbolI
 
 fn system_type_compatible(
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     table: &SymbolTable,
     param_name: &str,
     param_args: &[SmolStr],
@@ -234,7 +237,7 @@ fn system_type_compatible(
 ) -> Option<bool> {
     if param_name.eq_ignore_ascii_case(arg_name) {
         return if collection_kind(param_name).is_some() {
-            collection_args_compatible(schema, table, param_args, arg_args)
+            collection_args_compatible(schema, stdlib, table, param_args, arg_args)
         } else {
             Some(true)
         };
@@ -295,6 +298,64 @@ fn system_type_compatible(
         // collection vs a scalar) -- a real, definite mismatch.
         return Some(false);
     }
+    // A curated *scalar* (every curated name except `List`/`Set`/`Map`,
+    // via `collection_kind`) on either side is a real, definite mismatch
+    // against *any* other differing type name, not just another curated
+    // one -- Apex has no user-definable implicit conversions at all, so
+    // this holds regardless of what the other (uncurated, real but
+    // unmodeled) name turns out to be, the same way it already holds
+    // between two curated names above. Verified against a real org in
+    // both directions with names this module has no other rule for:
+    // `Schema.SObjectField`/`Schema.DescribeFieldResult`/`System.Comparable`
+    // are all real `Illegal assignment` compile errors against `String`,
+    // and so is the reverse (`String s = aSObjectFieldValue;`). Real bug
+    // this fixes: `checkFieldIsUpdateable(SObjectType, String)` /
+    // `(SObjectType, SObjectField)` / `(SObjectType, DescribeFieldResult)`
+    // overloads called with a `String` argument used to stay a
+    // three-way `Candidates` tie forever, since neither `SObjectField`
+    // nor `DescribeFieldResult` is curated and this function returned
+    // `None` (can't prove wrong) for both instead of ruling them out.
+    // Deliberately excludes `List`/`Set`/`Map`: those aren't sealed the
+    // same way -- confirmed a collection legitimately satisfies an
+    // uncurated *interface* name this module doesn't otherwise model
+    // (`List<String>` assigns to `Iterable<String>`, a real success, not
+    // a compile error) -- so a collection on either side must stay
+    // `None` here, not a guessed elimination.
+    if (is_curated(param_name) && collection_kind(param_name).is_none())
+        || (is_curated(arg_name) && collection_kind(arg_name).is_none())
+    {
+        return Some(false);
+    }
+    // Two *different*, both real -- each independently confirmed to be a
+    // genuine, documented stdlib class via `StdlibIndex`, not just a name
+    // guess -- and neither a curated collection: also a definite mismatch,
+    // for the same "Apex has no user-definable implicit conversions"
+    // reason the curated-scalar rule above already relies on. Verified
+    // against a real org: `Schema.SObjectField` does not assign to
+    // `Schema.DescribeFieldResult` (a real `Illegal assignment` compile
+    // error) even though *neither* name is in this module's curated set.
+    // Real bug this fixes: fflib's `checkFieldIsUpdateable(SObjectType,
+    // SObjectField)` / `(SObjectType, DescribeFieldResult)` overload pair,
+    // called with a `fflib_SObjectDescribe.getField(...)` argument (a
+    // real, resolved `SObjectField`), used to stay a `Candidates` tie
+    // forever -- goto-definition showed both -- since this function had
+    // no rule at all for two differing *uncurated* system names, only for
+    // a curated one against anything. Deliberately requires *both* names
+    // to resolve via `stdlib.class` (not just one): an unresolvable name
+    // on either side (a typo, or a genuinely unmodeled system type this
+    // crate's stdlib snapshot doesn't carry) must keep the honest
+    // "can't prove wrong" `None` below, never a guessed elimination.
+    // `Iterable`/`Iterator` aren't in the bundled snapshot at all (no
+    // scraped page with real method/property content), so `List`/`Set`
+    // satisfying them, as already covered by the collection exclusion
+    // above, is unaffected either way.
+    if collection_kind(param_name).is_none()
+        && collection_kind(arg_name).is_none()
+        && stdlib.class(param_name).is_some()
+        && stdlib.class(arg_name).is_some()
+    {
+        return Some(false);
+    }
     None
 }
 
@@ -308,6 +369,7 @@ fn system_type_compatible(
 /// compatible" to a caller deciding whether to *select* this candidate.
 fn collection_args_compatible(
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     table: &SymbolTable,
     param_args: &[SmolStr],
     arg_args: &[Ty],
@@ -317,7 +379,7 @@ fn collection_args_compatible(
     }
     let mut all_confirmed = true;
     for (p, a) in param_args.iter().zip(arg_args.iter()) {
-        match type_compatible(schema, table, p, &[], a) {
+        match type_compatible(schema, stdlib, table, p, &[], a) {
             Some(false) => return Some(false),
             Some(true) => {}
             None => all_confirmed = false,
@@ -372,7 +434,7 @@ fn ty_arg_name(table: &SymbolTable, ty: &Ty) -> SmolStr {
 /// confirmed is a real Apex compile error in its own right
 /// (`Incompatible types in ternary operator: Boolean, String`), not just
 /// this module being conservative.
-pub(crate) fn widen(schema: &SchemaIndex, table: &SymbolTable, a: &Ty, b: &Ty) -> Option<Ty> {
+pub(crate) fn widen(schema: &SchemaIndex, stdlib: &StdlibIndex, table: &SymbolTable, a: &Ty, b: &Ty) -> Option<Ty> {
     if a == b {
         return Some(a.clone());
     }
@@ -398,8 +460,8 @@ pub(crate) fn widen(schema: &SchemaIndex, table: &SymbolTable, a: &Ty, b: &Ty) -
         ) => {
             let a_arg_names: Vec<SmolStr> = a_args.iter().map(|t| ty_arg_name(table, t)).collect();
             let b_arg_names: Vec<SmolStr> = b_args.iter().map(|t| ty_arg_name(table, t)).collect();
-            let a_into_b = type_compatible(schema, table, b_name, &b_arg_names, a);
-            let b_into_a = type_compatible(schema, table, a_name, &a_arg_names, b);
+            let a_into_b = type_compatible(schema, stdlib, table, b_name, &b_arg_names, a);
+            let b_into_a = type_compatible(schema, stdlib, table, a_name, &a_arg_names, b);
             match (a_into_b, b_into_a) {
                 // Bidirectionally compatible with no established
                 // specificity (`Id`/`String` -- see this module's own
@@ -493,6 +555,15 @@ mod tests {
         SchemaIndex::from_sobjects(apex_stdlib::standard_sobjects().to_vec())
     }
 
+    /// The real bundled standard-class snapshot -- needed by every test
+    /// here, not just the ones specifically about the new "two real,
+    /// distinct stdlib classes" elimination rule, since `stdlib.class`
+    /// is now consulted (and must find nothing) even for names outside
+    /// that rule's own tests.
+    fn real_stdlib() -> StdlibIndex {
+        StdlibIndex::new()
+    }
+
     fn sys(name: &'static str) -> Ty {
         Ty::system(name)
     }
@@ -505,12 +576,13 @@ mod tests {
     fn object_param_accepts_anything() {
         let schema = empty_schema();
         let table = empty_table();
+        let stdlib = real_stdlib();
         assert_eq!(
-            type_compatible(&schema, &table, "Object", &[], &sys("String")),
+            type_compatible(&schema, &stdlib, &table, "Object", &[], &sys("String")),
             Some(true)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "Object", &[], &Ty::Project(sid(0))),
+            type_compatible(&schema, &stdlib, &table, "Object", &[], &Ty::Project(sid(0))),
             Some(true)
         );
     }
@@ -519,16 +591,17 @@ mod tests {
     fn numeric_widening_is_one_directional() {
         let schema = empty_schema();
         let table = empty_table();
+        let stdlib = real_stdlib();
         assert_eq!(
-            type_compatible(&schema, &table, "Long", &[], &sys("Integer")),
+            type_compatible(&schema, &stdlib, &table, "Long", &[], &sys("Integer")),
             Some(true)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "Integer", &[], &sys("Long")),
+            type_compatible(&schema, &stdlib, &table, "Integer", &[], &sys("Long")),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "Decimal", &[], &sys("Double")),
+            type_compatible(&schema, &stdlib, &table, "Decimal", &[], &sys("Double")),
             Some(true)
         );
     }
@@ -537,16 +610,17 @@ mod tests {
     fn string_and_boolean_are_exact_only() {
         let schema = empty_schema();
         let table = empty_table();
+        let stdlib = real_stdlib();
         assert_eq!(
-            type_compatible(&schema, &table, "String", &[], &sys("Boolean")),
+            type_compatible(&schema, &stdlib, &table, "String", &[], &sys("Boolean")),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "Boolean", &[], &sys("String")),
+            type_compatible(&schema, &stdlib, &table, "Boolean", &[], &sys("String")),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "String", &[], &sys("String")),
+            type_compatible(&schema, &stdlib, &table, "String", &[], &sys("String")),
             Some(true)
         );
     }
@@ -555,13 +629,99 @@ mod tests {
     fn uncurated_system_types_are_never_eliminated() {
         let schema = empty_schema();
         let table = empty_table();
+        let stdlib = real_stdlib();
         assert_eq!(
-            type_compatible(&schema, &table, "Comparable", &[], &Ty::Project(sid(0))),
+            type_compatible(&schema, &stdlib, &table, "Comparable", &[], &Ty::Project(sid(0))),
             None
         );
+        // Both names uncurated (`Iterable`/`SObjectField`, neither this
+        // module has a rule for) -- still an honest `None`, not the
+        // curated-scalar elimination `a_curated_scalar_is_never_compatible_with_an_uncurated_system_type`
+        // covers below, since neither side is a sealed scalar this
+        // module can reason about.
         assert_eq!(
-            type_compatible(&schema, &table, "Iterable", &[], &sys("Integer")),
+            type_compatible(&schema, &stdlib, &table, "Iterable", &[], &sys("SObjectField")),
             None
+        );
+        // `List` is curated but, unlike a scalar, isn't sealed against an
+        // uncurated *interface* name -- confirmed via a real org:
+        // `List<String>` assigns to an `Iterable<String>`-typed variable
+        // (a real success, not a compile error). Must stay `None`
+        // (`collection_kind` exempts it from the new scalar-elimination
+        // rule below), not a wrongly-guessed `Some(false)`.
+        assert_eq!(
+            type_compatible(&schema, &stdlib, &table, "Iterable", &[], &sys("List")),
+            None
+        );
+    }
+
+    /// A curated *scalar* (every curated name except `List`/`Set`/`Map`)
+    /// is never compatible with a differently-named, uncurated system
+    /// type on either side -- Apex has no user-definable implicit
+    /// conversions, so a sealed scalar's incompatibility with anything
+    /// outside its own curated relationships holds regardless of whether
+    /// this module has a rule for the *other* name too. Real bug this
+    /// fixes: fflib's `checkFieldIsUpdateable(SObjectType, String)` /
+    /// `(SObjectType, SObjectField)` / `(SObjectType, DescribeFieldResult)`
+    /// overload trio, called with a `String` argument, used to stay a
+    /// three-way `Candidates` tie forever (goto-definition showing all
+    /// three) since neither `SObjectField` nor `DescribeFieldResult` is
+    /// curated. Verified against a real org: `Schema.SObjectField`/
+    /// `Schema.DescribeFieldResult`/`System.Comparable` are all real
+    /// `Illegal assignment` compile errors against `String`, and so is
+    /// the reverse (`String s = aSObjectFieldValue;`).
+    #[test]
+    fn a_curated_scalar_is_never_compatible_with_an_uncurated_system_type() {
+        let schema = empty_schema();
+        let table = empty_table();
+        let stdlib = real_stdlib();
+        assert_eq!(
+            type_compatible(&schema, &stdlib, &table, "SObjectField", &[], &sys("String")),
+            Some(false)
+        );
+        assert_eq!(
+            type_compatible(&schema, &stdlib, &table, "DescribeFieldResult", &[], &sys("String")),
+            Some(false)
+        );
+        assert_eq!(
+            type_compatible(&schema, &stdlib, &table, "Comparable", &[], &sys("String")),
+            Some(false)
+        );
+        assert_eq!(
+            type_compatible(&schema, &stdlib, &table, "String", &[], &sys("SObjectField")),
+            Some(false)
+        );
+    }
+
+    /// Two *different*, both real (each independently confirmed present
+    /// in `StdlibIndex`, i.e. neither is a name guess or typo) system
+    /// types with neither curated at all are also a definite mismatch --
+    /// a further generalization beyond the curated-scalar rule above,
+    /// for the case *neither* side is curated. Real bug this fixes:
+    /// fflib's `checkFieldIsUpdateable(SObjectType, SObjectField)` /
+    /// `(SObjectType, DescribeFieldResult)` overload pair, called with a
+    /// real `fflib_SObjectDescribe.getField(...)` argument (resolved to
+    /// `SObjectField`), used to stay a `Candidates` tie forever --
+    /// goto-definition showed both -- since this function had no rule at
+    /// all for two differing uncurated names. Verified against a real
+    /// org: `Schema.DescribeFieldResult d = aSObjectFieldValue;` is a
+    /// real `Illegal assignment from Schema.SObjectField to
+    /// Schema.DescribeFieldResult` compile error. `Iterable` is
+    /// deliberately not in this test (see `uncurated_system_types_are_never_eliminated`
+    /// above): it isn't in the bundled snapshot at all, so it can never
+    /// trigger this rule regardless of the other side.
+    #[test]
+    fn two_different_real_uncurated_stdlib_classes_are_never_compatible() {
+        let schema = empty_schema();
+        let table = empty_table();
+        let stdlib = real_stdlib();
+        assert_eq!(
+            type_compatible(&schema, &stdlib, &table, "DescribeFieldResult", &[], &sys("SObjectField")),
+            Some(false)
+        );
+        assert_eq!(
+            type_compatible(&schema, &stdlib, &table, "SObjectField", &[], &sys("DescribeFieldResult")),
+            Some(false)
         );
     }
 
@@ -573,12 +733,13 @@ mod tests {
     fn id_and_string_are_mutually_compatible_with_no_specificity_order() {
         let schema = empty_schema();
         let table = empty_table();
+        let stdlib = real_stdlib();
         assert_eq!(
-            type_compatible(&schema, &table, "Id", &[], &sys("String")),
+            type_compatible(&schema, &stdlib, &table, "Id", &[], &sys("String")),
             Some(true)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "String", &[], &sys("Id")),
+            type_compatible(&schema, &stdlib, &table, "String", &[], &sys("Id")),
             Some(true)
         );
         assert!(!is_more_specific(&schema, &table, "Id", &[], "String", &[]));
@@ -593,20 +754,21 @@ mod tests {
     fn date_widens_to_datetime_but_not_the_reverse() {
         let schema = empty_schema();
         let table = empty_table();
+        let stdlib = real_stdlib();
         assert_eq!(
-            type_compatible(&schema, &table, "Datetime", &[], &sys("Date")),
+            type_compatible(&schema, &stdlib, &table, "Datetime", &[], &sys("Date")),
             Some(true)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "Date", &[], &sys("Datetime")),
+            type_compatible(&schema, &stdlib, &table, "Date", &[], &sys("Datetime")),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "Time", &[], &sys("Datetime")),
+            type_compatible(&schema, &stdlib, &table, "Time", &[], &sys("Datetime")),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "Time", &[], &sys("Date")),
+            type_compatible(&schema, &stdlib, &table, "Time", &[], &sys("Date")),
             Some(false)
         );
         assert!(is_more_specific(&schema, &table, "Date", &[], "Datetime", &[]));
@@ -620,12 +782,13 @@ mod tests {
     fn blob_has_no_relationship_with_string() {
         let schema = empty_schema();
         let table = empty_table();
+        let stdlib = real_stdlib();
         assert_eq!(
-            type_compatible(&schema, &table, "Blob", &[], &sys("String")),
+            type_compatible(&schema, &stdlib, &table, "Blob", &[], &sys("String")),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "String", &[], &sys("Blob")),
+            type_compatible(&schema, &stdlib, &table, "String", &[], &sys("Blob")),
             Some(false)
         );
     }
@@ -640,16 +803,17 @@ mod tests {
     fn a_real_object_type_widens_to_sobject_but_not_across_object_types() {
         let schema = standard_schema();
         let table = empty_table();
+        let stdlib = real_stdlib();
         assert_eq!(
-            type_compatible(&schema, &table, "SObject", &[], &sys("Account")),
+            type_compatible(&schema, &stdlib, &table, "SObject", &[], &sys("Account")),
             Some(true)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "Account", &[], &sys("SObject")),
+            type_compatible(&schema, &stdlib, &table, "Account", &[], &sys("SObject")),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&schema, &table, "Contact", &[], &sys("Account")),
+            type_compatible(&schema, &stdlib, &table, "Contact", &[], &sys("Account")),
             Some(false)
         );
         assert!(is_more_specific(&schema, &table, "Account", &[], "SObject", &[]));
@@ -663,9 +827,11 @@ mod tests {
     fn list_of_a_real_object_type_widens_to_list_of_sobject() {
         let schema = standard_schema();
         let table = empty_table();
+        let stdlib = real_stdlib();
         assert_eq!(
             type_compatible(
                 &schema,
+                &stdlib,
                 &table,
                 "List",
                 &[SmolStr::new_static("SObject")],
@@ -692,11 +858,13 @@ mod tests {
     fn a_real_object_type_is_never_compatible_with_a_curated_scalar() {
         let schema = standard_schema();
         let table = empty_table();
-        assert_eq!(type_compatible(&schema, &table, "Id", &[], &sys("Contact")), Some(false));
-        assert_eq!(type_compatible(&schema, &table, "String", &[], &sys("Contact")), Some(false));
+        let stdlib = real_stdlib();
+        assert_eq!(type_compatible(&schema, &stdlib, &table, "Id", &[], &sys("Contact")), Some(false));
+        assert_eq!(type_compatible(&schema, &stdlib, &table, "String", &[], &sys("Contact")), Some(false));
         assert_eq!(
             type_compatible(
                 &schema,
+                &stdlib,
                 &table,
                 "List",
                 &[SmolStr::new_static("Id")],
@@ -710,10 +878,12 @@ mod tests {
     fn collection_element_type_recurses_with_the_same_rules() {
         let schema = empty_schema();
         let table = empty_table();
+        let stdlib = real_stdlib();
         // List<Object> accepts any element type, same as a bare `Object`.
         assert_eq!(
             type_compatible(
                 &schema,
+                &stdlib,
                 &table,
                 "List",
                 &[SmolStr::new_static("Object")],
@@ -725,6 +895,7 @@ mod tests {
         assert_eq!(
             type_compatible(
                 &schema,
+                &stdlib,
                 &table,
                 "List",
                 &[SmolStr::new_static("Long")],
@@ -736,6 +907,7 @@ mod tests {
         assert_eq!(
             type_compatible(
                 &schema,
+                &stdlib,
                 &table,
                 "List",
                 &[SmolStr::new_static("Integer")],
@@ -747,6 +919,7 @@ mod tests {
         assert_eq!(
             type_compatible(
                 &schema,
+                &stdlib,
                 &table,
                 "Set",
                 &[SmolStr::new_static("Integer")],
@@ -788,23 +961,26 @@ mod tests {
     fn widen_returns_the_shared_type_unchanged_when_branches_already_match() {
         let schema = empty_schema();
         let table = empty_table();
-        assert_eq!(widen(&schema, &table, &sys("Integer"), &sys("Integer")), Some(sys("Integer")));
+        let stdlib = real_stdlib();
+        assert_eq!(widen(&schema, &stdlib, &table, &sys("Integer"), &sys("Integer")), Some(sys("Integer")));
     }
 
     #[test]
     fn widen_numeric_branches_to_the_wider_type() {
         let schema = empty_schema();
         let table = empty_table();
-        assert_eq!(widen(&schema, &table, &sys("Integer"), &sys("Long")), Some(sys("Long")));
-        assert_eq!(widen(&schema, &table, &sys("Long"), &sys("Integer")), Some(sys("Long")));
+        let stdlib = real_stdlib();
+        assert_eq!(widen(&schema, &stdlib, &table, &sys("Integer"), &sys("Long")), Some(sys("Long")));
+        assert_eq!(widen(&schema, &stdlib, &table, &sys("Long"), &sys("Integer")), Some(sys("Long")));
     }
 
     #[test]
     fn widen_date_branches_to_datetime() {
         let schema = empty_schema();
         let table = empty_table();
-        assert_eq!(widen(&schema, &table, &sys("Date"), &sys("Datetime")), Some(sys("Datetime")));
-        assert_eq!(widen(&schema, &table, &sys("Datetime"), &sys("Date")), Some(sys("Datetime")));
+        let stdlib = real_stdlib();
+        assert_eq!(widen(&schema, &stdlib, &table, &sys("Date"), &sys("Datetime")), Some(sys("Datetime")));
+        assert_eq!(widen(&schema, &stdlib, &table, &sys("Datetime"), &sys("Date")), Some(sys("Datetime")));
     }
 
     /// `Id`/`String` are bidirectionally compatible with no established
@@ -814,35 +990,40 @@ mod tests {
     fn widen_returns_none_for_bidirectionally_compatible_branches_with_no_specificity() {
         let schema = empty_schema();
         let table = empty_table();
-        assert_eq!(widen(&schema, &table, &sys("Id"), &sys("String")), None);
+        let stdlib = real_stdlib();
+        assert_eq!(widen(&schema, &stdlib, &table, &sys("Id"), &sys("String")), None);
     }
 
     #[test]
     fn widen_a_real_object_type_and_sobject_widens_to_sobject() {
         let schema = standard_schema();
         let table = empty_table();
-        assert_eq!(widen(&schema, &table, &sys("Account"), &sys("SObject")), Some(sys("SObject")));
-        assert_eq!(widen(&schema, &table, &sys("SObject"), &sys("Account")), Some(sys("SObject")));
+        let stdlib = real_stdlib();
+        assert_eq!(widen(&schema, &stdlib, &table, &sys("Account"), &sys("SObject")), Some(sys("SObject")));
+        assert_eq!(widen(&schema, &stdlib, &table, &sys("SObject"), &sys("Account")), Some(sys("SObject")));
     }
 
     #[test]
     fn widen_returns_none_for_two_different_object_types() {
         let schema = standard_schema();
         let table = empty_table();
-        assert_eq!(widen(&schema, &table, &sys("Account"), &sys("Contact")), None);
+        let stdlib = real_stdlib();
+        assert_eq!(widen(&schema, &stdlib, &table, &sys("Account"), &sys("Contact")), None);
     }
 
     #[test]
     fn widen_returns_none_for_genuinely_incompatible_branches() {
         let schema = empty_schema();
         let table = empty_table();
-        assert_eq!(widen(&schema, &table, &sys("String"), &sys("Boolean")), None);
+        let stdlib = real_stdlib();
+        assert_eq!(widen(&schema, &stdlib, &table, &sys("String"), &sys("Boolean")), None);
     }
 
     #[test]
     fn widen_returns_none_for_a_project_and_system_type_mismatch() {
         let schema = empty_schema();
         let table = empty_table();
-        assert_eq!(widen(&schema, &table, &Ty::Project(sid(0)), &sys("String")), None);
+        let stdlib = real_stdlib();
+        assert_eq!(widen(&schema, &stdlib, &table, &Ty::Project(sid(0)), &sys("String")), None);
     }
 }

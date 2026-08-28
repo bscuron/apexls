@@ -46,6 +46,24 @@ impl StdlibIndex {
             .copied()
     }
 
+    /// Like [`Self::class`], but for a reference that spells out its own
+    /// namespace (`Schema.SObjectField token;`, `System.String s;`) --
+    /// real, legal Apex, and the *only* way to name a class whose bare
+    /// name collides across namespaces (`Canvas.Test` vs `System.Test`)
+    /// unambiguously. `namespace` is matched case-insensitively against
+    /// each same-named candidate's own scraped `namespace`, not folded
+    /// into the same `CiKey`/`CiQuery` map `class` uses -- there are only
+    /// ever a handful of candidates per bare name (7 real collisions in
+    /// the whole corpus), so a linear scan here is simpler than doubling
+    /// the map to also key on `"Namespace.Name"`.
+    pub fn class_in_namespace(&self, namespace: &str, name: &str) -> Option<&'static StdlibClass> {
+        let candidates = self.classes.get(&CiQuery(name))?;
+        candidates
+            .iter()
+            .find(|c| c.namespace.as_deref().is_some_and(|ns| ns.eq_ignore_ascii_case(namespace)))
+            .copied()
+    }
+
     /// The first method named `member` on `class_name`, if any -- an
     /// existence check, not overload resolution (see
     /// [`Self::methods`] for every overload).

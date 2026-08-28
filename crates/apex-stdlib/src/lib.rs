@@ -225,7 +225,7 @@ fn to_stdlib_method(raw: RawMethod) -> StdlibMethod {
                 type_name: p.type_name.as_deref().map(normalize_type_string),
             })
             .collect(),
-        description: raw.description.map(|d| SmolStr::new(&d)),
+        description: raw.description.as_deref().map(normalize_description),
     }
 }
 
@@ -234,7 +234,7 @@ fn to_stdlib_property(raw: RawProperty) -> StdlibProperty {
         name: SmolStr::new(&raw.name),
         is_static: raw.is_static,
         type_name: raw.type_name.as_deref().map(normalize_type_string),
-        description: raw.description.map(|d| SmolStr::new(&d)),
+        description: raw.description.as_deref().map(normalize_description),
     }
 }
 
@@ -253,8 +253,29 @@ fn to_stdlib_property(raw: RawProperty) -> StdlibProperty {
 /// `tools/salesforce-doc-scraper`'s own `split_title` already strips
 /// from a *page title* -- this is that same artifact showing up in a
 /// type reference instead.
+/// Collapses whitespace runs -- including the embedded literal `\n` and
+/// following run-on indentation confirmed throughout the scraped source
+/// HTML (present in roughly half of the corpus's descriptions, e.g.
+/// `"Returns the expression that is evaluated when the action\nis
+/// invoked."`) -- down to single spaces, and trims the ends. Shared by
+/// [`normalize_type_string`] and [`normalize_description`] since both
+/// see the same source-HTML wrapping artifact.
+fn collapse_whitespace(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Cleans up a scraped method/property description the same way
+/// [`normalize_type_string`] cleans up a type string: collapsing the
+/// source HTML's embedded `\n` plus run-on indentation to single
+/// spaces. Left un-normalized, this shows up verbatim in hover text and
+/// signature-help documentation (`apexls-server::capabilities`), which
+/// otherwise renders the raw mid-sentence line breaks and indentation.
+fn normalize_description(raw: &str) -> SmolStr {
+    SmolStr::new(collapse_whitespace(raw))
+}
+
 fn normalize_type_string(raw: &str) -> SmolStr {
-    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapse_whitespace(raw);
     let collapsed = collapsed
         .replace(" <", "<")
         .replace("< ", "<")
@@ -365,6 +386,31 @@ mod tests {
         assert_eq!(is_blank.params[0].type_name.as_deref(), Some("String"));
         assert_eq!(is_blank.params[0].name.as_deref(), Some("inputString"));
         assert!(is_blank.description.is_some());
+    }
+
+    /// `ApexPages.Action.getExpression`'s scraped description is
+    /// `"Returns the expression that is evaluated when the action\nis
+    /// invoked."` -- a raw embedded newline from the source HTML's own
+    /// line-wrapping, not an intentional paragraph break. Confirms it
+    /// comes through the bundled snapshot collapsed to a single space
+    /// rather than verbatim, since a verbatim `\n` renders as a
+    /// mid-sentence line break in hover/signature-help markdown.
+    #[test]
+    fn a_methods_description_has_its_source_html_line_wrap_collapsed() {
+        let classes = standard_classes();
+        let action_class = classes
+            .iter()
+            .find(|c| c.name == "Action" && c.namespace.as_deref() == Some("ApexPages"))
+            .expect("ApexPages.Action should be in the bundled snapshot");
+        let get_expression = action_class
+            .methods
+            .iter()
+            .find(|m| m.name == "getExpression")
+            .expect("ApexPages.Action.getExpression should be in the bundled snapshot");
+        assert_eq!(
+            get_expression.description.as_deref(),
+            Some("Returns the expression that is evaluated when the action is invoked.")
+        );
     }
 
     /// `Database.query` is genuinely overloaded (1-arg and 2-arg real

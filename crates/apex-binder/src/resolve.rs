@@ -118,6 +118,7 @@ use smol_str::SmolStr;
 /// ambiguity, rare in code that actually compiles).
 fn narrow_by_overload(
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     table: &SymbolTable,
     candidates: Vec<SymbolId>,
     arg_types: &[Option<Ty>],
@@ -142,7 +143,7 @@ fn narrow_by_overload(
     let by_type: Vec<SymbolId> = pool
         .iter()
         .copied()
-        .filter(|&id| is_argument_type_compatible(schema, table, id, arg_types))
+        .filter(|&id| is_argument_type_compatible(schema, stdlib, table, id, arg_types))
         .collect();
     match by_type.len() {
         1 => Resolution::Resolved(by_type[0]),
@@ -171,68 +172,77 @@ fn stdlib_member_ref(
     class_name: &str,
     member: Option<&str>,
     arg_count: Option<usize>,
+    narrowed_param_types: Option<Vec<SmolStr>>,
 ) -> StdlibMemberRef {
     StdlibMemberRef {
         namespace,
         class_name: SmolStr::new(class_name),
         member: member.map(SmolStr::new),
         arg_count,
+        narrowed_param_types,
     }
 }
 
 /// Best-effort narrows `class.member`'s scraped overloads (arity, then
-/// `crate::conversions::type_compatible`) purely to pick a *propagated
-/// type* for continued chaining (`Database.query(soql).size()`) --
-/// deliberately simpler than [`narrow_by_overload`]'s full three-stage
-/// algorithm, since a stdlib reference's `Resolution` (`StdlibMember` vs.
-/// `Unresolved`) is already decided by mere name-existence before this
-/// ever runs; getting the exact overload right only affects how far a
-/// chained call keeps resolving, never whether this call itself does.
-/// Ambiguous (0 or 2+ survivors) -> `None`, same as the total absence of
-/// this information today -- never a guessed, possibly-wrong type.
-/// Takes an already-looked-up `class` (the caller needs it anyway, to
-/// decide the call's own `Resolution`) rather than a `stdlib`/
-/// `class_name` pair, and only collects the overloads into a `Vec` once
-/// it's confirmed there's more than one -- `member` overwhelmingly has
-/// just a single overload, and that common case returns without
-/// allocating at all.
-fn narrow_stdlib_overload_type(
+/// `crate::conversions::type_compatible`) down to the one real method a
+/// call actually invokes -- deliberately simpler than [`narrow_by_overload`]'s
+/// full three-stage algorithm, since a stdlib reference's `Resolution`
+/// (`StdlibMember` vs. `Unresolved`) is already decided by mere
+/// name-existence before this ever runs; getting the exact overload
+/// right only affects how far a chained call keeps resolving type-wise
+/// (`narrow_stdlib_overload_type`, below) and which one signature/
+/// description a hover shows (`bind_method_call_expr`'s own
+/// `StdlibMemberRef.narrowed_param_types`) -- never whether the call
+/// itself resolves at all. Ambiguous (0 or 2+ survivors) -> `None`, same
+/// as the total absence of this information today -- never a guessed,
+/// possibly-wrong winner. Takes an already-looked-up `class` (every
+/// caller needs it anyway, to decide the call's own `Resolution`) rather
+/// than a `stdlib`/`class_name` pair, and only collects the overloads
+/// into a `Vec` once it's confirmed there's more than one -- `member`
+/// overwhelmingly has just a single overload, and that common case
+/// returns without allocating at all.
+fn narrow_stdlib_overload(
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     table: &SymbolTable,
     class: &'static StdlibClass,
     member: &str,
     arg_types: &[Option<Ty>],
-) -> Option<Ty> {
+) -> Option<&'static StdlibMethod> {
     let mut overloads = StdlibIndex::methods_of(class, member).peekable();
     let first = overloads.next()?;
-    let winner = if overloads.peek().is_none() {
-        first
-    } else {
-        let overloads: Vec<&StdlibMethod> = std::iter::once(first).chain(overloads).collect();
-        let by_arity: Vec<&StdlibMethod> = overloads
-            .iter()
-            .copied()
-            .filter(|m| m.params.len() == arg_types.len())
-            .collect();
-        let pool: &[&StdlibMethod] = if by_arity.is_empty() { &overloads } else { &by_arity };
+    if overloads.peek().is_none() {
+        return Some(first);
+    }
+    let overloads: Vec<&StdlibMethod> = std::iter::once(first).chain(overloads).collect();
+    let by_arity: Vec<&StdlibMethod> = overloads
+        .iter()
+        .copied()
+        .filter(|m| m.params.len() == arg_types.len())
+        .collect();
+    let pool: &[&StdlibMethod] = if by_arity.is_empty() { &overloads } else { &by_arity };
 
-        match pool {
-            [one] => *one,
-            _ => {
-                let by_type: Vec<&StdlibMethod> = pool
-                    .iter()
-                    .copied()
-                    .filter(|m| stdlib_args_compatible(schema, table, m, arg_types))
-                    .collect();
-                match by_type.as_slice() {
-                    [one] => *one,
-                    _ => return None,
-                }
+    match pool {
+        [one] => Some(*one),
+        _ => {
+            let by_type: Vec<&StdlibMethod> = pool
+                .iter()
+                .copied()
+                .filter(|m| stdlib_args_compatible(schema, stdlib, table, m, arg_types))
+                .collect();
+            match by_type.as_slice() {
+                [one] => Some(*one),
+                _ => None,
             }
         }
-    };
+    }
+}
 
-    let return_type = winner.return_type.as_deref()?;
+/// A [`narrow_stdlib_overload`] winner's own declared return type,
+/// converted to the *propagated type* for continued chaining
+/// (`Database.query(soql).size()`).
+fn stdlib_method_return_ty(method: &StdlibMethod) -> Option<Ty> {
+    let return_type = method.return_type.as_deref()?;
     let (base, args) = apex_stdlib::split_generic_type(return_type);
     Some(Ty::system_owned(
         base,
@@ -247,6 +257,7 @@ fn narrow_stdlib_overload_type(
 /// rule `crate::conversions::type_compatible` itself already applies).
 fn stdlib_args_compatible(
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     table: &SymbolTable,
     method: &StdlibMethod,
     arg_types: &[Option<Ty>],
@@ -256,7 +267,7 @@ fn stdlib_args_compatible(
             continue;
         };
         let (param_name, param_args) = apex_stdlib::split_generic_type(param_type);
-        if conversions::type_compatible(schema, table, &param_name, &param_args, arg_type)
+        if conversions::type_compatible(schema, stdlib, table, &param_name, &param_args, arg_type)
             == Some(false)
         {
             return false;
@@ -361,6 +372,7 @@ fn widen_for_dynamic_dispatch(table: &SymbolTable, resolution: Resolution) -> Re
 
 fn is_argument_type_compatible(
     schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
     table: &SymbolTable,
     candidate: SymbolId,
     arg_types: &[Option<Ty>],
@@ -375,6 +387,7 @@ fn is_argument_type_compatible(
         };
         if conversions::type_compatible(
             schema,
+            stdlib,
             table,
             param_type_name,
             &param_symbol.type_args,
@@ -744,6 +757,45 @@ pub(crate) fn bind_initializer(
     binder.into_bound_body()
 }
 
+/// Builds a throwaway `BodyBinder` for `apex_binder::completion`'s
+/// receiver-type inference -- given a real, already-bound body's `scope`
+/// tree, lets `crate::completion` call the existing `bind_expr` on just a
+/// receiver subexpression (e.g. `foo` in `foo.|`) to get its `Ty`, reusing
+/// every existing chain-typing rule (arbitrary depth, every `Expr`
+/// variant, `this`/`super`, stdlib/schema fallthrough) instead of
+/// duplicating any of it.
+///
+/// Safe to discard afterward without merging anything back: `bind_expr`
+/// never mutates `scopes` (only statement-level `bind_stmt`, never reached
+/// from a bare `bind_expr` call on an already-existing expression, does
+/// that), and the fresh `ReferenceTable` this constructs is never anything
+/// but a scratch sink for `bind_expr`'s side-effecting `refs.set(...)`
+/// calls -- it's simply dropped, the same way every other `BodyBinder`
+/// above is already built fresh-and-discarded (or fresh-and-merged) per
+/// call, never shared or mutated across calls.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn body_binder_for_completion<'a>(
+    table: &'a SymbolTable,
+    schema: &'a SchemaIndex,
+    stdlib: &'a StdlibIndex,
+    file: FileId,
+    enclosing_type: Option<SymbolId>,
+    enclosing_member: Option<SymbolId>,
+    scopes: ScopeTree,
+) -> BodyBinder<'a> {
+    BodyBinder {
+        table,
+        schema,
+        stdlib,
+        refs: ReferenceTable::default(),
+        scopes,
+        pending_locals: Vec::new(),
+        file,
+        enclosing_type,
+        enclosing_member,
+    }
+}
+
 /// Resolves a single bare object-name reference (a trigger's `ON
 /// <object>`) against `schema`, wrapped as a `BoundBody` purely so it
 /// merges through the same sequential path as every other Pass 2
@@ -849,6 +901,34 @@ pub(crate) fn resolve_type_ref(
                 .collect()
         })
         .unwrap_or_default();
+    // A stdlib class referenced with its own namespace spelled out
+    // (`Schema.SObjectField token;`, `System.String s;`) -- real, legal
+    // Apex, and not covered by the plain `stdlib.class(&name)` lookup
+    // below, which only ever matches a *bare* class name: `name` here is
+    // the whole dotted path (`"Schema.SObjectField"`), which is never a
+    // key in `StdlibIndex`'s by-bare-name map, so a namespace-qualified
+    // declared type fell all the way through to `Unresolved` -- and with
+    // it, every member access on a variable declared with one (e.g.
+    // `token.getDescribe()` below), since the fallback `Ty::system_owned`
+    // then carried the whole dotted string as its "class name" instead
+    // of the real bare one. Only tried for exactly two segments: a
+    // deeper qualified path (`Foo.Bar.Baz`) isn't a real namespace-
+    // qualified stdlib shape.
+    if segments.len() == 2 {
+        if let Some(class) = stdlib.class_in_namespace(segments[0].text(), segments[1].text()) {
+            refs.set(
+                ptr,
+                Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                    class.namespace.clone(),
+                    &class.name,
+                    None,
+                    None,
+                    None,
+                ))),
+            );
+            return Some(Ty::system_owned(class.name.clone(), args));
+        }
+    }
     if schema.object(&name).is_some() {
         refs.set(
             ptr,
@@ -876,6 +956,7 @@ pub(crate) fn resolve_type_ref(
             Resolution::StdlibMember(Box::new(stdlib_member_ref(
                 class.namespace.clone(),
                 &name,
+                None,
                 None,
                 None,
             ))),
@@ -1116,7 +1197,7 @@ impl<'a> BodyBinder<'a> {
                 current = self.table.get(container).container;
             }
         }
-        let args = symbol
+        let args: Vec<Ty> = symbol
             .type_args
             .iter()
             .map(|name| match self.table.resolve_dotted_name(name) {
@@ -1124,6 +1205,27 @@ impl<'a> BodyBinder<'a> {
                 None => Ty::system_owned(name.clone(), Vec::new()),
             })
             .collect();
+        // A stdlib class referenced with its own namespace spelled out as
+        // the declared type (`Schema.SObjectField token;`) -- the same
+        // gap `resolve_type_ref` has for the `Type` AST node itself (see
+        // its own matching comment), but hit independently here: this
+        // function resolves a *reference* to an already-declared symbol
+        // from its stored `type_name` string, a wholly separate path
+        // that never consulted `StdlibIndex` by namespace at all. Without
+        // this, `token`'s own declared-type *annotation* could resolve
+        // fine while every later use of `token` (`token.getDescribe()`)
+        // still built a `Ty::System` carrying the literal dotted string
+        // `"Schema.SObjectField"` as its name -- never a key in
+        // `StdlibIndex`'s by-bare-name map -- so the method call itself
+        // stayed `Unresolved`. Only tried for exactly two segments, same
+        // restriction as `resolve_type_ref`.
+        if let Some((namespace, class_name)) = type_name.split_once('.') {
+            if !class_name.contains('.') {
+                if let Some(class) = self.stdlib.class_in_namespace(namespace, class_name) {
+                    return Some(Ty::system_owned(class.name.clone(), args));
+                }
+            }
+        }
         Some(Ty::system_owned(type_name.to_string(), args))
     }
 
@@ -1532,7 +1634,7 @@ impl<'a> BodyBinder<'a> {
                 // org -- see its own doc comment); only one side known
                 // still uses that side's type unchanged, never a guess.
                 match (then_ty, else_ty) {
-                    (Some(a), Some(b)) => conversions::widen(self.schema, self.table, &a, &b),
+                    (Some(a), Some(b)) => conversions::widen(self.schema, self.stdlib, self.table, &a, &b),
                     (Some(a), None) => Some(a),
                     (None, Some(b)) => Some(b),
                     (None, None) => None,
@@ -1731,6 +1833,7 @@ impl<'a> BodyBinder<'a> {
                     name,
                     None,
                     None,
+                    None,
                 ))),
             );
             return Some(Ty::system_owned(SmolStr::new(name), Vec::new()));
@@ -1794,6 +1897,7 @@ impl<'a> BodyBinder<'a> {
                         class.and_then(|c| c.namespace.clone()),
                         &object,
                         Some(name),
+                        None,
                         None,
                     ))),
                     None => Resolution::Unresolved,
@@ -2064,7 +2168,7 @@ impl<'a> BodyBinder<'a> {
                     .collect();
                 let resolution = widen_for_dynamic_dispatch(
                     self.table,
-                    narrow_by_overload(self.schema, self.table, methods, &arg_types),
+                    narrow_by_overload(self.schema, self.stdlib, self.table, methods, &arg_types),
                 );
                 let result_type = self.result_type_of(&resolution);
                 self.refs.set_with_highlight(ptr, highlight, resolution);
@@ -2107,12 +2211,36 @@ impl<'a> BodyBinder<'a> {
                             .flatten()
                             .filter(|c| StdlibIndex::methods_of(c, name).next().is_some())
                     });
+                let winner = method_class
+                    .and_then(|c| narrow_stdlib_overload(self.schema, self.stdlib, self.table, c, name, &arg_types));
+                // Only worth the `Vec` allocation when arity alone
+                // couldn't already have told a hover/signature-help
+                // consumer which overload this is -- a genuine
+                // same-arity overload pair (`List.addAll(List)` vs.
+                // `List.addAll(Set)`, both one parameter, but List/Set
+                // aren't implicitly convertible) is real but rare (per
+                // `StdlibMemberRef::narrowed_param_types`'s own doc
+                // comment, different-arity is far more common in the
+                // scraped data), so the overwhelming majority of real
+                // stdlib calls -- a single overload, or an arity-
+                // disambiguated one -- skip this entirely and cost
+                // nothing beyond the cheap, allocation-free arity recount
+                // below. `None` whenever it doesn't apply, or `winner`
+                // itself is ambiguous or missing a scraped param type.
+                let narrowed_param_types = method_class.zip(winner).and_then(|(c, m)| {
+                    let mut same_arity =
+                        StdlibIndex::methods_of(c, name).filter(|o| o.params.len() == arg_types.len());
+                    same_arity.next()?;
+                    same_arity.next()?; // fewer than two same-arity candidates -- arity alone already disambiguates
+                    m.params.iter().map(|p| p.type_name.clone()).collect::<Option<Vec<_>>>()
+                });
                 let resolution = match method_class {
                     Some(c) => Resolution::StdlibMember(Box::new(stdlib_member_ref(
                         c.namespace.clone(),
                         &c.name,
                         Some(name),
                         Some(arg_types.len()),
+                        narrowed_param_types,
                     ))),
                     None => Resolution::Unresolved,
                 };
@@ -2141,11 +2269,8 @@ impl<'a> BodyBinder<'a> {
                 // member `generics.rs` doesn't model, like `sort`/
                 // `addAll`, which need no substitution anyway) does the
                 // scraped, best-effort-narrowed return type get used.
-                crate::generics::builtin_generic_member_type(class, &base, &args, name).or_else(|| {
-                    method_class.and_then(|c| {
-                        narrow_stdlib_overload_type(self.schema, self.table, c, name, &arg_types)
-                    })
-                })
+                crate::generics::builtin_generic_member_type(class, &base, &args, name)
+                    .or_else(|| winner.and_then(stdlib_method_return_ty))
             }
             None => {
                 self.refs
@@ -2246,7 +2371,7 @@ impl<'a> BodyBinder<'a> {
             candidates
         };
 
-        let resolution = narrow_by_overload(self.schema, self.table, candidates, &arg_types);
+        let resolution = narrow_by_overload(self.schema, self.stdlib, self.table, candidates, &arg_types);
         // Never widened for `want_ctor`: a constructor call always
         // instantiates the exact named type, so there's no dynamic
         // dispatch to expand across (see `widen_for_dynamic_dispatch`'s
@@ -2309,7 +2434,7 @@ impl<'a> BodyBinder<'a> {
                     })
                     .collect();
                 if !ctors.is_empty() {
-                    let resolution = narrow_by_overload(self.schema, self.table, ctors, &arg_types);
+                    let resolution = narrow_by_overload(self.schema, self.stdlib, self.table, ctors, &arg_types);
                     // `new Outer.Inner(...)` names its constructor after
                     // the *last* segment (`Inner`) -- the type's own
                     // constructor, never `Outer`'s -- so this narrows to

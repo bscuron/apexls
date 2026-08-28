@@ -6,8 +6,8 @@
 
 use crate::line_index::{LineIndex, PositionEncoding};
 use apex_binder::{
-    BoundProgram, FileId, Resolution, SchemaObjectRef, StdlibMemberRef, Symbol, SymbolId,
-    SymbolKind, SyntaxPtr, Visibility,
+    BoundProgram, CompletionCandidate, CompletionCandidateKind, FileId, Resolution,
+    SchemaObjectRef, StdlibMemberRef, Symbol, SymbolId, SymbolKind, SyntaxPtr, Visibility,
 };
 use apex_syntax::ast::decl::{
     ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, HasDocComment, InterfaceDecl, MethodDecl,
@@ -16,10 +16,11 @@ use apex_syntax::ast::decl::{
 use apex_syntax::ast::expr::{ArgList, CallExpr, Expr, MethodCallExpr, NameExpr, NewExpr};
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall, CodeAction,
-    CodeActionKind, CodeActionOrCommand, Diagnostic, DiagnosticSeverity, DiagnosticTag,
+    CodeActionKind, CodeActionOrCommand, CompletionItem, CompletionItemKind, CompletionList,
+    CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity, DiagnosticTag,
     Documentation, DocumentHighlight, DocumentSymbol, FoldingRange, InlayHint, InlayHintKind,
-    InlayHintLabel, Location, ParameterInformation, ParameterLabel, Position, Range,
-    SelectionRange, SignatureHelp, SignatureInformation, SymbolInformation,
+    InlayHintLabel, InsertTextFormat, Location, ParameterInformation, ParameterLabel, Position,
+    Range, SelectionRange, SignatureHelp, SignatureInformation, SymbolInformation,
     SymbolKind as LspSymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 use rowan::ast::AstNode;
@@ -124,6 +125,24 @@ pub(crate) fn schema_location(program: &BoundProgram, r: &SchemaObjectRef) -> Op
 /// for a method/constructor -- its parameter list via
 /// `SymbolTable::params`), followed by its doc comment if it has one.
 pub(crate) fn describe_symbol(program: &BoundProgram, id: SymbolId) -> String {
+    let sig = symbol_signature(program, id);
+    let mut out = format!("```apex\n{sig}\n```");
+    if let Some(doc) = doc_comment_for(program, id) {
+        if !doc.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&doc);
+        }
+    }
+    out
+}
+
+/// The plain-text signature line `describe_symbol`'s Markdown wraps
+/// (modifiers, kind-appropriate keyword, type, name, and -- for a
+/// method/constructor -- its parameter list) -- factored out so
+/// `capabilities::completion`'s `CompletionItem::detail` can reuse
+/// exactly this formatting without a second implementation, since a
+/// completion item's `detail` is a plain one-liner, not Markdown.
+fn symbol_signature(program: &BoundProgram, id: SymbolId) -> String {
     let symbol = program.symbols.get(id);
     let mut sig = String::new();
 
@@ -207,14 +226,7 @@ pub(crate) fn describe_symbol(program: &BoundProgram, id: SymbolId) -> String {
         }
     }
 
-    let mut out = format!("```apex\n{sig}\n```");
-    if let Some(doc) = doc_comment_for(program, id) {
-        if !doc.is_empty() {
-            out.push_str("\n\n");
-            out.push_str(&doc);
-        }
-    }
-    out
+    sig
 }
 
 /// Renders a `Resolution::StdlibMember` reference as Markdown hover
@@ -228,16 +240,17 @@ pub(crate) fn describe_symbol(program: &BoundProgram, id: SymbolId) -> String {
 /// A bare class reference (`r.member: None`, e.g. hovering `String` in
 /// `String.isBlank(...)`) renders just the class name/namespace -- there's
 /// no per-class description in the bundled snapshot to show beyond that,
-/// unlike a method/property. A method call narrows to the overload(s)
-/// whose arity matches `r.arg_count` (the same arity-first signal
-/// `crate::resolve::narrow_stdlib_overload_type` already uses to narrow
-/// the *propagated type* -- see its own doc comment for why arity alone,
-/// not full type-based narrowing, is enough here too) -- falling back to
-/// showing every overload only when arity doesn't narrow to at least one
-/// (an unknown arg count, or the arity-matching set is somehow empty).
-/// Each surviving overload gets its own signature line, followed by the
-/// first one's description (real overloads of the same method
-/// overwhelmingly share one description in the scraped docs).
+/// unlike a method/property. A method call narrows to `r.narrowed_param_types`'s
+/// one exact overload when bind time already found one (real argument
+/// *type*, not just arity -- see `crate::resolve::narrow_stdlib_overload`'s
+/// own doc comment for why this needs bind time's real `Ty`s and can't
+/// just be redone here from `r` alone), falling back to arity-only
+/// narrowing via `r.arg_count` otherwise -- and to showing every overload
+/// only when neither narrows to at least one (an unknown arg count, or
+/// the arity-matching set is somehow empty). Each surviving overload gets
+/// its own signature line, followed by the first one's description (real
+/// overloads of the same method overwhelmingly share one description in
+/// the scraped docs).
 pub(crate) fn describe_stdlib_member(program: &BoundProgram, r: &StdlibMemberRef) -> Option<String> {
     let class = program.stdlib.class(&r.class_name)?;
     let ns_prefix = class
@@ -262,9 +275,31 @@ pub(crate) fn describe_stdlib_member(program: &BoundProgram, r: &StdlibMemberRef
     }
 
     let overloads: Vec<_> = program.stdlib.methods(&r.class_name, member).collect();
-    let narrowed: Vec<_> = match r.arg_count {
-        Some(n) => overloads.iter().copied().filter(|m| m.params.len() == n).collect(),
-        None => Vec::new(),
+    // `narrowed_param_types`, when present, already names the *one* real
+    // overload `crate::resolve::narrow_stdlib_overload` picked by
+    // argument type, not just arity -- a same-arity overload pair (`List.addAll(List)`
+    // vs. `addAll(Set)`, both one parameter, but List/Set aren't
+    // implicitly convertible) would otherwise show both signatures on
+    // hover with no way to tell which one a real call actually reaches.
+    // Falls back to the old arity-only filter whenever it's absent (a
+    // single overload to begin with, genuine ambiguity, or an
+    // incompletely-scraped winner).
+    let narrowed: Vec<_> = match &r.narrowed_param_types {
+        Some(param_types) => overloads
+            .iter()
+            .copied()
+            .filter(|m| {
+                m.params.len() == param_types.len()
+                    && m.params
+                        .iter()
+                        .zip(param_types.iter())
+                        .all(|(p, t)| p.type_name.as_deref() == Some(t.as_str()))
+            })
+            .collect(),
+        None => match r.arg_count {
+            Some(n) => overloads.iter().copied().filter(|m| m.params.len() == n).collect(),
+            None => Vec::new(),
+        },
     };
     let overloads = if narrowed.is_empty() { &overloads } else { &narrowed };
     let (first, rest) = overloads.split_first()?;
@@ -1511,6 +1546,145 @@ fn pick_active_signature(param_counts: &[usize], active_param: usize, typed_args
 /// `foo(Id accountId)` parameter) -- the hint would be pure noise
 /// repeating text already on the line, the same suppression
 /// rust-analyzer/clangd both apply by default.
+/// `textDocument/completion`: every candidate for the resolved context
+/// (`apex_binder::complete_at`), turned into `CompletionItem`s. No
+/// server-side filtering by whatever prefix has already been typed --
+/// the full candidate set for the resolved context is always returned
+/// (`is_incomplete: false`); each item carries a `text_edit` covering
+/// `replace_range` so accepting one overwrites rather than duplicates
+/// any already-typed partial text, and the client's own fuzzy matcher
+/// narrows the visible list further as the user keeps typing (standard
+/// LSP architecture, and much simpler than reimplementing fuzzy
+/// matching here).
+pub(crate) fn completion(
+    program: &BoundProgram,
+    file: FileId,
+    offset: TextSize,
+    encoding: PositionEncoding,
+) -> Option<CompletionResponse> {
+    let ctx = apex_binder::complete_at(program, file, offset)?;
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+    let range = Range {
+        start: index.to_position(&text, ctx.replace_range.start().into(), encoding),
+        end: index.to_position(&text, ctx.replace_range.end().into(), encoding),
+    };
+
+    let items = ctx
+        .candidates
+        .into_iter()
+        .map(|c| {
+            let detail = completion_detail(program, &c);
+            let sort_text = format!("{}{}", sort_tier(&c), c.label);
+            let label = c.label.to_string();
+            CompletionItem {
+                label: label.clone(),
+                kind: Some(lsp_completion_kind(c.kind)),
+                detail,
+                sort_text: Some(sort_text),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range,
+                    new_text: label,
+                })),
+                insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    Some(CompletionResponse::List(CompletionList {
+        is_incomplete: false,
+        items,
+    }))
+}
+
+/// A single leading sort-tier digit, so the client's default ascending
+/// sort (`sort_text`, then falling back to `label`) groups locals first,
+/// then direct members/project-wide types (structurally indistinguishable
+/// from each other on `CompletionCandidate` -- a project-wide type is
+/// exactly as directly relevant as a direct member when completing a
+/// bare identifier, so sharing a tier is a reasonable simplification, not
+/// an oversight), then inherited members, then stdlib, then SObject
+/// fields, then keywords last.
+fn sort_tier(c: &CompletionCandidate) -> &'static str {
+    match c.kind {
+        CompletionCandidateKind::Local | CompletionCandidateKind::Parameter => "0",
+        CompletionCandidateKind::StdlibClass
+        | CompletionCandidateKind::StdlibMethod
+        | CompletionCandidateKind::StdlibProperty => "3",
+        CompletionCandidateKind::SObjectField => "4",
+        CompletionCandidateKind::Keyword => "5",
+        _ => {
+            if c.is_inherited {
+                "2"
+            } else {
+                "1"
+            }
+        }
+    }
+}
+
+/// `CompletionItem::detail`: a plain one-line signature, reusing this
+/// module's own existing hover/signature-help formatters end-to-end
+/// (`symbol_signature` for a project-local candidate, the same stdlib/
+/// schema lookups `describe_stdlib_member`/`schema_location` already do
+/// for the other two) rather than a second formatter living in
+/// `apex_binder`'s protocol-agnostic `completion` module. Deliberately
+/// shorter than `describe_symbol`'s hover text: no Markdown fence, no doc
+/// comment/description -- `detail` is a single-line list annotation, not
+/// a hover popup.
+fn completion_detail(program: &BoundProgram, c: &CompletionCandidate) -> Option<String> {
+    if let Some(id) = c.symbol {
+        return Some(symbol_signature(program, id));
+    }
+    if let Some(class_name) = &c.stdlib_class {
+        if let Some(prop) = program.stdlib.property(class_name, &c.label) {
+            let modifier = if prop.is_static { "static " } else { "" };
+            let ty = prop.type_name.as_deref().unwrap_or("Object");
+            return Some(format!("public {modifier}{ty} {}", prop.name));
+        }
+        let m = program.stdlib.method(class_name, &c.label)?;
+        let modifier = if m.is_static { "static " } else { "" };
+        let ret = m.return_type.as_deref().unwrap_or("void");
+        let params = m.params.iter().map(stdlib_param_label).collect::<Vec<_>>().join(", ");
+        return Some(format!("public {modifier}{ret} {}({params})", m.name));
+    }
+    if let Some((object, field)) = &c.sobject_field {
+        let ty = program
+            .schema
+            .field(object, field)
+            .and_then(|f| f.field_type.as_deref())
+            .unwrap_or("Object");
+        return Some(format!("{ty} {field}"));
+    }
+    None
+}
+
+/// `apex_binder::CompletionCandidateKind` -> the closest `lsp_types::CompletionItemKind`.
+fn lsp_completion_kind(kind: CompletionCandidateKind) -> CompletionItemKind {
+    match kind {
+        CompletionCandidateKind::Local
+        | CompletionCandidateKind::Parameter => CompletionItemKind::VARIABLE,
+        CompletionCandidateKind::Field | CompletionCandidateKind::SObjectField => {
+            CompletionItemKind::FIELD
+        }
+        CompletionCandidateKind::Property | CompletionCandidateKind::StdlibProperty => {
+            CompletionItemKind::PROPERTY
+        }
+        CompletionCandidateKind::Method | CompletionCandidateKind::StdlibMethod => {
+            CompletionItemKind::METHOD
+        }
+        CompletionCandidateKind::Constructor => CompletionItemKind::CONSTRUCTOR,
+        CompletionCandidateKind::EnumConstant => CompletionItemKind::ENUM_MEMBER,
+        CompletionCandidateKind::Class | CompletionCandidateKind::StdlibClass => {
+            CompletionItemKind::CLASS
+        }
+        CompletionCandidateKind::Interface => CompletionItemKind::INTERFACE,
+        CompletionCandidateKind::Enum => CompletionItemKind::ENUM,
+        CompletionCandidateKind::Keyword => CompletionItemKind::KEYWORD,
+    }
+}
+
 pub(crate) fn inlay_hints(
     program: &BoundProgram,
     uri: &Url,

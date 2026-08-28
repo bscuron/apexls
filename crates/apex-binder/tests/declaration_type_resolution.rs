@@ -384,6 +384,7 @@ fn a_fields_stdlib_declared_type_resolves_as_stdlib_member() {
             class_name: "String".into(),
             member: None,
             arg_count: None,
+            narrowed_param_types: None,
         }))),
         "a field declared with a real stdlib type should resolve as StdlibMember"
     );
@@ -417,6 +418,7 @@ fn a_local_variables_generic_stdlib_type_resolves_as_stdlib_member() {
             class_name: "List".into(),
             member: None,
             arg_count: None,
+            narrowed_param_types: None,
         }))),
         "List's own Type node should resolve as StdlibMember"
     );
@@ -456,6 +458,7 @@ fn a_methods_stdlib_param_and_return_types_both_resolve() {
             class_name: "Boolean".into(),
             member: None,
             arg_count: None,
+            narrowed_param_types: None,
         }))),
         "a method's own return type should resolve as StdlibMember"
     );
@@ -466,6 +469,7 @@ fn a_methods_stdlib_param_and_return_types_both_resolve() {
             class_name: "Decimal".into(),
             member: None,
             arg_count: None,
+            narrowed_param_types: None,
         }))),
         "a method's own parameter type should resolve as StdlibMember"
     );

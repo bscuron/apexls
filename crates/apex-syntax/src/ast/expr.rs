@@ -14,7 +14,8 @@
 
 use super::soql::{SoqlExpr, SoslExpr};
 use super::{
-    ast_node, direct_tokens, dispatch_enum, first_non_trivia_token, last_non_trivia_token, Type,
+    ast_node, direct_tokens, dispatch_enum, first_non_trivia_token, last_member_name_token,
+    last_non_trivia_token, Type,
 };
 use crate::{ApexLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 use rowan::ast::{support, AstChildren, AstNode};
@@ -202,7 +203,7 @@ impl FieldExpr {
     /// token rather than a `Name` node (accessing `x.new` is fine even
     /// though *declaring* something named `new` wouldn't be).
     pub fn member_token(&self) -> Option<SyntaxToken> {
-        last_non_trivia_token(self.syntax())
+        last_member_name_token(self.syntax())
     }
 
     pub fn is_null_safe(&self) -> bool {
@@ -245,7 +246,7 @@ impl MethodCallExpr {
     }
 
     pub fn method_name_token(&self) -> Option<SyntaxToken> {
-        last_non_trivia_token(self.syntax())
+        last_member_name_token(self.syntax())
     }
 
     pub fn is_null_safe(&self) -> bool {

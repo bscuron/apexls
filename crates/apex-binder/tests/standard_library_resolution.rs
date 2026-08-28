@@ -90,6 +90,7 @@ fn a_real_static_stdlib_method_call_resolves_to_stdlib_member() {
             class_name: "String".into(),
             member: Some("isBlank".into()),
             arg_count: Some(1),
+            narrowed_param_types: None,
         }))),
         "String.isBlank is a real, documented stdlib method"
     );
@@ -114,6 +115,7 @@ fn an_overloaded_stdlib_method_call_also_resolves() {
             class_name: "Database".into(),
             member: Some("query".into()),
             arg_count: Some(1),
+            narrowed_param_types: None,
         }))),
         "Database.query is real and overloaded -- existence, not overload-exactness, decides the Resolution"
     );
@@ -145,6 +147,7 @@ fn a_stdlib_property_access_resolves_to_stdlib_member() {
             class_name: "ApexPages".into(),
             member: Some("currentPage".into()),
             arg_count: Some(0),
+            narrowed_param_types: None,
         })))
     );
     assert_eq!(
@@ -154,8 +157,48 @@ fn a_stdlib_property_access_resolves_to_stdlib_member() {
             class_name: "PageReference".into(),
             member: Some("getParameters".into()),
             arg_count: Some(0),
+            narrowed_param_types: None,
         }))),
         "chaining off Database/ApexPages's stdlib return type should still resolve the next call"
+    );
+}
+
+/// A local variable declared with its own namespace spelled out
+/// (`Schema.SObjectField token;`, real fflib-style code) must resolve
+/// the declared type to the real stdlib class, not fall through to
+/// `Unresolved` -- and a method called on that variable must resolve
+/// too, since it depends on the declared type having resolved first.
+/// Before this fix, `resolve_type_ref` only ever looked up the *whole*
+/// dotted string (`"Schema.SObjectField"`) against `StdlibIndex`'s
+/// by-bare-name map, which never matched, so both the declaration and
+/// every member access through it stayed `Unresolved` -- no hover, no
+/// goto-definition, nothing -- despite `SObjectField` being a real,
+/// fully-documented stdlib class.
+#[test]
+fn a_namespace_qualified_declared_type_resolves_and_chains_into_a_method_call() {
+    let dir = write_fixture_dir(
+        "stdlib-namespace-qualified-declared-type",
+        &[(
+            "Foo.cls",
+            "public class Foo { public void run() { \
+             Schema.SObjectField token; \
+             Schema.DescribeFieldResult r = token.getDescribe(); \
+             } }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        method_call_resolution(&program, "getDescribe"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("Schema".into()),
+            class_name: "SObjectField".into(),
+            member: Some("getDescribe".into()),
+            arg_count: Some(0),
+            narrowed_param_types: None,
+        }))),
+        "token.getDescribe() must resolve once `Schema.SObjectField` itself resolves as the declared type"
     );
 }
 
@@ -240,6 +283,7 @@ fn list_sort_falls_through_to_the_stdlib_lookup() {
             class_name: "List".into(),
             member: Some("sort".into()),
             arg_count: Some(0),
+            narrowed_param_types: None,
         })))
     );
 }
@@ -270,6 +314,7 @@ fn an_enum_constant_access_resolves_to_stdlib_member() {
             class_name: "LoggingLevel".into(),
             member: None,
             arg_count: None,
+            narrowed_param_types: None,
         }))),
         "the bare LoggingLevel receiver itself should resolve as a known stdlib class"
     );
@@ -280,6 +325,7 @@ fn an_enum_constant_access_resolves_to_stdlib_member() {
             class_name: "LoggingLevel".into(),
             member: Some("INFO".into()),
             arg_count: None,
+            narrowed_param_types: None,
         }))),
         "LoggingLevel.INFO should resolve as a known stdlib property (an enum value)"
     );
@@ -317,6 +363,7 @@ fn a_real_objects_generic_sobject_method_resolves_via_the_sobject_fallback() {
             class_name: "SObject".into(),
             member: Some("put".into()),
             arg_count: Some(2),
+            narrowed_param_types: None,
         }))),
         "Account.put should fall back to the generic SObject.put method"
     );
@@ -356,6 +403,7 @@ fn a_custom_objects_generic_sobject_method_resolves_via_the_sobject_fallback() {
             class_name: "SObject".into(),
             member: Some("getSObjectType".into()),
             arg_count: Some(0),
+            narrowed_param_types: None,
         }))),
         "a real custom object's getSObjectType() should fall back to the generic SObject method"
     );

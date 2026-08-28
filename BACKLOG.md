@@ -55,8 +55,12 @@ resolved argument nodes, so a dangling trailing comma with nothing typed
 after it yet still advances to the next parameter slot.
 `textDocument/inlayHint` is done too (a `paramName:` label per call
 argument, same on-demand posture, skipped for any ambiguous or stdlib
-call). Next up is §3's remaining "needs new binder-side work first" list
-(`completion`, `semanticTokens`), or §4's still-open standard-library/
+call). `textDocument/completion` is done too (member-access and bare-
+identifier contexts; see below for the full writeup), including a real
+parser-AST-layer bug fix it surfaced (`FieldExpr`/`MethodCallExpr`/
+`QualifiedName`'s member-token accessors mishandling a dangling dot with
+nothing typed after it). Next up is §3's remaining "needs new binder-side
+work first" item (`semanticTokens`), or §4's still-open standard-library/
 schema type-model gap.
 
 ## 1. Protocol / server layer
@@ -902,12 +906,116 @@ supports each one.
       `container`/`name`), with argument-position tracking (which
       parameter the cursor is currently in) layered on top via a
       `Comma`-token count, not resolved-argument-node count.
-- [ ] `textDocument/completion` -- needs scope-aware +
-      member-aware suggestion (have the data via `ScopeTree`/
-      `SymbolTable`), but also needs the parser's error recovery to
-      behave well for *mid-token* input (completion fires while the
-      user is still typing an identifier, a different failure mode than
-      recovering from a finished-but-wrong file).
+- [x] `textDocument/completion` -- done, scoped to two contexts: member-
+      access after a `.`/`?.` (`foo.|`) and bare-identifier/fresh-position
+      (`de|`, or nothing typed at all). Deliberately out of v1 scope, the
+      same way other entries here note honest gaps: SOQL/SOSL completion
+      (`FROM`/`WHERE`), snippet completion, auto-import, override-method
+      completion, and `completionItem/resolve` (documentation is never
+      fetched per candidate at all -- see below). Filtering by whatever
+      prefix is already typed is left to the client's own fuzzy matcher
+      (standard LSP architecture) rather than done server-side: every
+      request returns the *full* candidate set for the resolved context
+      (`isIncomplete: false`) plus a computed replace-range, and the
+      client narrows the visible list itself as the user keeps typing.
+
+      **The mid-token parser gap this item used to cite turned out to be
+      one specific, narrow bug, not a general recovery problem.** The
+      parser already produces a usable tree for genuinely incomplete
+      input (`foo.` still parses to a `FieldExpr` node,
+      `crates/apex-parser/src/grammar/expressions.rs`'s `expr_primary_chain`
+      completes the node either way) -- the actual defect was three AST
+      accessors (`FieldExpr::member_token`, `MethodCallExpr::method_name_token`,
+      `QualifiedName::last_token`) built on a shared `last_non_trivia_token`
+      helper that blindly returns a node's last direct token regardless
+      of kind, so a dangling dot with nothing typed after it was
+      misreported as a member literally named `"."`. Fixed with a new
+      `last_member_name_token` (`crates/apex-syntax/src/ast/mod.rs`,
+      mirroring an existing `soql.rs::alias_token` precedent) that
+      returns `None` when the trailing token turns out to be the
+      `Dot`/`QuestionDot` itself. Verified as a true no-op on every
+      existing complete-input test (the whole-corpus `ast_smoke.rs` walk
+      asserts these accessors `.is_some()` over real files, which never
+      exercises a missing identifier) before adding the new dangling-input
+      cases; two new golden fixtures
+      (`tests/golden/malformed/04_dangling_field_access.cls`,
+      `05_dangling_method_call.cls`) pin the parser's recovered tree shape
+      for this input class going forward.
+
+      **The completion engine** (`apex_binder::complete_at`, new
+      `crates/apex-binder/src/completion.rs`) needed no new binder-side
+      index -- every candidate source is already bounded (scope depth, or
+      one type's/one stdlib class's/one SObject's member count), matching
+      this project's established "on demand, no precomputed index"
+      posture for `signatureHelp`/`inlayHint`/`callHierarchy`:
+      - Receiver-type inference for member-access reuses `resolve::bind_expr`
+        verbatim via a new `resolve::body_binder_for_completion`
+        constructor, which builds a throwaway `BodyBinder` sharing the
+        real `SymbolTable`/`SchemaIndex`/`StdlibIndex` and a **clone** of
+        the real per-body `ScopeTree` (`BoundProgram::scope_tree`, already
+        public, already anticipating exactly this use per its own doc
+        comment) but a **fresh, discarded** `ReferenceTable` -- safe
+        because `bind_expr` never mutates `scopes` and `BodyBinder` is
+        already constructed fresh-per-call everywhere else in this crate,
+        so nothing new needed inventing for isolation. This reuses the
+        real chain-typing logic (arbitrary depth, `this`/`super`, stdlib/
+        schema fallthrough) with zero duplication.
+      - Locating *which* body/enclosing-type/enclosing-member a cursor
+        position belongs to is a single unified ancestor climb matching
+        declaration nodes structurally (by `Symbol::ptr` equality) rather
+        than duplicating `bind_symbol_body`'s per-kind dispatch --
+        correct at any nesting depth (a nested class's method, a
+        trigger's top-level body, a bare field initializer with no
+        enclosing `Block` at all) without special-casing each one.
+      - Member enumeration reuses `SymbolTable::lookup_member` (not a
+        second override-shadowing implementation) for project types,
+        `SObjectSchema::fields`/`StdlibClass::methods`/`::properties` for
+        schema/stdlib types (already public, directly enumerable, no new
+        `SchemaIndex`/`StdlibIndex` API needed). Deliberately includes
+        `Method`/`Constructor` candidates even though bare-name
+        *resolution* excludes them -- completion should still suggest
+        `getName()`. A local/param whose own declaration is textually
+        *after* the cursor is filtered out (`Scope::bindings` has no
+        position-ordering built in, since its one prior consumer,
+        `resolve_local`, is only ever asked about an already-valid
+        reference) so a not-yet-typed `Integer later = 0;` further down
+        the same block isn't offered as already in scope.
+      - `CompletionCandidate` deliberately carries no documentation field
+        at all -- fetching a doc comment is a tree walk per candidate, per
+        keystroke, expensive even done eagerly unlike everything else
+        here; a field/method's hover already covers it once a candidate
+        is actually inserted.
+
+      **`apexls-server`** (`capabilities::completion`, `lib.rs`'s
+      `completion` handler, `completionProvider` with `.` as the only
+      trigger character) mirrors `signature_help`'s exact on-demand
+      wiring shape. `CompletionItem::detail` reuses existing formatters
+      end-to-end rather than a second formatter in the protocol-agnostic
+      binder crate -- `describe_symbol` was split into a new
+      `symbol_signature` (the plain-text line, no Markdown fence, no doc)
+      that both hover and completion now call, a pure refactor confirmed
+      behavior-preserving against the existing hover test suite before
+      building on it. `sort_text` uses one leading tier digit (locals >
+      direct-or-project-wide-types > inherited > stdlib > SObject fields
+      > keywords) -- project-wide types collapse into the same tier as
+      direct members rather than their own, since `CompletionCandidateKind`
+      has no way to tell a nested-class member apart from a top-level
+      type scan result and both are equally "directly relevant" for a
+      bare identifier anyway.
+
+      Verified three ways: `crates/apex-binder/tests/completion.rs`
+      (binder-level -- nested-scope locals with correct shadowing and
+      not-yet-declared exclusion, direct vs. inherited members with
+      override-shadow correctness, member-access off a project/stdlib/
+      SObject-typed receiver, visibility filtering, and the dangling-dot-
+      vs-partial-identifier replace-range distinction);
+      `crates/apexls-server/tests/completion.rs` (protocol-level, spawns
+      the real binary -- capability advertisement, an end-to-end dangling-
+      dot request, and a bare-identifier request); and `cargo bench -p
+      apex-binder`, confirming no cold/warm regression (both initial
+      readings' apparent changes disappeared on repeated runs, matching
+      this project's own already-documented noise pattern on this exact
+      benchmark).
 - [ ] `textDocument/semanticTokens` -- needs a token-classification pass
       over the resolved AST (e.g. distinguishing a field access from a
       local, a resolved type name from an unresolved one).

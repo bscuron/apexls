@@ -35,6 +35,7 @@
 mod call_hierarchy;
 mod ci_key;
 mod collect;
+mod completion;
 mod conversions;
 mod dead_code;
 mod file_id;
@@ -54,6 +55,7 @@ mod symbol_table;
 mod ty;
 
 pub use call_hierarchy::{incoming_calls, is_callable, outgoing_calls, IncomingCall, OutgoingCall};
+pub use completion::{complete_at, CompletionCandidate, CompletionCandidateKind, CompletionContext};
 pub use dead_code::{kind_label, dead_symbols_in_file, DeadSymbol};
 pub use file_id::FileId;
 pub use incremental::BindCache;

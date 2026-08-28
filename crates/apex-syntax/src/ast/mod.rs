@@ -102,7 +102,7 @@ impl QualifiedName {
     /// comment for why a wrapping node's raw range can include trailing
     /// trivia this parser attaches as one of its own children.
     pub fn last_token(&self) -> Option<SyntaxToken> {
-        last_non_trivia_token(self.syntax())
+        last_member_name_token(self.syntax())
     }
 }
 
@@ -168,6 +168,18 @@ pub(crate) fn first_non_trivia_token(node: &SyntaxNode) -> Option<SyntaxToken> {
 /// with exactly one significant token.
 pub(crate) fn last_non_trivia_token(node: &SyntaxNode) -> Option<SyntaxToken> {
     direct_tokens(node).last()
+}
+
+/// [`last_non_trivia_token`], but `None` when that token turns out to be
+/// the `.`/`?.` the node opened with rather than a real name -- the "hole"
+/// `expect_any_id` leaves (records a `ParseError` without consuming) when
+/// the member name after a dot is missing or not yet typed, e.g. `foo.` at
+/// the end of a file being edited. Without this, a `FieldExpr`/
+/// `MethodCallExpr`/`QualifiedName` whose member is missing would report
+/// its own `.`/`?.` token as the member name.
+pub(crate) fn last_member_name_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+    let last = last_non_trivia_token(node)?;
+    (!matches!(last.kind(), SyntaxKind::Dot | SyntaxKind::QuestionDot)).then_some(last)
 }
 
 /// The first non-trivia token strictly after the first occurrence of a

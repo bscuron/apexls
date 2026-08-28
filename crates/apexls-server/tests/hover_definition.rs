@@ -359,6 +359,63 @@ fn hover_on_an_overloaded_stdlib_call_narrows_to_the_matching_arity() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `public class Foo {` / `    private List<SObject> objectsToInsert = new List<SObject>();` /
+/// `    public void run(List<SObject> sObjects) {` /
+/// `        objectsToInsert.addAll(sObjects);` / `    }` / `}` -- character
+/// 26 on line 3 lands inside "addAll". `List.addAll` is a real, confirmed
+/// *same-arity* overload pair (`addAll(List)`/`addAll(Set)`, both one
+/// parameter) -- arity alone can't tell them apart the way `System.debug`'s
+/// differently-arity pair above can, so hovering a `List`-typed receiver's
+/// call must narrow by the receiver's real argument *type* to just the
+/// `List` overload, not show both (List/Set aren't implicitly
+/// convertible, so showing the `Set` one too was actively misleading).
+const STDLIB_SAME_ARITY_OVERLOAD_CALL_SRC: &str = "public class Foo {\n    private List<SObject> objectsToInsert = new List<SObject>();\n    public void run(List<SObject> sObjects) {\n        objectsToInsert.addAll(sObjects);\n    }\n}\n";
+const STDLIB_SAME_ARITY_OVERLOAD_CALL_POSITION: (u32, u32) = (3, 26);
+
+#[test]
+fn hover_on_a_same_arity_overloaded_stdlib_call_narrows_by_argument_type() {
+    let dir = write_fixture_dir(
+        "hover-stdlib-same-arity-overload",
+        &[("Foo.cls", STDLIB_SAME_ARITY_OVERLOAD_CALL_SRC)],
+    );
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+
+    let mut session = Session::start_with_text(&foo_uri, &root_uri, STDLIB_SAME_ARITY_OVERLOAD_CALL_SRC);
+
+    let response = session.request(
+        2,
+        "textDocument/hover",
+        serde_json::json!({
+            "textDocument": { "uri": foo_uri },
+            "position": {
+                "line": STDLIB_SAME_ARITY_OVERLOAD_CALL_POSITION.0,
+                "character": STDLIB_SAME_ARITY_OVERLOAD_CALL_POSITION.1,
+            },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "hover returned an error: {response:?}"
+    );
+    let contents = response["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected hover contents.value, got {response:?}"));
+
+    assert!(
+        contents.contains("addAll(List"),
+        "hover should show the List overload's own signature: {contents}"
+    );
+    assert!(
+        !contents.contains("addAll(Set"),
+        "hover should NOT also show the Set overload once the argument's real List type narrows \
+         it out: {contents}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn definition_on_a_field_reference_points_back_at_its_declaration() {
     let dir = write_fixture_dir("definition", &[("Foo.cls", FOO_SRC)]);
