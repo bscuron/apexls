@@ -1522,3 +1522,96 @@ two real fixes, not just measurement:
       report before deciding whether it's worth wiring into CI as a
       standing gate, rather than assuming a coverage threshold is the
       right bar up front.
+- [x] **Generative, syntax-level fuzzer for Apex expressions --**
+      `crates/apex-parser/tests/expr_fuzz.rs`, `proptest`-based (already a
+      dev-dependency, no new one added). Recursively builds random-but-
+      grammatically-valid expression source text mirroring
+      `grammar::expressions`'s own production shapes, then checks it (a)
+      parses with zero errors, (b) has its top-level expression node cover
+      the whole input (not just the tree as a whole -- see below for why
+      that distinction matters), (c) round-trips byte-for-byte through
+      `apex_printer::render`, and (d) reparses to the same tree shape.
+      Complements `roundtrip.rs` (real NPSP-corpus fragments) and
+      `metamorphic_parens.rs` (paren-wrapping a fixed hand-picked seed
+      corpus, and itself only using `proptest` for combinatorial index
+      selection, never generating novel text) -- this is the third,
+      distinct lens: genuinely novel *generated* text, exploring operator/
+      production combinations neither real code nor a hand-picked corpus
+      happens to contain. Deliberately scoped to expressions only for v1
+      (matching `metamorphic_parens.rs`'s own scope) -- `new` expressions,
+      the `List<Foo>.class` reflection idiom, SOQL/SOSL, and keyword-
+      shaped `anyId` member names are all explicitly deferred, the last
+      because `grammar::ids`'s `id`/`anyId` classification functions are
+      `pub(crate)` and hand-copying that ~140-token exclusion list into a
+      test would drift out of sync with the real grammar being tested.
+
+      Finds parser bugs, not binder/semantic bugs (a bare generated
+      expression has no surrounding declared-symbol context to resolve
+      against): wrong-precedence tree shape on deep mixed-operator
+      combinations real code style never produces, multi-token lookahead/
+      merge bugs (`<`/`>` into `<=`/`>=`, shift-operator merges), cast-vs-
+      paren disambiguation gaps, chained postfix/field/method-call/index
+      bugs, and `apex_printer::render` losslessness gaps -- plus, via
+      proptest's own shrinking, any panic on structurally-plausible input.
+
+      **Building the generator itself surfaced three real bugs -- not in
+      the parser, but in the generator's own understanding of the
+      grammar, which is exactly the kind of thing worth shaking out before
+      trusting this file's future failures as genuine parser bugs.** All
+      three trace back to one fact: `instanceof` sits at its own fixed
+      precedence tier (between `equality` and `relational`), and its
+      result can only be used where something *at or looser than that
+      tier* is expected, never as the receiver of something strictly
+      *tighter* without explicit parens:
+      1. Chain-suffix operators (`.`/`?.`/`[...]`/postfix `++`/`--`) are
+         handled entirely by `expr_primary_chain`/`expr_unary`'s own
+         postfix loop, both *below* instanceof in the chain with no way to
+         "reach back up" -- `instanceof`'s own right-hand side is a
+         `type_ref` (`grammar::types`), not a full expression, so once it
+         finishes there's no still-open primary-chain loop left to absorb
+         a trailing suffix either (the same reasoning applies to
+         `PostfixExpr`, one level up). Fixed with `chain_receiver_strategy`,
+         which re-parses each chain-suffix candidate as its own oracle and
+         rejects an `InstanceofExpr`/`PostfixExpr`-shaped top level.
+      2. The same problem one tier up: operators strictly tighter than
+         `instanceof` (relational, shift, additive, multiplicative) can't
+         attach to an `InstanceofExpr` either, since `expr_instanceof`
+         only ever loops on the literal `instanceof` keyword. First
+         misdiagnosed as a `type_ref` generic-argument-list lookahead
+         ambiguity (forcing the type to always close with a trailing
+         `[ ]` didn't fix it, which is what revealed the real cause).
+         Fixed by splitting one flat `binary_op_strategy` into
+         `loose_binary_strategy` (assign/coalesce/`||`/`&&`/bitwise/
+         equality -- always safe, since those levels' own grammar loops on
+         a full instanceof-level operand naturally) and
+         `tight_binary_strategy` (relational/shift/additive/
+         multiplicative -- both operands filtered the same way a chain-
+         suffix receiver is).
+      3. `type_strategy` itself originally let array-suffix (`[ ]`) and
+         dotted segments (`. Name`) interleave freely, but the real `Type`
+         grammar (`TypeName ('.' TypeName)* ('[' ']')*`) requires every
+         dotted segment to precede any array suffix -- `A[].a` isn't a
+         valid `Type` at all. Found via `cast_strategy` silently orphaning
+         its own operand when `try_cast`'s speculative type parse
+         correctly failed and rolled back to reinterpreting the whole
+         `(type)` as a plain parenthesized expression instead. Fixed by
+         building `type_strategy` as two strictly ordered phases (a dotted
+         chain, then array suffixes appended after) instead of one flat
+         recursive `prop_oneof!`.
+
+      One further, purely mechanical wrinkle, unrelated to the grammar:
+      `chain_receiver_strategy`'s `prop_filter`, nested inside
+      `prop_recursive`, isn't always honored by proptest's own shrinker --
+      a confirmed rough edge in the library (stress-tested the same filter
+      in isolation across thousands of fresh, non-shrunk draws with zero
+      leaks; the leak only ever appeared via shrinking, and only after all
+      three bugs above were already fixed). Since a leak always manifests
+      as exactly the top-level-coverage check failing, only that one check
+      is a `prop_assume!` rather than a hard assertion -- matching
+      `metamorphic_parens.rs`'s own precedent of discarding an unusable
+      generated case, and not weakening any of the other three properties.
+      **Verified stable**: 25 rounds of 3,000 cases each (75,000 total)
+      plus one 20,000-case run, all clean, after the three fixes above;
+      the default `with_cases(256)` configuration (matching
+      `metamorphic_parens.rs`'s own precedent) also passes cleanly and is
+      what `cargo test` runs day to day.
