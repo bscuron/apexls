@@ -71,8 +71,10 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
+
+use parking_lot::{Mutex, RwLock};
 
 use apex_binder::{BindCache, BoundProgram, Resolution};
 use async_lsp::client_monitor::ClientProcessMonitorLayer;
@@ -163,10 +165,25 @@ struct Backend {
 /// `Backend` itself across an async boundary -- the watcher's callback
 /// in particular runs on a thread `notify` owns, not one `Backend`'s own
 /// `&mut self` methods ever run on, so it needs its own independent
-/// handle to this state. `std::sync::Mutex`/`RwLock`, not `tokio`'s --
+/// handle to this state. `parking_lot::Mutex`/`RwLock`, not `tokio`'s --
 /// every access happens either on a blocking-pool thread (the rebuild
 /// itself) or held only long enough to swap a value (never held across
-/// an `.await`), so there's no blocking-executor hazard to avoid.
+/// an `.await`), so there's no blocking-executor hazard to avoid. Not
+/// `std::sync`'s either (this crate's original choice): `std`'s locks
+/// *poison* -- once a panic unwinds while a guard is held, every later
+/// `.lock()`/`.read()`/`.write()` on that same lock also panics,
+/// forever, for the rest of the process. `program`'s read guard in
+/// particular is held across an entire capability call (`hover`/
+/// `completion`/`references`/...); `async_lsp`'s `ConcurrencyLayer`/
+/// `CatchUnwindLayer` (`main.rs`) already turn one panicking request
+/// into a clean per-request error rather than crashing the process, but
+/// poisoning would silently escalate that from "one bad request" to
+/// "every request for the rest of the session," with no crash and no
+/// signal beyond every later response also erroring. `parking_lot`'s
+/// locks never poison -- a panic under a held guard just unwinds
+/// normally and the lock is fully usable again on the next request --
+/// closing that whole failure class structurally instead of relying on
+/// every future capability never panicking under a held guard.
 /// `documents` moved here (from `Backend` directly) for the same reason:
 /// a rebuild the watcher triggers still needs to know which files are
 /// open, unsaved buffers so their in-memory content keeps overriding
@@ -276,6 +293,36 @@ impl Default for BindState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::AssertUnwindSafe;
+
+    /// The whole reason `BindState`'s locks are `parking_lot`'s rather
+    /// than `std::sync`'s (see the doc comment on the struct itself): a
+    /// panic while a guard is held must never leave the lock permanently
+    /// unusable for the rest of the process. `std::sync::RwLock` would
+    /// poison here, and every later `.read()`/`.write()` would panic too
+    /// -- `parking_lot`'s never poisons, so the lock must still work
+    /// completely normally right after.
+    #[test]
+    fn a_panic_while_holding_programs_write_lock_does_not_poison_it() {
+        let bind = BindState::default();
+
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut guard = bind.program.write();
+            *guard = None;
+            panic!("simulated panic while `program`'s write guard is held");
+        }));
+        assert!(panicked.is_err(), "the simulated panic should have actually unwound");
+
+        // If this were `std::sync::RwLock`, both of these would now
+        // panic too (poisoned forever). With `parking_lot`, they don't.
+        assert!(bind.program.read().is_none());
+        *bind.program.write() = None;
+    }
+}
+
 /// Every open buffer's in-memory text, plus a monotonically increasing
 /// `version` -- see `BindState::documents`'s doc comment for why the two
 /// live behind one shared lock.
@@ -371,7 +418,7 @@ impl Backend {
                     if !relevant {
                         return;
                     }
-                    callback_bind.cache.lock().unwrap().invalidate_discovery();
+                    callback_bind.cache.lock().invalidate_discovery();
                     callback_bind.rebuild_requested.notify_one();
                 },
             ) {
@@ -385,7 +432,7 @@ impl Backend {
                 warn!(%error, root = %watch_root.display(), "failed to start filesystem watcher");
                 return;
             }
-            *bind.watcher.lock().unwrap() = Some(debouncer);
+            *bind.watcher.lock() = Some(debouncer);
         });
     }
 }
@@ -437,7 +484,7 @@ fn spawn_rebuild_worker(
             // to survive into the `Err` arm past the closure, for exactly
             // the reason explained there.
             let (version, overrides) = {
-                let documents = bind.documents.lock().unwrap();
+                let documents = bind.documents.lock();
                 let overrides: HashMap<PathBuf, String> = documents
                     .texts
                     .iter()
@@ -447,11 +494,11 @@ fn spawn_rebuild_worker(
             };
             let rebuild_bind = Arc::clone(&bind);
             let result = tokio::task::spawn_blocking(move || {
-                let mut cache = rebuild_bind.cache.lock().unwrap();
+                let mut cache = rebuild_bind.cache.lock();
                 let program = BoundProgram::from_files_cached(&root, &overrides, &mut cache);
                 drop(cache);
                 let file_count = program.file_count();
-                *rebuild_bind.program.write().unwrap() = Some(program);
+                *rebuild_bind.program.write() = Some(program);
                 file_count
             })
             .await;
@@ -506,11 +553,11 @@ fn spawn_rebuild_worker(
 /// again would leave its stale warning on screen forever, since nothing
 /// else would ever tell the client to clear it.
 fn publish_dead_code_diagnostics(bind: &BindState, client: &ClientSocket, encoding: PositionEncoding) {
-    let program_guard = bind.program.read().unwrap();
+    let program_guard = bind.program.read();
     let Some(program) = program_guard.as_ref() else {
         return;
     };
-    let uris: Vec<Url> = bind.documents.lock().unwrap().texts.keys().cloned().collect();
+    let uris: Vec<Url> = bind.documents.lock().texts.keys().cloned().collect();
     for uri in uris {
         let Some(path) = uri.to_file_path().ok() else {
             continue;
@@ -686,7 +733,7 @@ impl LanguageServer for Backend {
     fn did_open(&mut self, params: DidOpenTextDocumentParams) -> Self::NotifyResult {
         let uri = params.text_document.uri;
         info!(%uri, "did_open");
-        let mut documents = self.bind.documents.lock().unwrap();
+        let mut documents = self.bind.documents.lock();
         documents.texts.insert(uri, params.text_document.text);
         documents.version += 1;
         drop(documents);
@@ -704,7 +751,7 @@ impl LanguageServer for Backend {
             return ControlFlow::Continue(());
         };
         info!(%uri, len = change.text.len(), "did_change");
-        let mut documents = self.bind.documents.lock().unwrap();
+        let mut documents = self.bind.documents.lock();
         documents.texts.insert(uri, change.text);
         documents.version += 1;
         drop(documents);
@@ -715,7 +762,7 @@ impl LanguageServer for Backend {
     fn did_close(&mut self, params: DidCloseTextDocumentParams) -> Self::NotifyResult {
         let uri = params.text_document.uri;
         info!(%uri, "did_close");
-        let mut documents = self.bind.documents.lock().unwrap();
+        let mut documents = self.bind.documents.lock();
         documents.texts.remove(&uri);
         documents.version += 1;
         drop(documents);
@@ -746,11 +793,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -804,11 +851,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -834,11 +881,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -863,11 +910,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let range = params.range;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -887,11 +934,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -935,11 +982,11 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -964,11 +1011,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -995,11 +1042,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let position = params.position;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -1032,11 +1079,11 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         let new_name = params.new_name;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -1064,11 +1111,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -1093,11 +1140,11 @@ impl LanguageServer for Backend {
         let uri = params.item.uri;
         let position = params.item.selection_range.start;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -1119,11 +1166,11 @@ impl LanguageServer for Backend {
         let uri = params.item.uri;
         let position = params.item.selection_range.start;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -1145,11 +1192,11 @@ impl LanguageServer for Backend {
     ) -> BoxFuture<'static, Result<Option<DocumentSymbolResponse>, Self::Error>> {
         let uri = params.text_document.uri;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -1172,11 +1219,11 @@ impl LanguageServer for Backend {
         params: WorkspaceSymbolParams,
     ) -> BoxFuture<'static, Result<Option<WorkspaceSymbolResponse>, Self::Error>> {
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -1193,11 +1240,11 @@ impl LanguageServer for Backend {
         params: FoldingRangeParams,
     ) -> BoxFuture<'static, Result<Option<Vec<FoldingRange>>, Self::Error>> {
         let uri = params.text_document.uri;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -1224,11 +1271,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let positions = params.positions;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };
@@ -1267,11 +1314,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let range = params.range;
         let encoding = self.position_encoding;
-        let target_version = self.bind.documents.lock().unwrap().version;
+        let target_version = self.bind.documents.lock().version;
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read().unwrap();
+            let program_guard = bind.program.read();
             let Some(program) = program_guard.as_ref() else {
                 return Ok(None);
             };

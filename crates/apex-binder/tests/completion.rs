@@ -36,7 +36,7 @@ fn split_cursor(src: &str) -> (String, u32) {
     (out, idx as u32)
 }
 
-fn labels_of<'a>(candidates: &'a [apex_binder::CompletionCandidate]) -> Vec<&'a str> {
+fn labels_of(candidates: &[apex_binder::CompletionCandidate]) -> Vec<&str> {
     candidates.iter().map(|c| c.label.as_str()).collect()
 }
 

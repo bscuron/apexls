@@ -137,6 +137,54 @@ schema type-model gap.
       binary and drives it through `initialize` -> `initialized` ->
       `didOpen`/`didChange` -> `shutdown` -> `exit`, asserting on the
       wire-level JSON responses and clean process exit.
+- [x] Misuse/robustness coverage: the server must never panic, hang, or
+      answer wrongly when driven in ways a well-behaved editor never
+      would. **Done** -- `crates/apexls-server/tests/misuse_robustness.rs`,
+      8 protocol-level cases through the real binary: no `workspaceFolders`/
+      `rootUri` at all (real single-file mode -- `bind.program` stays
+      `None` forever, so every capability must degrade to a clean `null`
+      rather than hanging on a rebuild that will never happen); a
+      workspace root that was never created on disk; a project root with
+      zero `.cls`/`.trigger` files that still binds a real file opened
+      inside it normally; a non-Apex-extension file (never a bind
+      candidate, `apex_discover` only ever looks at extensions) that
+      doesn't affect a real file next to it; a `.cls` file with
+      completely non-Apex garbage content, hovered at every offset (not
+      just one -- an off-by-one is more likely to surface at a specific
+      position than uniformly); a `.cls`/`.trigger` extension-vs-content
+      mismatch (parsing dispatches purely by extension,
+      `crates/apex-binder/src/lib.rs`); a position far past a file's own
+      end; and a request against a URI that was never opened and doesn't
+      exist. All 8 passed against the already-existing implementation
+      with no fixes needed -- this is a coverage gap being closed, not a
+      bug being fixed, and it's now a real regression guard: the "single-
+      file mode" behavior in particular (`BindState::worker_active`,
+      `wait_for_rebuild`'s doc comments) was previously only justified by
+      code comments, not pinned by a test that would actually catch it
+      breaking.
+- [x] **`BindState`'s locks switched from `std::sync` to `parking_lot`,
+      closing a real architectural risk an `unwrap()`-safety audit
+      surfaced.** Every capability handler holds `bind.program`'s read
+      guard across the *whole* request (`hover`/`completion`/
+      `references`/...); with `std::sync::RwLock`, a panic anywhere in
+      that call graph -- today provably none, per the same audit, but a
+      standing risk for anything added later -- would poison the lock,
+      and `async_lsp`'s `CatchUnwindLayer` (`main.rs`) turning that one
+      panic into a clean per-request error would do nothing to un-poison
+      it: every *later* request's own `.read()`/`.write()` would then
+      also panic, forever, silently degrading the whole session to
+      errors-only until the client restarts the server, with no crash
+      and no signal beyond that. `parking_lot`'s locks never poison -- a
+      panic under a held guard just unwinds normally and the lock is
+      fully usable again on the next request -- closing the whole failure
+      class structurally rather than relying on every future capability
+      never panicking under a held guard. All four `BindState` locks
+      (`program`/`cache`/`documents`/`watcher`), not just `program`,
+      for the same reason applied consistently. Verified with a new
+      `crates/apexls-server/src/lib.rs` unit test that deliberately
+      panics while holding `program`'s write guard (via `catch_unwind`)
+      and confirms the lock is still fully usable immediately after --
+      would fail (poisoned forever) against the old `std::sync::RwLock`.
 
 ## 2. Incremental computation ("fast")
 
@@ -1464,3 +1512,13 @@ two real fixes, not just measurement:
 - [ ] Distribution/packaging story (binary releases, editor extension
       packaging) -- out of scope for "LSP implementation" per se, but
       relevant to "featureful" in the sense a user could actually reach.
+- [ ] Code coverage via `cargo-llvm-cov`, run against the whole workspace
+      test suite (unit + integration, including the real-NPSP-corpus and
+      protocol-level binary-spawning tests) -- no coverage numbers exist
+      anywhere today, so it's currently a guess which real code paths
+      (an error-recovery branch, a defensive `else` arm, a rarely-hit
+      `Resolution` variant) the existing test suite actually exercises
+      versus only looks like it covers. Worth running once as a baseline
+      report before deciding whether it's worth wiring into CI as a
+      standing gate, rather than assuming a coverage threshold is the
+      right bar up front.

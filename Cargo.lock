@@ -231,6 +231,7 @@ dependencies = [
  "lsp-types",
  "notify",
  "notify-debouncer-full",
+ "parking_lot",
  "rowan",
  "serde_json",
  "tokio",
