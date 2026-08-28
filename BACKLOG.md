@@ -1327,6 +1327,57 @@ supports each one.
       becomes a third `textDocument/publishDiagnostics` source alongside
       syntax errors and dead code, or is better modeled as a parse-time
       restriction instead.
+- [ ] **Further diagnostic sources, roughly ranked by value vs. how much
+      new analysis each needs.** All would join `syntax_error_diagnostics`/
+      `dead_code_diagnostics` in the same merged `publish_diagnostics`
+      notification (`crates/apexls-server/src/lib.rs`) -- see that
+      function's own doc comment for why they must be merged, not
+      published as separate notifications per file.
+
+      **Already computed, just never surfaced -- cheapest to add:**
+      - Unresolved-reference diagnostics, from `Resolution::Unresolved` --
+        every reference the binder already couldn't resolve to anything (a
+        typo, wrong casing, a symbol that doesn't exist). Likely the
+        single highest-value addition: it's what most people mean by "red
+        squiggles" in a language server, and the data already exists,
+        unused as a diagnostic source, exactly like the syntax-error case
+        that just shipped.
+      - Unknown SOQL/SOSL object or field, from `Resolution::UnknownSchema`
+        -- a query referencing an object/field with no matching local or
+        standard schema (`FROM Unknown_Object__c`, a bad `WHERE` field).
+        Same story: already computed during binding, never surfaced.
+
+      **Needs new, well-scoped binder analysis:**
+      - DML or SOQL inside a loop -- the classic Apex governor-limit
+        bulkification anti-pattern. Extremely common in real Apex code,
+        well-defined as an AST pattern (a DML statement or SOQL query
+        whose ancestor is a `for`/`while`/`do` loop body), and Salesforce-
+        specific in exactly the way this project's own value proposition
+        already is.
+      - Unreachable code after an unconditional `return`/`throw`.
+      - Missing interface/abstract-method implementation -- needs real
+        "does this concrete class implement everything it must" checking,
+        not built yet.
+
+      **Riskier, more speculative -- not just "not built yet," genuinely
+      needs more thought before committing to it:**
+      - `Resolution::Candidates` (an unresolved-overload ambiguity) as an
+        error diagnostic -- tempting, but `Candidates` means "this binder
+        can't narrow the call further," not necessarily "a real compiler
+        would find this ambiguous too" (the whole reason `crate::conversions`
+        exists is to keep narrowing that gap without guessing). Surfacing
+        it as a red squiggle risks real false positives against this
+        project's own established "don't guess" discipline -- would need
+        verification against a real org first, the same way every
+        `conversions.rs` rule already is, not just an assumption that
+        "ambiguous to us" means "ambiguous to the compiler."
+      - Salesforce security/best-practice lints (hardcoded record IDs,
+        SOQL injection risk in dynamic queries built from unescaped user
+        input, a class missing `with sharing`) -- real value, but a
+        different *kind* of feature than "the compiler found a bug" (style/
+        security-review territory, closer to what Salesforce Code
+        Analyzer/PMD already do), not attempted alongside the correctness-
+        oriented diagnostics above.
 
 ## 4. Correctness gaps that block features, not just refine them
 
