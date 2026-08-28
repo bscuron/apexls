@@ -1033,6 +1033,50 @@ fn doc_comment_for(program: &BoundProgram, id: SymbolId) -> Option<String> {
     }
 }
 
+/// `textDocument/publishDiagnostics`: one `ERROR`-severity diagnostic per
+/// `apex_parser::ParseError` recorded for `file` (`BoundProgram::syntax_errors`)
+/// -- the parser's own "never panics, always records an error plus a
+/// best-effort tree" guarantee means this is just surfacing data that
+/// already existed, not computing anything new. `ParseError` only carries
+/// a single byte offset, not a span, so the range is deliberately just the
+/// one character at that offset (zero-width, clamped to the file's own
+/// length, for an error recorded at end-of-file, e.g. "expected Semi,
+/// found Eof") -- an honest v1 choice, not an oversight: extending to the
+/// nearest real token's full span would need either sniffing the message
+/// string for "found X" (fragile) or a token-at-offset lookup with its own
+/// edge cases (the offset landing in trivia, or genuinely at EOF with
+/// nothing to extend to). The message itself is passed through verbatim --
+/// the parser's own `"expected RParen, found Dot"`-style text already
+/// states what was expected and what was found, without a separate
+/// humanization layer translating token names to their real spelling.
+pub(crate) fn syntax_error_diagnostics(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<Diagnostic> {
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+    let len = text.len() as u32;
+    program
+        .syntax_errors(file)
+        .iter()
+        .map(|err| {
+            let start = err.offset.min(len);
+            let end = (err.offset + 1).min(len);
+            Diagnostic {
+                range: Range {
+                    start: index.to_position(&text, start, encoding),
+                    end: index.to_position(&text, end, encoding),
+                },
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("apexls".to_string()),
+                message: err.message.clone(),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
 /// `textDocument/publishDiagnostics`: one `WARNING`-severity diagnostic
 /// per symbol `apex_binder::dead_symbols_in_file` proves is dead, tagged
 /// `DiagnosticTag::UNNECESSARY` -- the standard LSP tag for "safe to

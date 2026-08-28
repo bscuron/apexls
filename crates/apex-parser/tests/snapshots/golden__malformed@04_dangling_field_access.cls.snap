@@ -24,4 +24,4 @@ StmtRoot@0..9
 
 # errors
 ParseError { message: "expected a member name, found Eof", offset: 9 }
-ParseError { message: "expected Semi, found Eof", offset: 9 }
+ParseError { message: "expected Semi, found Eof", offset: 8 }

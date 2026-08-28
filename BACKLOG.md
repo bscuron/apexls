@@ -1244,6 +1244,90 @@ supports each one.
       `recv()` everywhere now skips past notification frames while
       waiting for a specific response.
 
+      **Follow-up, closed: real syntax-error diagnostics (rust-analyzer-
+      style red squiggles), not just the dead-code warning above.** The
+      parser's own "never panics, always records a `ParseError` plus a
+      best-effort tree" guarantee (`apex_parser::errors`'s module doc
+      comment) meant the data already existed; it had just never been
+      surfaced to an editor. `BoundProgram::syntax_errors(file)` (new,
+      `crates/apex-binder/src/lib.rs`, right next to `syntax()`) exposes
+      each file's `Vec<ParseError>`; `capabilities::syntax_error_diagnostics`
+      turns each into an `ERROR`-severity `Diagnostic` -- range is
+      deliberately just the one byte at `ParseError::offset` (clamped to
+      the file's length for an end-of-file error), not extended to the
+      nearest token's full span, and the message is the parser's own
+      `"expected X, found Y"` text passed through verbatim, both honest v1
+      scope lines rather than oversights (see that function's own doc
+      comment for why). The one real design point: `textDocument/publishDiagnostics`
+      *replaces* a client's whole diagnostic set for a URI on every
+      notification rather than merging with the previous one, so this
+      couldn't be a second, independent publish call alongside the
+      existing dead-code one -- `publish_dead_code_diagnostics` was
+      renamed to `publish_diagnostics` and now merges both sources into
+      one notification per file, reusing the exact same "proactive after
+      every rebuild, unconditional even when empty so a fixed error
+      clears its own stale squiggle" mechanism unchanged. Verified via
+      `crates/apexls-server/tests/syntax_error_diagnostics.rs`: a real
+      syntax error gets an `ERROR` diagnostic with the parser's message, a
+      `didChange` that fixes it clears that diagnostic on the next
+      publish, and a file with both a syntax error *and* a genuinely dead
+      symbol gets both in the same notification -- pinning down the merge
+      specifically, since silently clobbering one diagnostic source with
+      the other is exactly the mistake the design point above call out.
+
+      **Second follow-up, also closed, from a real user report against the
+      feature above: "missing X" diagnostics landed on the wrong line.**
+      `Parser::expect` (`crates/apex-parser/src/parser.rs`) recorded a
+      failed expectation (a missing `;`/`)`/`}`/`]`/...) at the start of
+      whatever real token happened to follow the gap -- for a missing
+      semicolon immediately followed by another statement on the next
+      line, that put the squiggle on the *next* statement, reading as "this
+      is wrong" when it wasn't; the actual problem (no semicolon) sits at
+      the end of the *previous* line. Fixed by giving `expect`'s failure
+      path its own `error_at_gap`, positioned at the byte right after the
+      last significant token actually consumed (`Parser::prev_token_end`,
+      skipping any trivia in the gap -- a comment between the two
+      shouldn't push the diagnostic past it) -- matching rustc/rust-
+      analyzer's own convention for a missing-token diagnostic. `error()`'s
+      existing behavior (current-token positioning) is unchanged and still
+      used by every other `p.error(...)` call site in `grammar/` -- ~35 of
+      them describe more semantically-specific "expected a type"/"expected
+      a member name"/... shapes, plus one genuine "unexpected token" case
+      (`bump_if_no_progress`) that *should* keep pointing at the bad token,
+      not a gap before it; migrating any of those to `error_at_gap` is a
+      real, deliberately deferred follow-up, not attempted here since
+      `expect` alone already covers the overwhelming majority of what a
+      user hits while typing. Blast radius checked, not guessed: grepped
+      the whole workspace for hardcoded `ParseError`/offset expectations
+      outside `apex-parser`'s own tests -- none exist; only three of the
+      five `tests/golden/malformed/*.cls` snapshots actually shifted
+      (each manually reviewed, each moving to the correct gap position),
+      and `cargo bench -p apex-binder` confirmed no regression (the
+      changed code only runs on the already-cold error path, never during
+      a successful parse). New test:
+      `crates/apexls-server/tests/syntax_error_diagnostics.rs`'s
+      `a_missing_semicolon_is_reported_at_the_end_of_the_statement_missing_it_not_the_next_one`,
+      built directly from the reported example's shape.
+- [ ] **Duplicate/conflicting-modifier diagnostic -- a real gap, found via
+      a user report.** `private private private private void foo() {`
+      produces no error anywhere in the pipeline today: `grammar::declarations::modifiers`
+      parses `modifier*` as a plain repetition with no uniqueness
+      constraint (matching the ANTLR reference grammar -- this is normal,
+      expected *syntax*-level behavior, not a parser bug), and
+      `apex-binder`'s `ModifierSet::from_modifiers`
+      (`crates/apex-binder/src/symbol.rs:123-148`) just idempotently
+      re-assigns the same flag per repeated token, so five `private`s
+      produce the identical `ModifierSet` one would. A real Salesforce org
+      almost certainly rejects this at save/deploy time -- worth
+      confirming the *exact* shape (a syntax error in the real compiler,
+      or a semantic one, and whether it's specifically duplicates or any
+      conflicting-visibility combination like `private public`) against a
+      real org via the `sf` CLI oracle this project already uses for
+      disputed grammar/semantics questions, before deciding whether this
+      becomes a third `textDocument/publishDiagnostics` source alongside
+      syntax errors and dead code, or is better modeled as a parse-time
+      restriction instead.
+
 ## 4. Correctness gaps that block features, not just refine them
 
 These were flagged as deliberate, documented v1 scope cuts while

@@ -27,5 +27,5 @@ StmtRoot@0..13
 
 # errors
 ParseError { message: "expected expression, found Eof", offset: 13 }
-ParseError { message: "expected RParen, found Eof", offset: 13 }
-ParseError { message: "expected Semi, found Eof", offset: 13 }
+ParseError { message: "expected RParen, found Eof", offset: 12 }
+ParseError { message: "expected Semi, found Eof", offset: 12 }

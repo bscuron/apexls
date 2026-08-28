@@ -62,26 +62,71 @@ impl<'t> Parser<'t> {
     /// Consume the current token if it matches `kind`; otherwise record an
     /// error *without* consuming, so the caller's node still completes
     /// with a hole rather than eating a token that belongs to whatever
-    /// comes next.
+    /// comes next. The error is positioned at the *gap* right after the
+    /// last token actually consumed (`error_at_gap`), not at whatever real
+    /// content happens to follow it -- `expect` failing always means "a
+    /// specific token was supposed to go here and didn't," so that's
+    /// where the diagnostic belongs, matching rustc/rust-analyzer's own
+    /// convention for a missing token (found, concretely, via a user
+    /// report against a missing-semicolon case where the diagnostic
+    /// otherwise lands on the *next* statement instead of after the one
+    /// that's actually missing its terminator).
     pub(crate) fn expect(&mut self, kind: SyntaxKind) -> bool {
         if self.at(kind) {
             self.bump();
             true
         } else {
-            self.error(format!("expected {kind:?}, found {:?}", self.current()));
+            self.error_at_gap(format!("expected {kind:?}, found {:?}", self.current()));
             false
         }
     }
 
     pub(crate) fn error(&mut self, message: impl Into<String>) {
-        let offset = self.input.raw_index(self.pos).map_or_else(
-            || self.source_len(),
-            |raw_idx| self.input.raw[raw_idx as usize].start,
-        );
+        self.errors.push(ParseError {
+            message: message.into(),
+            offset: self.current_token_offset(),
+        });
+    }
+
+    /// Like [`Self::error`], but positioned at the byte right after the
+    /// last significant token actually consumed (`prev_token_end`)
+    /// instead of at whatever real content happens to follow the gap --
+    /// the right positioning for "you forgot to write a specific token
+    /// here" (a missing `;`/`)`/`}`/`]`/...), as opposed to `error`'s
+    /// "the current token itself is the problem" default. Only
+    /// [`Self::expect`] uses this today; a handful of the other
+    /// `p.error(...)` call sites throughout `grammar/` describe the same
+    /// "something is missing" shape and could reasonably migrate here
+    /// too, just not attempted in the same pass as this method's own
+    /// introduction.
+    fn error_at_gap(&mut self, message: impl Into<String>) {
+        let offset = self.prev_token_end().unwrap_or_else(|| self.current_token_offset());
         self.errors.push(ParseError {
             message: message.into(),
             offset,
         });
+    }
+
+    fn current_token_offset(&self) -> u32 {
+        self.input.raw_index(self.pos).map_or_else(
+            || self.source_len(),
+            |raw_idx| self.input.raw[raw_idx as usize].start,
+        )
+    }
+
+    /// The byte offset right after the last significant token consumed so
+    /// far, ignoring any trivia between it and the current token (a
+    /// comment sitting in the gap shouldn't push a "missing token"
+    /// diagnostic past it -- the missing token belongs right after the
+    /// real code, not after an intervening comment). `None` before
+    /// anything has been consumed yet (nothing to point after).
+    fn prev_token_end(&self) -> Option<u32> {
+        if self.pos == 0 {
+            return None;
+        }
+        self.input
+            .raw_index(self.pos - 1)
+            .map(|raw_idx| self.input.raw[raw_idx as usize].end())
     }
 
     fn source_len(&self) -> u32 {

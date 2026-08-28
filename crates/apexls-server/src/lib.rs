@@ -528,7 +528,7 @@ fn spawn_rebuild_worker(
                 Ok(file_count) => {
                     bind.bound_version.send_replace(version);
                     info!(file_count, "rebuild complete");
-                    publish_dead_code_diagnostics(&bind, &client, encoding);
+                    publish_diagnostics(&bind, &client, encoding);
                 }
                 Err(join_error) => {
                     bind.bound_version.send_replace(version);
@@ -549,10 +549,17 @@ fn spawn_rebuild_worker(
 /// keystroke would be wasted work no client displays anyway -- every
 /// real editor only shows diagnostics for buffers it has open. Published
 /// unconditionally for every open file, including an empty
-/// `diagnostics: vec![]` -- otherwise a dead symbol that gets referenced
-/// again would leave its stale warning on screen forever, since nothing
+/// `diagnostics: vec![]` -- otherwise a dead symbol (or a fixed syntax
+/// error) would leave its stale squiggle on screen forever, since nothing
 /// else would ever tell the client to clear it.
-fn publish_dead_code_diagnostics(bind: &BindState, client: &ClientSocket, encoding: PositionEncoding) {
+///
+/// Combines every diagnostic source (currently `syntax_error_diagnostics`
+/// and `dead_code_diagnostics`) into *one* notification per file --
+/// `textDocument/publishDiagnostics` replaces a client's whole diagnostic
+/// set for a URI on every notification rather than merging with the
+/// previous one, so sending two separate notifications for the same file
+/// would make the second one silently wipe out the first.
+fn publish_diagnostics(bind: &BindState, client: &ClientSocket, encoding: PositionEncoding) {
     let program_guard = bind.program.read();
     let Some(program) = program_guard.as_ref() else {
         return;
@@ -565,7 +572,8 @@ fn publish_dead_code_diagnostics(bind: &BindState, client: &ClientSocket, encodi
         let Some(file) = program.file_id(&path) else {
             continue;
         };
-        let diagnostics = capabilities::dead_code_diagnostics(program, file, encoding);
+        let mut diagnostics = capabilities::syntax_error_diagnostics(program, file, encoding);
+        diagnostics.extend(capabilities::dead_code_diagnostics(program, file, encoding));
         let _ = client.notify::<lsp_types::notification::PublishDiagnostics>(PublishDiagnosticsParams {
             uri,
             diagnostics,
@@ -1302,7 +1310,7 @@ impl LanguageServer for Backend {
     /// `capabilities::dead_code_actions`: a "Remove unused ..." quick-fix
     /// for every dead-code diagnostic (`capabilities::dead_code_diagnostics`,
     /// published proactively after each rebuild -- see
-    /// `publish_dead_code_diagnostics`) whose symbol overlaps the
+    /// `publish_diagnostics`) whose symbol overlaps the
     /// requested range. Re-derives dead symbols from `program` itself
     /// rather than trusting `params.context.diagnostics`, so this works
     /// even for a client that requests code actions without having first

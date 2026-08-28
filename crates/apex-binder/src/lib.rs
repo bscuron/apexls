@@ -68,6 +68,7 @@ pub use stdlib_index::StdlibIndex;
 pub use scope::{Scope, ScopeId, ScopeKind, ScopeTree};
 pub use symbol::{ModifierSet, Sharing, Symbol, SymbolId, SymbolKind, Visibility};
 pub use symbol_table::SymbolTable;
+pub use apex_parser::ParseError;
 
 use apex_parser::Parse;
 use apex_syntax::ast::decl::{
@@ -755,6 +756,18 @@ impl BoundProgram {
 
     pub fn syntax(&self, file: FileId) -> SyntaxNode {
         self.parses[&file].syntax()
+    }
+
+    /// Every `apex_parser::ParseError` recorded while parsing `file` --
+    /// the parser's own "never panics on malformed input, always records
+    /// an error plus a best-effort tree" guarantee
+    /// (`apex_parser::errors`'s own module doc comment) means this is
+    /// just surfacing data that already existed, not computing anything
+    /// new. Empty for a file that was never parsed (or parsed cleanly),
+    /// matching every other `self.parses`-backed lookup's "nothing
+    /// recorded" behavior.
+    pub fn syntax_errors(&self, file: FileId) -> &[ParseError] {
+        self.parses.get(&file).map_or(&[], |p| &p.errors)
     }
 
     pub fn file_count(&self) -> usize {

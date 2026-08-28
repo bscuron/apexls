@@ -29,4 +29,4 @@ StmtRoot@0..14
       RBrace@13..14 "}"
 
 # errors
-ParseError { message: "expected RParen, found LBrace", offset: 6 }
+ParseError { message: "expected RParen, found LBrace", offset: 5 }
