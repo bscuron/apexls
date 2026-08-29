@@ -11,8 +11,8 @@ use apex_binder::{
     VisualforcePageRef,
 };
 use apex_syntax::ast::decl::{
-    ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, HasDocComment, InterfaceDecl, MethodDecl,
-    PropertyDecl, TriggerUnit,
+    ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, FormalParam, FormalParamList, HasDocComment,
+    InterfaceDecl, MethodDecl, PropertyDecl, TriggerUnit,
 };
 use apex_syntax::ast::expr::{ArgList, CallExpr, Expr, MethodCallExpr, NameExpr, NewExpr};
 use apex_syntax::SyntaxKind;
@@ -897,34 +897,31 @@ fn references_resolve_cleanly(program: &BoundProgram, id: SymbolId) -> bool {
     })
 }
 
-/// A `Method` is renameable only when it can't be part of an override
-/// chain this feature doesn't cascade across (a distinct, unsolved problem
-/// from overload-call ambiguity): not itself marked `override`, not
-/// implementing an interface/base-class method of the same name and arity
-/// (Apex requires no `override` keyword for that case), and not itself
-/// overridden by any subclass. The last check scans every project symbol
-/// -- no index answers "which methods override this one" the way
-/// `SymbolTable`'s other lookups are O(1), but that's fine here: a rename
-/// is a rare, user-initiated action, not a per-keystroke path the rest of
-/// this codebase optimizes for.
-fn check_method_eligible(program: &BoundProgram, id: SymbolId) -> Result<(), RenameRefusal> {
+/// A `Method` can safely be treated as having exactly one, non-cascading
+/// declaration only when it can't be part of an override chain (a distinct,
+/// unsolved problem from overload-call ambiguity): not itself marked
+/// `override`, not implementing an interface/base-class method of the same
+/// name and arity (Apex requires no `override` keyword for that case), and
+/// not itself overridden by any subclass. `None` when clear; `Some(reason)`
+/// otherwise, for a caller to fold into its own refusal type (`check_method_eligible`
+/// for rename's `RenameRefusal`, `crate::capabilities::parameter_reorder_actions`
+/// for its own quiet "offer nothing" gate). The last check scans every
+/// project symbol -- no index answers "which methods override this one" the
+/// way `SymbolTable`'s other lookups are O(1), but that's fine here: both
+/// callers are rare, user-initiated actions, not a per-keystroke path the
+/// rest of this codebase optimizes for.
+fn method_override_chain_reason(program: &BoundProgram, id: SymbolId) -> Option<&'static str> {
     let symbol = program.symbols.get(id);
     if symbol.modifiers.is_override {
-        return Err(RenameRefusal::OverrideChain(
-            "it overrides a base class method",
-        ));
+        return Some("it overrides a base class method");
     }
-    let Some(container) = symbol.container else {
-        return Ok(());
-    };
+    let container = symbol.container?;
     let arity = program.symbols.params(id).len();
 
     for &ancestor in program.symbols.inherited_chain(container) {
         for candidate in program.symbols.lookup_member(ancestor, &symbol.name) {
             if candidate != id && program.symbols.params(candidate).len() == arity {
-                return Err(RenameRefusal::OverrideChain(
-                    "it implements an interface or base-class method of the same name",
-                ));
+                return Some("it implements an interface or base-class method of the same name");
             }
         }
     }
@@ -940,9 +937,19 @@ fn check_method_eligible(program: &BoundProgram, id: SymbolId) -> Result<(), Ren
                 .is_some_and(|c| program.symbols.inherited_chain(c).contains(&container))
     });
     if overridden_by_subclass {
-        return Err(RenameRefusal::OverrideChain("it's overridden by a subclass"));
+        return Some("it's overridden by a subclass");
     }
-    Ok(())
+    None
+}
+
+/// A `Method` is renameable only when [`method_override_chain_reason`]
+/// finds no reason it can't be -- see that function's own doc comment for
+/// what each case means.
+fn check_method_eligible(program: &BoundProgram, id: SymbolId) -> Result<(), RenameRefusal> {
+    match method_override_chain_reason(program, id) {
+        Some(reason) => Err(RenameRefusal::OverrideChain(reason)),
+        None => Ok(()),
+    }
 }
 
 /// Whether `new_name` is a syntactically legal, non-keyword Apex
@@ -1440,6 +1447,262 @@ pub(crate) fn dead_code_actions(
                 }),
                 ..Default::default()
             })
+        })
+        .collect()
+}
+
+/// One structural edit to a parameter/argument list -- shared by both a
+/// declaration's `FormalParamList` and a call site's `ArgList`, since Apex
+/// has no default/named/variadic arguments: a resolved, non-overloaded
+/// call's `ArgList` always has exactly as many positional expressions, in
+/// the same order, as the declaration has parameters, so the identical
+/// index transform is always safe on either side.
+#[derive(Clone, Copy)]
+enum ParamOp {
+    RotateLeft,
+    RotateRight,
+    RemoveAt(usize),
+}
+
+impl ParamOp {
+    fn apply(self, items: &[String]) -> Vec<String> {
+        match self {
+            ParamOp::RotateLeft if !items.is_empty() => {
+                let mut items = items.to_vec();
+                items.rotate_left(1);
+                items
+            }
+            ParamOp::RotateRight if !items.is_empty() => {
+                let mut items = items.to_vec();
+                items.rotate_right(1);
+                items
+            }
+            ParamOp::RotateLeft | ParamOp::RotateRight => Vec::new(),
+            ParamOp::RemoveAt(index) => items
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != index)
+                .map(|(_, s)| s.clone())
+                .collect(),
+        }
+    }
+}
+
+/// `op` applied to `item_texts`, joined back into the flat, single-line
+/// comma-separated form the rewritten list always takes (`", "`-joined;
+/// empty when the result has zero items, correctly producing a bare `()`).
+/// Deliberately reformats onto one line even when the original list was
+/// written multi-line -- still correct Apex either way, just not
+/// formatting-preserving, an accepted v1 simplification.
+fn reordered_list_text(item_texts: &[String], op: ParamOp) -> String {
+    op.apply(item_texts).join(", ")
+}
+
+/// `items`' own overall span (from the first item's start to the last
+/// item's end -- never touching the list's surrounding `(`/`)`) and each
+/// item's own trimmed source text, for `reordered_list_text` to
+/// reconstruct. `None` for an empty list (a call site's own `ArgList`
+/// should never actually be empty here -- the triggering method already
+/// has at least one parameter -- but a defensive `Option` costs nothing).
+/// Generic over `FormalParam`/`Expr` alike: both are real `AstNode`s over
+/// this crate's own `ApexLanguage`, and both list shapes need the
+/// identical span-and-texts computation.
+fn list_span_and_texts<N: rowan::ast::AstNode<Language = apex_syntax::ApexLanguage>>(
+    items: impl Iterator<Item = N>,
+) -> Option<(TextRange, Vec<String>)> {
+    let items: Vec<N> = items.collect();
+    let span = TextRange::new(
+        items.first()?.syntax().text_range().start(),
+        items.last()?.syntax().text_range().end(),
+    );
+    let texts = items
+        .iter()
+        .map(|n| n.syntax().text().to_string().trim().to_string())
+        .collect();
+    Some((span, texts))
+}
+
+/// The multi-file `WorkspaceEdit` for applying `op` to `method_id`'s own
+/// parameter list: rewrites its declaration's `FormalParamList` plus
+/// every one of `program.references_to`'s call sites. Each reference
+/// `ptr` is already keyed at the whole `MethodCallExpr` node
+/// (`resolve::bind_method_call_expr`'s own `SyntaxPtr::new(self.file,
+/// mc.syntax())`), so casting it directly gets the call's own `ArgList`
+/// with no further ancestor-walking. `None` only if the declaration
+/// itself can't be re-derived from `method_id` (shouldn't happen for a
+/// real `Method` symbol -- defensive, not expected). Mirrors
+/// `rename_edits`'s own per-file `TextEdit` grouping (`per_file`/`LineIndex`
+/// cache, keyed by `Url`) exactly, since both are genuinely project-wide,
+/// multi-file edits.
+fn parameter_op_workspace_edit(
+    program: &BoundProgram,
+    method_id: SymbolId,
+    op: ParamOp,
+    encoding: PositionEncoding,
+) -> Option<WorkspaceEdit> {
+    let decl_symbol = program.symbols.get(method_id);
+    let decl_root = program.syntax(decl_symbol.file);
+    let method = decl_symbol.ptr.to_node(&decl_root).and_then(MethodDecl::cast)?;
+    let param_list = method.params()?;
+    let (decl_span, decl_texts) = list_span_and_texts(param_list.params())?;
+
+    let mut sites: Vec<(FileId, TextRange, String)> =
+        vec![(decl_symbol.file, decl_span, reordered_list_text(&decl_texts, op))];
+
+    for ptr in program.references_to(method_id) {
+        let root = program.syntax(ptr.file());
+        let Some(call) = ptr.to_node(&root).and_then(MethodCallExpr::cast) else {
+            continue;
+        };
+        let Some(args) = call.args() else { continue };
+        let Some((arg_span, arg_texts)) = list_span_and_texts(args.args()) else {
+            continue;
+        };
+        sites.push((ptr.file(), arg_span, reordered_list_text(&arg_texts, op)));
+    }
+
+    let mut per_file: HashMap<FileId, (Url, String, LineIndex)> = HashMap::new();
+    let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+    for (site_file, site_range, new_text) in sites {
+        if let std::collections::hash_map::Entry::Vacant(e) = per_file.entry(site_file) {
+            let Some(uri) = Url::from_file_path(program.file_path(site_file)).ok() else {
+                continue;
+            };
+            let text = program.syntax(site_file).text().to_string();
+            let index = LineIndex::new(&text);
+            e.insert((uri, text, index));
+        }
+        let Some((uri, text, index)) = per_file.get(&site_file) else {
+            continue;
+        };
+        let start = index.to_position(text, site_range.start().into(), encoding);
+        let end = index.to_position(text, site_range.end().into(), encoding);
+        changes.entry(uri.clone()).or_default().push(TextEdit {
+            range: Range { start, end },
+            new_text,
+        });
+    }
+
+    Some(WorkspaceEdit {
+        changes: Some(changes),
+        ..Default::default()
+    })
+}
+
+/// `textDocument/codeAction`: "Rotate parameters left/right" and "Remove
+/// parameter '<name>'" for a non-virtual, non-overloaded method -- see
+/// `method_override_chain_reason`'s own doc comment for the override-chain
+/// half of the eligibility gate; the other half (no sibling method of the
+/// same name directly on the same class, and not declared on an
+/// `Interface` at all) is checked here directly. Both restrictions are
+/// deliberately conservative for v1: a wider version handling virtual/
+/// overloaded methods safely is a real, separate design problem (which
+/// declarations also need editing, whether a call site's target overload
+/// is still unambiguous after the edit), not attempted here.
+///
+/// Triggered only when `range`'s start lands inside a `FormalParam` of a
+/// `MethodDecl`'s own parameter list -- the same token-then-ancestors
+/// lookup pattern `prepare_rename_range` already uses. Every other case
+/// (no `FormalParam` there, the method fails eligibility, zero parameters)
+/// quietly offers nothing, the same "don't offer, don't explain" contract
+/// `dead_code_actions` already has -- unlike rename's `RenameRefusal`,
+/// there's no user-initiated single target to explain a refusal *to*.
+pub(crate) fn parameter_reorder_actions(
+    program: &BoundProgram,
+    file: FileId,
+    range: Range,
+    encoding: PositionEncoding,
+) -> Vec<CodeActionOrCommand> {
+    let root = program.syntax(file);
+    let text = root.text().to_string();
+    let index = LineIndex::new(&text);
+    let Some(offset) = index.to_offset(&text, range.start, encoding) else {
+        return Vec::new();
+    };
+    // A cursor sitting exactly on a token boundary (e.g. right after `(`,
+    // with no whitespace before the parameter's own type -- a real
+    // shape, not just a pathological input: `configure(String a)`'s
+    // first parameter starts immediately after `(`) needs *both*
+    // candidate tokens tried, not just one: `prepare_rename_range`'s own
+    // "prefer the non-trivia side" rule picks whichever token is meant
+    // for a *different* question ("what identifier is the cursor
+    // renaming") and answers this one wrong here, since the non-trivia
+    // side at a `(`/first-parameter boundary is the paren itself, not
+    // the parameter. Trying the token that *starts* at this offset
+    // first (what a cursor conventionally means to act on next) and
+    // falling back to the one that *ends* here covers every real
+    // boundary shape a parameter list can have.
+    let candidates: Vec<apex_syntax::SyntaxToken> = match root.token_at_offset(offset.into()) {
+        rowan::TokenAtOffset::None => return Vec::new(),
+        rowan::TokenAtOffset::Single(t) => vec![t],
+        rowan::TokenAtOffset::Between(left, right) => vec![right, left],
+    };
+    let Some(param) = candidates
+        .iter()
+        .find_map(|t| t.parent().and_then(|p| p.ancestors().find_map(FormalParam::cast)))
+    else {
+        return Vec::new();
+    };
+    let Some(param_list) = param.syntax().parent().and_then(FormalParamList::cast) else {
+        return Vec::new();
+    };
+    let Some(method) = param_list.syntax().parent().and_then(MethodDecl::cast) else {
+        return Vec::new();
+    };
+    let Some(method_name) = method.name() else {
+        return Vec::new();
+    };
+    let Some(method_id) = program.symbol_at(file, method_name.ident_range().start()) else {
+        return Vec::new();
+    };
+
+    let symbol = program.symbols.get(method_id);
+    if symbol.kind != SymbolKind::Method {
+        return Vec::new();
+    }
+    let Some(container) = symbol.container else {
+        return Vec::new();
+    };
+    if program.symbols.get(container).kind == SymbolKind::Interface {
+        return Vec::new();
+    }
+    if method_override_chain_reason(program, method_id).is_some() {
+        return Vec::new();
+    }
+    let has_sibling_overload = program.symbols.members_of(container).iter().any(|&m| {
+        m != method_id
+            && program.symbols.get(m).kind == SymbolKind::Method
+            && program.symbols.get(m).name.eq_ignore_ascii_case(&symbol.name)
+    });
+    if has_sibling_overload {
+        return Vec::new();
+    }
+
+    let params: Vec<FormalParam> = param_list.params().collect();
+    let Some(param_index) = params.iter().position(|p| p.syntax() == param.syntax()) else {
+        return Vec::new();
+    };
+
+    let mut ops: Vec<(&'static str, ParamOp)> = Vec::new();
+    if params.len() >= 2 {
+        ops.push(("Rotate parameters left", ParamOp::RotateLeft));
+        ops.push(("Rotate parameters right", ParamOp::RotateRight));
+    }
+    let remove_title = format!(
+        "Remove parameter '{}'",
+        params[param_index].name().and_then(|n| n.text()).unwrap_or_default()
+    );
+
+    ops.into_iter()
+        .chain(std::iter::once((remove_title.as_str(), ParamOp::RemoveAt(param_index))))
+        .filter_map(|(title, op)| {
+            let edit = parameter_op_workspace_edit(program, method_id, op, encoding)?;
+            Some(CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.to_string(),
+                kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                edit: Some(edit),
+                ..Default::default()
+            }))
         })
         .collect()
 }

@@ -670,11 +670,15 @@ impl LanguageServer for Backend {
                     workspace_symbol_provider: Some(OneOf::Left(true)),
                     folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                     selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
-                    // Only `QUICKFIX` offered -- the only kind `code_action`
-                    // ever returns today (`capabilities::dead_code_actions`).
+                    // `QUICKFIX` (`capabilities::dead_code_actions`) and
+                    // `REFACTOR_REWRITE` (`capabilities::parameter_reorder_actions`)
+                    // -- the only two kinds `code_action` ever returns today.
                     code_action_provider: Some(CodeActionProviderCapability::Options(
                         CodeActionOptions {
-                            code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                            code_action_kinds: Some(vec![
+                                CodeActionKind::QUICKFIX,
+                                CodeActionKind::REFACTOR_REWRITE,
+                            ]),
                             ..Default::default()
                         },
                     )),
@@ -1325,7 +1329,11 @@ impl LanguageServer for Backend {
     /// requested range. Re-derives dead symbols from `program` itself
     /// rather than trusting `params.context.diagnostics`, so this works
     /// even for a client that requests code actions without having first
-    /// displayed/round-tripped the diagnostic.
+    /// displayed/round-tripped the diagnostic. Also offers
+    /// `capabilities::parameter_reorder_actions` ("Rotate parameters
+    /// left/right"/"Remove parameter ...") when the requested range lands
+    /// on a non-virtual, non-overloaded method's own parameter -- see that
+    /// function's own doc comment for exactly which methods qualify.
     fn code_action(
         &mut self,
         params: CodeActionParams,
@@ -1347,7 +1355,10 @@ impl LanguageServer for Backend {
             let Some(file) = program.file_id(&path) else {
                 return Ok(None);
             };
-            let actions = capabilities::dead_code_actions(program, file, range, encoding);
+            let mut actions = capabilities::dead_code_actions(program, file, range, encoding);
+            actions.extend(capabilities::parameter_reorder_actions(
+                program, file, range, encoding,
+            ));
             Ok((!actions.is_empty()).then_some(actions))
         })
     }
