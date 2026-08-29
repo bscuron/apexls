@@ -939,6 +939,35 @@ pub(crate) fn resolve_type_ref(
     enclosing_type: Option<SymbolId>,
     ty: &Type,
 ) -> Option<Ty> {
+    let element = resolve_type_ref_base(table, schema, stdlib, refs, file, enclosing_type, ty)?;
+    // Legacy `Type[]` array sugar (`Object[]`, `Id[]`, ...) is Apex's own
+    // shorthand for `List<Type>` -- the compiler treats the two completely
+    // interchangeably, right down to `isEmpty()`/`size()`/`add()` working
+    // identically on either spelling (real NPSP shape:
+    // `fflib_Match.gatherMatchers(Object[] ignoredMatcherObjects)` calling
+    // `.isEmpty()`/`.size()` on its `Object[]`-typed parameter). Without
+    // this, `ty.text()`/`base_name_tokens()` already strip the `[]` suffix
+    // before `resolve_type_ref_base` ever sees it (see their own doc
+    // comments), so an array-typed reference resolved as its bare element
+    // type instead -- `Object[]` came out identical to `Object`, which has
+    // no `List` methods at all, and every member access on it fell
+    // straight to `Unresolved`.
+    if ty.is_array() {
+        Some(Ty::system_owned("List", vec![element]))
+    } else {
+        Some(element)
+    }
+}
+
+fn resolve_type_ref_base(
+    table: &SymbolTable,
+    schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
+    refs: &mut ReferenceTable,
+    file: FileId,
+    enclosing_type: Option<SymbolId>,
+    ty: &Type,
+) -> Option<Ty> {
     let name = ty.text();
     let ptr = SyntaxPtr::new(file, ty.syntax());
     let segments = ty.base_name_tokens();

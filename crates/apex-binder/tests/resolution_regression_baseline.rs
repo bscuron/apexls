@@ -586,8 +586,31 @@ fn corpus_root() -> PathBuf {
 ///     alone couldn't provide. `BASELINE_UNRESOLVED` dropped -412
 ///     (`6_643` -> `6_231`); `BASELINE_RESOLVED` rose +1 (`206_740` ->
 ///     `206_741`).
-const BASELINE_RESOLVED: usize = 206_741;
-const BASELINE_UNRESOLVED: usize = 6_231;
+///
+/// 21. Legacy `Type[]` array sugar (`Object[]`, `String[]`, ...) never
+///     accounted for `apex_syntax::ast::Type::is_array` anywhere: both
+///     `resolve::resolve_type_ref` (an expression's/declared type's
+///     inferred `Ty`) and `collect::type_ptr_and_name` (a `Symbol`'s
+///     cached `type_name`/`type_args`, used by overload narrowing) read
+///     an array type's base name and generic args exactly as if the `[]`
+///     weren't there, since `Type::text()`/`base_name_tokens()`/
+///     `type_args()` all already strip it (real NPSP shape:
+///     `fflib_Match.gatherMatchers(Object[] ignoredMatcherObjects)`
+///     calling `.isEmpty()`/`.size()` on the parameter -- `Object[]`
+///     resolved as bare `Object`, which has neither method, so both
+///     calls landed in `Unresolved`). Fixed by treating `Type[]`
+///     identically to `List<Type>` at both call sites. Also flipped one
+///     overload resolution from an accidental correct guess to a
+///     principled one: `UTIL_Query.withSelectFields`'s `Set<String>` vs.
+///     `String[]` overloads previously disambiguated only because a
+///     `new String[]{...}` argument and the `String[]` parameter were
+///     *both* miscounted as bare `String` (an incidental exact-string
+///     match); now both are correctly `List<String>`, still uniquely
+///     eliminating the `Set<String>` overload. `BASELINE_UNRESOLVED`
+///     dropped -55 (`6_231` -> `6_176`); `BASELINE_RESOLVED` rose +662
+///     (`206_741` -> `207_403`).
+const BASELINE_RESOLVED: usize = 207_403;
+const BASELINE_UNRESOLVED: usize = 6_176;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

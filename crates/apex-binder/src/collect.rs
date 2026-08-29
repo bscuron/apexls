@@ -84,11 +84,27 @@ fn type_ptr_and_name(
 ) -> (Option<AstPtr<Type>>, Option<SmolStr>, Vec<SmolStr>) {
     match ty {
         Some(ty) => {
+            let base_name = ty.text();
             let args = ty
                 .type_args()
                 .map(|list| list.args().map(|a| a.text()).collect())
                 .unwrap_or_default();
-            (Some(AstPtr::new(file, &ty)), Some(ty.text()), args)
+            // Legacy `Type[]` array sugar (`String[]`, `Object[]`, ...) is
+            // Apex's own shorthand for `List<Type>` -- interchangeable
+            // right down to overload resolution (real NPSP shape:
+            // `UTIL_Query.withSelectFields` overloaded on `Set<String>`
+            // vs. `String[]`, only disambiguable if `String[]` is compared
+            // as `List<String>`, not as bare `String`). `ty.text()`/
+            // `type_args()` already strip the `[]` suffix (see their own
+            // doc comments) and it carries no `<...>` of its own, so
+            // without this an array-sugared declared type cached here as
+            // its bare element name -- indistinguishable from a genuinely
+            // non-generic declaration of that same name.
+            if ty.is_array() {
+                (Some(AstPtr::new(file, &ty)), Some(SmolStr::new_static("List")), vec![base_name])
+            } else {
+                (Some(AstPtr::new(file, &ty)), Some(base_name), args)
+            }
         }
         None => (None, None, Vec::new()),
     }
