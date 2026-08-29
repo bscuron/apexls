@@ -78730,6 +78730,148 @@
     "properties": []
   },
   {
+    "page_id": "apex_pages_message_class",
+    "name": "ApexPages.Message",
+    "kind": "Class",
+    "namespace": "ApexPages",
+    "description": "Represents a single message, either informational, warning, or error, that's associated with a Visualforce page. Hand-added and verified against a live connected org (sf apex run) -- this page's own scraped entry (kind: Unknown, no methods/properties captured) never made it into the bundled snapshot, the same gap Exception/Trigger had before being hand-corrected the same way.",
+    "methods": [
+      {
+        "anchor_id": "apex_pages_message_ctor_2",
+        "name": "Message",
+        "signature": "public Message(ApexPages.Severity severity, String summary)",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": null,
+        "params": [
+          {
+            "name": "severity",
+            "type_name": "ApexPages.Severity"
+          },
+          {
+            "name": "summary",
+            "type_name": "String"
+          }
+        ],
+        "description": "Creates a new message with the specified severity and summary."
+      },
+      {
+        "anchor_id": "apex_pages_message_ctor_3",
+        "name": "Message",
+        "signature": "public Message(ApexPages.Severity severity, String summary, String detail)",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": null,
+        "params": [
+          {
+            "name": "severity",
+            "type_name": "ApexPages.Severity"
+          },
+          {
+            "name": "summary",
+            "type_name": "String"
+          },
+          {
+            "name": "detail",
+            "type_name": "String"
+          }
+        ],
+        "description": "Creates a new message with the specified severity, summary, and detail."
+      },
+      {
+        "anchor_id": "apex_pages_message_getSummary",
+        "name": "getSummary",
+        "signature": "public String getSummary()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "String",
+        "params": [],
+        "description": "Returns the summary text of the message."
+      },
+      {
+        "anchor_id": "apex_pages_message_getDetail",
+        "name": "getDetail",
+        "signature": "public String getDetail()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "String",
+        "params": [],
+        "description": "Returns the detail text of the message."
+      },
+      {
+        "anchor_id": "apex_pages_message_getSeverity",
+        "name": "getSeverity",
+        "signature": "public ApexPages.Severity getSeverity()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "ApexPages.Severity",
+        "params": [],
+        "description": "Returns the severity of the message."
+      },
+      {
+        "anchor_id": "apex_pages_message_getComponentLabel",
+        "name": "getComponentLabel",
+        "signature": "public String getComponentLabel()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "String",
+        "params": [],
+        "description": "Returns the label of the component associated with the message, if any."
+      }
+    ],
+    "properties": []
+  },
+  {
+    "page_id": "apex_pages_severity_enum",
+    "name": "ApexPages.Severity",
+    "kind": "Enum",
+    "namespace": null,
+    "description": "Represents the severity of an ApexPages.Message. Hand-added and verified against a live connected org (sf apex run) -- this page's own scraped entry never made it into the bundled snapshot, the same gap Exception/Trigger had before being hand-corrected the same way.",
+    "methods": [],
+    "properties": [
+      {
+        "anchor_id": "apex_pages_severity_CONFIRM",
+        "name": "CONFIRM",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "ApexPages.Severity",
+        "description": "A confirmation message."
+      },
+      {
+        "anchor_id": "apex_pages_severity_ERROR",
+        "name": "ERROR",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "ApexPages.Severity",
+        "description": "An error message."
+      },
+      {
+        "anchor_id": "apex_pages_severity_FATAL",
+        "name": "FATAL",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "ApexPages.Severity",
+        "description": "A fatal error message."
+      },
+      {
+        "anchor_id": "apex_pages_severity_INFO",
+        "name": "INFO",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "ApexPages.Severity",
+        "description": "An informational message."
+      },
+      {
+        "anchor_id": "apex_pages_severity_WARNING",
+        "name": "WARNING",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "ApexPages.Severity",
+        "description": "A warning message."
+      }
+    ]
+  },
+  {
     "page_id": "apex_methods_system_approval",
     "name": "Approval",
     "kind": "Class",

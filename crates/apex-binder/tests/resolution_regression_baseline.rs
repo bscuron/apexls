@@ -668,8 +668,38 @@ fn corpus_root() -> PathBuf {
 ///
 ///     `BASELINE_UNRESOLVED` dropped -433 (`6_157` -> `5_724`);
 ///     `BASELINE_RESOLVED` rose +354 (`207_422` -> `207_776`).
+///
+/// 24. Two more gaps from the same sweep, fixed together:
+///
+///     - A *standard* relationship name (`Contact.Account`,
+///       `OpportunityContactRole.Opportunity`, `Owner`, `CreatedBy`, ...)
+///       had no field entry of its own to look up at all -- only the
+///       underlying `...Id` reference field is ever scraped/discovered,
+///       never the relationship name Apex code actually traverses with.
+///       Real NPSP shape: `queryCon[0].Account.Name` dead-ended right
+///       after `.Account`, even though `Contact.AccountId` itself
+///       resolves fine. Fixed with `SchemaIndex::standard_relationship_field`,
+///       a best-effort fallback (documented as such, not a guarantee --
+///       see its own doc comment) that derives the relationship name
+///       from a real `<Name>Id` field by stripping the trailing `Id`,
+///       the one transform Salesforce's own naming convention actually
+///       guarantees for the common case.
+///     - `ApexPages.Severity` (an enum) and `ApexPages.Message` (a
+///       class) had no bundled stdlib entry at all -- confirmed directly
+///       against the raw `apex_reference.json`, the same scraper gap
+///       `Exception`/`Trigger` had before being hand-corrected. Both
+///       hand-added the same way, with real members verified against a
+///       live connected org (`sf apex run`) rather than guessed --
+///       confirmed along the way that `ApexPages.Message` has no
+///       single-`String` constructor and no `setComponentLabel`/
+///       `getStrength` methods, despite those being plausible guesses.
+///
+///     `BASELINE_UNRESOLVED` dropped -186 (`5_724` -> `5_538`);
+///     `BASELINE_RESOLVED` unaffected (`207_776` unchanged -- a schema
+///     field/stdlib member reference lands in the untallied
+///     `Resolution::SchemaObject`/`StdlibMember` bucket, not `Resolved`).
 const BASELINE_RESOLVED: usize = 207_776;
-const BASELINE_UNRESOLVED: usize = 5_724;
+const BASELINE_UNRESOLVED: usize = 5_538;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

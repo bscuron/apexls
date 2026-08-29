@@ -496,6 +496,47 @@ mod tests {
         assert!(test_classes.iter().any(|c| c.namespace.as_deref() == Some("System")));
     }
 
+    /// `ApexPages.Message`/`ApexPages.Severity` had no scraped page at all
+    /// captured with real content (unlike the sibling `ApexPages.Action`
+    /// tested above) -- hand-added directly to `data/apex_reference.json`
+    /// and verified against a live connected org (`sf apex run`), the
+    /// same "measure, don't guess" discipline `Exception`/`Trigger`'s own
+    /// hand-corrected entries already use (see `standard_classes`'s doc
+    /// comment). Confirmed empirically that `ApexPages.Message` has no
+    /// single-`String` constructor and no `setComponentLabel`/
+    /// `getStrength` methods, despite those being plausible guesses from
+    /// the sibling `getComponentLabel` getter.
+    #[test]
+    fn apexpages_message_and_severity_are_bundled_as_nested_types() {
+        let classes = standard_classes();
+        let message = classes
+            .iter()
+            .find(|c| c.name == "ApexPages.Message")
+            .expect("ApexPages.Message should be in the bundled snapshot");
+        let ctor_overloads: Vec<_> = message.methods.iter().filter(|m| m.name == "Message").collect();
+        assert_eq!(ctor_overloads.len(), 2, "expected both real Message constructors");
+        for getter in ["getSummary", "getDetail", "getSeverity", "getComponentLabel"] {
+            assert!(
+                message.methods.iter().any(|m| m.name == getter),
+                "expected {getter} on ApexPages.Message"
+            );
+        }
+
+        let severity = classes
+            .iter()
+            .find(|c| c.name == "ApexPages.Severity")
+            .expect("ApexPages.Severity should be in the bundled snapshot");
+        for value in ["CONFIRM", "ERROR", "FATAL", "INFO", "WARNING"] {
+            let prop = severity
+                .properties
+                .iter()
+                .find(|p| p.name == value)
+                .unwrap_or_else(|| panic!("expected ApexPages.Severity.{value}"));
+            assert!(prop.is_static);
+            assert_eq!(prop.type_name.as_deref(), Some("ApexPages.Severity"));
+        }
+    }
+
     #[test]
     fn normalize_type_string_collapses_whitespace_and_rewrites_array_sugar() {
         assert_eq!(normalize_type_string("Map <String, Boolean>").as_str(), "Map<String,Boolean>");

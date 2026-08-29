@@ -93,7 +93,7 @@ impl SchemaIndex {
             // Tried only once the object's own real fields have already
             // missed, so a project that *does* declare a custom field
             // that happens to share one of these names still wins.
-            None => universal_field(field_api_name),
+            None => universal_field(field_api_name).or_else(|| standard_relationship_field(entry, field_api_name)),
         }
     }
 
@@ -202,10 +202,10 @@ pub(crate) fn resolve_object(
 /// many objects [`SchemaIndex::field`] falls back to it for, so there's
 /// no reason to rebuild it per object or per lookup. `Owner`/`CreatedBy`/
 /// `LastModifiedBy` are deliberately left out here -- those are
-/// *relationship* names, not field API names, and get no special
-/// handling for the same documented reason [`relationship_field_api_name`]
-/// doesn't attempt one either (a standard relationship name has no fixed
-/// transform this crate can derive).
+/// *relationship* names, not field API names, and `SchemaIndex::field`'s
+/// own further fallback to [`standard_relationship_field`] already
+/// derives them (as `OwnerId`/`CreatedById`/`LastModifiedById` minus
+/// their trailing `Id`) without needing a second, redundant listing here.
 fn universal_field(field_api_name: &str) -> Option<&'static FieldSchema> {
     static FIELDS: OnceLock<Vec<FieldSchema>> = OnceLock::new();
     fn field(api_name: &'static str, field_type: &'static str, reference_to: &[&'static str]) -> FieldSchema {
@@ -231,17 +231,57 @@ fn universal_field(field_api_name: &str) -> Option<&'static FieldSchema> {
     fields.iter().find(|f| f.api_name.eq_ignore_ascii_case(field_api_name))
 }
 
+/// A *standard* relationship name (`Account`, `Owner`, `CreatedBy`, ...)
+/// looked up against `entry`'s own real fields via the one fixed
+/// transform Salesforce's relationship-naming convention actually
+/// guarantees: for the overwhelming majority of reference fields, the
+/// relationship name is the field's own API name with a trailing `Id`
+/// stripped (`AccountId` -> `Account`, `OwnerId` -> `Owner`). Only
+/// consulted from [`SchemaIndex::field`] once `field_api_name` has
+/// already failed to match any real field there -- both to let a real
+/// field win on a collision, and because this is a best-effort derived
+/// name, not scraped/discovered data the way every other lookup here is:
+/// v1 doesn't model the full relationship-name table Salesforce derives
+/// server-side, so a standard relationship name that *doesn't* happen to
+/// equal its field's own API name minus `Id` (rare, but possible -- a
+/// polymorphic lookup's relationship name isn't always this predictable
+/// either) won't hop correctly. Real NPSP shape this fixed:
+/// `queryCon[0].Account.Name` -- `Contact.AccountId` is a real scraped
+/// field, but `Contact.Account` (the relationship traversal Apex code
+/// actually writes) had no field entry of its own at all, so the whole
+/// chain dead-ended right after `.Account`. Guards against `__r`-suffixed
+/// input even though real callers should never actually reach here with
+/// one (every caller already runs a `__r` name through
+/// `relationship_field_api_name` *before* calling `field`) -- appending
+/// `"Id"` to a literal `__r` string can never be a real field name, so
+/// this is defensive precision, not a load-bearing check.
+fn standard_relationship_field<'a>(entry: &'a ObjectEntry, field_api_name: &str) -> Option<&'a FieldSchema> {
+    if field_api_name.len() > 3 && field_api_name.to_ascii_lowercase().ends_with("__r") {
+        return None;
+    }
+    let candidate = format!("{field_api_name}Id");
+    // `<Name>Id` itself is often *also* one of `universal_field`'s own
+    // base fields (`Owner` -> `OwnerId`, `CreatedBy` -> `CreatedById`,
+    // `LastModifiedBy` -> `LastModifiedById`) rather than a field really
+    // listed on `entry` -- same reason those needed `universal_field` at
+    // all. Tried as a fallback, not the primary lookup, so a project
+    // that *does* declare a real `<Name>Id` field of its own still wins.
+    let field = match entry.fields.get(&CiQuery(&candidate)) {
+        Some(&idx) => entry.schema.fields.get(idx)?,
+        None => universal_field(&candidate)?,
+    };
+    (!field.reference_to.is_empty()).then_some(field)
+}
+
 /// A custom relationship name's field-schema-lookup form (`Batch__r` ->
 /// `Batch__c`) -- the common, documented Salesforce convention for
 /// custom lookup/master-detail fields; a standard relationship name
-/// (`Owner`, `CreatedBy`, ...) has no such transform and is looked up
-/// as-is. v1 doesn't model the full relationship-name table Salesforce
-/// derives server-side, so a standard relationship name that doesn't
-/// happen to equal its field's own API name (rare, but possible) won't
-/// hop correctly -- an accepted, documented gap, not silently assumed
-/// away. Shared by `crate::soql` (a SOQL relationship-field chain) and
-/// `crate::resolve` (the same `__r` alias used in a plain Apex
-/// expression, e.g. `dataImport.Related__r.Name__c`).
+/// (`Owner`, `CreatedBy`, ...) has no such fixed suffix transform and is
+/// looked up as-is, falling to [`standard_relationship_field`]'s own
+/// best-effort `<Name>Id` -> `<Name>` derivation instead once it reaches
+/// [`SchemaIndex::field`]. Shared by `crate::soql` (a SOQL relationship-
+/// field chain) and `crate::resolve` (the same `__r` alias used in a
+/// plain Apex expression, e.g. `dataImport.Related__r.Name__c`).
 pub(crate) fn relationship_field_api_name(segment: &str) -> String {
     if segment.len() > 3 && segment.to_ascii_lowercase().ends_with("__r") {
         format!("{}__c", &segment[..segment.len() - 3])
