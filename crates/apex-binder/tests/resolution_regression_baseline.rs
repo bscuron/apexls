@@ -491,8 +491,26 @@ fn corpus_root() -> PathBuf {
 ///     documents for standard schema. `BASELINE_RESOLVED` rose +1
 ///     (`206_715` -> `206_716`), the same "argument/chain type newly
 ///     known" ripple effect documented in step 1.
+/// 18. Visualforce page references (`Page.<name>`, real Apex compiler-
+///     magic syntax -- `PageReference pr = Page.MyPage;`), found the same
+///     way as step 17: `examples/unresolved_clusters.rs`'s top clusters,
+///     re-run after step 17 landed. Unlike `Label`, there is no real
+///     "Page" class anywhere in Salesforce's own docs at all (confirmed:
+///     no such `apex_reference.json` entry), so the bare `Page` identifier
+///     itself has nothing to resolve to -- detected instead from the
+///     receiver's own raw token text in `bind_field_expr` (new
+///     `apex_binder::PageIndex`, keyed by a `.page` file's own file-stem
+///     name; no content parsing needed at all, unlike `LabelIndex`, since
+///     a page's name *is* its file's base name). `classify_unresolved`
+///     (`apexls-server`) extended to grade the bare `Page` identifier's
+///     own still-`Unresolved` outcome `WARNING` rather than `ERROR` --
+///     without that, every real `Page.<name>` reference would still show
+///     one spurious `ERROR` apiece even after the reference as a whole
+///     resolves correctly. `BASELINE_UNRESOLVED` dropped -117 (`7_097` ->
+///     `6_980`); `BASELINE_RESOLVED` unaffected (`VisualforcePage` isn't
+///     tallied by either counter, same as `Label`/`StdlibMember`).
 const BASELINE_RESOLVED: usize = 206_716;
-const BASELINE_UNRESOLVED: usize = 7_097;
+const BASELINE_UNRESOLVED: usize = 6_980;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {
@@ -514,7 +532,8 @@ fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {
             | Resolution::SchemaObject(_)
             | Resolution::UnknownSchema(_)
             | Resolution::StdlibMember(_)
-            | Resolution::Label(_) => {}
+            | Resolution::Label(_)
+            | Resolution::VisualforcePage(_) => {}
         }
     }
 

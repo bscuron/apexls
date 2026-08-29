@@ -792,8 +792,8 @@ impl LanguageServer for Backend {
     /// `capabilities::describe_symbol`'s doc comment for how a `Symbol`
     /// becomes hover text. `Candidates` (no overload narrowing for a bare
     /// name) shows the first candidate plus an honest "+N more" note
-    /// rather than silently picking one; `StdlibMember`/`Label` render via
-    /// their own describe functions; `SchemaObject`/`UnknownSchema`/
+    /// rather than silently picking one; `StdlibMember`/`Label`/
+    /// `VisualforcePage` render via their own describe functions; `SchemaObject`/`UnknownSchema`/
     /// `Unresolved`/no bind yet all fall through to no hover, matching
     /// this binder's existing honesty about the still-unmodeled stdlib/
     /// schema surface (`BACKLOG.md` §4).
@@ -834,6 +834,7 @@ impl LanguageServer for Backend {
                     }),
                     Some(Resolution::StdlibMember(r)) => capabilities::describe_stdlib_member(program, r),
                     Some(Resolution::Label(r)) => capabilities::describe_label(program, r),
+                    Some(Resolution::VisualforcePage(r)) => capabilities::describe_visualforce_page(program, r),
                     _ => None,
                 }
             };
@@ -977,6 +978,9 @@ impl LanguageServer for Backend {
                 }
                 Some(Resolution::Label(r)) => {
                     capabilities::label_location(program, r).map(GotoDefinitionResponse::Scalar)
+                }
+                Some(Resolution::VisualforcePage(r)) => {
+                    capabilities::visualforce_page_location(program, r).map(GotoDefinitionResponse::Scalar)
                 }
                 _ => None,
             };

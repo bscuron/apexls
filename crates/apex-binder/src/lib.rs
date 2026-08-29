@@ -44,6 +44,7 @@ mod generics;
 mod incremental;
 mod inherit;
 mod label_index;
+mod page_index;
 mod ptr;
 mod reference_table;
 mod resolve;
@@ -62,9 +63,11 @@ pub use file_id::FileId;
 pub use incremental::BindCache;
 pub use ptr::{AstPtr, SyntaxPtr};
 pub use reference_table::{
-    ExternalKey, LabelRef, ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef, UnknownSchemaRef,
+    ExternalKey, LabelRef, ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef,
+    UnknownSchemaRef, VisualforcePageRef,
 };
 pub use label_index::LabelIndex;
+pub use page_index::{PageIndex, VisualforcePage};
 pub use schema_index::SchemaIndex;
 pub use stdlib_index::StdlibIndex;
 pub use scope::{Scope, ScopeId, ScopeKind, ScopeTree};
@@ -133,6 +136,10 @@ pub struct BoundProgram {
     /// the same reason: derived from the same directory walk, only
     /// redone on the same `need_fresh_discovery` trigger.
     pub labels: Arc<LabelIndex>,
+    /// Every project-declared Visualforce page, keyed by file-stem name --
+    /// what a `Page.<name>` reference resolves against. `Arc`-wrapped and
+    /// rebuilt alongside `schema`/`labels` for the same reason.
+    pub pages: Arc<PageIndex>,
     bodies: FxHashMap<FileId, Arc<FileBodies>>,
     /// Every class name (lowercased) a real `.page` file names as its
     /// `controller`/`extensions` -- `crate::dead_code`'s Visualforce-
@@ -280,15 +287,23 @@ impl BoundProgram {
                 let vf_referenced_classes = Arc::new(
                     apex_metadata::visualforce::referenced_controller_classes(&discovery.page_files),
                 );
+                // No `rayon::join` needed here, unlike `schema`/`labels`
+                // above: unlike those, there's no bundled JSON snapshot or
+                // file content to parse at all -- a page's own name is
+                // just its already-in-memory file-stem (see `PageIndex`'s
+                // own doc comment), so building this is effectively free.
+                let pages = Arc::new(PageIndex::from_discovery(&discovery));
                 cache.discovery = Some(discovery);
                 cache.schema = Some(schema);
                 cache.labels = Some(labels);
+                cache.pages = Some(pages);
                 cache.vf_referenced_classes = Some(vf_referenced_classes);
             });
         }
         let discovery = cache.discovery.as_ref().unwrap();
         let schema = Arc::clone(cache.schema.as_ref().unwrap());
         let labels = Arc::clone(cache.labels.as_ref().unwrap());
+        let pages = Arc::clone(cache.pages.as_ref().unwrap());
         let stdlib = global_stdlib_index();
         let vf_referenced_classes = Arc::clone(cache.vf_referenced_classes.as_ref().unwrap());
 
@@ -613,7 +628,16 @@ impl BoundProgram {
                     .par_iter()
                     .flat_map(|(file, id, symbol)| {
                         let root_node = parse_by_file[file].syntax();
-                        bind_symbol_body(&cache.table, &schema, &stdlib, &labels, &root_node, *id, symbol)
+                        bind_symbol_body(
+                            &cache.table,
+                            &schema,
+                            &stdlib,
+                            &labels,
+                            &pages,
+                            &root_node,
+                            *id,
+                            symbol,
+                        )
                             .into_iter()
                             .map(move |(key, body)| (*file, key, body))
                             .collect::<Vec<_>>()
@@ -737,6 +761,7 @@ impl BoundProgram {
             schema,
             stdlib,
             labels,
+            pages,
             bodies,
             vf_referenced_classes,
         }
@@ -1185,11 +1210,13 @@ pub(crate) fn enclosing_type_of(table: &SymbolTable, symbol: &Symbol) -> Option<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_symbol_body(
     table: &SymbolTable,
     schema: &SchemaIndex,
     stdlib: &StdlibIndex,
     labels: &LabelIndex,
+    pages: &PageIndex,
     root: &SyntaxNode,
     id: SymbolId,
     symbol: &Symbol,
@@ -1228,6 +1255,7 @@ fn bind_symbol_body(
                     schema,
                     stdlib,
                     labels,
+                    pages,
                     symbol.file,
                     symbol.container,
                     Some(id),
@@ -1252,6 +1280,7 @@ fn bind_symbol_body(
                 schema,
                 stdlib,
                 labels,
+                pages,
                 symbol.file,
                 symbol.container,
                 Some(id),
@@ -1272,6 +1301,7 @@ fn bind_symbol_body(
                         schema,
                         stdlib,
                         labels,
+                        pages,
                         symbol.file,
                         symbol.container,
                         None,
@@ -1297,6 +1327,7 @@ fn bind_symbol_body(
                     schema,
                     stdlib,
                     labels,
+                    pages,
                     symbol.file,
                     symbol.container,
                     &init,
@@ -1328,6 +1359,7 @@ fn bind_symbol_body(
                     schema,
                     stdlib,
                     labels,
+                    pages,
                     symbol.file,
                     Some(id),
                     &block,

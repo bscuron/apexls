@@ -8,6 +8,7 @@ use crate::line_index::{LineIndex, PositionEncoding};
 use apex_binder::{
     BoundProgram, CompletionCandidate, CompletionCandidateKind, FileId, LabelRef, Resolution,
     SchemaObjectRef, StdlibMemberRef, Symbol, SymbolId, SymbolKind, SyntaxPtr, Visibility,
+    VisualforcePageRef,
 };
 use apex_syntax::ast::decl::{
     ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, HasDocComment, InterfaceDecl, MethodDecl,
@@ -147,6 +148,33 @@ pub(crate) fn describe_label(program: &BoundProgram, r: &LabelRef) -> Option<Str
         Some(value) => format!("```apex\nLabel.{}\n```\n\n{value}", label.full_name),
         None => format!("```apex\nLabel.{}\n```", label.full_name),
     })
+}
+
+/// A `Resolution::VisualforcePage` resolution's goto-definition target:
+/// the page's own `.page` file. Always points at the file's very start --
+/// there's no finer-grained position to point at (a `Page.<name>`
+/// reference doesn't name any specific markup inside the page, just the
+/// page as a whole).
+pub(crate) fn visualforce_page_location(program: &BoundProgram, r: &VisualforcePageRef) -> Option<Location> {
+    let page = program.pages.get(&r.name)?;
+    let uri = Url::from_file_path(&page.path).ok()?;
+    Some(Location {
+        uri,
+        range: Range::default(),
+    })
+}
+
+/// Renders a `Resolution::VisualforcePage` reference as Markdown hover
+/// text -- there's no further description to show beyond the page's own
+/// name and that it's a `PageReference` (unlike a label, a `.page` file
+/// has no single short "value" text of its own to surface), but a hover
+/// still confirms the reference resolved to a real, specific page rather
+/// than showing nothing at all.
+pub(crate) fn describe_visualforce_page(program: &BoundProgram, r: &VisualforcePageRef) -> Option<String> {
+    program
+        .pages
+        .get(&r.name)
+        .map(|page| format!("```apex\nPage.{}\n```\n\nVisualforce page (`PageReference`)", page.name))
 }
 
 /// Renders `id` as Markdown hover text: a fenced-code signature line
@@ -1200,8 +1228,29 @@ fn classify_unresolved(program: &BoundProgram, ptr: SyntaxPtr, name: &str) -> Op
         // missed exactly the most common real case (confirmed against a
         // real `System.String` reference, where `"System"`'s own token
         // kind is `SyntaxKind::System`, not `Identifier`).
-        SyntaxKind::NameExpr
-        | SyntaxKind::FieldExpr
+        // The bare `Page` identifier in `Page.<name>` (a Visualforce page
+        // reference) -- unlike `Label`/`Schema`, there is no real "Page"
+        // class anywhere in Salesforce's own docs for this to resolve
+        // against (confirmed: no such `apex_reference.json` entry), so it
+        // stays `Unresolved` by design even when the *whole* `Page.<name>`
+        // reference resolves correctly one level up
+        // (`resolve::bind_field_expr`'s own doc comment on this exact
+        // shape). Scoped specifically to a `NameExpr` whose own parent is
+        // a `FieldExpr` (the receiver position) so an unrelated variable
+        // that happens to be named `page` doesn't get misclassified.
+        SyntaxKind::NameExpr => {
+            let root = program.syntax(ptr.file());
+            let is_page_namespace_prefix = ptr.to_node(&root).and_then(NameExpr::cast).is_some_and(|ne| {
+                ne.name_token().is_some_and(|t| t.text().eq_ignore_ascii_case("Page"))
+                    && ne.syntax().parent().is_some_and(|p| p.kind() == SyntaxKind::FieldExpr)
+            });
+            is_page_namespace_prefix.then_some(
+                "the bare `Page` identifier is pure compiler-magic Visualforce-page-reference \
+                 syntax with no real declaration of its own -- only the page name after the dot \
+                 needs to exist",
+            )
+        }
+        SyntaxKind::FieldExpr
         | SyntaxKind::Type
         | SyntaxKind::MethodCallExpr
         | SyntaxKind::NewExpr

@@ -108,6 +108,16 @@ pub struct LabelRef {
     pub full_name: SmolStr,
 }
 
+/// A Visualforce page reference (`Page.<name>`) -- sourced from
+/// `crate::page_index::PageIndex` (a `.page` file's own name), the same
+/// project-metadata-not-bundled-docs distinction `LabelRef` draws.
+/// `name` alone is enough identity to look the rest (the page's own file
+/// path) back up via `PageIndex`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisualforcePageRef {
+    pub name: SmolStr,
+}
+
 /// `SchemaObject`/`UnknownSchema`/`StdlibMember` box their payload so
 /// their `SmolStr`-carrying fields don't force every other variant -- in
 /// particular the by-far-most-common `Resolved`/`Unresolved`, one entry
@@ -121,6 +131,7 @@ pub enum Resolution {
     UnknownSchema(Box<UnknownSchemaRef>),
     StdlibMember(Box<StdlibMemberRef>),
     Label(Box<LabelRef>),
+    VisualforcePage(Box<VisualforcePageRef>),
     Unresolved,
 }
 
@@ -175,6 +186,9 @@ pub enum ExternalKey {
     Label {
         full_name: SmolStr,
     },
+    VisualforcePage {
+        name: SmolStr,
+    },
 }
 
 /// `external_key()` calls this for every `SchemaObject`/`UnknownSchema`/
@@ -221,6 +235,7 @@ impl Resolution {
             | Resolution::UnknownSchema(_)
             | Resolution::StdlibMember(_)
             | Resolution::Label(_)
+            | Resolution::VisualforcePage(_)
             | Resolution::Unresolved => &[],
         }
     }
@@ -268,6 +283,9 @@ impl Resolution {
             }),
             Resolution::Label(r) => Some(ExternalKey::Label {
                 full_name: lower(&r.full_name),
+            }),
+            Resolution::VisualforcePage(r) => Some(ExternalKey::VisualforcePage {
+                name: lower(&r.name),
             }),
             Resolution::Resolved(_) | Resolution::Candidates(_) | Resolution::Unresolved => None,
         }

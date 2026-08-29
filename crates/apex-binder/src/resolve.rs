@@ -52,9 +52,11 @@
 use crate::conversions;
 use crate::file_id::FileId;
 use crate::label_index::LabelIndex;
+use crate::page_index::PageIndex;
 use crate::ptr::{AstPtr, SyntaxPtr};
 use crate::reference_table::{
     LabelRef, ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef, UnknownSchemaRef,
+    VisualforcePageRef,
 };
 use crate::schema_index::{relationship_field_api_name, SchemaIndex};
 use crate::scope::{ScopeId, ScopeKind, ScopeTree};
@@ -722,6 +724,7 @@ pub(crate) struct BodyBinder<'a> {
     pub(crate) schema: &'a SchemaIndex,
     pub(crate) stdlib: &'a StdlibIndex,
     pub(crate) labels: &'a LabelIndex,
+    pub(crate) pages: &'a PageIndex,
     pub(crate) refs: ReferenceTable,
     pub(crate) scopes: ScopeTree,
     pending_locals: Vec<Symbol>,
@@ -749,6 +752,7 @@ pub(crate) fn bind_body(
     schema: &SchemaIndex,
     stdlib: &StdlibIndex,
     labels: &LabelIndex,
+    pages: &PageIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     enclosing_member: Option<SymbolId>,
@@ -761,6 +765,7 @@ pub(crate) fn bind_body(
         schema,
         stdlib,
         labels,
+        pages,
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
@@ -781,12 +786,14 @@ pub(crate) fn bind_body(
 /// shaped children only) never reaches. Walks direct `Stmt` children
 /// alongside (interleaved with, in source order) the `Member`
 /// declarations Pass 1 already collected separately.
+#[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub(crate) fn bind_trigger_body(
     table: &SymbolTable,
     schema: &SchemaIndex,
     stdlib: &StdlibIndex,
     labels: &LabelIndex,
+    pages: &PageIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     block: &TriggerBlock,
@@ -797,6 +804,7 @@ pub(crate) fn bind_trigger_body(
         schema,
         stdlib,
         labels,
+        pages,
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
@@ -815,12 +823,14 @@ pub(crate) fn bind_trigger_body(
 /// Binds a bare expression with no enclosing statement context (a
 /// field/property initializer) -- member lookup only, no locals, no
 /// `ScopeTree` worth keeping around afterward.
+#[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub(crate) fn bind_initializer(
     table: &SymbolTable,
     schema: &SchemaIndex,
     stdlib: &StdlibIndex,
     labels: &LabelIndex,
+    pages: &PageIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     expr: &Expr,
@@ -831,6 +841,7 @@ pub(crate) fn bind_initializer(
         schema,
         stdlib,
         labels,
+        pages,
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
@@ -864,6 +875,7 @@ pub(crate) fn body_binder_for_completion<'a>(
     schema: &'a SchemaIndex,
     stdlib: &'a StdlibIndex,
     labels: &'a LabelIndex,
+    pages: &'a PageIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     enclosing_member: Option<SymbolId>,
@@ -874,6 +886,7 @@ pub(crate) fn body_binder_for_completion<'a>(
         schema,
         stdlib,
         labels,
+        pages,
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
@@ -2200,6 +2213,47 @@ impl<'a> BodyBinder<'a> {
                         None
                     }
                 };
+            }
+        }
+
+        // `Page.<name>` (`PageReference pr = Page.MyPage;`) -- pure
+        // compiler-magic syntax, unlike `Label`/`Schema`: there is no real
+        // "Page" class anywhere in Salesforce's own docs (confirmed: no
+        // such entry in `apex_reference.json`, unlike `Label`'s real
+        // `System.Label` one), so the bare `Page` identifier itself has
+        // nothing to resolve to and honestly stays `Resolution::Unresolved`
+        // via the ordinary `bind_expr` call for `f.target()` at the top of
+        // this function -- `target_type` is `None` here as a direct
+        // result. Detected instead from the receiver's own raw token text
+        // (there's no resolved `Ty` to key off, unlike every other special
+        // case in this function), the same "recognize the two-token shape
+        // itself" approach the `.class` idiom above already takes for a
+        // different reason. Only applies when nothing else already
+        // resolved as `Page` (`target_type.is_none()`) -- Apex doesn't
+        // reserve `Page` as a keyword, so a project genuinely declaring
+        // its own real `Page` type correctly shadows this instead. Always
+        // types as `PageReference` (a real, documented stdlib class) on a
+        // successful lookup, matching real Apex.
+        if target_type.is_none() {
+            if let Some(Expr::Name(target_name)) = f.target() {
+                if target_name
+                    .name_token()
+                    .is_some_and(|t| t.text().eq_ignore_ascii_case("Page"))
+                {
+                    return match self.pages.get(name) {
+                        Some(page) => {
+                            let resolution = Resolution::VisualforcePage(Box::new(VisualforcePageRef {
+                                name: page.name.clone(),
+                            }));
+                            self.refs.set_with_highlight(ptr, highlight, resolution);
+                            Some(Ty::system("PageReference"))
+                        }
+                        None => {
+                            self.refs.set_with_highlight(ptr, highlight, Resolution::Unresolved);
+                            None
+                        }
+                    };
+                }
             }
         }
 

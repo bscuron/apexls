@@ -67,7 +67,11 @@ fn write_fixture_dir(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("apexls-server-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for (file_name, src) in files {
-        std::fs::write(dir.join(file_name), src).unwrap();
+        let path = dir.join(file_name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, src).unwrap();
     }
     dir
 }
@@ -394,6 +398,47 @@ fn a_namespace_qualified_type_segment_is_reported_as_a_warning_not_an_error() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+const VISUALFORCE_PAGE_REF_SRC: &str =
+    "public class Foo {\n    public PageReference run() {\n        return Page.MyPage;\n    }\n}\n";
+
+/// The bare `Page` identifier in `Page.<name>` (a Visualforce page
+/// reference) has no real declaration of its own to resolve against --
+/// see `resolve::bind_field_expr`'s own doc comment -- so it stays
+/// `Unresolved`, but should be graded `WARNING`, not `ERROR`, since the
+/// *whole* `Page.MyPage` reference resolves correctly (a real `MyPage.page`
+/// file exists in this fixture).
+#[test]
+fn a_bare_page_namespace_prefix_is_reported_as_a_warning_not_an_error() {
+    let dir = write_fixture_dir(
+        "unresolved-page-prefix",
+        &[
+            ("Foo.cls", VISUALFORCE_PAGE_REF_SRC),
+            ("pages/MyPage.page", "<apex:page>Hello</apex:page>"),
+        ],
+    );
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+
+    let mut session = Session::start(&root_uri, &foo_uri, VISUALFORCE_PAGE_REF_SRC);
+
+    let notification = session.next_diagnostics();
+    let diagnostics = unresolved_reference_diagnostics(&notification);
+    assert_eq!(diagnostics.len(), 1, "expected only the bare `Page` prefix's own WARNING: {diagnostics:?}");
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic["severity"],
+        serde_json::json!(2),
+        "expected a WARNING, not an ERROR, since Page.MyPage as a whole resolves: {diagnostic:?}"
+    );
+    assert!(
+        diagnostic["message"].as_str().unwrap().contains("Page"),
+        "expected the message to name 'Page': {diagnostic:?}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A genuine typo *and* a catch-clause exception type in the same file --
 /// confirms the classifier runs per-reference within one merged
 /// `publishDiagnostics` notification, not just in isolation.
@@ -468,6 +513,38 @@ fn a_real_npsp_fflib_query_factory_file_has_no_error_severity_diagnostics() {
 fn a_real_npsp_fflib_security_utils_file_has_no_error_severity_diagnostics() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus/npsp");
     let file = root.join("force-app/infrastructure/apex-common/main/classes/fflib_SecurityUtils.cls");
+    let root_uri = Url::from_file_path(&root).unwrap();
+    let file_uri = Url::from_file_path(&file).unwrap();
+    let src = std::fs::read_to_string(&file).unwrap();
+
+    let mut session = Session::start(&root_uri, &file_uri, &src);
+
+    let notification = session.next_diagnostics();
+    let diagnostics = notification["params"]["diagnostics"].as_array().unwrap();
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d["severity"] == serde_json::json!(1))
+        .collect();
+    assert!(errors.is_empty(), "expected no ERROR-severity diagnostics: {errors:?}");
+
+    session.shutdown();
+}
+
+/// Third real-corpus smoke test, for the Visualforce-page integration
+/// specifically: `LVL_LevelEdit_TEST.cls` reads `Page.LVL_LevelEdit` four
+/// times (`Test.setCurrentPage(Page.LVL_LevelEdit)`) -- confirms
+/// `apex_discover::Discovery::page_files`, `apex_binder::PageIndex`, and
+/// `bind_field_expr`'s `Page.<name>` resolution wire together end to end,
+/// *and* that `classify_unresolved` grades the bare `Page` identifier's
+/// own still-`Unresolved` outcome (see `resolve::bind_field_expr`'s doc
+/// comment on why that's `Unresolved` by design, not a bug) as a
+/// `WARNING` rather than an `ERROR` -- without that, every `Page.<name>`
+/// reference in this file would still show one spurious `ERROR` apiece
+/// even though the reference as a whole resolves correctly.
+#[test]
+fn a_real_npsp_lvl_level_edit_test_file_has_no_error_severity_diagnostics() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus/npsp");
+    let file = root.join("force-app/main/default/classes/LVL_LevelEdit_TEST.cls");
     let root_uri = Url::from_file_path(&root).unwrap();
     let file_uri = Url::from_file_path(&file).unwrap();
     let src = std::fs::read_to_string(&file).unwrap();

@@ -1506,6 +1506,38 @@ supports each one.
       that segment against, the same class of gap `apex-metadata`'s own
       module doc comment already documents for standard schema.
       `BASELINE_UNRESOLVED`: `9,155` -> `7,097` (entry 17).
+
+      **Sixth round: not one file, and not found by file-by-file
+      dogfooding either -- `examples/unresolved_clusters.rs`'s top
+      clusters, re-run after the fifth round landed.** Its highest-ranked
+      shape was `Page.<name>` (Visualforce page references, real Apex
+      compiler-magic syntax -- `PageReference pr = Page.MyPage;`), ~200
+      references project-wide across several clusters (the receiver
+      itself, the `.member` hop, and further chained calls all showed up
+      as separate fingerprints). Unlike `Label`, there's no real "Page"
+      class anywhere in Salesforce's own docs at all (confirmed: no such
+      `apex_reference.json` entry) -- `Page` is pure syntax, not a
+      documented namespace, so the bare identifier has nothing to resolve
+      to and can't reuse `Label`'s `class_in_namespace`-fallback approach.
+      Fixed with a new `apex_binder::PageIndex` keyed by a `.page` file's
+      own file-stem name (no content parsing at all, unlike
+      `LabelIndex` -- a page's name *is* its file's base name), consulted
+      from a new check in `bind_field_expr` that recognizes the
+      `Page.<name>` shape from the receiver's own raw token text rather
+      than any resolved `Ty` (there isn't one to key off, unlike every
+      other special case in that function). New `Resolution::VisualforcePage`
+      variant, with real hover/goto-definition support
+      (`capabilities::describe_visualforce_page`/`visualforce_page_location`,
+      pointing at the page's own file). Also extended `classify_unresolved`
+      to grade the bare `Page` identifier's own still-honestly-`Unresolved`
+      outcome `WARNING` instead of the default `ERROR` -- caught during
+      this round's own real-corpus verification (`LVL_LevelEdit_TEST.cls`,
+      picked from the cluster report): without that, every real
+      `Page.<name>` reference still showed one spurious `ERROR` for the
+      bare prefix even after the `.member` hop itself started resolving
+      correctly, which would have made this fix look incomplete from a
+      diagnostics-only view. `BASELINE_UNRESOLVED`: `7,097` -> `6,980`
+      (entry 18).
 - [ ] **Duplicate/conflicting-modifier diagnostic -- a real gap, found via
       a user report.** `private private private private void foo() {`
       produces no error anywhere in the pipeline today: `grammar::declarations::modifiers`

@@ -30,6 +30,7 @@ struct Counts {
     unknown_schema: usize,
     stdlib_member: usize,
     label: usize,
+    visualforce_page: usize,
     unresolved: usize,
 }
 
@@ -52,6 +53,7 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
             Resolution::UnknownSchema(_) => counts.unknown_schema += 1,
             Resolution::StdlibMember(_) => counts.stdlib_member += 1,
             Resolution::Label(_) => counts.label += 1,
+            Resolution::VisualforcePage(_) => counts.visualforce_page += 1,
             Resolution::Unresolved => counts.unresolved += 1,
         }
     }
@@ -62,6 +64,7 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
         + counts.unknown_schema
         + counts.stdlib_member
         + counts.label
+        + counts.visualforce_page
         + counts.unresolved;
     assert!(
         total > 200_000,
@@ -106,6 +109,11 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
         counts.label > 1_000,
         "expected >1,000 Label references, got {}: {counts:?}",
         counts.label
+    );
+    assert!(
+        counts.visualforce_page > 50,
+        "expected >50 VisualforcePage references, got {}: {counts:?}",
+        counts.visualforce_page
     );
 
     let unresolved_ratio = counts.unresolved as f64 / total as f64;

@@ -200,6 +200,7 @@ fn member_access_context(
         &program.schema,
         &program.stdlib,
         &program.labels,
+        &program.pages,
         file,
         enclosing.enclosing_type,
         enclosing.enclosing_member,

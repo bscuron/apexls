@@ -11,6 +11,7 @@
 use crate::file_id::FileId;
 use crate::file_table::FileTable;
 use crate::label_index::LabelIndex;
+use crate::page_index::PageIndex;
 use crate::ptr::{AstPtr, SyntaxPtr};
 use crate::reference_table::ReferenceTable;
 use crate::schema_index::SchemaIndex;
@@ -107,6 +108,10 @@ pub struct BindCache {
     /// the same `need_fresh_discovery` trigger -- see
     /// `crate::label_index::LabelIndex`.
     pub(crate) labels: Option<Arc<LabelIndex>>,
+    /// Every project-declared Visualforce page, rebuilt alongside
+    /// `schema`/`labels` on the same `need_fresh_discovery` trigger -- see
+    /// `crate::page_index::PageIndex`.
+    pub(crate) pages: Option<Arc<PageIndex>>,
     /// Every class name (lowercased) a real `.page` file's `controller`/
     /// `extensions` attribute names -- rebuilt alongside `schema` on the
     /// same `need_fresh_discovery` trigger, since it's derived from the
