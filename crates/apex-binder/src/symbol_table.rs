@@ -637,34 +637,38 @@ impl SymbolTable {
     /// (`crate::inherit::resolve_inheritance`), which -- working from
     /// Pass 1's plain collected strings, not a live `Type` AST node --
     /// otherwise has no notion of "which type declared this name" context
-    /// at all, unlike every other `resolve_dotted_name` caller
-    /// (`crate::resolve::type_of_symbol`'s own declared-type case climbs
-    /// its symbol's enclosing chain separately, before ever calling
-    /// `resolve_dotted_name` plain). Real NPSP shape this fixes: `class
-    /// ObjectError extends Error` where `Error` is a *sibling* nested
-    /// class, both declared directly inside the same enclosing
-    /// `fflib_SObjectDomain` -- `resolve_dotted_name("Error")` alone only
-    /// ever checks `top_level`, which a nested class is never keyed
-    /// under, so `Error`'s own inherited fields (`message`, `domain`)
-    /// stayed permanently unreachable from `ObjectError`. Only tried for
-    /// a genuinely single-segment name, matching every other version of
-    /// this fallback's identical restriction: a dotted name that already
-    /// failed names a real (if unresolvable) top-level type as its first
+    /// at all (every other `resolve_dotted_name` caller with such a
+    /// context -- `crate::resolve::type_of_symbol`'s own declared-type
+    /// case -- climbs its own enclosing chain the identical way, and in
+    /// the identical order, rather than calling this). Real NPSP shape
+    /// this fixes: `class ObjectError extends Error` where `Error` is a
+    /// *sibling* nested class, both declared directly inside the same
+    /// enclosing `fflib_SObjectDomain` -- `resolve_dotted_name("Error")`
+    /// alone only ever checks `top_level`, which a nested class is never
+    /// keyed under, so `Error`'s own inherited fields (`message`,
+    /// `domain`) stayed permanently unreachable from `ObjectError`. Only
+    /// tried for a genuinely single-segment name, matching every other
+    /// version of this fallback's identical restriction: a dotted name
+    /// names a real (if unresolvable) top-level type as its first
     /// segment, not an unqualified nested-type reference to retry here.
     pub fn resolve_dotted_name_from(&self, name: &str, from: Option<SymbolId>) -> Option<SymbolId> {
-        if let Some(id) = self.resolve_dotted_name(name) {
-            return Some(id);
-        }
-        if name.contains('.') {
-            return None;
-        }
-        let mut current = from;
-        while let Some(container) = current {
-            if let Some(id) = self.nested_type_visible_from(container, name) {
-                return Some(id);
+        // Checked before the plain `resolve_dotted_name` fallback below,
+        // not after: real Apex resolves an unqualified name through the
+        // lexically enclosing scope first, only falling back to an
+        // unrelated top-level type of the same name -- confirmed
+        // empirically against a real org (`sf apex run`), and the same
+        // ordering fix `crate::resolve::type_of_symbol`/
+        // `crate::resolve::resolve_type_ref_base` both needed for the
+        // identical reason.
+        if !name.contains('.') {
+            let mut current = from;
+            while let Some(container) = current {
+                if let Some(id) = self.nested_type_visible_from(container, name) {
+                    return Some(id);
+                }
+                current = self.get(container).container;
             }
-            current = self.get(container).container;
         }
-        None
+        self.resolve_dotted_name(name)
     }
 }

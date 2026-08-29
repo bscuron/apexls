@@ -626,8 +626,50 @@ fn corpus_root() -> PathBuf {
 ///     real method already uses. `BASELINE_UNRESOLVED` dropped -19
 ///     (`6_176` -> `6_157`); `BASELINE_RESOLVED` rose +19 (`207_403` ->
 ///     `207_422`).
-const BASELINE_RESOLVED: usize = 207_422;
-const BASELINE_UNRESOLVED: usize = 6_157;
+///
+/// 23. Two unrelated, real gaps found from a corpus-wide error-diagnostic
+///     sweep (clustering every `ERROR`-severity `Resolution::Unresolved`
+///     reference, mirroring `capabilities.rs`'s own `classify_unresolved`
+///     split), fixed together:
+///
+///     - An unqualified type name that exists *both* as a top-level
+///       class and as a nested type of the lexically enclosing class
+///       resolved to the wrong (top-level) one, because every one of
+///       four separate lookup sites checked the project's flat
+///       top-level name table before ever trying the lexically
+///       enclosing scope, backwards from real Apex's own precedence --
+///       confirmed empirically against a real org (`sf apex run`: a
+///       nested `Widget` shadowed an unrelated top-level `Widget` from
+///       inside its own outer class's method). Real NPSP shape:
+///       `PSC_ManageSoftCredits_CTRL` declares its own nested
+///       `SoftCredit`, but the project also has an unrelated top-level
+///       `SoftCredit.cls` -- every `SoftCredit`-typed local, and every
+///       `List<SoftCredit>`-typed property, silently bound to the wrong
+///       class, so real members (`sc.partial`, `sc.contactRole`) fell to
+///       `Unresolved`. Fixed at all four sites that independently
+///       duplicated this same "top-level first" order:
+///       `resolve::resolve_type_ref_base` (a live `Type` AST node),
+///       `resolve::type_of_symbol` (a declared symbol's cached
+///       `type_name`, both for the type itself and for each of its
+///       generic type arguments), and `SymbolTable::resolve_dotted_name_from`
+///       (an `extends`/`implements` clause).
+///     - Every real SObject -- standard or custom -- inherits a handful
+///       of base fields (`Id`, `OwnerId`, `CreatedDate`, `CreatedById`,
+///       `LastModifiedDate`, `LastModifiedById`, `SystemModstamp`,
+///       `IsDeleted`) that Salesforce's own docs describe once, in
+///       prose, as common to every object, rather than repeating them
+///       per object -- confirmed directly against the raw bundled
+///       `standard_objects.json`: zero of Account/Contact/Opportunity/
+///       OpportunityContactRole list an `Id` field. `"id"` alone was the
+///       single most common unresolved reference name across the whole
+///       corpus. Fixed with a small `'static` fallback table in
+///       `SchemaIndex::field`, tried only once an object's own real
+///       fields have already missed.
+///
+///     `BASELINE_UNRESOLVED` dropped -433 (`6_157` -> `5_724`);
+///     `BASELINE_RESOLVED` rose +354 (`207_422` -> `207_776`).
+const BASELINE_RESOLVED: usize = 207_776;
+const BASELINE_UNRESOLVED: usize = 5_724;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

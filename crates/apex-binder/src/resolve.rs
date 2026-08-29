@@ -985,22 +985,24 @@ fn resolve_type_ref_base(
     if segments.len() > 1 {
         record_qualified_segments(table, stdlib, refs, file, &segments);
     }
-    if let Some(id) = resolve_dotted_top_level(table, &segments) {
-        refs.set(ptr, Resolution::Resolved(id));
-        return Some(Ty::Project(id));
-    }
     // A bare, unqualified reference to a *nested* type from within its
     // own enclosing type (or a subclass) doesn't need qualifying --
     // real NPSP shape: `TDTM_Runnable`'s own abstract `run` method
     // returns `List<DmlWrapper>`, not `List<TDTM_Runnable.DmlWrapper>`.
-    // `resolve_dotted_top_level` above only ever checks `SymbolTable::top_level`
-    // (top-level type names only), so this never resolved without a
-    // separate check against the *lexically* enclosing type's own (and
-    // inherited) nested types -- the same fallback unqualified member
-    // lookup already gets via `SymbolTable::lookup_member`. Only
-    // attempted for a single-segment name: a partially-qualified deeper
-    // path (`Outer.Inner` referenced from three levels of nesting down)
-    // is a rarer shape not covered here.
+    // Checked *before* `resolve_dotted_top_level` below, not after: real
+    // Apex resolves an unqualified name through the lexically enclosing
+    // scope first, only falling back to an unrelated top-level type of
+    // the same name -- confirmed empirically against a real org (`sf
+    // apex run`; a nested `Widget` shadowed a same-named top-level
+    // `Widget` class from inside its own outer class's method). Checking
+    // `resolve_dotted_top_level` first (the original order here) got
+    // this backwards: real NPSP shape `PSC_ManageSoftCredits_CTRL`
+    // declares its own nested `SoftCredit`, but the project also has an
+    // unrelated top-level `SoftCredit.cls` -- every unqualified
+    // `SoftCredit sc = ...` inside the outer class silently bound `sc`
+    // to the *wrong* class, so `sc.partial`/`sc.contactRole` (real
+    // members of the nested one) fell to `Unresolved` even though both
+    // names are declared and reachable.
     //
     // Walks outward through the *whole* lexical nesting chain, not just
     // the reference site's immediate enclosing type -- a reference from
@@ -1011,7 +1013,10 @@ fn resolve_type_ref_base(
     // referencing `TestSObjectDomain` unqualified) has to check each
     // enclosing level's own (and inherited) nested types in turn, since
     // real Apex resolves an unqualified name through the full enclosing-
-    // scope chain, not just the one immediate container.
+    // scope chain, not just the one immediate container. Only attempted
+    // for a single-segment name: a partially-qualified deeper path
+    // (`Outer.Inner` referenced from three levels of nesting down) is a
+    // rarer shape not covered here.
     if segments.len() == 1 {
         let mut current = enclosing_type;
         while let Some(container) = current {
@@ -1021,6 +1026,10 @@ fn resolve_type_ref_base(
             }
             current = table.get(container).container;
         }
+    }
+    if let Some(id) = resolve_dotted_top_level(table, &segments) {
+        refs.set(ptr, Resolution::Resolved(id));
+        return Some(Ty::Project(id));
     }
     let args: Vec<Ty> = ty
         .type_args()
@@ -1421,51 +1430,40 @@ impl<'a> BodyBinder<'a> {
             return Some(Ty::Project(id));
         }
         let type_name = symbol.type_name.as_deref()?;
-        // `resolve_dotted_name` handles both the overwhelmingly common
-        // single-segment case (`Account`) and a fully-qualified nested
-        // one (`Outer.Inner`, resolved from a real top-level `Outer`) in
-        // one call -- a plain `top_level(type_name)` here used to miss
-        // every qualified case, since `top_level` is keyed by simple
-        // declared name only. Real NPSP shape this fixed:
+        let enclosing = crate::enclosing_type_of(self.table, symbol);
+        // `resolve_dotted_name_from` handles the overwhelmingly common
+        // single-segment case (`Account`), a fully-qualified nested one
+        // (`Outer.Inner`, resolved from a real top-level `Outer`), *and*
+        // an unqualified reference to a nested type visible from
+        // `symbol`'s own lexical scope, checked in that priority order --
+        // real Apex resolves an unqualified name through the lexically
+        // enclosing scope first, only falling back to an unrelated top-
+        // level type of the same name (confirmed empirically against a
+        // real org, `sf apex run`). A plain `top_level(type_name)` here
+        // used to miss every qualified case, since `top_level` is keyed
+        // by simple declared name only -- real NPSP shape that fixed:
         // `UTIL_CurrencyCache.CurrencyData currData = ...;` declared
-        // *inside* `UTIL_CurrencyCache` itself -- `currData`'s own
-        // `type_name` is the whole dotted string, and without this,
-        // every `currData.someField = ...` assignment stayed
-        // `Unresolved`, wrongly flagging genuinely-written-to fields/
-        // properties (`IsoCode`, `defaultRate`) as dead.
-        if let Some(project_id) = self.table.resolve_dotted_name(type_name) {
+        // *inside* `UTIL_CurrencyCache` itself. And checking only
+        // `top_level` (even qualified) before ever trying the enclosing-
+        // scope fallback -- this function's own previous order -- got a
+        // same-named collision backwards: real NPSP shape
+        // `PSC_ManageSoftCredits_CTRL` declares its own nested
+        // `SoftCredit`, but the project also has an unrelated top-level
+        // `SoftCredit.cls`; every `SoftCredit sc = ...` local's own
+        // *declared-type annotation* already resolved to the right
+        // (nested) class via `resolve::resolve_type_ref_base`, but `sc`'s
+        // propagated `Ty` for further member chaining came from this
+        // function instead, which silently bound it to the wrong class,
+        // so `sc.partial`/`sc.contactRole` (real members of the nested
+        // one) fell to `Unresolved` even though both classes and both
+        // members are declared and reachable.
+        if let Some(project_id) = self.table.resolve_dotted_name_from(type_name, enclosing) {
             return Some(Ty::Project(project_id));
-        }
-        // A member (field/property/parameter) declared with an
-        // *unqualified* reference to a nested type as its own type --
-        // same gap `resolve_type_ref`'s single-segment fallback had, and
-        // the same fix: walk outward through the whole lexical nesting
-        // chain starting from `symbol`'s own enclosing type, not just
-        // `top_level`. Real NPSP shape: `fflib_SObjectDomain`'s
-        // `Configuration` property is declared with its sibling-nested
-        // `Configuration` class as its type -- without this,
-        // `Configuration.OldOnUpdateValidateBehaviour` resolved
-        // `Configuration` fine (a plain member lookup) but could never
-        // chain to `OldOnUpdateValidateBehaviour` after the dot, since
-        // this method never produced a `Ty::Project` to look members up
-        // against. Only attempted for a single-segment name, matching
-        // `resolve_type_ref`'s own identical restriction -- a dotted
-        // name that already failed `resolve_dotted_name` above named a
-        // real (if unresolvable) top-level type as its first segment,
-        // not an unqualified nested-type reference to retry here.
-        if !type_name.contains('.') {
-            let mut current = crate::enclosing_type_of(self.table, symbol);
-            while let Some(container) = current {
-                if let Some(id) = self.table.nested_type_visible_from(container, type_name) {
-                    return Some(Ty::Project(id));
-                }
-                current = self.table.get(container).container;
-            }
         }
         let args: Vec<Ty> = symbol
             .type_args
             .iter()
-            .map(|name| match self.table.resolve_dotted_name(name) {
+            .map(|name| match self.table.resolve_dotted_name_from(name, enclosing) {
                 Some(id) => Ty::Project(id),
                 // A namespace-qualified stdlib type as a *generic type
                 // argument* (`Map<System.Type, System.Type> bindings;`) --

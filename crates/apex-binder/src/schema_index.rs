@@ -8,8 +8,10 @@ use crate::ci_key::{CiKey, CiMap, CiQuery};
 use crate::ptr::SyntaxPtr;
 use crate::reference_table::{ReferenceTable, Resolution, SchemaObjectRef, UnknownSchemaRef};
 use apex_metadata::{FieldSchema, SObjectSchema};
+use smol_str::SmolStr;
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::OnceLock;
 
 pub struct SchemaIndex {
     objects: CiMap<ObjectEntry>,
@@ -76,8 +78,23 @@ impl SchemaIndex {
 
     pub fn field(&self, object_api_name: &str, field_api_name: &str) -> Option<&FieldSchema> {
         let entry = self.objects.get(&CiQuery(object_api_name))?;
-        let idx = *entry.fields.get(&CiQuery(field_api_name))?;
-        entry.schema.fields.get(idx)
+        match entry.fields.get(&CiQuery(field_api_name)) {
+            Some(&idx) => entry.schema.fields.get(idx),
+            // Every real SObject -- standard or custom -- inherits a
+            // handful of base fields (`Id`, `OwnerId`, `CreatedDate`, ...)
+            // that Salesforce's own docs describe once, in prose, as
+            // common to every object rather than repeating per object;
+            // neither the bundled `standard_objects.json` scrape nor a
+            // project's own `.field-meta.xml` files ever list them
+            // per-object (confirmed directly against the raw JSON --
+            // zero of Account/Contact/Opportunity/OpportunityContactRole
+            // list an `Id` field). `"id"` alone was the single most
+            // common unresolved reference across the whole NPSP corpus.
+            // Tried only once the object's own real fields have already
+            // missed, so a project that *does* declare a custom field
+            // that happens to share one of these names still wins.
+            None => universal_field(field_api_name),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -174,6 +191,44 @@ pub(crate) fn resolve_object(
         }))
     };
     refs.set(ptr, resolution);
+}
+
+/// One of the handful of base fields every real SObject -- standard or
+/// custom -- inherits (Salesforce's own docs: "Standard Fields Available
+/// on All Objects"), looked up case-insensitively the same way a real
+/// per-object field is. Built once into a `'static` slice (`OnceLock`,
+/// the same pattern `apex_stdlib`'s own bundled-snapshot parsers use):
+/// there's exactly one copy of this handful of fields regardless of how
+/// many objects [`SchemaIndex::field`] falls back to it for, so there's
+/// no reason to rebuild it per object or per lookup. `Owner`/`CreatedBy`/
+/// `LastModifiedBy` are deliberately left out here -- those are
+/// *relationship* names, not field API names, and get no special
+/// handling for the same documented reason [`relationship_field_api_name`]
+/// doesn't attempt one either (a standard relationship name has no fixed
+/// transform this crate can derive).
+fn universal_field(field_api_name: &str) -> Option<&'static FieldSchema> {
+    static FIELDS: OnceLock<Vec<FieldSchema>> = OnceLock::new();
+    fn field(api_name: &'static str, field_type: &'static str, reference_to: &[&'static str]) -> FieldSchema {
+        FieldSchema {
+            api_name: SmolStr::new_static(api_name),
+            field_type: Some(SmolStr::new_static(field_type)),
+            reference_to: reference_to.iter().map(|&s| SmolStr::new_static(s)).collect(),
+            source_path: None,
+        }
+    }
+    let fields = FIELDS.get_or_init(|| {
+        vec![
+            field("Id", "id", &[]),
+            field("OwnerId", "reference", &["User"]),
+            field("CreatedDate", "datetime", &[]),
+            field("CreatedById", "reference", &["User"]),
+            field("LastModifiedDate", "datetime", &[]),
+            field("LastModifiedById", "reference", &["User"]),
+            field("SystemModstamp", "datetime", &[]),
+            field("IsDeleted", "boolean", &[]),
+        ]
+    });
+    fields.iter().find(|f| f.api_name.eq_ignore_ascii_case(field_api_name))
 }
 
 /// A custom relationship name's field-schema-lookup form (`Batch__r` ->
