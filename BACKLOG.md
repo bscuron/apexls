@@ -1351,6 +1351,28 @@ supports each one.
       `unresolved_reference_diagnostics`, wired into the existing merged
       `publish_diagnostics`. Tests:
       `crates/apexls-server/tests/unresolved_reference_diagnostics.rs`.
+
+      **Follow-up, closed: dogfooded against a real, dense third-party
+      file (`fflib_QueryFactory.cls`) until it had zero `ERROR`-severity
+      diagnostics.** Found and fixed six real, general binder/stdlib gaps
+      this way, none special-cased for that file -- see
+      `resolution_regression_baseline.rs`'s own numbered history (entries
+      12-13) for the full writeup of each: the `Exception` stdlib-entry
+      gap flagged above (now closed, plus the new general fallback it
+      needed for inherited member lookup on an unresolvable-but-real
+      stdlib supertype), `SObject.Id`, `Iterator<T>`, `String.split`'s
+      scraped array return type (58 methods project-wide had the same
+      bug), a namespace-qualified class reference used in *expression*
+      position (`Schema.SoapType.ID`), and -- the highest-volume one --
+      `record_qualified_segments`'s per-segment resolution never
+      consulting `StdlibIndex` the way the *whole* reference already did,
+      so a namespace-qualified declared type (`Schema.SObjectType token;`)
+      resolved fine as a whole but every individual segment still reported
+      `Unresolved` regardless (34 references in that one file, 68
+      per-segment entries). Whole-corpus impact: `BASELINE_UNRESOLVED`
+      dropped from `28,172` to `18,200` across this follow-up (`24,637`
+      from the `Exception`/`Iterator`/`split` fixes, `18,200` from the
+      `record_qualified_segments` one alone).
 - [ ] **Duplicate/conflicting-modifier diagnostic -- a real gap, found via
       a user report.** `private private private private void foo() {`
       produces no error anywhere in the pipeline today: `grammar::declarations::modifiers`

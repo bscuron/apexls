@@ -299,26 +299,29 @@ fn a_super_call_on_an_unresolvable_supertype_is_reported_as_a_warning_not_an_err
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `System.String s = 'hi';` -- a namespace-qualified stdlib type
-/// reference, two dotted segments. Neither `System` (columns 8-14) nor
-/// `String` (columns 15-21) has a `Resolution` of its own beyond
-/// `resolve::record_qualified_segments`'s per-segment entry, which is
-/// always `Unresolved` by construction for both segments (see that
-/// function's doc comment) -- even though the *whole* `System.String`
-/// reference (the enclosing `Type` node) resolves just fine as a real
-/// `StdlibMember`, confirmed directly against `BoundProgram` while
-/// developing this test. Not asserted here via a hover request, though:
-/// `BoundProgram::resolution_at`'s own doc comment says a per-token
-/// resolution, when one is recorded, is always checked *before* climbing
-/// to any enclosing node's -- so hovering either segment surfaces that
-/// segment's own `Unresolved` entry, never the whole node's real
-/// resolution, for exactly the same structural reason this diagnostic
-/// fires at all. `System` in particular is tokenized as its own
-/// recognized keyword (`SyntaxKind::System`), not a plain
-/// `SyntaxKind::Identifier` -- `classify_unresolved` deliberately
-/// classifies this shape by excluding the known node kinds rather than
-/// matching a specific token kind, for exactly this reason.
-const QUALIFIED_TYPE_SRC: &str = "public class Foo {\n    public void run() {\n        System.String s = 'hi';\n    }\n}\n";
+/// `Schema.SObjectTyp s = null;` -- a namespace-qualified stdlib type
+/// reference with a typo in its *second* segment. `Schema` itself
+/// (columns 8-14) resolves cleanly: `resolve::record_qualified_segments`'s
+/// first-segment entry now also tries `StdlibIndex::class` when the
+/// project-local lookup misses, and `Schema` is a real class in its own
+/// right (`Schema.getGlobalDescribe()` is a real static call), not just a
+/// namespace prefix. `SObjectTyp` (columns 15-25, missing its trailing
+/// `e`) has no real class in the `Schema` namespace by that name
+/// (`StdlibIndex::class_in_namespace("Schema", "SObjectTyp")` misses) --
+/// and, at the exact same range (`BoundProgram::highlight_range` narrows
+/// a whole-node `Type`-kind pointer to its own last dotted segment), the
+/// *whole* `Schema.SObjectTyp` reference independently fails too
+/// (`resolve_type_ref`'s own later, separate fallbacks -- `schema.object`/
+/// `stdlib.class` against the *whole* dotted string -- don't rescue a
+/// real typo like this one either). Two independent `Resolution::Unresolved`
+/// entries, two different `SyntaxKind`s, coincidentally the same visual
+/// span: the per-segment one is structural (`WARNING`, any per-segment
+/// token pointer is, regardless of how far its own fallback chain got
+/// before missing), the whole-node one is the higher-confidence default
+/// (`ERROR`, `Type` isn't a recognized structural shape). Both are real,
+/// not a bug -- confirmed genuinely wrong code gets flagged twice,
+/// redundant-looking but not incorrect.
+const QUALIFIED_TYPE_SRC: &str = "public class Foo {\n    public void run() {\n        Schema.SObjectTyp s = null;\n    }\n}\n";
 
 #[test]
 fn a_namespace_qualified_type_segment_is_reported_as_a_warning_not_an_error() {
@@ -330,20 +333,28 @@ fn a_namespace_qualified_type_segment_is_reported_as_a_warning_not_an_error() {
 
     let notification = session.next_diagnostics();
     let diagnostics = unresolved_reference_diagnostics(&notification);
-    assert_eq!(diagnostics.len(), 2, "expected both the 'System' and 'String' segments: {diagnostics:?}");
+    assert_eq!(diagnostics.len(), 2, "expected the per-segment WARNING and the whole-node ERROR, both on 'SObjectTyp': {diagnostics:?}");
     assert!(
-        diagnostics.iter().all(|d| d["severity"] == serde_json::json!(2)),
-        "expected both segments to be WARNING, not ERROR: {diagnostics:?}"
+        diagnostics.iter().all(|d| d["message"].as_str().unwrap().contains("SObjectTyp")),
+        "expected both messages to name the unresolved segment: {diagnostics:?}"
     );
-    assert!(
-        diagnostics.iter().all(|d| d["message"].as_str().unwrap().contains("apexls limitation")),
-        "expected both messages to explain this is a tool limitation: {diagnostics:?}"
-    );
-    let system = diagnostics
+    let warning = diagnostics
         .iter()
-        .find(|d| d["range"]["start"]["character"] == serde_json::json!(8))
-        .unwrap_or_else(|| panic!("expected an entry starting at 'System': {diagnostics:?}"));
-    assert_eq!(system["range"]["end"]["character"], serde_json::json!(14), "expected the range to cover just 'System': {system:?}");
+        .find(|d| d["severity"] == serde_json::json!(2))
+        .unwrap_or_else(|| panic!("expected a WARNING-severity entry for the per-segment reference: {diagnostics:?}"));
+    assert!(
+        warning["message"].as_str().unwrap().contains("apexls limitation"),
+        "expected the WARNING's message to explain it's a tool limitation: {warning:?}"
+    );
+    assert!(
+        diagnostics.iter().any(|d| d["severity"] == serde_json::json!(1)),
+        "expected an ERROR-severity entry for the whole-node type reference: {diagnostics:?}"
+    );
+    for diagnostic in &diagnostics {
+        let range = &diagnostic["range"];
+        assert_eq!(range["start"]["character"], serde_json::json!(15), "expected the range to start at 'SObjectTyp': {range:?}");
+        assert_eq!(range["end"]["character"], serde_json::json!(25), "expected the range to cover just 'SObjectTyp': {range:?}");
+    }
 
     session.shutdown();
     let _ = std::fs::remove_dir_all(&dir);

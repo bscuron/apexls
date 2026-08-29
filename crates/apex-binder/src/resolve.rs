@@ -896,7 +896,7 @@ pub(crate) fn resolve_type_ref(
     // last dotted segment's own token range on demand instead, only when
     // a documentHighlight/references/rename request actually asks.
     if segments.len() > 1 {
-        record_qualified_segments(table, refs, file, &segments);
+        record_qualified_segments(table, stdlib, refs, file, &segments);
     }
     if let Some(id) = resolve_dotted_top_level(table, &segments) {
         refs.set(ptr, Resolution::Resolved(id));
@@ -1066,6 +1066,7 @@ fn resolve_dotted_top_level(
 /// identical range under a different `SyntaxKind`.
 fn record_qualified_segments(
     table: &SymbolTable,
+    stdlib: &StdlibIndex,
     refs: &mut ReferenceTable,
     file: FileId,
     segments: &[apex_syntax::SyntaxToken],
@@ -1073,11 +1074,67 @@ fn record_qualified_segments(
     let Some((first, rest)) = segments.split_first() else {
         return;
     };
-    let mut current = table.top_level(first.text());
-    refs.set(
-        SyntaxPtr::for_token(file, first),
-        current.map_or(Resolution::Unresolved, Resolution::Resolved),
-    );
+    let current = table.top_level(first.text());
+    // `first` alone might be a real stdlib class in its own right, not
+    // just a namespace prefix -- `Schema`/`System`/... are simultaneously
+    // both (`Schema.getGlobalDescribe()` is a real static call on the
+    // `Schema` class itself), so `Schema.SObjectType`'s own first segment
+    // deserves the same StdlibMember treatment `resolve_type_ref`'s
+    // whole-node single-segment lookup (`stdlib.class(&name)`) already
+    // gives a bare `Schema` reference elsewhere.
+    let first_resolution = match current {
+        Some(id) => Resolution::Resolved(id),
+        None => match stdlib.class(first.text()) {
+            Some(class) => Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                class.namespace.clone(),
+                &class.name,
+                None,
+                None,
+                None,
+            ))),
+            None => Resolution::Unresolved,
+        },
+    };
+    refs.set(SyntaxPtr::for_token(file, first), first_resolution);
+    let Some((second, deeper)) = rest.split_first() else {
+        return;
+    };
+    let Some(current) = current else {
+        // `first` isn't a project type -- it might still be a real
+        // namespace (`Schema`, `System`, ...) qualifying a real stdlib
+        // class one segment later (`Schema.SObjectType`). Only tried
+        // here, for the segment immediately after `first`: real Apex
+        // namespace-qualified references are always exactly
+        // `Namespace.Class`, never deeper through a bare namespace
+        // prefix, so a further segment (`Schema.SObjectType.Whatever`,
+        // not a real shape in practice) has no model to fall back to and
+        // stays honestly `Unresolved`, same as before this fallback
+        // existed. Mirrors `resolve::bind_field_expr`'s identical
+        // `class_in_namespace` fallback for this same shape used in
+        // *expression* position (`Schema.SoapType.ID`) -- this is the
+        // *type*-position (`Schema.SObjectType token;`) counterpart, a
+        // real, common gap in a real fflib_QueryFactory.cls: the *whole*
+        // `Schema.SObjectType` reference already resolved fine via
+        // `resolve_type_ref`'s own two-segment fallback further down --
+        // only *this* per-segment hover/goto-definition/diagnostic
+        // record never learned the same trick.
+        let resolution = match stdlib.class_in_namespace(first.text(), second.text()) {
+            Some(class) => Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                class.namespace.clone(),
+                &class.name,
+                None,
+                None,
+                None,
+            ))),
+            None => Resolution::Unresolved,
+        };
+        refs.set(SyntaxPtr::for_token(file, second), resolution);
+        for seg in deeper {
+            refs.set(SyntaxPtr::for_token(file, seg), Resolution::Unresolved);
+        }
+        return;
+    };
+    let mut current = Some(current);
     for seg in rest {
         current = current.and_then(|prev| table.nested_type(prev, seg.text()));
         refs.set(

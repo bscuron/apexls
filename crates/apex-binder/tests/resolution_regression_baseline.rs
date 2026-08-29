@@ -322,8 +322,36 @@ fn corpus_root() -> PathBuf {
 ///     an unresolvable-but-real stdlib base benefits the same way.
 ///     `BASELINE_RESOLVED` rose +545 (`205_519` -> `206_064`);
 ///     `BASELINE_UNRESOLVED` dropped -3,535 (`28_172` -> `24_637`).
-const BASELINE_RESOLVED: usize = 206_064;
-const BASELINE_UNRESOLVED: usize = 24_637;
+/// 13. `resolve::record_qualified_segments`'s per-segment resolution (the
+///     one `BoundProgram::resolution_at` checks before falling back to a
+///     dotted `Type` node's own whole-reference resolution -- see that
+///     function's doc comment) only ever tried this project's own
+///     `SymbolTable`, never `StdlibIndex`, even though the *whole*
+///     reference (`resolve_type_ref`'s separate, later fallback) already
+///     did. A namespace-qualified system type used as a declared type
+///     (`Schema.SObjectType token;`, extremely common real Apex) resolved
+///     fine as a whole, but clicking (or, after step 1's diagnostic,
+///     getting a squiggle on) either individual segment reported
+///     `Unresolved` regardless -- confirmed a real, high-volume gap via a
+///     real fflib_QueryFactory.cls, not a rare edge case: 34 such
+///     references in that one file alone, 68 per-segment `Unresolved`
+///     entries between them. Fixed by giving the first segment a
+///     `StdlibIndex::class` fallback (a namespace like `Schema`/`System`
+///     is very often a real class in its own right, e.g.
+///     `Schema.getGlobalDescribe()`) and the second segment a
+///     `StdlibIndex::class_in_namespace` one (mirroring
+///     `resolve::bind_field_expr`'s identical fallback for this same
+///     shape in *expression* position, `Schema.SoapType.ID`, added in the
+///     same pass as this diagnostic). Only tried for the segment
+///     immediately after the first: real Apex namespace-qualified
+///     references are always exactly `Namespace.Class`, never deeper.
+///     `BASELINE_RESOLVED` barely moved (+4, `206_064` -> `206_068`,
+///     `StdlibMember` isn't tallied by either counter, so this fallback's
+///     own hits mostly don't show up here at all); `BASELINE_UNRESOLVED`
+///     dropped a further -6,437 (`24_637` -> `18_200`), all project-wide
+///     instances of the exact same per-segment gap.
+const BASELINE_RESOLVED: usize = 206_068;
+const BASELINE_UNRESOLVED: usize = 18_200;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {
