@@ -1538,6 +1538,39 @@ supports each one.
       correctly, which would have made this fix look incomplete from a
       diagnostics-only view. `BASELINE_UNRESOLVED`: `7,097` -> `6,980`
       (entry 18).
+
+      **Seventh round: two related schema-describe-token shapes, again
+      found via `examples/unresolved_clusters.rs`'s top clusters and
+      verified against a real file (`AdditionalObjectJSON_TEST.cls`).**
+      (a) `<ObjectType>.<Field>` (a bare SObject *type* name, not an
+      instance, dotted with a field API name --
+      `DataImport__c.Account1Imported__c.getDescribe()`) is real,
+      documented Apex shorthand for a `Schema.SObjectField` describe
+      token (confirmed against a real org), but `bind_field_expr` always
+      propagated the field's own scalar/relationship type regardless of
+      whether the receiver was a bare type name or a real instance --
+      correct for the instance case (`acct.Name` really is a `String`)
+      but wrong here, where the chained `.getDescribe()`/`.getName()`/
+      `.getLabel()` call always stayed `Unresolved`. Fixed by checking
+      the receiver's own already-recorded resolution: a bare type name
+      resolves as `Resolution::SchemaObject` with no field at all
+      (`bind_name_expr`'s own `self.schema.object(name)` fallback), which
+      an instance variable never does, and that distinction alone is
+      enough to pick `Schema.SObjectField` over the field's own type. (b)
+      The *reversed* order, `SObjectType.<ObjectName>` (bare, not
+      `Schema.SObjectType.<ObjectName>`), turned out to be a genuinely
+      *different* compiler-magic idiom from (a) and from the existing
+      `<ObjectName>.SObjectType` fallback -- confirmed against a real org
+      that it evaluates to a `Schema.DescribeSObjectResult`, not a
+      `Schema.SObjectType` token (`SObjectType.Account`'s live runtime
+      type dumped as `Schema.DescribeSObjectResult`, not the token an
+      initial reading of the two orderings as "the same idiom, either
+      order" would have predicted -- worth flagging since it's the kind
+      of assumption that's easy to get wrong without checking a real
+      org). Fixed with its own early check in `bind_field_expr`.
+      `BASELINE_UNRESOLVED`: `6,980` -> `6,643` (`-189` from (a), `-148`
+      from (b) on top of it); `BASELINE_RESOLVED`: `206,716` -> `206,740`
+      (entry 19).
 - [ ] **Duplicate/conflicting-modifier diagnostic -- a real gap, found via
       a user report.** `private private private private void foo() {`
       produces no error anywhere in the pipeline today: `grammar::declarations::modifiers`

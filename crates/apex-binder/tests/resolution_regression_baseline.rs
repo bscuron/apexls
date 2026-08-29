@@ -509,8 +509,44 @@ fn corpus_root() -> PathBuf {
 ///     resolves correctly. `BASELINE_UNRESOLVED` dropped -117 (`7_097` ->
 ///     `6_980`); `BASELINE_RESOLVED` unaffected (`VisualforcePage` isn't
 ///     tallied by either counter, same as `Label`/`StdlibMember`).
-const BASELINE_RESOLVED: usize = 206_716;
-const BASELINE_UNRESOLVED: usize = 6_980;
+/// 19. Two related schema-describe-token shapes in `bind_field_expr`,
+///     found the same way as step 18: `examples/unresolved_clusters.rs`'s
+///     top clusters, re-run after that step landed, then a real-corpus
+///     file (`AdditionalObjectJSON_TEST.cls`) verified for both shapes at
+///     once. (a) `<ObjectType>.<Field>` (a bare SObject *type* name, not
+///     an instance, dotted with a field API name -- `DataImport__c.Account1Imported__c.getDescribe()`)
+///     is real, documented Apex shorthand for a `Schema.SObjectField`
+///     describe token, confirmed against a real org
+///     (`Schema.SObjectField f = Account.Name;` compiles,
+///     `f.getDescribe()` works) -- but `bind_field_expr` always
+///     propagated the field's own scalar/relationship type regardless of
+///     whether the receiver was a bare type name or a real instance,
+///     correct for the instance case (`acct.Name` really is a `String`)
+///     but wrong here, where the chained `.getDescribe()`/`.getName()`/
+///     `.getLabel()` call always stayed `Unresolved` (a `Boolean`/
+///     `String`/... has no such method). Fixed by checking the
+///     receiver's own already-recorded resolution (a bare type name
+///     resolves as `Resolution::SchemaObject` with no field at all,
+///     `bind_name_expr`'s own `self.schema.object(name)` fallback -- an
+///     instance variable never resolves that way) and propagating
+///     `Schema.SObjectField` instead whenever it matches. (b) The
+///     *reversed* order, `SObjectType.<ObjectName>` (bare, not
+///     `Schema.SObjectType.<ObjectName>`), is a genuinely *different*
+///     compiler-magic idiom from (a) and from `<ObjectName>.SObjectType`
+///     (an existing, already-handled fallback) -- confirmed against a
+///     real org that it evaluates to a `Schema.DescribeSObjectResult`,
+///     not a `Schema.SObjectType` token (`SObjectType.Account`'s live
+///     runtime type dumped as `Schema.DescribeSObjectResult`). Fixed with
+///     a dedicated early check in `bind_field_expr`, mirroring the
+///     `Label`/`.class` checks' placement. Measured independently: (a)
+///     alone moved `BASELINE_RESOLVED` +23 (`206_716` -> `206_739`) and
+///     `BASELINE_UNRESOLVED` -189 (`6_980` -> `6_791`, the same "argument/
+///     chain type newly known" ripple effect documented in step 1); (b)
+///     on top of (a) moved `BASELINE_RESOLVED` +1 more (`206_739` ->
+///     `206_740`) and `BASELINE_UNRESOLVED` -148 more (`6_791` ->
+///     `6_643`).
+const BASELINE_RESOLVED: usize = 206_740;
+const BASELINE_UNRESOLVED: usize = 6_643;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

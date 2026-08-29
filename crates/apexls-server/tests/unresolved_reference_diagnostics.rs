@@ -501,6 +501,35 @@ fn a_real_npsp_fflib_query_factory_file_has_no_error_severity_diagnostics() {
     session.shutdown();
 }
 
+/// Fourth real-corpus smoke test, for two related `bind_field_expr` fixes
+/// at once: the `SObjectType.Field` shorthand (a bare SObject *type*
+/// name dotted with a field, e.g. `Allocation__c.General_Accounting_Unit__c.getDescribe()`)
+/// resolving as a real `Schema.SObjectField` token instead of the field's
+/// own scalar value type, and the bare `SObjectType.<ObjectName>` idiom
+/// (e.g. `SObjectType.Allocation__c.getName()`) resolving as a real
+/// `Schema.DescribeSObjectResult` instead of the object's own type --
+/// `AdditionalObjectJSON_TEST.cls` uses both shapes together.
+#[test]
+fn a_real_npsp_additional_object_json_test_file_has_no_error_severity_diagnostics() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus/npsp");
+    let file = root.join("force-app/main/default/classes/AdditionalObjectJSON_TEST.cls");
+    let root_uri = Url::from_file_path(&root).unwrap();
+    let file_uri = Url::from_file_path(&file).unwrap();
+    let src = std::fs::read_to_string(&file).unwrap();
+
+    let mut session = Session::start(&root_uri, &file_uri, &src);
+
+    let notification = session.next_diagnostics();
+    let diagnostics = notification["params"]["diagnostics"].as_array().unwrap();
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d["severity"] == serde_json::json!(1))
+        .collect();
+    assert!(errors.is_empty(), "expected no ERROR-severity diagnostics: {errors:?}");
+
+    session.shutdown();
+}
+
 /// Second real-corpus smoke test, for the custom-label integration
 /// specifically: `fflib_SecurityUtils.cls` reads `System.Label.fflib_security_error_*`
 /// (declared in `fflib-Apex-Common-CustomLabels.labels-meta.xml`) in its own

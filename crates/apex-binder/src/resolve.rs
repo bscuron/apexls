@@ -2116,7 +2116,8 @@ impl<'a> BodyBinder<'a> {
     }
 
     fn bind_field_expr(&mut self, scope: ScopeId, f: &FieldExpr) -> Option<Ty> {
-        let target_type = f.target().and_then(|t| self.bind_expr(scope, &t));
+        let target_expr = f.target();
+        let target_type = target_expr.as_ref().and_then(|t| self.bind_expr(scope, t));
         let tok = f.member_token()?;
         let name = tok.text();
         let ptr = SyntaxPtr::new(self.file, f.syntax());
@@ -2235,7 +2236,7 @@ impl<'a> BodyBinder<'a> {
         // types as `PageReference` (a real, documented stdlib class) on a
         // successful lookup, matching real Apex.
         if target_type.is_none() {
-            if let Some(Expr::Name(target_name)) = f.target() {
+            if let Some(Expr::Name(target_name)) = &target_expr {
                 if target_name
                     .name_token()
                     .is_some_and(|t| t.text().eq_ignore_ascii_case("Page"))
@@ -2254,6 +2255,39 @@ impl<'a> BodyBinder<'a> {
                         }
                     };
                 }
+            }
+        }
+
+        // `SObjectType.<ObjectName>` (bare, *not* `Schema.SObjectType.<ObjectName>`)
+        // -- a genuinely different compiler-magic idiom from
+        // `<ObjectName>.SObjectType` handled above (`Opportunity.SObjectType`,
+        // this same reversed-order shape): confirmed against a real org
+        // that this one evaluates to a `Schema.DescribeSObjectResult`, not
+        // a `Schema.SObjectType` token (`Object x = SObjectType.Account;`
+        // -- `x`'s live runtime type dumped as `Schema.DescribeSObjectResult`,
+        // its own `getName()` producing `"Account"`). The two orderings
+        // aren't the same idiom spelled two ways; each has its own result
+        // type. `target_type` already resolves to `Ty::System { name:
+        // "SObjectType", .. }` here via the ordinary stdlib-class fallback
+        // above (`SObjectType` is a real class, unlike `Page`), so unlike
+        // that check this doesn't need to inspect the receiver's raw
+        // token text -- just intercept before the generic
+        // `self.schema.object(name)` fallback further down, which would
+        // otherwise resolve correctly (a real `SchemaObject` reference)
+        // but propagate the *object's own* type instead of the describe
+        // result's, stranding a further `.getName()`/`.getLabel()`/...
+        // chained off it as `Unresolved`.
+        if let Some(Ty::System { name: object, .. }) = &target_type {
+            if object.eq_ignore_ascii_case("SObjectType") && self.schema.object(name).is_some() {
+                self.refs.set_with_highlight(
+                    ptr,
+                    highlight,
+                    Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                        object: SmolStr::new(name),
+                        field: None,
+                    })),
+                );
+                return Some(Ty::system("DescribeSObjectResult"));
             }
         }
 
@@ -2308,6 +2342,46 @@ impl<'a> BodyBinder<'a> {
                         })),
                     };
                     self.refs.set_with_highlight(ptr, highlight, resolution);
+
+                    // A bare SObject *type* name used as the receiver
+                    // (`DataImport__c.Account1Imported__c`, not an
+                    // instance variable of that type) is real, documented
+                    // Apex shorthand for a `Schema.SObjectField` describe
+                    // token -- confirmed against a real org
+                    // (`Schema.SObjectField f = Account.Name;` compiles,
+                    // and `f.getDescribe()` works on it), never a scalar/
+                    // relationship value read, which needs an actual
+                    // instance (`myRecord.Field__c`) to mean anything.
+                    // `target_expr`'s own already-recorded resolution is
+                    // exactly the signal that tells the two apart:
+                    // `Resolution::SchemaObject` with no field at all is
+                    // specifically what a bare type name resolves as
+                    // (`bind_name_expr`'s own `self.schema.object(name)`
+                    // fallback, a few hundred lines up) -- an instance
+                    // variable of that same SObject type never resolves
+                    // that way (it's `Resolution::Resolved`, pointing at
+                    // its own declaration, not a synthesized `SchemaObjectRef`).
+                    // Without this, every one of these -- extremely common
+                    // real Apex, hundreds of references in NPSP alone --
+                    // instead propagated the field's own scalar/
+                    // relationship type, so `.getDescribe()`/`.getName()`/
+                    // `.getLabel()` chained off it always stayed
+                    // `Unresolved` (a `Boolean`/`String`/... has no such
+                    // method).
+                    let target_is_bare_object_type = target_expr.as_ref().is_some_and(|t| {
+                        let target_ptr = SyntaxPtr::new(self.file, t.syntax());
+                        matches!(
+                            self.refs.get(target_ptr),
+                            Some(Resolution::SchemaObject(sr)) if sr.field.is_none()
+                        )
+                    });
+                    if target_is_bare_object_type && field_schema.is_some() {
+                        return self
+                            .stdlib
+                            .class("SObjectField")
+                            .map(|c| Ty::system_owned(c.name.clone(), Vec::new()));
+                    }
+
                     return field_schema.and_then(|f| {
                         f.reference_to
                             .first()
