@@ -8031,7 +8031,7 @@
   {
     "page_id": "apex_class_commercepayments_AuditParamsRequest",
     "name": "AuditParamsRequest",
-    "kind": "Unknown",
+    "kind": "Class",
     "namespace": "CommercePayments",
     "description": "AuditParamsRequest is used for audit parameters in a\n      transaction request. This is an abstract request class that is extended by the BaseRequest class.",
     "methods": [
@@ -12147,7 +12147,7 @@
   {
     "page_id": "apex_class_commercepayments_ReferencedRefundRequest",
     "name": "ReferencedRefundRequest",
-    "kind": "Unknown",
+    "kind": "Class",
     "namespace": "CommercePayments",
     "description": "Access information about the referenced refund requests. Extends the\n        RefundRequest class.",
     "methods": [
@@ -13242,7 +13242,7 @@
   {
     "page_id": "apex_class_commercepayments_SalesforceResultCodeInfo",
     "name": "SalesforceResultCodeInfo",
-    "kind": "Unknown",
+    "kind": "Class",
     "namespace": "CommercePayments",
     "description": "Stores Salesforce result code information from payment gateway\n      adapters.",
     "methods": [
@@ -59038,8 +59038,8 @@
   },
   {
     "page_id": "apex_classes_email_outbound_base",
-    "name": "Email Class (Base Email Methods)",
-    "kind": "Unknown",
+    "name": "Email",
+    "kind": "Class",
     "namespace": "Messaging",
     "description": "Contains base email methods common to both single and mass\nemail.",
     "methods": [
@@ -86994,8 +86994,8 @@
   },
   {
     "page_id": "apex_class_System_IntegrationTest",
-    "name": "IntegrationTest Class (Developer Preview)",
-    "kind": "Unknown",
+    "name": "IntegrationTest",
+    "kind": "Class",
     "namespace": "System",
     "description": "Contains the commitTestOnly() method that can be\n    called from an @IntegrationMethod to commit data\n    mid-transaction so that it’s visible to service threads such as Agentforce and Data\n    360.",
     "methods": [
@@ -92273,7 +92273,7 @@
   {
     "page_id": "apex_class_system_remoteobjectcontroller",
     "name": "RemoteObjectController",
-    "kind": "Unknown",
+    "kind": "Class",
     "namespace": "System",
     "description": "Use RemoteObjectController to access the\n  standard Visualforce Remote Objects operations in your Remote Objects override\n  methods.",
     "methods": [

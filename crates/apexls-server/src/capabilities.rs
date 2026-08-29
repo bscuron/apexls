@@ -1093,8 +1093,9 @@ pub(crate) fn syntax_error_diagnostics(
 /// single object to resolve against (most commonly a `TYPEOF ... ELSE`
 /// field, `soql::bind_typeof`'s own doc comment: "always `Unresolved`").
 /// `None` for everything else (`NameExpr`, `FieldExpr`, `MethodCallExpr`,
-/// `NewExpr`, `Type`, `ThisExpr`, an unqualified non-`this`/`super` call)
-/// -- the higher-confidence default, on the theory that a reference this
+/// `NewExpr`, `Type` not shaped like a built-in exception subtype's name,
+/// `ThisExpr`, an unqualified non-`this`/`super` call) -- the higher-
+/// confidence default, on the theory that a reference this
 /// investigation couldn't specifically explain away is more likely a real
 /// typo than not. This is a best-effort heuristic, not a proof: the
 /// `CallExpr` case in particular can't distinguish "the supertype itself
@@ -1107,11 +1108,32 @@ pub(crate) fn syntax_error_diagnostics(
 /// of `unresolved_reference_diagnostics` is full visibility into every
 /// `Unresolved` reference, with severity as a confidence signal rather
 /// than a filter -- see that function's own doc comment.
-fn classify_unresolved(program: &BoundProgram, ptr: SyntaxPtr) -> Option<&'static str> {
+fn classify_unresolved(program: &BoundProgram, ptr: SyntaxPtr, name: &str) -> Option<&'static str> {
     match ptr.kind() {
         SyntaxKind::QualifiedName => Some(
             "catch-clause/switch-value/upsert-field type lookups resolve only against \
              project-local types, with no standard-library or schema fallback",
+        ),
+        // A built-in Apex exception *subtype* (`DmlException`,
+        // `QueryException`, `NullPointerException`, ...) used as a type
+        // reference (`System.DmlException caughtEx;`) -- Salesforce's own
+        // docs only cover these in prose alongside `Exception` itself,
+        // never as their own scraped class/method reference page (same
+        // gap `Exception` itself had before this crate's own bundled
+        // entry was hand-corrected -- see `apex_stdlib::standard_classes`'s
+        // doc comment), so this crate has no way to confirm one by name
+        // and never will without scraper changes. Every real Apex
+        // exception class name ends in literally `Exception`, not just
+        // convention -- a hard compiler rule (confirmed against a real
+        // org: "Classes extending Exception must have a name ending in
+        // Exception"), so this is a safe, general signal to classify by,
+        // not a guess. Scoped to `Type` specifically (not `NameExpr`/
+        // `FieldExpr`/...): an unrelated *variable* merely named
+        // `somethingException` is not this shape at all.
+        SyntaxKind::Type if name.ends_with("Exception") => Some(
+            "the referenced name looks like a built-in Apex exception subtype (ends in \
+             \"Exception\"), which this binder can never individually confirm -- Salesforce's \
+             own docs cover these only in prose, never as their own class reference page",
         ),
         SyntaxKind::SuperExpr => Some(
             "this class's own supertype couldn't be resolved (often a standard exception \
@@ -1201,7 +1223,7 @@ pub(crate) fn unresolved_reference_diagnostics(
                 start: index.to_position(&text, range.start().into(), encoding),
                 end: index.to_position(&text, range.end().into(), encoding),
             };
-            let (severity, message) = match classify_unresolved(program, *ptr) {
+            let (severity, message) = match classify_unresolved(program, *ptr, name) {
                 Some(reason) => (
                     DiagnosticSeverity::WARNING,
                     format!(

@@ -1422,6 +1422,40 @@ supports each one.
       idiom (verified against a real org) with no real method on the
       field's own scalar type otherwise. `BASELINE_UNRESOLVED`: `17,363`
       -> `11,027`.
+
+      **Fourth file, fourth round: `fflib_SObjectUnitOfWorkTest.cls`.**
+      Four more (entry 16): `SObjectTypeName.SObjectType`
+      (`Opportunity.SObjectType`, `Schema.Opportunity.SObjectType`) --
+      another compiler-magic universal property, this time on any real
+      SObject type name, plus the matching fallback that lets
+      `Schema.Opportunity` resolve as a real schema object at all
+      (`Opportunity` isn't a stdlib class). A `catch (Type e)` clause's
+      own variable was declared with no type at all, unconditionally --
+      so `e.getMessage()` stayed `Unresolved` inside *every* catch block,
+      not just for an unmodeled type; new `declare_local_with_type_name`
+      (a catch clause's exception name parses as a `QualifiedName`, not a
+      `Type`, so `declare_local` itself can't be reused). The stdlib
+      fallback added in entries 12/14 for a project type's own inherited
+      method call only ever computed the right `Resolution`, never the
+      right *result type* -- a real bug in that fallback's own first
+      version (`result_type_of` only ever handles a project `SymbolId`'s
+      own type, never `StdlibMember`), so a further chained call right
+      after it always stayed `Unresolved` regardless. A *built-in*
+      exception subtype (`DmlException`) has no `apex_stdlib` entry and
+      structurally never will -- new fallback: every real Apex exception
+      class name ends in literally `Exception`, a hard compiler rule
+      (confirmed against a real org), so an unmodeled `*Exception`-named
+      type now falls back to `Exception`'s own methods; the unresolved-
+      reference diagnostic's own `classify_unresolved` extended to match,
+      grading this shape `WARNING` instead of the default `ERROR`. Also
+      found and fixed 6 more `"Unknown"`-kind `apex_stdlib` entries with
+      real content, just misclassified (`Email`, `IntegrationTest`,
+      `RemoteObjectController`, `AuditParamsRequest`,
+      `ReferencedRefundRequest`, `SalesforceResultCodeInfo`) -- leaving
+      only 2 of the original ~8 still excluded (see
+      `apex_stdlib::standard_classes`'s own doc comment for why those two
+      specifically still need more thought). `BASELINE_UNRESOLVED`:
+      `11,027` -> `9,155`.
 - [ ] **Duplicate/conflicting-modifier diagnostic -- a real gap, found via
       a user report.** `private private private private void foo() {`
       produces no error anywhere in the pipeline today: `grammar::declarations::modifiers`

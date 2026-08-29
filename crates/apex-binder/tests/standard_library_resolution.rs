@@ -698,3 +698,104 @@ fn a_scalar_schema_fields_value_resolves_a_chained_stdlib_call_and_add_error() {
         "opp.Type.addError(...) should resolve via the field-value addError idiom"
     );
 }
+
+/// `SObjectTypeName.SObjectType` (`Opportunity.SObjectType`,
+/// `Schema.Opportunity.SObjectType`) -- a compiler-magic universal
+/// property on any real SObject type name, confirmed against a real org.
+/// The namespace-qualified form also confirms the companion fix:
+/// `Schema.Opportunity` itself resolving as a real schema object, not
+/// just a stdlib class-in-namespace lookup (`Opportunity` isn't a stdlib
+/// class at all).
+#[test]
+fn sobjecttype_resolves_on_a_bare_and_namespace_qualified_sobject_name() {
+    let dir = write_fixture_dir(
+        "stdlib-sobjecttype-token",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             public void run() { \
+                 Schema.SObjectType t1 = Opportunity.SObjectType; \
+                 Schema.SObjectType t2 = Schema.Opportunity.SObjectType; \
+             } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        field_expr_resolution(&program, "SObjectType"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("Schema".into()),
+            class_name: "SObjectType".into(),
+            member: None,
+            arg_count: None,
+            narrowed_param_types: None,
+        }))),
+        "Opportunity.SObjectType should resolve as a reference to the real Schema.SObjectType class"
+    );
+    assert_eq!(
+        field_expr_resolution(&program, "Opportunity"),
+        Some(Resolution::SchemaObject(Box::new(SchemaObjectRef {
+            object: "Opportunity".into(),
+            field: None,
+        }))),
+        "Schema.Opportunity should resolve as a real schema object, not stay Unresolved"
+    );
+}
+
+/// The exact user-reported bug: a `catch (Type e)` clause's own variable
+/// used to be declared with no type at all (`declare_local(..., None)`),
+/// discarding it *unconditionally* -- so `e.getMessage()` stayed
+/// `Unresolved` inside *every* catch block, not just for an unmodeled
+/// exception type. Chains a further call (`.getMessage().contains(...)`)
+/// on a *built-in* exception subtype specifically (`DmlException`, which
+/// has no `apex_stdlib` entry of its own at all) to also confirm the
+/// companion `*Exception`-name fallback in `bind_method_call_expr`'s
+/// `Ty::System` arm, and that the stdlib fallback added for a project
+/// type's own inherited call (steps 12/14) computes a real result type,
+/// not just a resolution, so the chained call keeps resolving too.
+#[test]
+fn a_catch_variables_declared_type_resolves_for_chained_calls() {
+    let dir = write_fixture_dir(
+        "catch-var-type",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             public void run() { \
+                 try { \
+                     doSomething(); \
+                 } catch (System.DmlException dmlex) { \
+                     Boolean has = dmlex.getMessage().contains('bad'); \
+                 } \
+             } \
+             private void doSomething() {} \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        method_call_resolution(&program, "getMessage"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "Exception".into(),
+            member: Some("getMessage".into()),
+            arg_count: Some(0),
+            narrowed_param_types: None,
+        }))),
+        "dmlex.getMessage() should resolve via Exception's own methods, DmlException having none of its own modeled"
+    );
+    assert_eq!(
+        method_call_resolution(&program, "contains"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "String".into(),
+            member: Some("contains".into()),
+            arg_count: Some(1),
+            narrowed_param_types: None,
+        }))),
+        "chaining .contains(...) off getMessage()'s own String result should keep resolving"
+    );
+}

@@ -299,6 +299,40 @@ fn a_super_call_on_an_unresolvable_supertype_is_reported_as_a_warning_not_an_err
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `System.DmlException x = null;` -- a real, built-in Apex exception
+/// *subtype* used as a declared type. `DmlException` has no
+/// `apex_stdlib` entry at all and structurally never will (Salesforce's
+/// docs cover it only in prose alongside `Exception` itself, never its
+/// own class/method reference page) -- but every real Apex exception
+/// class name ends in literally `Exception`, a hard compiler rule
+/// (confirmed against a real org), so `classify_unresolved` recognizes
+/// this shape specifically and grades it the same `WARNING` confidence
+/// as `QualifiedName`'s catch-clause case, not the default `ERROR`.
+const EXCEPTION_SUFFIX_TYPE_SRC: &str = "public class Foo {\n    public void run() {\n        System.DmlException x = null;\n    }\n}\n";
+
+#[test]
+fn an_unmodeled_builtin_exception_subtype_is_reported_as_a_warning_not_an_error() {
+    let dir = write_fixture_dir("unresolved-exception-suffix", &[("Foo.cls", EXCEPTION_SUFFIX_TYPE_SRC)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let foo_uri = Url::from_file_path(dir.join("Foo.cls")).unwrap();
+
+    let mut session = Session::start(&root_uri, &foo_uri, EXCEPTION_SUFFIX_TYPE_SRC);
+
+    let notification = session.next_diagnostics();
+    let diagnostics = unresolved_reference_diagnostics(&notification);
+    assert!(
+        diagnostics.iter().all(|d| d["severity"] == serde_json::json!(2)),
+        "expected every diagnostic here to be WARNING, none ERROR: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics.iter().any(|d| d["message"].as_str().unwrap().contains("DmlException")),
+        "expected a diagnostic naming DmlException: {diagnostics:?}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `Schema.SObjectTyp s = null;` -- a namespace-qualified stdlib type
 /// reference with a typo in its *second* segment. `Schema` itself
 /// (columns 8-14) resolves cleanly: `resolve::record_qualified_segments`'s

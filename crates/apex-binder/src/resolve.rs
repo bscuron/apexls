@@ -1268,6 +1268,44 @@ impl<'a> BodyBinder<'a> {
             }
             None => (None, None, Vec::new()),
         };
+        self.declare_local_raw(kind, name, type_ptr, type_name, type_args)
+    }
+
+    /// Like [`Self::declare_local`], but for a caller with a plain type-
+    /// name *string* on hand instead of a real `Type` AST node --
+    /// specifically, a catch clause's own exception name, parsed as a
+    /// `QualifiedName` (per real Apex grammar: `catch (Type e)`'s `Type`
+    /// production is a bare `qualifiedName`, not a full `typeRef`, so
+    /// there's no `Type` node to reuse [`Self::declare_local`] with at
+    /// all -- see `resolve_type_ref`'s own doc comment on
+    /// `QualifiedName`'s other two uses, `whenValue`/`upsert`, for the
+    /// same grammar distinction). Before this, a catch variable's own
+    /// declared type was silently discarded entirely (`declare_local`
+    /// called with `None`), so `e.getMessage()` inside *any* catch block
+    /// stayed `Unresolved` regardless of whether the exception type
+    /// itself was ever modeled -- real, common Apex, not an edge case.
+    /// No `type_ref`/`type_args` to carry (a caught exception type is
+    /// never generic), so those stay empty; only `type_name` feeds
+    /// `type_of_symbol`'s existing `resolve_dotted_name`/`stdlib.class`
+    /// lookup, the same one the catch clause's own exception-type
+    /// reference already resolves through.
+    fn declare_local_with_type_name(
+        &mut self,
+        kind: SymbolKind,
+        name: &Name,
+        type_name: Option<SmolStr>,
+    ) -> SymbolId {
+        self.declare_local_raw(kind, name, None, type_name, Vec::new())
+    }
+
+    fn declare_local_raw(
+        &mut self,
+        kind: SymbolKind,
+        name: &Name,
+        type_ptr: Option<AstPtr<Type>>,
+        type_name: Option<SmolStr>,
+        type_args: Vec<SmolStr>,
+    ) -> SymbolId {
         let symbol = Symbol {
             kind,
             name: name.text().unwrap_or_default(),
@@ -1420,6 +1458,21 @@ impl<'a> BodyBinder<'a> {
                 if let Some(class) = self.stdlib.class_in_namespace(namespace, class_name) {
                     return Some(Ty::system_owned(class.name.clone(), args));
                 }
+                // Not a *documented* class in this namespace either (a
+                // built-in exception subtype like `DmlException`, most
+                // commonly -- see `bind_method_call_expr`'s own matching
+                // fallback) -- but the shape is still unambiguous
+                // (`Namespace.Class`), and every `Ty::System` name
+                // elsewhere in this crate is bare, never namespace-
+                // prefixed, so falling through to the *whole* dotted
+                // string below would only ever produce a name no later
+                // `stdlib.class`/`self.schema.object` lookup could ever
+                // match -- strictly worse than the bare class name, never
+                // better. Real NPSP shape: `System.DmlException caughtEx
+                // = null;` -- stripping the namespace here is what lets
+                // `caughtEx.getMessage()` reach `bind_method_call_expr`'s
+                // own `base.ends_with("Exception")` fallback at all.
+                return Some(Ty::system_owned(SmolStr::new(class_name), args));
             }
         }
         Some(Ty::system_owned(type_name.to_string(), args))
@@ -1620,13 +1673,26 @@ impl<'a> BodyBinder<'a> {
                     self.bind_child_block(scope, &b);
                 }
                 for catch in s.catch_clauses() {
-                    if let Some(ty) = catch.exception_type() {
+                    // The exception type name, trimmed -- also fed to the
+                    // catch variable's own declared type below, kept
+                    // outside the reference-resolution block so both uses
+                    // share the one trim instead of recomputing it.
+                    let exception_type_name = catch.exception_type().map(|ty| {
                         let ptr = SyntaxPtr::new(self.file, ty.syntax());
                         // `QualifiedName` (not `Type`) -- resolve by its
                         // whole-text base name against project types
                         // only; unlike `resolve_type_ref`, exception
                         // types are never SObject-shaped, so there's no
-                        // schema fallback to attempt here.
+                        // schema fallback to attempt here. (The catch
+                        // *variable*'s own type, set below via
+                        // `declare_local_with_type_name`, still gets the
+                        // fuller `type_of_symbol` resolution -- including
+                        // its `stdlib.class` fallback -- when something
+                        // later in the block actually uses `e`; this
+                        // reference alone deliberately stays project-only,
+                        // the "structural" classification
+                        // `capabilities::classify_unresolved` documents
+                        // for exactly this shape.)
                         //
                         // `ty.syntax().text_range()` can be wider than the
                         // name (trailing trivia; see `bind_name_expr`'s
@@ -1642,19 +1708,30 @@ impl<'a> BodyBinder<'a> {
                         // clause exception type -- dotted or not --
                         // always missed `top_level`/`resolve_dotted_name`
                         // and stayed permanently `Unresolved`.
-                        let name = ty.syntax().text().to_string();
-                        match self.table.resolve_dotted_name(name.trim()) {
+                        let name = SmolStr::new(ty.syntax().text().to_string().trim());
+                        match self.table.resolve_dotted_name(&name) {
                             Some(id) => self.refs.set(ptr, Resolution::Resolved(id)),
                             None => self.refs.set(ptr, Resolution::Unresolved),
                         }
-                    }
+                        name
+                    });
                     let child = self.scopes.push(
                         Some(scope),
                         ScopeKind::Catch,
                         catch.syntax().text_range(),
                     );
                     if let Some(name) = catch.name() {
-                        let sym = self.declare_local(SymbolKind::CatchVar, &name, None);
+                        // Real Apex has no generic exception type, so
+                        // `declare_local_with_type_name` (no `type_args`)
+                        // is exact here, not a simplification -- see its
+                        // own doc comment for why this can't just reuse
+                        // `declare_local` the way every other local
+                        // declaration does.
+                        let sym = self.declare_local_with_type_name(
+                            SymbolKind::CatchVar,
+                            &name,
+                            exception_type_name,
+                        );
                         if let Some(text) = name.text() {
                             self.scopes.bind(child, text, sym);
                         }
@@ -2046,6 +2123,31 @@ impl<'a> BodyBinder<'a> {
             return class.map(|c| Ty::system_owned(c.name.clone(), Vec::new()));
         }
 
+        // `SObjectTypeName.SObjectType` (`Opportunity.SObjectType`,
+        // `Schema.Opportunity.SObjectType` once `Schema.Opportunity`
+        // itself resolves as a real schema object via the fallback
+        // further down) -- another compiler-magic universal property,
+        // confirmed against a real org, this time specifically on any
+        // real SObject type name (standard or custom). Not a real
+        // documented member of anything (`self.schema.field`/the stdlib-
+        // property lookup below never find it), so this needs the same
+        // early, targeted intercept `.class` gets just above -- scoped
+        // specifically to a confirmed real schema object receiver,
+        // unlike `.class`, which applies to any type at all.
+        if let Some(Ty::System { name: object, .. }) = &target_type {
+            if name.eq_ignore_ascii_case("SObjectType") && self.schema.object(object).is_some() {
+                let class = self.stdlib.class("SObjectType");
+                self.refs.set_with_highlight(
+                    ptr,
+                    highlight,
+                    class.map_or(Resolution::Unresolved, |c| {
+                        Resolution::StdlibMember(Box::new(stdlib_member_ref(c.namespace.clone(), &c.name, None, None, None)))
+                    }),
+                );
+                return class.map(|c| Ty::system_owned(c.name.clone(), Vec::new()));
+            }
+        }
+
         let container = match target_type {
             Some(Ty::Project(container)) => container,
             // A schema SObject value (`this.dataImport` typed as the
@@ -2159,6 +2261,26 @@ impl<'a> BodyBinder<'a> {
                         ))),
                     );
                     return Some(Ty::system_owned(namespaced.name.clone(), Vec::new()));
+                }
+                // `Schema.Opportunity` (a real schema object referenced
+                // through the `Schema` namespace prefix, real Apex --
+                // confirmed against a real org, most often immediately
+                // followed by `.SObjectType`, the early check above) --
+                // `name` isn't a stdlib *class* in this namespace, but it
+                // might still be a real SObject, standard or custom,
+                // reachable the same way a bare `Opportunity` `NameExpr`
+                // already resolves (`bind_name_expr`'s own `self.schema.object`
+                // fallback).
+                if self.schema.object(name).is_some() {
+                    self.refs.set_with_highlight(
+                        ptr,
+                        highlight,
+                        Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                            object: SmolStr::new(name),
+                            field: None,
+                        })),
+                    );
+                    return Some(Ty::system_owned(SmolStr::new(name), Vec::new()));
                 }
                 self.refs.set_with_highlight(ptr, highlight, Resolution::Unresolved);
                 return None;
@@ -2481,22 +2603,39 @@ impl<'a> BodyBinder<'a> {
                 // declared override always wins outright, same priority
                 // order `lookup_member`'s own inherited-chain walk
                 // already gives a project ancestor over a further one.
-                let resolution = if matches!(resolution, Resolution::Unresolved) {
-                    stdlib_class_via_unresolved_supertype(self.table, self.stdlib, container)
-                        .filter(|c| StdlibIndex::methods_of(c, name).next().is_some())
-                        .map_or(resolution, |c| {
-                            Resolution::StdlibMember(Box::new(stdlib_member_ref(
-                                c.namespace.clone(),
-                                &c.name,
-                                Some(name),
-                                Some(arg_types.len()),
-                                None,
-                            )))
-                        })
-                } else {
-                    resolution
+                let stdlib_fallback = matches!(resolution, Resolution::Unresolved)
+                    .then(|| stdlib_class_via_unresolved_supertype(self.table, self.stdlib, container))
+                    .flatten()
+                    .and_then(|c| narrow_stdlib_overload(self.schema, self.stdlib, self.table, c, name, &arg_types).map(|m| (c, m)));
+                let (resolution, result_type) = match stdlib_fallback {
+                    Some((c, winner)) => (
+                        Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                            c.namespace.clone(),
+                            &c.name,
+                            Some(name),
+                            Some(arg_types.len()),
+                            None,
+                        ))),
+                        // `result_type_of` only ever handles `Resolved`/
+                        // `Candidates` (a project `SymbolId`'s own type),
+                        // never `StdlibMember` -- computed directly here
+                        // instead, the same way the `Ty::System` arm below
+                        // already does for every other stdlib call. Without
+                        // this, the *resolution* was already correct
+                        // (`getMessage()` itself resolved) but its *result
+                        // type* silently stayed `None`, so a further
+                        // chained call (`caughtEx.getMessage().contains(...)`,
+                        // a real fflib_SObjectUnitOfWorkTest.cls shape)
+                        // stayed `Unresolved` right after -- a real bug in
+                        // this fallback's own first version, not a
+                        // pre-existing gap.
+                        stdlib_method_return_ty(self.stdlib, winner),
+                    ),
+                    None => {
+                        let result_type = self.result_type_of(&resolution);
+                        (resolution, result_type)
+                    }
                 };
-                let result_type = self.result_type_of(&resolution);
                 self.refs.set_with_highlight(ptr, highlight, resolution);
                 result_type
             }
@@ -2534,6 +2673,30 @@ impl<'a> BodyBinder<'a> {
                             .object(&base)
                             .is_some()
                             .then(|| self.stdlib.class("SObject"))
+                            .flatten()
+                            .filter(|c| StdlibIndex::methods_of(c, name).next().is_some())
+                    })
+                    .or_else(|| {
+                        // A built-in Apex exception *subtype*
+                        // (`DmlException`, `QueryException`,
+                        // `NullPointerException`, ...) -- Salesforce's own
+                        // docs only cover these in prose alongside
+                        // `Exception` itself, never as their own scraped
+                        // class/method reference page, so `class` above
+                        // is always `None` for one of these (confirmed:
+                        // no `apex_stdlib::standard_classes()` entry at
+                        // all, same gap `Exception` itself had before
+                        // this crate's own entry was hand-corrected).
+                        // Every real Apex exception class name ends in
+                        // literally `Exception` -- not just convention,
+                        // a hard compiler rule (confirmed against a real
+                        // org: "Classes extending Exception must have a
+                        // name ending in Exception") -- so this is a
+                        // safe, fully general signal, not fflib-specific.
+                        // Real NPSP shape: `System.DmlException caughtEx
+                        // = null; ... caughtEx.getMessage()`.
+                        base.ends_with("Exception")
+                            .then(|| self.stdlib.class("Exception"))
                             .flatten()
                             .filter(|c| StdlibIndex::methods_of(c, name).next().is_some())
                     });

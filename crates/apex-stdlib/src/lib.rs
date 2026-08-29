@@ -171,36 +171,40 @@ struct RawProperty {
 const APEX_REFERENCE_JSON: &str = include_str!("../data/apex_reference.json");
 
 /// Every standard Apex class/interface's bundled method/property
-/// schema, parsed once on first use. Excludes both the scraper's own
-/// empty navigation-page entries (`kind` other than `Class`/`Interface`,
+/// schema, parsed once on first use. Excludes the scraper's own empty
+/// navigation-page entries (`kind` other than `Class`/`Interface`/`Enum`,
 /// or no methods/properties at all -- roughly 1550 of the ~2220 raw
 /// entries, confirmed via direct inspection to be section/index pages
-/// like `"Apex Release Notes"`, not real types) and a handful (~8) of
-/// synthetic "Unknown"-kind doc-section groupings with real content but
-/// an atypical title (e.g. `"Email Class (Base Email Methods)"`) -- an
-/// accepted, tiny, documented gap rather than a bespoke title parser
-/// for a handful of entries, the same tolerance this project's scraper
-/// work has already established for similarly small residuals.
+/// like `"Apex Release Notes"`, not real types).
 ///
-/// One of those `"Unknown"`-kind entries was `"Exception Class and
-/// Built-In Exceptions"` -- the page documenting `Exception`'s own common
-/// methods (`getMessage`, `setMessage`, `getCause`, ...), laid out too
-/// differently from a normal method-reference page for the scraper's
-/// table walker to extract at all (real content, zero methods captured).
-/// Unlike the still-accepted "atypical title" residuals above, this one
-/// was worth hand-fixing directly in `data/apex_reference.json`: `extends
-/// Exception` and an inherited `Exception` method call are both extremely
-/// common in real Apex (every custom exception subclass has exactly this
-/// base), so this single entry's absence had an outsized real-world cost.
-/// `kind` corrected to `"Class"`, `name` to `"Exception"`, and `methods`
-/// populated with its real four constructors and seven common methods --
-/// verified directly against a live connected org (`sf apex run`), not
-/// guessed, the same "measure, don't guess" discipline this project's own
-/// `sf`-CLI-oracle convention already applies to disputed grammar
-/// questions. `initCause` in particular returns `void`, not `Exception`
-/// as its name might suggest -- confirmed by the exact compile error a
-/// wrong guess produced (`Illegal assignment from void to Exception`)
-/// before this was corrected.
+/// A further handful of raw entries came through with real content but
+/// `kind: "Unknown"` -- the scraper found a real page but couldn't
+/// classify it, usually because its title has an atypical shape
+/// (`"Email Class (Base Email Methods)"`) or, for `Exception`/`Trigger`
+/// specifically, because the whole page is laid out too differently from
+/// a normal method-reference table for the scraper's walker to extract
+/// any methods/properties at all. Most of these are hand-corrected
+/// directly in `data/apex_reference.json` rather than left as an accepted
+/// gap, since each was a real, outsized cost once actually found via a
+/// real report (`extends Exception`/an inherited `Exception` method,
+/// `Trigger.oldMap`/`Trigger.isBefore`/..., a `Messaging.Email` parameter
+/// type, ... are all common real Apex): `kind` corrected to `"Class"`,
+/// `name` stripped of its title's parenthetical/prefix noise where
+/// present, and -- for `Exception`/`Trigger`, whose pages had zero
+/// methods/properties actually captured -- their real, common members
+/// hand-populated, verified directly against a live connected org (`sf
+/// apex run`), not guessed, the same "measure, don't guess" discipline
+/// this project's own `sf`-CLI-oracle convention already applies to
+/// disputed grammar questions. (`Exception::initCause` in particular
+/// returns `void`, not `Exception` as its name might suggest -- confirmed
+/// by the exact compile error a wrong guess produced, `Illegal assignment
+/// from void to Exception`.) Two of the original raw `"Unknown"` entries
+/// stay excluded, deliberately not guessed at: `"Custom Settings Methods"`
+/// (its own title isn't a real class name at all, more likely a grouped
+/// how-to page than one specific class) and `"ConnectApi.BatchResult"`
+/// (name carries its own namespace prefix baked in, a difference in kind
+/// from every other entry's plain bare name that needs more thought
+/// before assuming a safe rename).
 ///
 /// Includes `Enum` (104 in the whole corpus, e.g. `LoggingLevel`) --
 /// each of its values is modeled as one of its `properties` (`is_static:

@@ -417,8 +417,56 @@ fn corpus_root() -> PathBuf {
 ///     org) with no real method to find on the field's own scalar type.
 ///     `BASELINE_RESOLVED` rose +559 (`206_068` -> `206_627`);
 ///     `BASELINE_UNRESOLVED` dropped -6,336 (`17_363` -> `11_027`).
-const BASELINE_RESOLVED: usize = 206_627;
-const BASELINE_UNRESOLVED: usize = 11_027;
+/// 16. Fourth file (`fflib_SObjectUnitOfWorkTest.cls`), four more real,
+///     general gaps: (a) `SObjectTypeName.SObjectType` (`Opportunity.SObjectType`,
+///     `Schema.Opportunity.SObjectType`) -- another compiler-magic
+///     universal property (confirmed against a real org), this time on
+///     any real SObject type name, plus the matching `bind_field_expr`
+///     fallback that lets `Schema.Opportunity` itself resolve as a real
+///     schema object in the first place. (b) A `catch (Type e)` clause's
+///     own variable was declared with `declare_local(..., None)`,
+///     discarding its type *entirely* regardless of whether the
+///     exception type itself was ever modeled -- so `e.getMessage()`
+///     stayed `Unresolved` inside *every* catch block, unconditionally,
+///     not just for unmodeled types. New `declare_local_with_type_name`
+///     (a catch clause's exception name parses as a `QualifiedName`, not
+///     a `Type`, so `declare_local` itself can't be reused directly).
+///     (c) The stdlib fallback added in step 12/14 for a project type's
+///     own inherited method call only ever computed the right
+///     `Resolution`, never the right *result type* (`result_type_of`
+///     only ever handles a project `SymbolId`'s own type, never
+///     `StdlibMember`) -- so the call itself resolved, but a further
+///     chained call right after it (`caughtEx.getMessage().contains(...)`)
+///     stayed `Unresolved` regardless -- a real bug in that fallback's
+///     own first version, not a pre-existing gap. Fixed by computing the
+///     winning overload's own return type directly, the same way the
+///     `Ty::System` arm already does for every other stdlib call. (d) A
+///     *built-in* Apex exception subtype (`DmlException`, `System.DmlException`)
+///     has no `apex_stdlib` entry at all and structurally never will
+///     (Salesforce's docs cover these only in prose, never their own
+///     class/method reference page) -- new fallback in
+///     `bind_method_call_expr`'s `Ty::System` arm: since every real Apex
+///     exception class name ends in literally `Exception` (a hard
+///     compiler rule, confirmed against a real org: "Classes extending
+///     Exception must have a name ending in Exception"), an unmodeled
+///     `*Exception`-named type falls back to `Exception`'s own methods.
+///     `classify_unresolved` (`apexls-server`) extended to match: a
+///     `Type`-kind reference shaped this way is now classified structural
+///     (`WARNING`) rather than the default (`ERROR`), the same "this
+///     binder can never individually confirm this, and never will"
+///     reasoning `QualifiedName` already gets. Also, dogfooding this file
+///     surfaced one more `"Unknown"`-kind `apex_stdlib` entry
+///     (`"Email Class (Base Email Methods)"`, real content, just
+///     misclassified) -- while fixing it, found and fixed 5 more of the
+///     same shape project-wide (`AuditParamsRequest`, `ReferencedRefundRequest`,
+///     `SalesforceResultCodeInfo`, `IntegrationTest`, `RemoteObjectController`),
+///     leaving only 2 of the original ~8 still excluded (see
+///     `apex_stdlib::standard_classes`'s own doc comment for why those
+///     two specifically still need more thought before a safe rename).
+///     `BASELINE_RESOLVED` rose +88 (`206_627` -> `206_715`);
+///     `BASELINE_UNRESOLVED` dropped -1,872 (`11_027` -> `9_155`).
+const BASELINE_RESOLVED: usize = 206_715;
+const BASELINE_UNRESOLVED: usize = 9_155;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {
