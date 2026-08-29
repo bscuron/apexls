@@ -45,6 +45,7 @@ use crate::ci_key::{CiKey, CiMap, CiQuery};
 use crate::file_id::FileId;
 use crate::symbol::{Symbol, SymbolId, Visibility};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use smol_str::SmolStr;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -114,6 +115,24 @@ struct Indices {
     /// order doesn't reliably preserve "which ancestor was the direct
     /// base class" once interfaces are mixed in.
     direct_super: FxHashMap<SymbolId, SymbolId>,
+    /// Populated by Pass 1.5: a class symbol's own raw `extends` name,
+    /// but *only* when that name failed to resolve against this project's
+    /// `SymbolTable` at all (`direct_super` above stays empty for that
+    /// same symbol in that case -- the two are mutually exclusive per
+    /// symbol). The overwhelmingly common reason: the name is real, but
+    /// external (`extends Exception`, `extends DmlException`, ...) --
+    /// `crate::inherit::resolve_inheritance`'s own doc comment already
+    /// covers why an unresolvable supertype otherwise "simply drops"
+    /// rather than aborting the chain. Kept, rather than discarded the
+    /// way the rest of Pass 1's raw name strings are once Pass 1.5 is
+    /// done with them, specifically so a project type's own member lookup
+    /// (`crate::resolve::bind_method_call_expr`'s `Ty::Project` arm) can
+    /// still fall back to a *real, documented* standard-library class of
+    /// this exact name when this project's own inheritance chain has
+    /// nothing by this member name -- see that fallback's own doc
+    /// comment for the motivating case (a custom exception subclass
+    /// calling an inherited `Exception` method like `setMessage`).
+    unresolved_direct_super: FxHashMap<SymbolId, SmolStr>,
     /// Populated by Pass 1.5: the reverse of `inherited_chain` -- for a
     /// type symbol that has at least one, every `SymbolId` transitively
     /// `extends`/`implements`-ing *it*, cycle-guarded the same way.
@@ -342,6 +361,21 @@ impl SymbolTable {
 
     pub fn direct_super(&self, id: SymbolId) -> Option<SymbolId> {
         self.indices.direct_super.get(&id).copied()
+    }
+
+    pub(crate) fn set_unresolved_direct_super(&mut self, id: SymbolId, name: SmolStr) {
+        Arc::make_mut(&mut self.indices)
+            .unresolved_direct_super
+            .insert(id, name);
+    }
+
+    /// `id`'s own raw `extends` name, when it failed to resolve against
+    /// this project at all (see [`Indices::unresolved_direct_super`]'s own
+    /// doc comment). `None` either when `id` has no `extends` clause, or
+    /// when it does and it resolved fine (check [`Self::direct_super`]
+    /// instead).
+    pub fn unresolved_direct_super(&self, id: SymbolId) -> Option<&str> {
+        self.indices.unresolved_direct_super.get(&id).map(SmolStr::as_str)
     }
 
     pub(crate) fn set_subtypes(&mut self, id: SymbolId, chain: Vec<SymbolId>) {

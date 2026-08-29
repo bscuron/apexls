@@ -1308,6 +1308,49 @@ supports each one.
       `crates/apexls-server/tests/syntax_error_diagnostics.rs`'s
       `a_missing_semicolon_is_reported_at_the_end_of_the_statement_missing_it_not_the_next_one`,
       built directly from the reported example's shape.
+- [x] **Unresolved-reference diagnostics, from `Resolution::Unresolved` --
+      shipped, but not the way this backlog originally framed it below
+      ("likely the single highest-value addition... cheapest to add").** A
+      pre-implementation investigation into every `refs.set(..., Resolution::Unresolved)`
+      call site in `resolve.rs`/`soql.rs` found several **structural,
+      confirmed, high-volume false-positive sources**, not just typos:
+      catch-clause/`whenValue`/`upsert`-external-id lookups
+      (`SymbolTable::resolve_dotted_name`, project-local only, no stdlib
+      fallback), `super`/`super(...)`/`this(...)` on a type whose own
+      supertype is unresolvable (`inherit::resolve_inheritance`'s own doc
+      comment: "an unresolvable supertype... is simply dropped" -- true for
+      *any* stdlib base, `Exception` included, confirmed empirically while
+      writing this feature's own tests), one segment of a namespace-
+      qualified type reference (`resolve::record_qualified_segments`,
+      always `Unresolved` per-segment even when the whole reference
+      resolves fine -- and often a recognized keyword token like
+      `SyntaxKind::System`, not a plain identifier, also confirmed
+      empirically), and a SOQL `TYPEOF ... ELSE` field (unconditional by
+      `soql.rs`'s own design). `resolution_regression_baseline.rs` (pins
+      `Unresolved`'s count at `28,172` on the real NPSP corpus) already
+      said as much: it explicitly doesn't track what fraction is "a real
+      bug" vs. "a known, still-unmodeled gap," and every historical
+      reduction in that count turned out to be the latter. Given that, the
+      shipped design doesn't filter down to only the safe cases -- it shows
+      **every** `Unresolved` reference (full visibility, not hidden
+      precision, was the explicit goal), and grades confidence via
+      severity instead: `capabilities::classify_unresolved` recognizes the
+      specific structural shapes above and reports those `WARNING` with a
+      message explaining why (doubling as a live, in-editor discovery feed
+      for closing those exact binder gaps later, the same purpose
+      `examples/unresolved_clusters.rs` already serves offline); everything
+      else is `ERROR` as the higher-confidence default -- though, per
+      `classify_unresolved`'s own doc comment, that's a best-effort
+      heuristic, not a proof, and this feature's own test suite caught a
+      real example of the limitation: `extends Exception`'s own `Type`-kind
+      reference lands in the `ERROR` bucket too, because `Exception` itself
+      turned out to be unmodeled in this binder's stdlib class index --
+      likely a real, separate, still-open gap, not a diagnostic bug. New:
+      `BoundProgram::resolutions_in_file` (`crates/apex-binder/src/lib.rs`,
+      mirrors `all_resolutions` but per-file), `capabilities::classify_unresolved`/
+      `unresolved_reference_diagnostics`, wired into the existing merged
+      `publish_diagnostics`. Tests:
+      `crates/apexls-server/tests/unresolved_reference_diagnostics.rs`.
 - [ ] **Duplicate/conflicting-modifier diagnostic -- a real gap, found via
       a user report.** `private private private private void foo() {`
       produces no error anywhere in the pipeline today: `grammar::declarations::modifiers`
@@ -1335,13 +1378,6 @@ supports each one.
       published as separate notifications per file.
 
       **Already computed, just never surfaced -- cheapest to add:**
-      - Unresolved-reference diagnostics, from `Resolution::Unresolved` --
-        every reference the binder already couldn't resolve to anything (a
-        typo, wrong casing, a symbol that doesn't exist). Likely the
-        single highest-value addition: it's what most people mean by "red
-        squiggles" in a language server, and the data already exists,
-        unused as a diagnostic source, exactly like the syntax-error case
-        that just shipped.
       - Unknown SOQL/SOSL object or field, from `Resolution::UnknownSchema`
         -- a query referencing an object/field with no matching local or
         standard schema (`FROM Unknown_Object__c`, a bad `WHERE` field).

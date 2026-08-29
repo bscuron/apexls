@@ -553,8 +553,9 @@ fn spawn_rebuild_worker(
 /// error) would leave its stale squiggle on screen forever, since nothing
 /// else would ever tell the client to clear it.
 ///
-/// Combines every diagnostic source (currently `syntax_error_diagnostics`
-/// and `dead_code_diagnostics`) into *one* notification per file --
+/// Combines every diagnostic source (currently `syntax_error_diagnostics`,
+/// `dead_code_diagnostics`, and `unresolved_reference_diagnostics`) into
+/// *one* notification per file --
 /// `textDocument/publishDiagnostics` replaces a client's whole diagnostic
 /// set for a URI on every notification rather than merging with the
 /// previous one, so sending two separate notifications for the same file
@@ -574,6 +575,7 @@ fn publish_diagnostics(bind: &BindState, client: &ClientSocket, encoding: Positi
         };
         let mut diagnostics = capabilities::syntax_error_diagnostics(program, file, encoding);
         diagnostics.extend(capabilities::dead_code_diagnostics(program, file, encoding));
+        diagnostics.extend(capabilities::unresolved_reference_diagnostics(program, file, encoding));
         let _ = client.notify::<lsp_types::notification::PublishDiagnostics>(PublishDiagnosticsParams {
             uri,
             diagnostics,

@@ -14,6 +14,7 @@ use apex_syntax::ast::decl::{
     PropertyDecl, TriggerUnit,
 };
 use apex_syntax::ast::expr::{ArgList, CallExpr, Expr, MethodCallExpr, NameExpr, NewExpr};
+use apex_syntax::SyntaxKind;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall, CodeAction,
     CodeActionKind, CodeActionOrCommand, CompletionItem, CompletionItemKind, CompletionList,
@@ -1071,6 +1072,153 @@ pub(crate) fn syntax_error_diagnostics(
                 severity: Some(DiagnosticSeverity::ERROR),
                 source: Some("apexls".to_string()),
                 message: err.message.clone(),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// `Some(reason)` when `ptr` matches one of the specific, identified
+/// shapes where the binder produces `Resolution::Unresolved` not because
+/// the referenced name doesn't exist in real Apex, but because this
+/// binder's own resolution has no fallback for that shape at all --
+/// catch-clause/`whenValue`/`upsert`-external-id lookups
+/// (`SymbolTable::resolve_dotted_name`, project-local only, no stdlib or
+/// schema fallback), one segment of a namespace-qualified stdlib type
+/// (`resolve::record_qualified_segments`, the one case a bare *token*
+/// gets its own recorded `Resolution` -- see `SyntaxPtr::for_token`'s doc
+/// comment), a bare `super` reference or `super(...)`/`this(...)` call
+/// when the enclosing type's own supertype couldn't be resolved
+/// (`SymbolTable::direct_super`), or a SOQL field reference with no
+/// single object to resolve against (most commonly a `TYPEOF ... ELSE`
+/// field, `soql::bind_typeof`'s own doc comment: "always `Unresolved`").
+/// `None` for everything else (`NameExpr`, `FieldExpr`, `MethodCallExpr`,
+/// `NewExpr`, `Type`, `ThisExpr`, an unqualified non-`this`/`super` call)
+/// -- the higher-confidence default, on the theory that a reference this
+/// investigation couldn't specifically explain away is more likely a real
+/// typo than not. This is a best-effort heuristic, not a proof: the
+/// `CallExpr` case in particular can't distinguish "the supertype itself
+/// is unresolvable" from "the supertype resolved fine but no constructor
+/// overload matched these arguments" (both funnel into the same
+/// `Resolution::Unresolved` at the same `ptr` -- see
+/// `resolve::BodyBinder::bind_call_expr`), and a `None` classification
+/// here doesn't guarantee the reference isn't *also* a still-unidentified
+/// binder gap. That's an accepted tradeoff, not an oversight: the point
+/// of `unresolved_reference_diagnostics` is full visibility into every
+/// `Unresolved` reference, with severity as a confidence signal rather
+/// than a filter -- see that function's own doc comment.
+fn classify_unresolved(program: &BoundProgram, ptr: SyntaxPtr) -> Option<&'static str> {
+    match ptr.kind() {
+        SyntaxKind::QualifiedName => Some(
+            "catch-clause/switch-value/upsert-field type lookups resolve only against \
+             project-local types, with no standard-library or schema fallback",
+        ),
+        SyntaxKind::SuperExpr => Some(
+            "this class's own supertype couldn't be resolved (often a standard exception \
+             type or another unmodeled standard-library base)",
+        ),
+        SyntaxKind::SoqlFieldName => Some(
+            "a SOQL field reference with no single object to resolve against (most often \
+             a TYPEOF ... ELSE field, which by design applies across every non-matched type)",
+        ),
+        SyntaxKind::CallExpr => {
+            let root = program.syntax(ptr.file());
+            let is_this_or_super = ptr
+                .to_node(&root)
+                .and_then(CallExpr::cast)
+                .and_then(|c| c.callee_token())
+                .is_some_and(|t| matches!(t.kind(), SyntaxKind::This | SyntaxKind::Super));
+            is_this_or_super.then_some(
+                "an unqualified this(...)/super(...) constructor call on a type whose own \
+                 inheritance couldn't be resolved",
+            )
+        }
+        // Every node kind Pass 2 ever registers a `Resolution` under is
+        // one of the ten matched here or listed explicitly below --
+        // `BoundProgram::resolution_at`'s own doc comment confirms this
+        // exhaustively by reading every `refs.set(...)` call site in
+        // `resolve.rs`/`soql.rs`. Anything landing in this arm is
+        // therefore never a node at all: it's a bare *token*-kind pointer
+        // (`SyntaxPtr::for_token`), which -- per that constructor's own
+        // doc comment -- only ever arises from `resolve::record_qualified_segments`,
+        // one segment of a namespace-qualified type reference (e.g.
+        // `System.Foo`). Deliberately matched by exclusion rather than by
+        // a specific token kind (`SyntaxKind::Identifier`, say): a
+        // namespace segment is very often a recognized keyword-shaped
+        // token in its own right (`System`, `Schema`, `Database`, ...),
+        // not a plain identifier -- matching only `Identifier` silently
+        // missed exactly the most common real case (confirmed against a
+        // real `System.String` reference, where `"System"`'s own token
+        // kind is `SyntaxKind::System`, not `Identifier`).
+        SyntaxKind::NameExpr
+        | SyntaxKind::FieldExpr
+        | SyntaxKind::Type
+        | SyntaxKind::MethodCallExpr
+        | SyntaxKind::NewExpr
+        | SyntaxKind::ThisExpr => None,
+        _ => Some(
+            "one segment of a namespace-qualified type reference (e.g. `System.Foo`) -- \
+             the whole reference may still resolve correctly",
+        ),
+    }
+}
+
+/// `textDocument/publishDiagnostics`: one diagnostic per reference the
+/// binder recorded as `Resolution::Unresolved` (`resolutions_in_file`) --
+/// deliberately *every* one, not a subset picked for precision. An
+/// earlier design only surfaced the highest-confidence shapes (a bare
+/// name) and quietly dropped the rest; that hid real information the
+/// project itself needs, since every one of `resolution_regression_baseline.rs`'s
+/// `28,172`-and-counting `Unresolved` references on the real NPSP corpus
+/// is either a genuine bug in someone's Apex or a gap in this binder's own
+/// modeling -- and the only way to keep closing those gaps
+/// (`examples/unresolved_clusters.rs`'s whole purpose, run offline today)
+/// is to keep seeing where they are. So instead of filtering, this grades
+/// confidence via severity: `classify_unresolved` recognizes the specific
+/// shapes already known to be a binder limitation rather than a code
+/// defect and reports those as `WARNING` with a message explaining why;
+/// everything else -- the more likely-a-real-bug default, though not a
+/// guarantee, see `classify_unresolved`'s own doc comment -- is `ERROR`.
+/// Range and message text both come from `BoundProgram::highlight_range`,
+/// which already narrows every reference kind here to its tight
+/// identifier span (its own doc comment covers all of them); slicing the
+/// file's raw text at that same range is simpler and more uniform than a
+/// separate per-`SyntaxKind` AST accessor for "the name text."
+pub(crate) fn unresolved_reference_diagnostics(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<Diagnostic> {
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+    program
+        .resolutions_in_file(file)
+        .filter(|(_, res)| matches!(res, Resolution::Unresolved))
+        .map(|(ptr, _)| {
+            let range = program.highlight_range(*ptr);
+            let name = &text[usize::from(range.start())..usize::from(range.end())];
+            let lsp_range = Range {
+                start: index.to_position(&text, range.start().into(), encoding),
+                end: index.to_position(&text, range.end().into(), encoding),
+            };
+            let (severity, message) = match classify_unresolved(program, *ptr) {
+                Some(reason) => (
+                    DiagnosticSeverity::WARNING,
+                    format!(
+                        "unresolved reference to '{name}' -- likely an apexls limitation \
+                         ({reason}), not necessarily invalid Apex"
+                    ),
+                ),
+                None => (
+                    DiagnosticSeverity::ERROR,
+                    format!("cannot resolve reference to '{name}'"),
+                ),
+            };
+            Diagnostic {
+                range: lsp_range,
+                severity: Some(severity),
+                source: Some("apexls".to_string()),
+                message,
                 ..Default::default()
             }
         })

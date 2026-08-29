@@ -293,8 +293,37 @@ fn corpus_root() -> PathBuf {
 ///     `CallExpr`/`NewExpr` references specifically); `BASELINE_RESOLVED`
 ///     rose +8 (`205_511` -> `205_519`) from the same "argument/chain
 ///     type newly known" ripple effect documented in step 1.
-const BASELINE_RESOLVED: usize = 205_519;
-const BASELINE_UNRESOLVED: usize = 28_172;
+/// 12. `apex_stdlib::standard_classes()` had no entry at all for
+///     `Exception` -- the real page documenting its common methods
+///     (`getMessage`, `setMessage`, `getCause`, ...) is laid out too
+///     differently from a normal method-reference page for the scraper's
+///     table walker to extract, so it came through with `kind: "Unknown"`
+///     and zero methods, which `standard_classes()`'s own filter then
+///     excluded entirely. Every custom exception subclass has `Exception`
+///     as its base, so this single gap was outsized: `extends Exception`
+///     itself never resolved, and neither did any inherited `Exception`
+///     method call from within such a subclass. Fixed in two parts: (a)
+///     hand-corrected the one bundled JSON entry directly (`kind` ->
+///     `"Class"`, `name` -> `"Exception"`, real methods/constructors
+///     populated -- verified against a live connected org via `sf apex
+///     run`, not guessed; see `apex_stdlib::standard_classes`'s own doc
+///     comment), which alone fixes `extends Exception`'s own `Type`-kind
+///     reference (`resolve::resolve_type_ref`'s existing `stdlib.class(&name)`
+///     fallback now finds it); (b) added a new, more general fallback --
+///     `resolve::stdlib_class_via_unresolved_supertype`, wired into
+///     `bind_method_call_expr`'s `Ty::Project` arm -- for a project type's
+///     own *inherited* member lookup, which previously had no fallback at
+///     all beyond this project's own `SymbolTable`: when a project type's
+///     `extends` name never resolved as a project symbol in the first
+///     place (`SymbolTable::unresolved_direct_super`, new), but the name
+///     *is* a real stdlib class, an inherited call now resolves against
+///     that stdlib class's own members instead of staying `Unresolved`
+///     forever. Not specific to `Exception` -- any project type extending
+///     an unresolvable-but-real stdlib base benefits the same way.
+///     `BASELINE_RESOLVED` rose +545 (`205_519` -> `206_064`);
+///     `BASELINE_UNRESOLVED` dropped -3,535 (`28_172` -> `24_637`).
+const BASELINE_RESOLVED: usize = 206_064;
+const BASELINE_UNRESOLVED: usize = 24_637;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

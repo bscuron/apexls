@@ -34,12 +34,15 @@ pub(crate) fn resolve_inheritance(
     raw_extends: &[(SymbolId, Vec<SmolStr>)],
     raw_super: &[(SymbolId, SmolStr)],
 ) {
-    let direct_super: Vec<(SymbolId, SymbolId)> = raw_super
+    let resolved_super: Vec<(SymbolId, Result<SymbolId, SmolStr>)> = raw_super
         .par_iter()
-        .filter_map(|(type_id, name)| table.resolve_dotted_name(name).map(|super_id| (*type_id, super_id)))
+        .map(|(type_id, name)| (*type_id, table.resolve_dotted_name(name).ok_or_else(|| name.clone())))
         .collect();
-    for (type_id, super_id) in direct_super {
-        table.set_direct_super(type_id, super_id);
+    for (type_id, resolved) in resolved_super {
+        match resolved {
+            Ok(super_id) => table.set_direct_super(type_id, super_id),
+            Err(name) => table.set_unresolved_direct_super(type_id, name),
+        }
     }
 
     // Resolve each type's *direct* supertype names to `SymbolId`s first,

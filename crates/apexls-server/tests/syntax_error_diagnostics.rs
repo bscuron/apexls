@@ -213,16 +213,17 @@ fn a_real_syntax_error_gets_an_error_severity_diagnostic() {
     let notification = session.next_diagnostics();
     assert_eq!(notification["params"]["uri"], serde_json::json!(foo_uri));
     let diagnostics = notification["params"]["diagnostics"].as_array().unwrap();
-    // Filtered to ERROR severity, not asserted as the *only* diagnostic:
-    // `run`'s own body is unrelated to whether it has a real caller, and
-    // this fixture (deliberately minimal, no second file) leaves it
-    // legitimately dead-code-flagged too -- irrelevant to what this test
-    // actually checks.
+    // Filtered to a syntax-error-shaped message, not just ERROR severity
+    // and not asserted as the *only* diagnostic: `run`'s own body is
+    // unrelated to whether it has a real caller (legitimately dead-code-
+    // flagged too), and `foo(1, 2` also calls an undeclared `foo`
+    // (legitimately `unresolved_reference_diagnostics`-flagged, also
+    // ERROR severity) -- neither is what this test actually checks.
     let errors: Vec<_> = diagnostics
         .iter()
-        .filter(|d| d["severity"] == serde_json::json!(1))
+        .filter(|d| d["severity"] == serde_json::json!(1) && d["message"].as_str().unwrap_or_default().starts_with("expected"))
         .collect();
-    assert_eq!(errors.len(), 1, "expected exactly one ERROR-severity diagnostic: {diagnostics:?}");
+    assert_eq!(errors.len(), 1, "expected exactly one syntax-error diagnostic: {diagnostics:?}");
     let diagnostic = errors[0];
     assert_eq!(diagnostic["source"], serde_json::json!("apexls"));
     let message = diagnostic["message"].as_str().unwrap();
@@ -243,23 +244,27 @@ fn fixing_the_error_clears_the_diagnostic_on_the_next_publish() {
 
     let mut session = Session::start(&root_uri, &foo_uri, MISSING_CLOSE_PAREN_SRC);
 
-    let has_error = |v: &serde_json::Value| {
+    // Specifically a syntax-error-shaped message, not just ERROR severity:
+    // `FIXED_SRC` still calls an undeclared `foo(1, 2)`, which legitimately
+    // keeps its own, unrelated ERROR from `unresolved_reference_diagnostics`
+    // even after the syntax error itself is fixed.
+    let has_syntax_error = |v: &serde_json::Value| {
         v["params"]["diagnostics"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|d| d["severity"] == serde_json::json!(1))
+            .any(|d| d["severity"] == serde_json::json!(1) && d["message"].as_str().unwrap_or_default().starts_with("expected"))
     };
 
     let first = session.next_diagnostics();
-    assert!(has_error(&first), "expected the initial broken file to have an ERROR diagnostic: {first:?}");
+    assert!(has_syntax_error(&first), "expected the initial broken file to have a syntax-error diagnostic: {first:?}");
 
     session.did_change(&foo_uri, 2, FIXED_SRC);
     let second = session.next_diagnostics();
     assert_eq!(second["params"]["uri"], serde_json::json!(foo_uri));
     assert!(
-        !has_error(&second),
-        "fixing the syntax error should clear its ERROR diagnostic, not leave a stale squiggle: {second:?}"
+        !has_syntax_error(&second),
+        "fixing the syntax error should clear its diagnostic, not leave a stale squiggle: {second:?}"
     );
 
     session.shutdown();
@@ -287,11 +292,17 @@ fn a_missing_semicolon_is_reported_at_the_end_of_the_statement_missing_it_not_th
 
     let notification = session.next_diagnostics();
     let diagnostics = notification["params"]["diagnostics"].as_array().unwrap();
+    // Filtered to a syntax-error-shaped message: `Foo` declares neither
+    // `populateAvailableFields` nor `populateSoftCredits`, so both calls
+    // also legitimately (and separately) trip `unresolved_reference_diagnostics`,
+    // ERROR severity same as a real syntax error -- irrelevant to what
+    // this test actually checks (where the *missing-semicolon* diagnostic
+    // lands).
     let errors: Vec<_> = diagnostics
         .iter()
-        .filter(|d| d["severity"] == serde_json::json!(1))
+        .filter(|d| d["severity"] == serde_json::json!(1) && d["message"].as_str().unwrap_or_default().starts_with("expected"))
         .collect();
-    assert_eq!(errors.len(), 1, "expected exactly one ERROR-severity diagnostic: {diagnostics:?}");
+    assert_eq!(errors.len(), 1, "expected exactly one syntax-error diagnostic: {diagnostics:?}");
     let range = &errors[0]["range"];
     assert_eq!(
         range["start"]["line"], serde_json::json!(2),

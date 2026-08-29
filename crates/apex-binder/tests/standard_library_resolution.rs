@@ -9,7 +9,7 @@
 //! works (that's tried first and always wins when it applies); this is
 //! purely the fallback for everything else.
 
-use apex_binder::{BoundProgram, Resolution, StdlibMemberRef};
+use apex_binder::{BoundProgram, Resolution, SchemaObjectRef, StdlibMemberRef};
 use apex_syntax::ast::expr::{FieldExpr, MethodCallExpr, NameExpr};
 use rowan::ast::AstNode;
 
@@ -406,5 +406,43 @@ fn a_custom_objects_generic_sobject_method_resolves_via_the_sobject_fallback() {
             narrowed_param_types: None,
         }))),
         "a real custom object's getSObjectType() should fall back to the generic SObject method"
+    );
+}
+
+/// The exact user-reported bug: `sobj.Id` where `sobj` is declared as the
+/// bare generic `SObject` type (e.g. a `Map<Id, SObject>` value), not a
+/// concrete object -- real Apex allows `.Id` directly on any `SObject`-
+/// typed value with no cast, since every SObject has one, unlike every
+/// other field (`.Name`, say, isn't guaranteed the same way). `SObject`
+/// itself is never a `self.schema.object(...)` entry (it isn't a real,
+/// queryable object) and the bundled stdlib snapshot's own `SObject`
+/// class genuinely has no scraped `properties` at all (Salesforce's own
+/// docs treat `Id` as a schema field, not a class member) -- so both the
+/// schema-field and stdlib-property fallbacks this test file otherwise
+/// exercises miss it, and `sobj.Id` fell to `Resolution::Unresolved`
+/// unconditionally before this fix.
+#[test]
+fn the_generic_sobject_types_id_field_resolves_without_a_cast() {
+    let dir = write_fixture_dir(
+        "stdlib-sobject-generic-id",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             public void run(Map<Id, SObject> sObjectMap, SObject sobj) { \
+                 SObject inMap = sObjectMap.get(sobj.Id); \
+             } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        field_expr_resolution(&program, "Id"),
+        Some(Resolution::SchemaObject(Box::new(SchemaObjectRef {
+            object: "SObject".into(),
+            field: Some("Id".into()),
+        }))),
+        "sobj.Id should resolve as a field access on the generic SObject type, not Unresolved"
     );
 }

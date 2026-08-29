@@ -53,13 +53,28 @@ pub(crate) fn builtin_generic_member_type(
             "size" => Some(Ty::system("Integer")),
             "isempty" => Some(Ty::boolean()),
             "contains" => Some(Ty::boolean()),
-            // `Iterator<T>`'s own members aren't modeled anywhere in
-            // this crate -- harmless, the same "type known, no member
-            // model" situation as a bare `Ty::System` already is
-            // everywhere else, just with a real type argument attached
-            // instead of none.
             "iterator" => Some(Ty::system_with_args("Iterator", element.into_iter().collect())),
             _ => same_type_as_receiver(class, "List", args, member),
+        },
+        // `Iterator<T>` itself: `apex_stdlib::standard_classes()` now has
+        // a real (hand-authored, not scraped -- Salesforce's docs cover
+        // it in a language-guide page about "Using Iterators," not the
+        // class/method reference `tools/salesforce-doc-scraper` walks)
+        // `"Iterator"` entry with both real methods, which alone is
+        // enough for `hasNext`/`next` to resolve at all. This per-method
+        // entry still earns its keep on top of that: `Iterator.next()`'s
+        // scraped-equivalent return type is the generic `Object` (the
+        // Apex language spec has no way to say "the same `T` the
+        // `Iterator<T>` was parameterized with" in a plain reference
+        // page), so without this, `Iterator<String>`'s own `.next()`
+        // widened to `Object` instead of staying `String` through a
+        // further chained call -- the exact same "generic method needs
+        // real substitution, not just existence" reasoning `List.get`/
+        // `Map.get`/... above already needed.
+        "iterator" => match member_lower.as_str() {
+            "hasnext" => Some(Ty::boolean()),
+            "next" => element,
+            _ => None,
         },
         "map" => match member_lower.as_str() {
             "get" => value,

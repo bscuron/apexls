@@ -182,6 +182,26 @@ const APEX_REFERENCE_JSON: &str = include_str!("../data/apex_reference.json");
 /// for a handful of entries, the same tolerance this project's scraper
 /// work has already established for similarly small residuals.
 ///
+/// One of those `"Unknown"`-kind entries was `"Exception Class and
+/// Built-In Exceptions"` -- the page documenting `Exception`'s own common
+/// methods (`getMessage`, `setMessage`, `getCause`, ...), laid out too
+/// differently from a normal method-reference page for the scraper's
+/// table walker to extract at all (real content, zero methods captured).
+/// Unlike the still-accepted "atypical title" residuals above, this one
+/// was worth hand-fixing directly in `data/apex_reference.json`: `extends
+/// Exception` and an inherited `Exception` method call are both extremely
+/// common in real Apex (every custom exception subclass has exactly this
+/// base), so this single entry's absence had an outsized real-world cost.
+/// `kind` corrected to `"Class"`, `name` to `"Exception"`, and `methods`
+/// populated with its real four constructors and seven common methods --
+/// verified directly against a live connected org (`sf apex run`), not
+/// guessed, the same "measure, don't guess" discipline this project's own
+/// `sf`-CLI-oracle convention already applies to disputed grammar
+/// questions. `initCause` in particular returns `void`, not `Exception`
+/// as its name might suggest -- confirmed by the exact compile error a
+/// wrong guess produced (`Illegal assignment from void to Exception`)
+/// before this was corrected.
+///
 /// Includes `Enum` (104 in the whole corpus, e.g. `LoggingLevel`) --
 /// each of its values is modeled as one of its `properties` (`is_static:
 /// true`, `type_name`: the enum's own name), so `LoggingLevel.INFO`

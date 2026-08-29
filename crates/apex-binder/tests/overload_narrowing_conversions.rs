@@ -232,14 +232,63 @@ fn a_list_of_a_project_local_subtype_eliminates_a_mismatched_element_leaf_type()
 
 #[test]
 fn argument_and_parameter_types_outside_the_curated_set_stay_ambiguous() {
-    // `Exception`/`PageReference` are real Apex system types, but neither
-    // is in `crate::conversions`'s curated set -- an `Exception`-typed
+    // `Iterable`/`PageReference` are real Apex system types, but
+    // `Iterable` specifically has no `apex_stdlib::standard_classes()`
+    // entry at all (confirmed against the raw bundled
+    // `data/apex_reference.json`: `List`/`Set`'s own `implements Iterable<T>`
+    // isn't itself a scraped class/method reference page) -- so
+    // `stdlib.class("Iterable")` stays `None`, and an `Iterable`-typed
     // argument must never eliminate a `PageReference` overload (or vice
-    // versa), even though a real compiler would reject this call. "Can't
-    // prove wrong" must keep winning outside the curated rules, exactly
-    // as it did before this work for every system type.
+    // versa) on that basis. "Can't prove wrong" must keep winning
+    // whenever either side isn't a `StdlibIndex`-confirmed real class,
+    // exactly as it did before this work for every system type
+    // (`Exception` used to be this test's second example, then
+    // `Iterator` -- see `exception_and_page_reference_are_now_curated_and_correctly_disambiguate`
+    // below for that first transition, the same "was ambiguous, now
+    // correctly resolved" shape `id_and_blob_are_now_curated_and_correctly_disambiguate`
+    // already documents; `Iterator` itself got a real bundled entry
+    // later, breaking this test a second time -- hence `Iterable`, not
+    // `Iterator`, now. Inherently a moving target: whichever real system
+    // type this crate hasn't modeled yet is this test's example, by
+    // construction, and stays only until the next one gets modeled).
     let dir = write_fixture_dir(
         "uncurated-stays-ambiguous",
+        &[(
+            "Toolbox.cls",
+            "public class Toolbox { \
+             public void pick(Iterable<String> x) { } \
+             public void pick(PageReference x) { } \
+             public void run() { Iterable<String> anIterable; pick(anIterable); } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for(&program, SymbolKind::Class, "Toolbox");
+    let Some(Resolution::Candidates(remaining)) = the_call_resolution(&program, file, "pick") else {
+        panic!("expected pick(anIterable) to stay Candidates when one overload's type isn't a confirmed real stdlib class");
+    };
+    assert_eq!(remaining.len(), 2);
+}
+
+#[test]
+fn exception_and_page_reference_are_now_curated_and_correctly_disambiguate() {
+    // `Exception`/`PageReference` used to be this file's own example of
+    // "two real, uncurated system types stay ambiguous" (see the test
+    // above's own doc comment) -- `Exception` is now a real, populated
+    // `apex_stdlib::standard_classes()` entry (it used to have none at
+    // all: the real page documenting it is laid out too differently from
+    // a normal method-reference page for the scraper to extract, a real,
+    // now-fixed data gap -- see `apex_stdlib::standard_classes`'s own doc
+    // comment), so `crate::conversions::type_compatible`'s "two
+    // different, both real stdlib classes" elimination rule now applies:
+    // an `Exception`-typed argument positively rules out the
+    // `PageReference` overload instead of leaving both as candidates,
+    // matching a real org (`Exception` and `PageReference` are not
+    // implicitly convertible either way).
+    let dir = write_fixture_dir(
+        "exception-page-reference-now-curated",
         &[(
             "Toolbox.cls",
             "public class Toolbox { \
@@ -253,10 +302,11 @@ fn argument_and_parameter_types_outside_the_curated_set_stay_ambiguous() {
     std::fs::remove_dir_all(&dir).ok();
 
     let file = file_for(&program, SymbolKind::Class, "Toolbox");
-    let Some(Resolution::Candidates(remaining)) = the_call_resolution(&program, file, "pick") else {
-        panic!("expected pick(anEx) to stay Candidates when both overloads are uncurated system types");
-    };
-    assert_eq!(remaining.len(), 2);
+    let exception_overload = pick_overload_with_param_type(&program, "Exception");
+    assert_eq!(
+        the_call_resolution(&program, file, "pick"),
+        Some(Resolution::Resolved(exception_overload))
+    );
 }
 
 #[test]

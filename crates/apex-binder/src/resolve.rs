@@ -183,6 +183,27 @@ fn stdlib_member_ref(
     }
 }
 
+/// The real, documented standard-library class `container` (or the
+/// nearest ancestor of it, walking `SymbolTable::inherited_chain` the
+/// same outward order `SymbolTable::lookup_member` already does) `extends`
+/// but could never resolve as a project type at all -- see
+/// `SymbolTable::unresolved_direct_super`'s own doc comment for why that
+/// name is kept around rather than discarded once Pass 1.5 is done with
+/// it. `None` when no ancestor in the chain has an unresolved `extends`
+/// name, or when the one it does have doesn't match any real bundled
+/// stdlib class (a genuinely unmodeled/nonexistent base, indistinguishable
+/// from a typo without more information than this project has).
+fn stdlib_class_via_unresolved_supertype(
+    table: &SymbolTable,
+    stdlib: &StdlibIndex,
+    container: SymbolId,
+) -> Option<&'static StdlibClass> {
+    std::iter::once(container)
+        .chain(table.inherited_chain(container).iter().copied())
+        .find_map(|id| table.unresolved_direct_super(id))
+        .and_then(|name| stdlib.class(name))
+}
+
 /// Best-effort narrows `class.member`'s scraped overloads (arity, then
 /// `crate::conversions::type_compatible`) down to the one real method a
 /// call actually invokes -- deliberately simpler than [`narrow_by_overload`]'s
@@ -238,16 +259,37 @@ fn narrow_stdlib_overload(
     }
 }
 
+/// Turns a scraped type string (`StdlibMethod::return_type`,
+/// `StdlibProperty::type_name`, ...) into a `Ty::System`, stripping a
+/// leading `"Namespace."` prefix down to the class's own bare name first
+/// when `stdlib` confirms that's a real (namespace, class) pair.
+/// `StdlibIndex`'s registry (like every other class lookup in this crate)
+/// is keyed by a class's bare name only, never a namespace-qualified
+/// compound string -- a return type scraped as `"Schema.DescribeFieldResult"`
+/// (real, confirmed: `SObjectField.getDescribe()`'s own scraped return
+/// type is exactly this shape) used to produce a `Ty::System` named
+/// literally `"Schema.DescribeFieldResult"`, which no later
+/// `stdlib.class(&name)` lookup could ever match -- silently dead-ending
+/// any further chained call right after it (`token.getDescribe().getName()`,
+/// a real bug this fixed). Left as the whole original string when it
+/// isn't a recognized two-segment namespace+class pair (a generic
+/// argument, a name that merely happens to contain a dot, ...) -- "can't
+/// prove it's namespace-qualified" keeps today's behavior, never a guess.
+fn ty_from_scraped_type(stdlib: &StdlibIndex, type_str: &str) -> Ty {
+    let (base, args) = apex_stdlib::split_generic_type(type_str);
+    let base = match base.rsplit_once('.') {
+        Some((ns, name)) if stdlib.class_in_namespace(ns, name).is_some() => SmolStr::new(name),
+        _ => base,
+    };
+    Ty::system_owned(base, args.into_iter().map(|a| Ty::system_owned(a, Vec::new())).collect())
+}
+
 /// A [`narrow_stdlib_overload`] winner's own declared return type,
 /// converted to the *propagated type* for continued chaining
 /// (`Database.query(soql).size()`).
-fn stdlib_method_return_ty(method: &StdlibMethod) -> Option<Ty> {
+fn stdlib_method_return_ty(stdlib: &StdlibIndex, method: &StdlibMethod) -> Option<Ty> {
     let return_type = method.return_type.as_deref()?;
-    let (base, args) = apex_stdlib::split_generic_type(return_type);
-    Some(Ty::system_owned(
-        base,
-        args.into_iter().map(|a| Ty::system_owned(a, Vec::new())).collect(),
-    ))
+    Some(ty_from_scraped_type(stdlib, return_type))
 }
 
 /// Mirrors [`is_argument_type_compatible`], but against a scraped
@@ -1868,9 +1910,30 @@ impl<'a> BodyBinder<'a> {
             Some(Ty::System { name: object, .. }) => {
                 let real_field_name = relationship_field_api_name(name);
                 let field_schema = self.schema.field(&object, &real_field_name);
-                if field_schema.is_some() || self.schema.object(&object).is_some() {
+                // The generic `SObject` type itself is never a registered
+                // `self.schema.object(...)` entry -- it isn't a real,
+                // queryable object, just Apex's common base type -- so
+                // `field_schema`/`self.schema.object` both miss every
+                // field on it, `Id` included. Real Apex still allows
+                // `.Id` directly on any `SObject`-typed value with no
+                // cast, unlike every other field (`.Name`, say, isn't
+                // guaranteed to exist on every SObject the way `Id` is):
+                // confirmed against a real org, and also confirmed
+                // against this project's own bundled stdlib snapshot --
+                // `System.SObject`'s scraped `properties` list is
+                // genuinely empty (Salesforce's own docs describe `Id`
+                // as a schema field, not a class member), so there's no
+                // stdlib-property fallback to reach for either. This is
+                // the one narrow, language-level exception, not a general
+                // "SObject has every field" relaxation.
+                let is_universal_id = object.eq_ignore_ascii_case("SObject") && real_field_name.eq_ignore_ascii_case("Id");
+                if field_schema.is_some() || is_universal_id || self.schema.object(&object).is_some() {
                     let resolution = match &field_schema {
                         Some(_) => Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                            object: object.clone(),
+                            field: Some(SmolStr::new(&real_field_name)),
+                        })),
+                        None if is_universal_id => Resolution::SchemaObject(Box::new(SchemaObjectRef {
                             object: object.clone(),
                             field: Some(SmolStr::new(&real_field_name)),
                         })),
@@ -1892,21 +1955,51 @@ impl<'a> BodyBinder<'a> {
                 // lookup, unlike the method-call arm's narrowing).
                 let class = self.stdlib.class(&object);
                 let property = class.and_then(|c| StdlibIndex::property_of(c, name));
-                let resolution = match property {
-                    Some(_) => Resolution::StdlibMember(Box::new(stdlib_member_ref(
-                        class.and_then(|c| c.namespace.clone()),
-                        &object,
-                        Some(name),
-                        None,
-                        None,
-                    ))),
-                    None => Resolution::Unresolved,
-                };
-                self.refs.set_with_highlight(ptr, highlight, resolution);
-                return property.and_then(|p| p.type_name.as_deref()).map(|type_name| {
-                    let (base, args) = apex_stdlib::split_generic_type(type_name);
-                    Ty::system_owned(base, args.into_iter().map(|a| Ty::system_owned(a, Vec::new())).collect())
-                });
+                if let Some(prop) = property {
+                    self.refs.set_with_highlight(
+                        ptr,
+                        highlight,
+                        Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                            class.and_then(|c| c.namespace.clone()),
+                            &object,
+                            Some(name),
+                            None,
+                            None,
+                        ))),
+                    );
+                    return prop.type_name.as_deref().map(|type_name| ty_from_scraped_type(self.stdlib, type_name));
+                }
+                // `name` isn't a *property* of `object` -- but `object`
+                // (e.g. `Schema`, itself a real class as well as a real
+                // namespace -- `Schema.getGlobalDescribe()` is a real
+                // static call) might still be acting as a namespace
+                // prefix here, not a value: `Schema.SoapType` used in
+                // expression position (`... == Schema.SoapType.ID`), the
+                // same namespace-qualified shape `resolve_type_ref`'s own
+                // two-segment `class_in_namespace` fallback already
+                // handles for a *type* reference, just never mirrored
+                // here for an *expression* one. Without this,
+                // `Schema.SoapType` had no member model at all (`SoapType`
+                // is a whole separate class, not a property of `Schema`),
+                // so it -- and every further member off it, like the real
+                // bug this fixes, `Schema.SoapType.ID` -- stayed
+                // `Unresolved` unconditionally.
+                if let Some(namespaced) = self.stdlib.class_in_namespace(&object, name) {
+                    self.refs.set_with_highlight(
+                        ptr,
+                        highlight,
+                        Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                            namespaced.namespace.clone(),
+                            &namespaced.name,
+                            None,
+                            None,
+                            None,
+                        ))),
+                    );
+                    return Some(Ty::system_owned(namespaced.name.clone(), Vec::new()));
+                }
+                self.refs.set_with_highlight(ptr, highlight, Resolution::Unresolved);
+                return None;
             }
             // `target_type` is entirely unknown -- honestly `Unresolved`
             // rather than a guess.
@@ -2170,6 +2263,36 @@ impl<'a> BodyBinder<'a> {
                     self.table,
                     narrow_by_overload(self.schema, self.stdlib, self.table, methods, &arg_types),
                 );
+                // This project's own inheritance chain has nothing by
+                // this name -- but `container` (or an ancestor of it)
+                // might still `extends` a *real* standard-library type
+                // this project's `SymbolTable` could never resolve in the
+                // first place (`extends Exception`, most commonly: see
+                // `SymbolTable::unresolved_direct_super`'s own doc
+                // comment). Without this, every custom exception
+                // subclass's own inherited `getMessage`/`setMessage`/
+                // `getCause`/... call -- extremely common real Apex,
+                // `Exception` being the one base *every* custom exception
+                // has -- looked exactly like a typo. Only tried when the
+                // project-local lookup came up empty: a real project-
+                // declared override always wins outright, same priority
+                // order `lookup_member`'s own inherited-chain walk
+                // already gives a project ancestor over a further one.
+                let resolution = if matches!(resolution, Resolution::Unresolved) {
+                    stdlib_class_via_unresolved_supertype(self.table, self.stdlib, container)
+                        .filter(|c| StdlibIndex::methods_of(c, name).next().is_some())
+                        .map_or(resolution, |c| {
+                            Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                                c.namespace.clone(),
+                                &c.name,
+                                Some(name),
+                                Some(arg_types.len()),
+                                None,
+                            )))
+                        })
+                } else {
+                    resolution
+                };
                 let result_type = self.result_type_of(&resolution);
                 self.refs.set_with_highlight(ptr, highlight, resolution);
                 result_type
@@ -2270,7 +2393,7 @@ impl<'a> BodyBinder<'a> {
                 // `addAll`, which need no substitution anyway) does the
                 // scraped, best-effort-narrowed return type get used.
                 crate::generics::builtin_generic_member_type(class, &base, &args, name)
-                    .or_else(|| winner.and_then(stdlib_method_return_ty))
+                    .or_else(|| winner.and_then(|m| stdlib_method_return_ty(self.stdlib, m)))
             }
             None => {
                 self.refs

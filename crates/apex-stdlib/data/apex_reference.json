@@ -590,7 +590,7 @@
         "signature": "public sObject[] getRecords()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "sObject",
+        "return_type": "sObject[]",
         "params": [],
         "description": "Returns the list of sObjects in the current page set. This\nlist is immutable, i.e. you can't call clear() on it."
       },
@@ -610,7 +610,7 @@
         "signature": "public sObject[] getSelected()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "sObject",
+        "return_type": "sObject[]",
         "params": [],
         "description": "Returns the list of sObjects that have been selected."
       },
@@ -929,7 +929,7 @@
         "signature": "public ID[] getNextApproverIds()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "ID",
+        "return_type": "ID[]",
         "params": [],
         "description": "Returns the list of user IDs of user specified as approvers."
       },
@@ -989,7 +989,7 @@
         "signature": "public Database.Error[] getErrors()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "Database.Error",
+        "return_type": "Database.Error[]",
         "params": [],
         "description": "If an error occurred, returns an array of one or more database\nerror objects including the error code and description."
       },
@@ -1019,7 +1019,7 @@
         "signature": "public ID[] getNewWorkitemIds()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "ID",
+        "return_type": "ID[]",
         "params": [],
         "description": "The IDs of the new items submitted to the approval process.\nThere can be 0 or 1 approval processes."
       },
@@ -19088,7 +19088,7 @@
         "signature": "public static ConnectApi.BatchResult[]\n          getCommentBatch(String communityId, List<String> commentIds)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Get a list of comments."
       },
@@ -19474,7 +19474,7 @@
         "signature": "public static ConnectApi.BatchResult[]\n               getFeedElementBatch(String communityId, List<String> feedElementIds)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Get a list of feed elements."
       },
@@ -21200,7 +21200,7 @@
         "signature": "public static ConnectApi.BatchResult[]\n                    postFeedElementBatch(String communityId, List<ConnectApi.BatchInput>\n                    feedElements)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Post a list of feed elements."
       },
@@ -22154,7 +22154,7 @@
         "signature": "public static ConnectApi.BatchResult[]\n          updateFeedElementReadByCapabilityBatch(String communityId, List<String>\n          feedElementIds, ConnectApi.ReadByCapabilityInput readBy)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Mark multiple feed elements as read by the context user at the same time using an input class."
       },
@@ -22164,7 +22164,7 @@
         "signature": "public static ConnectApi.BatchResult[]\n          updateFeedElementReadByCapabilityBatch(String communityId, List<String>\n          feedElementIds, Boolean isReadByMe)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Mark multiple feed elements as read by the context user at the same time."
       },
@@ -24258,7 +24258,7 @@
         "signature": "public static ConnectApi.BatchResult[]\n                    getFeedItemBatch(String communityId, List<String> feedItemIds)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Get a list of feed items."
       },
@@ -26187,7 +26187,7 @@
         "signature": "public static ConnectApi.BatchResult[]\n                    getGroupBatch(String communityId, List<String> groupIds)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Get information about a list of groups."
       },
@@ -26313,7 +26313,7 @@
         "signature": "public static ConnectApi.BatchResult[] getMembershipBatch(String\ncommunityId, List<String> membershipIds)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Get information about a list of group memberships."
       },
@@ -27167,7 +27167,7 @@
         "signature": "public static ConnectApi.BatchResult[] getUserBatch(String\ncommunityId, List<String> userIds)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Get information about a list of users."
       },
@@ -28509,7 +28509,7 @@
         "signature": "public static ConnectApi.BatchResult[] addItemsToCart(String\n          webstoreId, String effectiveAccountId, String activeCartOrId,\n          List<ConnectApi.BatchInput> cartItems)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Add a batch of up to 100 items to a cart."
       },
@@ -28519,7 +28519,7 @@
         "signature": "public static ConnectApi.BatchResult[] addItemsToCart(String webstoreId, String effectiveAccountId, String activeCartOrId, List<ConnectApi.BatchInput> cartItems, String currencyIsoCode)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Add a batch of up to 100 items to a cart of a specific\n    currency."
       },
@@ -34488,7 +34488,7 @@
         "signature": "public static ConnectApi.BatchResult[]\n          getAudienceBatch(String communityId, List<String> audienceIds)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Get audience information for a comma-separated list of audience\n      IDs."
       },
@@ -34626,7 +34626,7 @@
         "signature": "public static ConnectApi.BatchResult[] getTargetBatch(String\n          communityId, List<String> targetIds)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Get target information for a comma-separated list of target\n    IDs."
       },
@@ -35969,7 +35969,7 @@
         "signature": "public static ConnectApi.BatchResult[] getMotifBatch(String\ncommunityId, List<String> idOrPrefixList)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ConnectApi.BatchResult",
+        "return_type": "ConnectApi.BatchResult[]",
         "params": [],
         "description": "Get a motif for a list of objects."
       }
@@ -49474,7 +49474,7 @@
         "signature": "public Database.Error[] getErrors()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "Database.Error",
+        "return_type": "Database.Error[]",
         "params": [],
         "description": "If an error occurred, returns an array of one or more database error objects providing\n  the error code and description. If no error occurred, returns an empty set."
       },
@@ -49740,7 +49740,7 @@
         "signature": "public String[] getFields()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "String",
+        "return_type": "String[]",
         "params": [],
         "description": "Returns an array of one or more field names. Identifies\nwhich fields in the object, if any, affected the error condition."
       },
@@ -50275,7 +50275,7 @@
         "signature": "public Database.Error[] getErrors()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "Database.Error",
+        "return_type": "Database.Error[]",
         "params": [],
         "description": "If an error occurred, an array of one or more database\nerror objects providing the error code and description."
       },
@@ -50513,7 +50513,7 @@
         "signature": "public Database.Error[] getErrors()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "Database.Error",
+        "return_type": "Database.Error[]",
         "params": [],
         "description": "If an error occurred, returns an array of one or more database error objects providing\n  the error code and description. If no error occurred, returns an empty set."
       },
@@ -50553,7 +50553,7 @@
         "signature": "public Database.Error[] getErrors()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "Database.Error",
+        "return_type": "Database.Error[]",
         "params": [],
         "description": "If an error occurred, returns an array of one or more database error objects providing\n  the error code and description. If no error occurred, returns null."
       },
@@ -50593,7 +50593,7 @@
         "signature": "public Database.Error[] getErrors()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "Database.Error",
+        "return_type": "Database.Error[]",
         "params": [],
         "description": "If an error occurred, returns an array of one or more database error objects providing\n  the error code and description. If no error occurred, returns an empty set."
       },
@@ -53969,7 +53969,7 @@
         "signature": "public Dom.XmlNode[] getChildElements()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "Dom.XmlNode",
+        "return_type": "Dom.XmlNode[]",
         "params": [],
         "description": "Returns the child element nodes for this node. This doesn't\ninclude child text or comment nodes."
       },
@@ -53979,7 +53979,7 @@
         "signature": "public Dom.XmlNode[] getChildren()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "Dom.XmlNode",
+        "return_type": "Dom.XmlNode[]",
         "params": [],
         "description": "Returns the child nodes for this node. This includes all\nnode types."
       },
@@ -60020,7 +60020,7 @@
         "signature": "public String[] getFields()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "String",
+        "return_type": "String[]",
         "params": [],
         "description": "A list of one or more field names. Identifies which fields\nin the object, if any, affected the error condition."
       },
@@ -60070,7 +60070,7 @@
         "signature": "public SendEmailError[] getErrors()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "Messaging.SendEmailError",
+        "return_type": "Messaging.SendEmailError[]",
         "params": [],
         "description": "If an error occurred during the sendEmail method, a SendEmailError object is returned."
       },
@@ -78270,7 +78270,7 @@
         "signature": "public System.PageReference[]\n     generateUrlFor(System.PageReference[] salesforceUrls)",
         "is_static": false,
         "visibility": "public",
-        "return_type": "System.PageReference",
+        "return_type": "System.PageReference[]",
         "params": [
           {
             "name": "salesforceUrls",
@@ -78613,7 +78613,7 @@
         "signature": "public static ID[] findSimilar(Question yourQuestion)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ID",
+        "return_type": "ID[]",
         "params": [
           {
             "name": "yourQuestion",
@@ -78697,7 +78697,7 @@
         "signature": "public ApexPages.Message[] getMessages()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "ApexPages.Message",
+        "return_type": "ApexPages.Message[]",
         "params": [],
         "description": "Returns a list of the messages associated with the current\ncontext."
       },
@@ -78972,7 +78972,7 @@
         "signature": "public static Approval.ProcessResult []\n     process(Approval.ProcessRequest[] approvalRequests)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Approval.ProcessResult",
+        "return_type": "Approval.ProcessResult[]",
         "params": [
           {
             "name": "approvalRequests",
@@ -78987,7 +78987,7 @@
         "signature": "public static Approval.ProcessResult []\n     process(Approval.ProcessRequest[] approvalRequests, Boolean allOrNone)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Approval.ProcessResult",
+        "return_type": "Approval.ProcessResult[]",
         "params": [
           {
             "name": "approvalRequests",
@@ -81095,7 +81095,7 @@
         "signature": "public static Database.LeadConvertResult[]\n     convertLead(Database.LeadConvert[] leadsToConvert, Boolean allOrNone)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Database.LeadConvertResult",
+        "return_type": "Database.LeadConvertResult[]",
         "params": [
           {
             "name": "leadsToConvert",
@@ -81320,7 +81320,7 @@
         "signature": "public static Database.DeleteResult[]\n                                        delete(SObject[] recordsToDelete, Boolean\n                                        allOrNone)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Database.DeleteResult",
+        "return_type": "Database.DeleteResult[]",
         "params": [
           {
             "name": "recordsToDelete",
@@ -81358,7 +81358,7 @@
         "signature": "public static Database.DeleteResult[] delete(ID[] recordIDs,\n     Boolean allOrNone)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Database.DeleteResult",
+        "return_type": "Database.DeleteResult[]",
         "params": [
           {
             "name": "recordIDs",
@@ -81689,7 +81689,7 @@
         "signature": "public static\n                                        Database.EmptyRecycleBinResult[] emptyRecycleBin(ID []\n                                        recordIds)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Database.EmptyRecycleBinResult",
+        "return_type": "Database.EmptyRecycleBinResult[]",
         "params": [
           {
             "name": "recordIds",
@@ -81719,7 +81719,7 @@
         "signature": "public static Database.EmptyRecycleBinResult[]\n     emptyRecycleBin(sObject[] listOfSObjects)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Database.EmptyRecycleBinResult",
+        "return_type": "Database.EmptyRecycleBinResult[]",
         "params": [
           {
             "name": "listOfSObjects",
@@ -82100,7 +82100,7 @@
         "signature": "public static Database.SaveResult[] insert(sObject[]\n                    recordsToInsert, Boolean allOrNone)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Database.SaveResult",
+        "return_type": "Database.SaveResult[]",
         "params": [
           {
             "name": "recordsToInsert",
@@ -82940,7 +82940,7 @@
         "signature": "public static Database.UndeleteResult[]\n                                        undelete(sObject[] recordsToUndelete, Boolean\n                                        allOrNone)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Database.UndeleteResult",
+        "return_type": "Database.UndeleteResult[]",
         "params": [
           {
             "name": "recordsToUndelete",
@@ -82978,7 +82978,7 @@
         "signature": "public static Database.UndeleteResult[] undelete(ID[]\n     recordIDs, Boolean allOrNone)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Database.UndeleteResult",
+        "return_type": "Database.UndeleteResult[]",
         "params": [
           {
             "name": "RecordIDs",
@@ -83108,7 +83108,7 @@
         "signature": "public static Database.SaveResult[] update(sObject[]\n     recordsToUpdate, Boolean allOrNone)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Database.SaveResult",
+        "return_type": "Database.SaveResult[]",
         "params": [
           {
             "name": "recordsToUpdate",
@@ -83146,7 +83146,7 @@
         "signature": "public static Database.SaveResult[] update(sObject[]\n     recordsToUpdate, Database.DMLOptions dmlOptions)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Database.SaveResult",
+        "return_type": "Database.SaveResult[]",
         "params": [
           {
             "name": "recordsToUpdate",
@@ -83280,7 +83280,7 @@
         "signature": "public static Database.UpsertResult[] upsert(sObject[]\n          recordsToUpsert, Schema.SObjectField externalIdField, Boolean allOrNone)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "Database.UpsertResult",
+        "return_type": "Database.UpsertResult[]",
         "params": [
           {
             "name": "recordsToUpsert",
@@ -85535,11 +85535,181 @@
   },
   {
     "page_id": "apex_classes_exception_methods",
-    "name": "Exception Class and Built-In Exceptions",
-    "kind": "Unknown",
-    "namespace": null,
+    "name": "Exception",
+    "kind": "Class",
+    "namespace": "System",
     "description": "An exception denotes an error that disrupts the normal flow of code execution. You\n        can use Apex built-in exceptions or create custom exceptions. All exceptions have common\n        methods.",
-    "methods": [],
+    "methods": [
+      {
+        "anchor_id": "apex_System_Exception_ctor",
+        "name": "Exception",
+        "signature": "public Exception()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": null,
+        "params": [],
+        "description": "Creates a new exception instance with no arguments."
+      },
+      {
+        "anchor_id": "apex_System_Exception_ctor_2",
+        "name": "Exception",
+        "signature": "public Exception(String message)",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": null,
+        "params": [
+          {
+            "name": "message",
+            "type_name": "String"
+          }
+        ],
+        "description": "Creates a new exception instance with the specified error message."
+      },
+      {
+        "anchor_id": "apex_System_Exception_ctor_3",
+        "name": "Exception",
+        "signature": "public Exception(Exception cause)",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": null,
+        "params": [
+          {
+            "name": "cause",
+            "type_name": "System.Exception"
+          }
+        ],
+        "description": "Creates a new exception instance with the specified cause."
+      },
+      {
+        "anchor_id": "apex_System_Exception_ctor_4",
+        "name": "Exception",
+        "signature": "public Exception(String message, Exception cause)",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": null,
+        "params": [
+          {
+            "name": "message",
+            "type_name": "String"
+          },
+          {
+            "name": "cause",
+            "type_name": "System.Exception"
+          }
+        ],
+        "description": "Creates a new exception instance with the specified error message and cause."
+      },
+      {
+        "anchor_id": "apex_System_Exception_getCause",
+        "name": "getCause",
+        "signature": "public Exception getCause()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "System.Exception",
+        "params": [],
+        "description": "Returns the cause of the exception as an exception object, or null if the cause is\n      unknown or nonexistent."
+      },
+      {
+        "anchor_id": "apex_System_Exception_getLineNumber",
+        "name": "getLineNumber",
+        "signature": "public Integer getLineNumber()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "Integer",
+        "params": [],
+        "description": "Returns the line number from where the exception was thrown."
+      },
+      {
+        "anchor_id": "apex_System_Exception_getMessage",
+        "name": "getMessage",
+        "signature": "public String getMessage()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "String",
+        "params": [],
+        "description": "Returns the error message that displays for the user."
+      },
+      {
+        "anchor_id": "apex_System_Exception_getStackTraceString",
+        "name": "getStackTraceString",
+        "signature": "public String getStackTraceString()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "String",
+        "params": [],
+        "description": "Returns the stack trace as a string."
+      },
+      {
+        "anchor_id": "apex_System_Exception_getTypeName",
+        "name": "getTypeName",
+        "signature": "public String getTypeName()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "String",
+        "params": [],
+        "description": "Returns the name of the exception type. For example, System.NullPointerException,\n      MyException, and so on."
+      },
+      {
+        "anchor_id": "apex_System_Exception_setMessage",
+        "name": "setMessage",
+        "signature": "public void setMessage(String message)",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "Void",
+        "params": [
+          {
+            "name": "message",
+            "type_name": "String"
+          }
+        ],
+        "description": "Sets the error message that displays for the user."
+      },
+      {
+        "anchor_id": "apex_System_Exception_initCause",
+        "name": "initCause",
+        "signature": "public void initCause(Exception cause)",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "Void",
+        "params": [
+          {
+            "name": "cause",
+            "type_name": "System.Exception"
+          }
+        ],
+        "description": "Sets the cause of the exception."
+      }
+    ],
+    "properties": []
+  },
+  {
+    "page_id": "langCon_apex_iterators",
+    "name": "Iterator",
+    "kind": "Interface",
+    "namespace": "System",
+    "description": "The Iterator interface enables you to iterate through a collection, such as a set or a\n      list, in script. An instance of this interface allows the traversal of a collection of\n      objects. This interface has no built-in implementations -- it's implemented by a\n      generic Iterator (Iterator<T>) type that List/Set's own iterator() method returns, or\n      by a custom class that implements Iterator<T> itself.",
+    "methods": [
+      {
+        "anchor_id": "apex_System_Iterator_hasNext",
+        "name": "hasNext",
+        "signature": "Boolean hasNext()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "Boolean",
+        "params": [],
+        "description": "Returns true if there's another element in the collection being iterated over."
+      },
+      {
+        "anchor_id": "apex_System_Iterator_next",
+        "name": "next",
+        "signature": "Object next()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "Object",
+        "params": [],
+        "description": "Returns the next element in the collection."
+      }
+    ],
     "properties": []
   },
   {
@@ -86392,7 +86562,7 @@
         "signature": "public String[] getHeaderKeys()",
         "is_static": false,
         "visibility": "public",
-        "return_type": "String",
+        "return_type": "String[]",
         "params": [],
         "description": "Retrieves an array of header keys returned in the response."
       },
@@ -86663,7 +86833,7 @@
         "signature": "public static ID[] findSimilar(Idea idea)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ID",
+        "return_type": "ID[]",
         "params": [
           {
             "name": "idea",
@@ -86678,7 +86848,7 @@
         "signature": "public static ID[] getAllRecentReplies(String userID, String\n          communityID)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ID",
+        "return_type": "ID[]",
         "params": [
           {
             "name": "userID",
@@ -86697,7 +86867,7 @@
         "signature": "public static ID[] getReadRecentReplies(String userID,\n          String communityID)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ID",
+        "return_type": "ID[]",
         "params": [
           {
             "name": "userID",
@@ -86716,7 +86886,7 @@
         "signature": "public static ID[] getUnreadRecentReplies(String userID,\n          String communityID)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "ID",
+        "return_type": "ID[]",
         "params": [
           {
             "name": "userID",
@@ -90610,7 +90780,7 @@
         "signature": "public Messaging.SendEmailResult[] sendEmail(Messaging.Email[]\nemails, Boolean allOrNothing)",
         "is_static": false,
         "visibility": "public",
-        "return_type": "Messaging.SendEmailResult",
+        "return_type": "Messaging.SendEmailResult[]",
         "params": [
           {
             "name": "emails",
@@ -90629,7 +90799,7 @@
         "signature": "public Messaging.SendEmailResult[] sendEmailMessage(List<ID>\n          emailMessageIds, Boolean allOrNothing)",
         "is_static": false,
         "visibility": "public",
-        "return_type": "Messaging.SendEmailResult",
+        "return_type": "Messaging.SendEmailResult[]",
         "params": [
           {
             "name": "emailMessageIds",
@@ -91509,7 +91679,7 @@
         "signature": "public String[] split(String regExp)",
         "is_static": false,
         "visibility": "public",
-        "return_type": "String",
+        "return_type": "String[]",
         "params": [
           {
             "name": "regExp",
@@ -91524,7 +91694,7 @@
         "signature": "public String[] split(String regExp, Integer\n        limit)",
         "is_static": false,
         "visibility": "public",
-        "return_type": "String",
+        "return_type": "String[]",
         "params": [
           {
             "name": "regExp",
@@ -94260,7 +94430,7 @@
         "signature": "public SObject[] getSObjects(String fieldName)",
         "is_static": false,
         "visibility": "public",
-        "return_type": "SObject",
+        "return_type": "SObject[]",
         "params": [
           {
             "name": "fieldName",
@@ -94275,7 +94445,7 @@
         "signature": "public SObject[] getSObjects(Schema.SObjectType\n     fieldName)",
         "is_static": false,
         "visibility": "public",
-        "return_type": "SObject",
+        "return_type": "SObject[]",
         "params": [
           {
             "name": "fieldName",
@@ -95933,7 +96103,7 @@
         "signature": "public String[] split(String\n                                        regExp)",
         "is_static": false,
         "visibility": "public",
-        "return_type": "String",
+        "return_type": "String[]",
         "params": [
           {
             "name": "regExp",
@@ -95948,7 +96118,7 @@
         "signature": "public String[] split(String regExp, Integer\n                    limit)",
         "is_static": false,
         "visibility": "public",
-        "return_type": "String",
+        "return_type": "String[]",
         "params": [
           {
             "name": "regExp",

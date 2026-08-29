@@ -985,6 +985,17 @@ impl BoundProgram {
         self.bodies.values().flat_map(|fb| fb.refs.iter())
     }
 
+    /// Like [`Self::all_resolutions`], but scoped to one file -- the
+    /// per-open-file granularity `textDocument/publishDiagnostics`
+    /// actually needs (matching `Self::syntax_errors`/`dead_symbols_in_file`'s
+    /// existing per-file posture) instead of iterating the whole project
+    /// for every file a client happens to have open. Empty for a file with
+    /// no bound body, matching every other `self.bodies.get(...)`-backed
+    /// lookup's "nothing recorded" behavior.
+    pub fn resolutions_in_file(&self, file: FileId) -> impl Iterator<Item = (&SyntaxPtr, &Resolution)> {
+        self.bodies.get(&file).into_iter().flat_map(|fb| fb.refs.iter())
+    }
+
     /// Every reference (project-wide) whose `Resolution` touches `id` --
     /// `textDocument/references`'s primitive. Backed by each file's own
     /// `ReferenceTable::references_to`, an O(1) hash lookup per file
