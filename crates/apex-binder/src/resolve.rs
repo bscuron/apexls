@@ -1301,7 +1301,28 @@ impl<'a> BodyBinder<'a> {
             .iter()
             .map(|name| match self.table.resolve_dotted_name(name) {
                 Some(id) => Ty::Project(id),
-                None => Ty::system_owned(name.clone(), Vec::new()),
+                // A namespace-qualified stdlib type as a *generic type
+                // argument* (`Map<System.Type, System.Type> bindings;`) --
+                // the exact same gap the field's own outer `type_name`
+                // gets the `class_in_namespace` fallback for just below,
+                // but never mirrored here for each *argument* name
+                // independently. Without this, `bindings`'s own `Ty`
+                // carried `"System.Type"` (the whole dotted string,
+                // unsplit) as an argument's name -- never a key in
+                // `StdlibIndex`'s by-bare-name map -- so every further
+                // hop off a `.get(...)`-substituted argument type (real
+                // NPSP shape: `this.bindings.get(interfaceType).newInstance()`)
+                // stayed `Unresolved`, even though the field's own
+                // top-level `Map` type resolved fine.
+                None => match name.split_once('.') {
+                    Some((namespace, class_name)) if !class_name.contains('.') => {
+                        match self.stdlib.class_in_namespace(namespace, class_name) {
+                            Some(class) => Ty::system_owned(class.name.clone(), Vec::new()),
+                            None => Ty::system_owned(name.clone(), Vec::new()),
+                        }
+                    }
+                    _ => Ty::system_owned(name.clone(), Vec::new()),
+                },
             })
             .collect();
         // A stdlib class referenced with its own namespace spelled out as
@@ -1948,6 +1969,30 @@ impl<'a> BodyBinder<'a> {
         let name = tok.text();
         let ptr = SyntaxPtr::new(self.file, f.syntax());
         let highlight = tok.text_range();
+
+        // The `X.class` reflection idiom (`fflib_IAppBinding.class`,
+        // `String.class`, ...) -- valid on any project or stdlib type
+        // name and not a real member of anything (`class` is a reserved
+        // word, never a real field/method name, so this can't collide
+        // with a genuine one). `List<Foo>.class`/`Map<K, V>.class` never
+        // reach here: `bind_name_expr`'s own `n.type_ref()` check
+        // intercepts the whole expression first for that generic-
+        // collection form (see its doc comment) -- this only needs to
+        // cover the plain-name case that doesn't go through. Resolves to
+        // the real `System.Type` class, the same `Ty` a `System.Type`-
+        // declared variable already carries, so a further chained call
+        // (`fflib_IAppBinding.class.getName()`) keeps resolving too.
+        if target_type.is_some() && name.eq_ignore_ascii_case("class") {
+            let class = self.stdlib.class("Type");
+            self.refs.set_with_highlight(
+                ptr,
+                highlight,
+                class.map_or(Resolution::Unresolved, |c| {
+                    Resolution::StdlibMember(Box::new(stdlib_member_ref(c.namespace.clone(), &c.name, None, None, None)))
+                }),
+            );
+            return class.map(|c| Ty::system_owned(c.name.clone(), Vec::new()));
+        }
 
         let container = match target_type {
             Some(Ty::Project(container)) => container,

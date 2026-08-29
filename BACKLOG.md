@@ -1373,6 +1373,22 @@ supports each one.
       dropped from `28,172` to `18,200` across this follow-up (`24,637`
       from the `Exception`/`Iterator`/`split` fixes, `18,200` from the
       `record_qualified_segments` one alone).
+
+      **Second file, second round: `fflib_AppBindingResolver.cls`.** Two
+      more real, general gaps (entry 14 of the same numbered history):
+      `type_of_symbol`'s generic-type-argument resolution
+      (`Map<System.Type, System.Type> bindings;`'s own `System.Type`
+      arguments) never got the `class_in_namespace` fallback its *outer*
+      declared type already had a few lines below in the same function --
+      so a further hop off a `.get(...)`-substituted argument
+      (`this.bindings.get(interfaceType).newInstance()`) stayed
+      `Unresolved` even though the field's own top-level `Map` type
+      resolved fine; and the `X.class` reflection idiom
+      (`fflib_IAppBinding.class`) had no handling at all outside the
+      unrelated `List<Foo>.class` generic-collection form, since `class`
+      (a reserved word, never a real declared member) always missed
+      `bind_field_expr`'s ordinary member lookup regardless of the
+      receiver's own type. `BASELINE_UNRESOLVED`: `18,200` -> `17,363`.
 - [ ] **Duplicate/conflicting-modifier diagnostic -- a real gap, found via
       a user report.** `private private private private void foo() {`
       produces no error anywhere in the pipeline today: `grammar::declarations::modifiers`

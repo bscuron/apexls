@@ -350,8 +350,30 @@ fn corpus_root() -> PathBuf {
 ///     own hits mostly don't show up here at all); `BASELINE_UNRESOLVED`
 ///     dropped a further -6,437 (`24_637` -> `18_200`), all project-wide
 ///     instances of the exact same per-segment gap.
+/// 14. Two more real, general gaps, found the same way as steps 12-13
+///     (dogfooding against a real file, this time `fflib_AppBindingResolver.cls`):
+///     (a) `type_of_symbol`'s generic-type-argument resolution
+///     (`Map<System.Type, System.Type> bindings;`'s own `System.Type`
+///     arguments) never got the `class_in_namespace` fallback its
+///     *outer* declared type already has a few lines below in the same
+///     function -- a namespace-qualified stdlib type as a *generic
+///     argument* specifically stayed the literal unsplit dotted string
+///     (`"System.Type"`, never a real `StdlibIndex` key), so every
+///     further hop off a `.get(...)`-substituted argument
+///     (`this.bindings.get(interfaceType).newInstance()`) stayed
+///     `Unresolved` even though the field's own top-level `Map` type
+///     resolved fine. (b) The `X.class` reflection idiom
+///     (`fflib_IAppBinding.class`) had no handling at all outside the
+///     unrelated `List<Foo>.class` generic-collection form -- `class` is
+///     a reserved word, never a real declared member, so `bind_field_expr`'s
+///     ordinary member lookup always missed it regardless of the
+///     receiver's own type. Fixed with an early, receiver-type-agnostic
+///     check in `bind_field_expr` resolving straight to the real
+///     `System.Type` class. `BASELINE_RESOLVED` unchanged (`206_068`,
+///     `StdlibMember` again not tallied); `BASELINE_UNRESOLVED` dropped
+///     -837 (`18_200` -> `17_363`).
 const BASELINE_RESOLVED: usize = 206_068;
-const BASELINE_UNRESOLVED: usize = 18_200;
+const BASELINE_UNRESOLVED: usize = 17_363;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

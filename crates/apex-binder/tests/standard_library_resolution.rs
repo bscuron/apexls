@@ -446,3 +446,82 @@ fn the_generic_sobject_types_id_field_resolves_without_a_cast() {
         "sobj.Id should resolve as a field access on the generic SObject type, not Unresolved"
     );
 }
+
+/// The `X.class` reflection idiom (`MyInterface.class`, real, common Apex
+/// for building a `Map<System.Type, System.Type>`-style binding registry)
+/// -- `class` is a reserved word, never a real declared member, so
+/// `bind_field_expr`'s ordinary member lookup always missed it regardless
+/// of whether the receiver was a project type or a stdlib one. Distinct
+/// from the already-working `List<Foo>.class` generic-collection form
+/// (handled entirely differently, via `bind_name_expr`'s own `type_ref()`
+/// check) -- this is the plain-name case that form doesn't cover.
+#[test]
+fn the_x_class_reflection_idiom_resolves_to_the_real_type_class() {
+    let dir = write_fixture_dir(
+        "stdlib-class-reflection",
+        &[
+            (
+                "Foo.cls",
+                "public class Foo { \
+                 public void run() { \
+                     System.Type t = MyInterface.class; \
+                 } \
+             }",
+            ),
+            ("MyInterface.cls", "public interface MyInterface {}"),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        field_expr_resolution(&program, "class"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "Type".into(),
+            member: None,
+            arg_count: None,
+            narrowed_param_types: None,
+        }))),
+        "MyInterface.class should resolve as a reference to the real System.Type class"
+    );
+}
+
+/// The exact user-reported bug: `Map<System.Type, System.Type> bindings;`'s
+/// own `System.Type` generic type arguments never got the same
+/// `class_in_namespace` fallback `type_of_symbol`'s *outer* declared type
+/// already has a few lines below in the same function -- a namespace-
+/// qualified stdlib type as a generic *argument* stayed the literal
+/// unsplit dotted string (`"System.Type"`, never a real `StdlibIndex`
+/// key), so a further hop off a `.get(...)`-substituted argument type
+/// stayed `Unresolved` even though `bindings`'s own top-level `Map` type
+/// resolved fine.
+#[test]
+fn a_namespace_qualified_generic_type_argument_resolves_for_chained_calls() {
+    let dir = write_fixture_dir(
+        "stdlib-generic-arg-namespace",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             private Map<System.Type, System.Type> bindings; \
+             public Object run(System.Type interfaceType) { \
+                 return this.bindings.get(interfaceType).newInstance(); \
+             } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        method_call_resolution(&program, "newInstance"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "Type".into(),
+            member: Some("newInstance".into()),
+            arg_count: Some(0),
+            narrowed_param_types: None,
+        }))),
+        "chaining off a namespace-qualified generic type argument (Map<System.Type, System.Type>.get(...)) should keep resolving"
+    );
+}
