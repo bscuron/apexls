@@ -1389,6 +1389,39 @@ supports each one.
       (a reserved word, never a real declared member) always missed
       `bind_field_expr`'s ordinary member lookup regardless of the
       receiver's own type. `BASELINE_UNRESOLVED`: `18,200` -> `17,363`.
+
+      **Third file, third round: `fflib_SObjectDomain.cls`.** Five more
+      (entry 15): `Trigger` had no `apex_stdlib` entry either -- the same
+      scraper gap as `Exception`, a real page found but its content (the
+      13 trigger context variables) never captured, hand-corrected the
+      same way, verified against a live org. `SymbolTable::lookup_member`
+      had no field/property-shadowing concept at all (only same-arity
+      `override` methods) -- a subclass's own `static` member with the
+      same name as an unrelated one on its supertype
+      (`fflib_SObjectDomain extends fflib_SObjects`, both independently
+      declaring their own `Errors`) stayed `Candidates` forever instead of
+      resolving to the more-derived one, real Apex field-hiding
+      semantics; fixed generally, a non-method match at any chain level
+      now stops the walk before reaching further ancestors.
+      `inherit::resolve_inheritance`'s `extends`/`implements` resolution
+      had no enclosing-chain fallback for an unqualified sibling nested
+      type at all (`class ObjectError extends Error`, both nested
+      directly inside `fflib_SObjectDomain`) -- new
+      `SymbolTable::resolve_dotted_name_from`, mirroring
+      `resolve_type_ref`'s identical single-segment fallback. `Expr::Index`
+      (`list[0]`) never propagated a `List<T>`'s own element type (a
+      documented "v1" gap) -- fixed the same way `crate::generics`'s own
+      `list`/`get` arm already does. A schema field access outside SOQL
+      only ever got an inferred `Ty` for a *relationship* field -- every
+      *scalar* field (`opp.Name`, `opp.Type`) had none, so a chained call
+      on it always stayed `Unresolved`, extremely common real Apex; new
+      `resolve::apex_type_for_schema_field_type` maps a field's own
+      metadata type to its real Apex type, conservatively (the scraped
+      standard-schema `field_type` strings are real prose, not a clean
+      enum). Also: `sobjectExpr.Field.addError(msg)`, a real Apex compiler
+      idiom (verified against a real org) with no real method on the
+      field's own scalar type otherwise. `BASELINE_UNRESOLVED`: `17,363`
+      -> `11,027`.
 - [ ] **Duplicate/conflicting-modifier diagnostic -- a real gap, found via
       a user report.** `private private private private void foo() {`
       produces no error anywhere in the pipeline today: `grammar::declarations::modifiers`

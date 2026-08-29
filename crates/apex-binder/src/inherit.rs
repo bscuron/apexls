@@ -36,7 +36,10 @@ pub(crate) fn resolve_inheritance(
 ) {
     let resolved_super: Vec<(SymbolId, Result<SymbolId, SmolStr>)> = raw_super
         .par_iter()
-        .map(|(type_id, name)| (*type_id, table.resolve_dotted_name(name).ok_or_else(|| name.clone())))
+        .map(|(type_id, name)| {
+            let from = table.get(*type_id).container;
+            (*type_id, table.resolve_dotted_name_from(name, from).ok_or_else(|| name.clone()))
+        })
         .collect();
     for (type_id, resolved) in resolved_super {
         match resolved {
@@ -53,7 +56,8 @@ pub(crate) fn resolve_inheritance(
     let direct: FxHashMap<SymbolId, Vec<SymbolId>> = raw_extends
         .par_iter()
         .map(|(type_id, names)| {
-            let resolved = names.iter().filter_map(|n| table.resolve_dotted_name(n)).collect();
+            let from = table.get(*type_id).container;
+            let resolved = names.iter().filter_map(|n| table.resolve_dotted_name_from(n, from)).collect();
             (*type_id, resolved)
         })
         .collect();

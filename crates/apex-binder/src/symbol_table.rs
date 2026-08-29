@@ -510,6 +510,25 @@ impl SymbolTable {
                 continue;
             };
             let mut newly_overridden = Vec::new();
+            // A field/property (or nested type) has no overload concept
+            // at all -- unlike a method, where a same-arity ancestor
+            // match is only excluded once an explicit `override` marks
+            // it superseded, a *non-method* member declared at this
+            // level unconditionally shadows anything of the same name
+            // declared anywhere further up the chain, real Apex field-
+            // hiding semantics (confirmed against a real deploy: two
+            // *unrelated* classes both declaring a `static` property
+            // named identically, one `extends`-ing the other, compiles
+            // and resolves to the more-derived one, not an ambiguity --
+            // real fflib shape, `fflib_SObjectDomain extends fflib_SObjects`,
+            // both declaring their own unrelated `static ... Errors`
+            // property). Without this, `lookup_member` kept walking every
+            // further ancestor level regardless, so a same-named field/
+            // property/nested-type match anywhere up the chain always
+            // joined the self-declared one as a second, spurious
+            // `Resolution::Candidates` entry -- permanently ambiguous,
+            // even though a real compiler never sees any ambiguity here.
+            let mut shadowed_by_non_method = false;
             for &id in members {
                 let arity = self.params(id).len();
                 if overridden_arities.contains(&arity) {
@@ -519,8 +538,17 @@ impl SymbolTable {
                 if self.get(id).modifiers.is_override {
                     newly_overridden.push(arity);
                 }
+                if !matches!(
+                    self.get(id).kind,
+                    crate::symbol::SymbolKind::Method | crate::symbol::SymbolKind::Constructor
+                ) {
+                    shadowed_by_non_method = true;
+                }
             }
             overridden_arities.extend(newly_overridden);
+            if shadowed_by_non_method {
+                break;
+            }
         }
         found
     }
@@ -597,5 +625,46 @@ impl SymbolTable {
             current = self.nested_type(current, seg)?;
         }
         Some(current)
+    }
+
+    /// Like [`Self::resolve_dotted_name`], but for a caller that also has
+    /// an enclosing-type starting point (`from`) to retry an otherwise-
+    /// unresolvable *single-segment* name against -- the same "unqualified
+    /// nested-type reference visible from this lexical context" fallback
+    /// [`Self::nested_type_visible_from`]'s own doc comment already
+    /// describes for an ordinary type reference, extended here to
+    /// `extends`/`implements` clause resolution specifically
+    /// (`crate::inherit::resolve_inheritance`), which -- working from
+    /// Pass 1's plain collected strings, not a live `Type` AST node --
+    /// otherwise has no notion of "which type declared this name" context
+    /// at all, unlike every other `resolve_dotted_name` caller
+    /// (`crate::resolve::type_of_symbol`'s own declared-type case climbs
+    /// its symbol's enclosing chain separately, before ever calling
+    /// `resolve_dotted_name` plain). Real NPSP shape this fixes: `class
+    /// ObjectError extends Error` where `Error` is a *sibling* nested
+    /// class, both declared directly inside the same enclosing
+    /// `fflib_SObjectDomain` -- `resolve_dotted_name("Error")` alone only
+    /// ever checks `top_level`, which a nested class is never keyed
+    /// under, so `Error`'s own inherited fields (`message`, `domain`)
+    /// stayed permanently unreachable from `ObjectError`. Only tried for
+    /// a genuinely single-segment name, matching every other version of
+    /// this fallback's identical restriction: a dotted name that already
+    /// failed names a real (if unresolvable) top-level type as its first
+    /// segment, not an unqualified nested-type reference to retry here.
+    pub fn resolve_dotted_name_from(&self, name: &str, from: Option<SymbolId>) -> Option<SymbolId> {
+        if let Some(id) = self.resolve_dotted_name(name) {
+            return Some(id);
+        }
+        if name.contains('.') {
+            return None;
+        }
+        let mut current = from;
+        while let Some(container) = current {
+            if let Some(id) = self.nested_type_visible_from(container, name) {
+                return Some(id);
+            }
+            current = self.get(container).container;
+        }
+        None
     }
 }

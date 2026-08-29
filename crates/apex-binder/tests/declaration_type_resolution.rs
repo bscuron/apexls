@@ -1034,3 +1034,56 @@ fn a_relationship_alias_resolves_and_chains_to_the_related_objects_field() {
         "the chain should continue onto the related object's own field"
     );
 }
+
+/// The exact real NPSP shape that surfaced this gap:
+/// `fflib_SObjectDomain.ObjectError extends Error`, where `Error` is a
+/// *sibling* nested class -- both declared directly inside the same
+/// enclosing `fflib_SObjectDomain`, `Error` referenced unqualified.
+/// `SymbolTable::resolve_dotted_name` alone only ever checks `top_level`,
+/// which a nested class is never keyed under, so `Error` never became
+/// `ObjectError`'s recorded `direct_super`/`inherited_chain` member at
+/// all -- `Error`'s own inherited field (`message`) then stayed
+/// permanently unreachable from `ObjectError`, even though a real
+/// compiler resolves this without any ambiguity.
+#[test]
+fn extends_resolves_an_unqualified_sibling_nested_type() {
+    let dir = write_fixture_dir(
+        "decl-type-sibling-extends",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             public class ObjectError extends Error { \
+                 public void run() { this.message = 'x'; } \
+             } \
+             public abstract class Error { \
+                 public String message; \
+             } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let object_error = symbol_id(&program, SymbolKind::Class, "ObjectError");
+    let error = symbol_id(&program, SymbolKind::Class, "Error");
+    assert_eq!(
+        program.symbols.direct_super(object_error),
+        Some(error),
+        "ObjectError's direct_super should resolve to the sibling nested Error class"
+    );
+
+    let file = file_for(&program, SymbolKind::Class, "Foo");
+    let root = program.syntax(file);
+    let message_field = root
+        .descendants()
+        .filter_map(apex_syntax::ast::expr::FieldExpr::cast)
+        .find(|f| f.member_token().is_some_and(|t| t.text() == "message"))
+        .expect("expected a this.message FieldExpr");
+    let offset = message_field.syntax().text_range().end() - rowan::TextSize::from(1);
+    let message_field_id = symbol_id(&program, SymbolKind::Field, "message");
+    assert_eq!(
+        program.resolution_at(file, offset).cloned(),
+        Some(Resolution::Resolved(message_field_id)),
+        "this.message should resolve to Error's inherited field, not stay Unresolved"
+    );
+}

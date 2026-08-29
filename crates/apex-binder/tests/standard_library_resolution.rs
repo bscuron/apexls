@@ -9,7 +9,7 @@
 //! works (that's tried first and always wins when it applies); this is
 //! purely the fallback for everything else.
 
-use apex_binder::{BoundProgram, Resolution, SchemaObjectRef, StdlibMemberRef};
+use apex_binder::{BoundProgram, Resolution, SchemaObjectRef, StdlibMemberRef, SymbolKind};
 use apex_syntax::ast::expr::{FieldExpr, MethodCallExpr, NameExpr};
 use rowan::ast::AstNode;
 
@@ -523,5 +523,178 @@ fn a_namespace_qualified_generic_type_argument_resolves_for_chained_calls() {
             narrowed_param_types: None,
         }))),
         "chaining off a namespace-qualified generic type argument (Map<System.Type, System.Type>.get(...)) should keep resolving"
+    );
+}
+
+/// `Trigger` (the special context-variable pseudo-class) had no
+/// `apex_stdlib::standard_classes()` entry at all -- the same scraper-
+/// extraction gap as `Exception`: a real page found, but its content (the
+/// trigger context variables themselves) never captured as structured
+/// properties, so `Trigger.oldMap`/`Trigger.isBefore`/... all stayed
+/// `Unresolved` unconditionally. Real, common Apex: every trigger
+/// handler class references at least one of these.
+#[test]
+fn trigger_context_variables_resolve_to_stdlib_members() {
+    let dir = write_fixture_dir(
+        "stdlib-trigger-context",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             public void run() { \
+                 Map<Id, SObject> oldMap = Trigger.oldMap; \
+                 Boolean before = Trigger.isBefore; \
+             } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        field_expr_resolution(&program, "oldMap"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "Trigger".into(),
+            member: Some("oldMap".into()),
+            arg_count: None,
+            narrowed_param_types: None,
+        }))),
+        "Trigger.oldMap should resolve as a real Trigger context variable"
+    );
+    assert_eq!(
+        field_expr_resolution(&program, "isBefore"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "Trigger".into(),
+            member: Some("isBefore".into()),
+            arg_count: None,
+            narrowed_param_types: None,
+        }))),
+        "Trigger.isBefore should resolve as a real Trigger context variable"
+    );
+}
+
+/// A same-named `static` member declared independently on both a class
+/// and its supertype used to leave `SymbolTable::lookup_member` with no
+/// way to prefer the more-derived one: a real Apex compiler resolves
+/// `Sub.member` (where `Sub extends Base`, both declaring their own
+/// unrelated `static ... member`) to `Sub`'s own declaration without any
+/// ambiguity (field-hiding semantics) -- this used to land in
+/// `Resolution::Candidates` forever instead. Exact real NPSP shape:
+/// `fflib_SObjectDomain extends fflib_SObjects`, both independently
+/// declaring `static fflib_SObjectDomain.ErrorFactory Errors`-shaped
+/// members.
+#[test]
+fn a_subclasss_own_static_member_shadows_a_same_named_one_on_its_supertype() {
+    let dir = write_fixture_dir(
+        "stdlib-static-member-shadowing",
+        &[
+            (
+                "Base.cls",
+                "public virtual class Base { public static String Config { get; private set; } }",
+            ),
+            (
+                "Sub.cls",
+                "public class Sub extends Base { \
+                 public static Integer Config { get; private set; } \
+                 public void run() { Integer c = Sub.Config; } \
+             }",
+            ),
+        ],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let sub_config = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Property && s.name == "Config" && s.type_name.as_deref() == Some("Integer"))
+        .map(|(id, _)| id)
+        .expect("Sub's own Config property should be collected");
+    assert_eq!(
+        field_expr_resolution(&program, "Config"),
+        Some(Resolution::Resolved(sub_config)),
+        "Sub.Config should resolve to Sub's own property, not stay Candidates against Base's unrelated one"
+    );
+}
+
+/// The exact user-reported bug: `sObjectList[0].Name` where `sObjectList`
+/// is `List<Opportunity>` -- `Expr::Index` (`list[0]`) never propagated a
+/// `List<T>`'s own element type at all (a documented "v1" gap), so
+/// `[0]`'s own result stayed untyped and every further chained access
+/// (`.Name`) stayed `Unresolved` regardless of how real the field was.
+#[test]
+fn indexing_a_list_propagates_the_element_type_for_chained_access() {
+    let dir = write_fixture_dir(
+        "index-expr-element-type",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             public void run(List<Opportunity> sObjectList) { \
+                 String n = sObjectList[0].Name; \
+             } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        field_expr_resolution(&program, "Name"),
+        Some(Resolution::SchemaObject(Box::new(SchemaObjectRef {
+            object: "Opportunity".into(),
+            field: Some("Name".into()),
+        }))),
+        "sObjectList[0].Name should resolve as a real field access, not stay Unresolved"
+    );
+}
+
+/// A schema field access outside SOQL only ever got an inferred `Ty` for
+/// a *relationship* field (via its own `reference_to`) -- every *scalar*
+/// field (`opp.Name`, a plain `String`) had none at all, so a chained
+/// call on it (`opp.Name.equals(...)`) always stayed `Unresolved`, real
+/// and common Apex, not an edge case. Also confirms the companion fix:
+/// `sobjectExpr.Field.addError(msg)`, a real Apex compiler idiom (valid
+/// on *any* field-value access chained off an SObject record, regardless
+/// of that field's own scalar type -- verified against a real org), which
+/// has no real method to find on the field's own type otherwise.
+#[test]
+fn a_scalar_schema_fields_value_resolves_a_chained_stdlib_call_and_add_error() {
+    let dir = write_fixture_dir(
+        "schema-scalar-field-type",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             public void run(Opportunity opp) { \
+                 Boolean b = opp.Name.equals('x'); \
+                 opp.Type.addError('bad type'); \
+             } \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        method_call_resolution(&program, "equals"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "String".into(),
+            member: Some("equals".into()),
+            arg_count: Some(1),
+            narrowed_param_types: None,
+        }))),
+        "opp.Name.equals(...) should resolve now that opp.Name carries a real String Ty"
+    );
+    assert_eq!(
+        method_call_resolution(&program, "addError"),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "SObject".into(),
+            member: Some("addError".into()),
+            arg_count: Some(1),
+            narrowed_param_types: None,
+        }))),
+        "opp.Type.addError(...) should resolve via the field-value addError idiom"
     );
 }

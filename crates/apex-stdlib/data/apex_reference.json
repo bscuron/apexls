@@ -98035,7 +98035,112 @@
     "namespace": "System",
     "description": "Use the Trigger class to access run-time context\n  information in a trigger, such as the type of trigger or the list of sObject records that the\n  trigger operates on.",
     "methods": [],
-    "properties": []
+    "properties": [
+      {
+        "anchor_id": "apex_System_Trigger_new",
+        "name": "new",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "List<SObject>",
+        "description": "A list of the new versions of the sObject records. This sObject list is only available\n      in insert, update, and undelete triggers, and the records can only be modified in the\n      before triggers."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_old",
+        "name": "old",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "List<SObject>",
+        "description": "A list of the old versions of the sObject records. This sObject list is only available\n      in update and delete triggers."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_newMap",
+        "name": "newMap",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Map<Id,SObject>",
+        "description": "A map of IDs to the new versions of the sObject records. This map is only available in\n      before update, after insert, and after update triggers."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_oldMap",
+        "name": "oldMap",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Map<Id,SObject>",
+        "description": "A map of IDs to the old versions of the sObject records. This map is only available in\n      update and delete triggers."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_isExecuting",
+        "name": "isExecuting",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Boolean",
+        "description": "Returns true if the current context for the Apex code is a trigger, not a Visualforce\n      page, a Web service, or an executeanonymous() API call."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_isInsert",
+        "name": "isInsert",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Boolean",
+        "description": "Returns true if this trigger was fired due to an insert operation, from the Salesforce\n      user interface, Apex, or the API."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_isUpdate",
+        "name": "isUpdate",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Boolean",
+        "description": "Returns true if this trigger was fired due to an update operation, from the Salesforce\n      user interface, Apex, or the API."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_isDelete",
+        "name": "isDelete",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Boolean",
+        "description": "Returns true if this trigger was fired due to a delete operation, from the Salesforce\n      user interface, Apex, or the API."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_isBefore",
+        "name": "isBefore",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Boolean",
+        "description": "Returns true if this trigger was fired before a record was saved."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_isAfter",
+        "name": "isAfter",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Boolean",
+        "description": "Returns true if this trigger was fired after a record was saved."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_isUndelete",
+        "name": "isUndelete",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Boolean",
+        "description": "Returns true if this trigger was fired after a record was recovered from the Recycle\n      Bin."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_operationType",
+        "name": "operationType",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "TriggerOperation",
+        "description": "Returns an enum that corresponds to the current operation, as per the following\n      lists."
+      },
+      {
+        "anchor_id": "apex_System_Trigger_size",
+        "name": "size",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Integer",
+        "description": "The total number of records in a trigger invocation, both for single save operations\n      and bulk DML operations."
+      }
+    ]
   },
   {
     "page_id": "apex_enum_System_TriggerOperation",

@@ -372,8 +372,53 @@ fn corpus_root() -> PathBuf {
 ///     `System.Type` class. `BASELINE_RESOLVED` unchanged (`206_068`,
 ///     `StdlibMember` again not tallied); `BASELINE_UNRESOLVED` dropped
 ///     -837 (`18_200` -> `17_363`).
-const BASELINE_RESOLVED: usize = 206_068;
-const BASELINE_UNRESOLVED: usize = 17_363;
+/// 15. Five more real, general gaps, third file dogfooded
+///     (`fflib_SObjectDomain.cls`): (a) `Trigger` had no `apex_stdlib`
+///     entry at all -- same scraper-extraction gap as `Exception` (step
+///     12), a real page found but its content (the trigger context
+///     variables: `new`/`old`/`newMap`/`oldMap`/`isBefore`/.../`operationType`)
+///     never captured as structured properties. Hand-corrected the same
+///     way, 13 real properties, verified against a live org. (b)
+///     `SymbolTable::lookup_member` had no notion of a field/property
+///     *shadowing* a same-named ancestor member at all (only a same-
+///     *arity* `override` method did) -- so a subclass declaring its own
+///     `static` member with the same name as an unrelated one on its
+///     supertype (`fflib_SObjectDomain extends fflib_SObjects`, both
+///     independently declaring `static ... Errors`) landed in
+///     `Resolution::Candidates` forever, permanently ambiguous, even
+///     though a real compiler resolves it to the more-derived one without
+///     any ambiguity. Fixed generally: a non-method match at any chain
+///     level now stops the walk before reaching further ancestors, real
+///     Apex field-hiding semantics. (c) `inherit::resolve_inheritance`'s
+///     `extends`/`implements` name resolution (`SymbolTable::resolve_dotted_name`)
+///     had no enclosing-chain fallback for an unqualified *sibling*
+///     nested-type name at all -- `class ObjectError extends Error`,
+///     where `Error` is a sibling nested class (both declared directly
+///     inside `fflib_SObjectDomain`), never resolved as a supertype, so
+///     `Error`'s own inherited fields stayed permanently unreachable from
+///     `ObjectError`. New `SymbolTable::resolve_dotted_name_from`, mirroring
+///     `resolve_type_ref`'s identical single-segment enclosing-chain
+///     fallback, wired into both `raw_super`/`raw_extends` resolution.
+///     (d) `Expr::Index` (`list[0]`) never propagated a `List<T>`'s own
+///     element type at all (a documented "v1" gap) -- fixed the same way
+///     `crate::generics`'s own `"list"`/`"get"` arm already does, `[...]`
+///     being `.get(...)`'s own syntax sugar. (e) A schema field access
+///     outside SOQL only ever got an inferred `Ty` for a *relationship*
+///     field (via its `reference_to`) -- every *scalar* field (`opp.Name`,
+///     `opp.Type`, ...) had none at all, so a chained call on it
+///     (`opp.Name.equals(...)`) always stayed `Unresolved`, an extremely
+///     common real pattern, not an edge case. New
+///     `resolve::apex_type_for_schema_field_type` maps a field's own
+///     metadata `field_type` string to its real Apex type, conservatively
+///     (only clear, `sf`-verified cases; the scraped standard-schema
+///     `field_type` strings are real prose, not a clean enum, confirmed
+///     by direct inspection). Also fixed, same file: `sobjectExpr.Field.addError(msg)`,
+///     a real, documented Apex compiler idiom (confirmed against a real
+///     org) with no real method to find on the field's own scalar type.
+///     `BASELINE_RESOLVED` rose +559 (`206_068` -> `206_627`);
+///     `BASELINE_UNRESOLVED` dropped -6,336 (`17_363` -> `11_027`).
+const BASELINE_RESOLVED: usize = 206_627;
+const BASELINE_UNRESOLVED: usize = 11_027;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

@@ -284,6 +284,41 @@ fn ty_from_scraped_type(stdlib: &StdlibIndex, type_str: &str) -> Ty {
     Ty::system_owned(base, args.into_iter().map(|a| Ty::system_owned(a, Vec::new())).collect())
 }
 
+/// The real Apex type a schema field's *value* has, from its own
+/// metadata `field_type` (Salesforce's `<type>` element text --
+/// `"Picklist"`, `"Currency"`, `"DateTime"`, ... -- see
+/// `apex_metadata::FieldSchema::field_type`'s own doc comment), for a
+/// non-relationship field accessed outside SOQL (`opp.Name`, `opp.Type`
+/// -- a `reference_to`-bearing field already gets its own `Ty` a
+/// different way, via the field's real target object, not this).
+/// Without this, *every* scalar field access had no inferred type at
+/// all, so a chained call on it (`opp.Name.equals(...)`, `opp.Type.startsWith(...)`,
+/// both real fflib_SObjectDomain.cls shapes) stayed `Unresolved`
+/// unconditionally -- an extremely common real Apex pattern, not a rare
+/// edge case. Deliberately conservative: the bundled standard-object
+/// snapshot's own `field_type` strings are scraped prose, not a clean
+/// enum (confirmed by direct inspection -- alongside clean values like
+/// `"picklist"`/`"currency"` there's real noise like `"ManageableState
+/// enumerated list"`/`"reference to a WorkGoal object"`), so an
+/// unrecognized value stays honestly unknown (`None`) rather than
+/// guessed. The recognized mappings themselves are verified against a
+/// real org (`sf apex run`), not assumed from memory.
+fn apex_type_for_schema_field_type(field_type: &str) -> Option<&'static str> {
+    match field_type.trim().to_ascii_lowercase().as_str() {
+        "string" | "text" | "textarea" | "picklist" | "multipicklist" | "combobox" | "email" | "phone" | "url"
+        | "encryptedstring" | "base64" => Some("String"),
+        "boolean" | "check" => Some("Boolean"),
+        "date" => Some("Date"),
+        "datetime" => Some("Datetime"),
+        "time" | "timeonly" => Some("Time"),
+        "currency" | "percent" | "double" | "number" => Some("Decimal"),
+        "int" | "integer" => Some("Integer"),
+        "long" => Some("Long"),
+        "id" => Some("Id"),
+        _ => None,
+    }
+}
+
 /// A [`narrow_stdlib_overload`] winner's own declared return type,
 /// converted to the *propagated type* for continued chaining
 /// (`Database.query(soql).size()`).
@@ -1018,6 +1053,47 @@ pub(crate) fn resolve_type_ref(
     // so the returned `Ty` keeps it.
     refs.set(ptr, Resolution::Unresolved);
     Some(Ty::system_owned(name, args))
+}
+
+/// A field/property named identically to a *nested type* also declared
+/// in the same enclosing class is a real, idiomatic Apex pattern (NPSP
+/// shape: `fflib_SObjectDomain`'s `Configuration Configuration { get;
+/// private set; }`) -- `SymbolTable::lookup_member` finds both (nested
+/// types are indexed as members alongside fields/properties, with no
+/// kind partitioning), which would otherwise land in the `Candidates`
+/// arm and give up before ever inferring a type to chain further access
+/// off of. In expression position the *value* always wins over the
+/// same-named type -- the same "instance member shadows a type name"
+/// precedence `static_member_access.rs` already documents for the
+/// separate top-level-type fallback, extended here to when both
+/// candidates come from member lookup itself. Only actually drops
+/// anything when a non-type alternative exists; a lone nested-type match
+/// (a bare reference to a sibling nested type) is untouched. Shared by
+/// `bind_name_expr` (a *bare* reference, `Configuration` from within
+/// `fflib_SObjectDomain` itself) and `bind_field_expr` (a *qualified*
+/// one, `domainObject.Configuration`) -- the first is where this was
+/// originally fixed; the second had the identical gap, found only later
+/// via a real `domainObject.Configuration.TriggerStateEnabled` chain
+/// that needed the *value*'s own type to keep resolving further.
+fn prefer_value_over_same_named_type(table: &SymbolTable, members: Vec<SymbolId>) -> Vec<SymbolId> {
+    if members.len() <= 1 {
+        return members;
+    }
+    let non_type: Vec<SymbolId> = members
+        .iter()
+        .copied()
+        .filter(|&id| {
+            !matches!(
+                table.get(id).kind,
+                SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum
+            )
+        })
+        .collect();
+    if non_type.is_empty() {
+        members
+    } else {
+        non_type
+    }
 }
 
 /// Resolves a type's dotted base-name path (`Outer.Inner` -- the first
@@ -1771,18 +1847,29 @@ impl<'a> BodyBinder<'a> {
             }
             Expr::Field(f) => self.bind_field_expr(scope, f),
             Expr::Index(idx) => {
-                if let Some(t) = idx.target() {
-                    self.bind_expr(scope, &t);
-                }
+                let target_ty = idx.target().and_then(|t| self.bind_expr(scope, &t));
+                let has_real_index = idx.index().is_some();
                 if let Some(i) = idx.index() {
                     self.bind_expr(scope, &i);
                 }
-                // v1 doesn't model List<T>/Map<K,V> element-type
-                // inference for indexing syntax (only for the
-                // `crate::generics` method-call table `[...]` doesn't go
-                // through), so an indexing expression's own type is
-                // always unknown.
-                None
+                // The empty-`[]` array-type-suffix form of the
+                // `Foo[].class` reflection idiom (`IndexExpr::index`'s own
+                // doc comment) is a type marker, not a real index -- never
+                // worth an element type. A real index (`list[0]`) on a
+                // `List<T>`/`T[]` target does propagate `T`, the same
+                // substitution `crate::generics::builtin_generic_member_type`'s
+                // `"list"` -> `"get"` arm already gives `list.get(0)` --
+                // `[...]` is just `.get(...)`'s own syntax sugar, so it
+                // deserves the identical result type. Real Apex has no
+                // `map[key]` bracket syntax at all (`Map` only ever
+                // indexes via `.get(...)`), so this never needs a `Map`
+                // arm the way the method-call table does.
+                match target_ty {
+                    Some(Ty::System { name, args }) if has_real_index && name.eq_ignore_ascii_case("List") => {
+                        args.into_iter().next()
+                    }
+                    _ => None,
+                }
             }
             Expr::Call(c) => self.bind_call_expr(scope, c),
             Expr::MethodCall(mc) => self.bind_method_call_expr(scope, mc),
@@ -1853,42 +1940,7 @@ impl<'a> BodyBinder<'a> {
                     ) && self.table.is_visible_from(id, self.enclosing_type)
                 })
                 .collect();
-            // A field/property named identically to a *nested type* also
-            // declared in the same enclosing class is a real, idiomatic
-            // Apex pattern (NPSP shape: `fflib_SObjectDomain`'s
-            // `Configuration Configuration { get; private set; }`) --
-            // `lookup_member` above finds both (nested types are indexed
-            // as members alongside fields/properties, with no kind
-            // partitioning), which used to land in the `Candidates` arm
-            // below and give up before ever inferring a type to chain
-            // `.member` off of. In expression position the *value* always
-            // wins over the same-named type -- the same "instance member
-            // shadows a type name" precedence `static_member_access.rs`
-            // already documents for the separate top-level-type fallback,
-            // extended here to when both candidates come from member
-            // lookup itself. Only actually drops anything when a
-            // non-type alternative exists; a lone nested-type match (the
-            // common "bare reference to a sibling nested type" case) is
-            // untouched.
-            let members = if members.len() > 1 {
-                let non_type: Vec<SymbolId> = members
-                    .iter()
-                    .copied()
-                    .filter(|&id| {
-                        !matches!(
-                            self.table.get(id).kind,
-                            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum
-                        )
-                    })
-                    .collect();
-                if non_type.is_empty() {
-                    members
-                } else {
-                    non_type
-                }
-            } else {
-                members
-            };
+            let members = prefer_value_over_same_named_type(self.table, members);
             match members.as_slice() {
                 [] => {} // try the next-outer enclosing level, if any
                 [one] => {
@@ -2045,9 +2097,17 @@ impl<'a> BodyBinder<'a> {
                         })),
                     };
                     self.refs.set_with_highlight(ptr, highlight, resolution);
-                    return field_schema
-                        .and_then(|f| f.reference_to.first())
-                        .map(|next| Ty::system_owned(next.clone(), Vec::new()));
+                    return field_schema.and_then(|f| {
+                        f.reference_to
+                            .first()
+                            .map(|next| Ty::system_owned(next.clone(), Vec::new()))
+                            .or_else(|| {
+                                f.field_type
+                                    .as_deref()
+                                    .and_then(apex_type_for_schema_field_type)
+                                    .map(|apex_type| Ty::system(apex_type))
+                            })
+                    });
                 }
                 // Not a known SObject/field at all (real or standard) --
                 // try a stdlib class property before finally giving up
@@ -2122,6 +2182,7 @@ impl<'a> BodyBinder<'a> {
                 ) && self.table.is_visible_from(id, self.enclosing_type)
             })
             .collect();
+        let members = prefer_value_over_same_named_type(self.table, members);
         match members.as_slice() {
             [] => {
                 self.refs
@@ -2349,6 +2410,46 @@ impl<'a> BodyBinder<'a> {
         let name = tok.text();
         let ptr = SyntaxPtr::new(self.file, mc.syntax());
         let highlight = tok.text_range();
+
+        // `sobjectExpr.FieldName.addError(errorMsg)` -- a real,
+        // documented Apex compiler idiom (the canonical way to attach a
+        // field-level validation error, e.g. `Trigger.new[0].SomeField.addError('msg')`),
+        // confirmed against a real org: `.addError` is valid on *any*
+        // field-value access chained off an SObject record, regardless
+        // of that field's own scalar type (`Opportunity.Type` is a
+        // `Picklist`/`String`-typed field; `opp.Type.addError(...)` still
+        // compiles) -- not really calling `addError` on the field's VALUE
+        // type at all, compiler magic recognizing this specific syntactic
+        // shape. `SObject.addError` itself already resolves fine when
+        // called on the *object* directly (`opp.addError(...)`,
+        // `System.SObject`'s own scraped method, matched by the ordinary
+        // `Ty::System` arm below when the target is a *reference* field
+        // like `opp.AccountId`) -- this covers only the narrower gap: a
+        // *scalar* field's own value has no real `addError` method to
+        // find on its own type (`String.addError` isn't a real stdlib
+        // method), so it stayed `Unresolved` unconditionally otherwise.
+        // Guarded to only apply when the target isn't already a real
+        // project type (`Ty::Project`) -- a user-defined class with its
+        // own, unrelated `addError` method reached via a property chain
+        // must still resolve through the ordinary member lookup below,
+        // never overridden by this.
+        if name.eq_ignore_ascii_case("addError")
+            && !matches!(target_type, Some(Ty::Project(_)))
+            && matches!(mc.target(), Some(Expr::Field(_)))
+        {
+            let class = self.stdlib.class("SObject");
+            let resolution = class.map_or(Resolution::Unresolved, |c| {
+                Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                    c.namespace.clone(),
+                    &c.name,
+                    Some(name),
+                    Some(arg_types.len()),
+                    None,
+                )))
+            });
+            self.refs.set_with_highlight(ptr, highlight, resolution);
+            return None;
+        }
 
         match target_type {
             Some(Ty::Project(container)) => {
