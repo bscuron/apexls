@@ -1523,17 +1523,21 @@ fn list_span_and_texts<N: rowan::ast::AstNode<Language = apex_syntax::ApexLangua
 }
 
 /// The multi-file `WorkspaceEdit` for applying `op` to `method_id`'s own
-/// parameter list: rewrites its declaration's `FormalParamList` plus
-/// every one of `program.references_to`'s call sites. Each reference
-/// `ptr` is already keyed at the whole `MethodCallExpr` node
+/// parameter list (a `Method` or a `Constructor` -- `SymbolKind` decides
+/// which AST shapes to expect at both the declaration and each call
+/// site): rewrites its declaration's `FormalParamList` plus every one of
+/// `program.references_to`'s call sites. Each reference `ptr` is already
+/// keyed at the whole call node -- a `MethodCallExpr` for a method
 /// (`resolve::bind_method_call_expr`'s own `SyntaxPtr::new(self.file,
-/// mc.syntax())`), so casting it directly gets the call's own `ArgList`
-/// with no further ancestor-walking. `None` only if the declaration
-/// itself can't be re-derived from `method_id` (shouldn't happen for a
-/// real `Method` symbol -- defensive, not expected). Mirrors
-/// `rename_edits`'s own per-file `TextEdit` grouping (`per_file`/`LineIndex`
-/// cache, keyed by `Url`) exactly, since both are genuinely project-wide,
-/// multi-file edits.
+/// mc.syntax())`) or a `NewExpr` for a constructor
+/// (`resolve::bind_new_expr`'s identical pattern) -- so casting it
+/// directly gets the call's own `ArgList` with no further ancestor-
+/// walking. `None` only if the declaration itself can't be re-derived
+/// from `method_id` (shouldn't happen for a real `Method`/`Constructor`
+/// symbol -- defensive, not expected). Mirrors `rename_edits`'s own
+/// per-file `TextEdit` grouping (`per_file`/`LineIndex` cache, keyed by
+/// `Url`) exactly, since both are genuinely project-wide, multi-file
+/// edits.
 fn parameter_op_workspace_edit(
     program: &BoundProgram,
     method_id: SymbolId,
@@ -1541,9 +1545,14 @@ fn parameter_op_workspace_edit(
     encoding: PositionEncoding,
 ) -> Option<WorkspaceEdit> {
     let decl_symbol = program.symbols.get(method_id);
+    let is_constructor = decl_symbol.kind == SymbolKind::Constructor;
     let decl_root = program.syntax(decl_symbol.file);
-    let method = decl_symbol.ptr.to_node(&decl_root).and_then(MethodDecl::cast)?;
-    let param_list = method.params()?;
+    let decl_node = decl_symbol.ptr.to_node(&decl_root)?;
+    let param_list = if is_constructor {
+        ConstructorDecl::cast(decl_node)?.params()?
+    } else {
+        MethodDecl::cast(decl_node)?.params()?
+    };
     let (decl_span, decl_texts) = list_span_and_texts(param_list.params())?;
 
     let mut sites: Vec<(FileId, TextRange, String)> =
@@ -1551,10 +1560,13 @@ fn parameter_op_workspace_edit(
 
     for ptr in program.references_to(method_id) {
         let root = program.syntax(ptr.file());
-        let Some(call) = ptr.to_node(&root).and_then(MethodCallExpr::cast) else {
-            continue;
+        let Some(node) = ptr.to_node(&root) else { continue };
+        let args = if is_constructor {
+            NewExpr::cast(node).and_then(|n| n.args())
+        } else {
+            MethodCallExpr::cast(node).and_then(|c| c.args())
         };
-        let Some(args) = call.args() else { continue };
+        let Some(args) = args else { continue };
         let Some((arg_span, arg_texts)) = list_span_and_texts(args.args()) else {
             continue;
         };
@@ -1589,24 +1601,59 @@ fn parameter_op_workspace_edit(
     })
 }
 
+/// The declared symbol (a `Method` or a `Constructor`) that owns
+/// `param_list`, if any -- `param_list`'s immediate parent is either a
+/// `MethodDecl` (whose own name is a separate `Name` node) or a
+/// `ConstructorDecl` (whose "name" reuses the `Type` slot instead, since
+/// Apex requires it to equal its class's own name -- see
+/// `ConstructorDecl::type_ref`'s own doc comment; `collect::collect_constructor`
+/// keys the `Symbol`'s `name_range` off that `Type`'s own last base-name
+/// token for the identical reason). Either way, resolving through
+/// `BoundProgram::symbol_at` off that name token's own start offset is
+/// the same declaration-to-symbol lookup pattern used everywhere else in
+/// this file.
+fn declared_symbol_owning_param_list(
+    program: &BoundProgram,
+    file: FileId,
+    param_list: &FormalParamList,
+) -> Option<SymbolId> {
+    let parent = param_list.syntax().parent()?;
+    if let Some(method) = MethodDecl::cast(parent.clone()) {
+        return program.symbol_at(file, method.name()?.ident_range().start());
+    }
+    if let Some(constructor) = ConstructorDecl::cast(parent) {
+        let offset = constructor.type_ref()?.base_name_tokens().last()?.text_range().start();
+        return program.symbol_at(file, offset);
+    }
+    None
+}
+
 /// `textDocument/codeAction`: "Rotate parameters left/right" and "Remove
-/// parameter '<name>'" for a non-virtual, non-overloaded method -- see
-/// `method_override_chain_reason`'s own doc comment for the override-chain
-/// half of the eligibility gate; the other half (no sibling method of the
-/// same name directly on the same class, and not declared on an
-/// `Interface` at all) is checked here directly. Both restrictions are
+/// parameter '<name>'" for a non-virtual, non-overloaded method or
+/// constructor -- see `method_override_chain_reason`'s own doc comment
+/// for the override-chain half of a *method*'s eligibility gate (moot for
+/// a constructor: Apex constructors are never `virtual`/`override`, never
+/// inherited, and interfaces can't declare one at all). The other half
+/// -- no sibling declaration of the same name directly on the same class
+/// -- applies to both, though it bites a constructor far more often:
+/// every constructor of a class shares its class's own name, so this
+/// refuses whenever a class has *more than one* constructor at all, not
+/// just a genuine overload in the method sense. A method additionally
+/// can't be declared directly on an `Interface`. All of this is
 /// deliberately conservative for v1: a wider version handling virtual/
-/// overloaded methods safely is a real, separate design problem (which
-/// declarations also need editing, whether a call site's target overload
-/// is still unambiguous after the edit), not attempted here.
+/// overloaded methods (and multi-constructor classes) safely is a real,
+/// separate design problem (which declarations also need editing,
+/// whether a call site's target overload is still unambiguous after the
+/// edit), not attempted here.
 ///
 /// Triggered only when `range`'s start lands inside a `FormalParam` of a
-/// `MethodDecl`'s own parameter list -- the same token-then-ancestors
-/// lookup pattern `prepare_rename_range` already uses. Every other case
-/// (no `FormalParam` there, the method fails eligibility, zero parameters)
-/// quietly offers nothing, the same "don't offer, don't explain" contract
-/// `dead_code_actions` already has -- unlike rename's `RenameRefusal`,
-/// there's no user-initiated single target to explain a refusal *to*.
+/// `MethodDecl`/`ConstructorDecl`'s own parameter list -- the same
+/// token-then-ancestors lookup pattern `prepare_rename_range` already
+/// uses. Every other case (no `FormalParam` there, the declaration fails
+/// eligibility, zero parameters) quietly offers nothing, the same "don't
+/// offer, don't explain" contract `dead_code_actions` already has --
+/// unlike rename's `RenameRefusal`, there's no user-initiated single
+/// target to explain a refusal *to*.
 pub(crate) fn parameter_reorder_actions(
     program: &BoundProgram,
     file: FileId,
@@ -1646,36 +1693,42 @@ pub(crate) fn parameter_reorder_actions(
     let Some(param_list) = param.syntax().parent().and_then(FormalParamList::cast) else {
         return Vec::new();
     };
-    let Some(method) = param_list.syntax().parent().and_then(MethodDecl::cast) else {
-        return Vec::new();
-    };
-    let Some(method_name) = method.name() else {
-        return Vec::new();
-    };
-    let Some(method_id) = program.symbol_at(file, method_name.ident_range().start()) else {
+    let Some(method_id) = declared_symbol_owning_param_list(program, file, &param_list) else {
         return Vec::new();
     };
 
     let symbol = program.symbols.get(method_id);
-    if symbol.kind != SymbolKind::Method {
-        return Vec::new();
-    }
     let Some(container) = symbol.container else {
         return Vec::new();
     };
-    if program.symbols.get(container).kind == SymbolKind::Interface {
-        return Vec::new();
-    }
-    if method_override_chain_reason(program, method_id).is_some() {
-        return Vec::new();
-    }
-    let has_sibling_overload = program.symbols.members_of(container).iter().any(|&m| {
-        m != method_id
-            && program.symbols.get(m).kind == SymbolKind::Method
-            && program.symbols.get(m).name.eq_ignore_ascii_case(&symbol.name)
-    });
-    if has_sibling_overload {
-        return Vec::new();
+    match symbol.kind {
+        SymbolKind::Method => {
+            if program.symbols.get(container).kind == SymbolKind::Interface {
+                return Vec::new();
+            }
+            if method_override_chain_reason(program, method_id).is_some() {
+                return Vec::new();
+            }
+            let has_sibling_overload = program.symbols.members_of(container).iter().any(|&m| {
+                m != method_id
+                    && program.symbols.get(m).kind == SymbolKind::Method
+                    && program.symbols.get(m).name.eq_ignore_ascii_case(&symbol.name)
+            });
+            if has_sibling_overload {
+                return Vec::new();
+            }
+        }
+        SymbolKind::Constructor => {
+            let has_sibling_constructor = program
+                .symbols
+                .members_of(container)
+                .iter()
+                .any(|&m| m != method_id && program.symbols.get(m).kind == SymbolKind::Constructor);
+            if has_sibling_constructor {
+                return Vec::new();
+            }
+        }
+        _ => return Vec::new(),
     }
 
     let params: Vec<FormalParam> = param_list.params().collect();

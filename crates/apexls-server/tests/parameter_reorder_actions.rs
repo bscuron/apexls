@@ -329,6 +329,82 @@ fn rotate_left_right_and_remove_rewrite_the_declaration_and_every_call_site() {
 }
 
 #[test]
+fn a_constructors_parameters_rewrite_the_declaration_and_every_call_site() {
+    const WIDGET_SRC: &str = "public class Widget {\n    \
+         public Widget(String a, String b, String c) {\n        \
+             System.debug(a + b + c);\n    \
+         }\n\
+         }\n";
+    const CALLER_A_SRC: &str = "public class CallerA {\n    public void run() { new Widget('x', 'y', 'z'); }\n}\n";
+    let dir = write_fixture_dir(
+        "param-reorder-constructor",
+        &[("Widget.cls", WIDGET_SRC), ("CallerA.cls", CALLER_A_SRC)],
+    );
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let widget_uri = Url::from_file_path(dir.join("Widget.cls")).unwrap();
+    let caller_a_uri = Url::from_file_path(dir.join("CallerA.cls")).unwrap();
+
+    let mut session = Session::start(&root_uri, &widget_uri, WIDGET_SRC);
+    let response = code_action_request(&mut session, &widget_uri, WIDGET_SRC, "String b");
+    let actions = response["result"].as_array().expect("expected a code action array");
+    assert_eq!(actions.len(), 3, "expected all three actions for a 3-param constructor: {actions:?}");
+
+    let rotate_left = action_named(actions, "Rotate parameters left");
+    let changes = rotate_left["edit"]["changes"].as_object().unwrap();
+    assert_eq!(changes.len(), 2, "expected an edit in both files: {changes:?}");
+    assert_eq!(
+        apply_edits(WIDGET_SRC, changes[widget_uri.as_str()].as_array().unwrap()),
+        "public class Widget {\n    public Widget(String b, String c, String a) {\n        \
+         System.debug(a + b + c);\n    }\n}\n"
+    );
+    assert_eq!(
+        apply_edits(CALLER_A_SRC, changes[caller_a_uri.as_str()].as_array().unwrap()),
+        "public class CallerA {\n    public void run() { new Widget('y', 'z', 'x'); }\n}\n"
+    );
+
+    let remove = action_named(actions, "Remove parameter 'b'");
+    let changes = remove["edit"]["changes"].as_object().unwrap();
+    assert_eq!(
+        apply_edits(WIDGET_SRC, changes[widget_uri.as_str()].as_array().unwrap()),
+        "public class Widget {\n    public Widget(String a, String c) {\n        \
+         System.debug(a + b + c);\n    }\n}\n"
+    );
+    assert_eq!(
+        apply_edits(CALLER_A_SRC, changes[caller_a_uri.as_str()].as_array().unwrap()),
+        "public class CallerA {\n    public void run() { new Widget('x', 'z'); }\n}\n"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_class_with_multiple_constructors_offers_no_parameter_actions() {
+    // Every constructor of a class shares its class's own name, so v1's
+    // "no same-name sibling" rule (the same one that refuses an
+    // overloaded *method*) refuses here too, just far more often --
+    // deliberate, see `parameter_reorder_actions`'s own doc comment.
+    const SRC: &str = "public class Widget {\n    \
+         public Widget(String a, String b) { }\n    \
+         public Widget() { }\n\
+         }\n";
+    let dir = write_fixture_dir("param-reorder-multi-ctor", &[("Widget.cls", SRC)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let widget_uri = Url::from_file_path(dir.join("Widget.cls")).unwrap();
+
+    let mut session = Session::start(&root_uri, &widget_uri, SRC);
+    let response = code_action_request(&mut session, &widget_uri, SRC, "String a, String b");
+    let actions = response["result"].as_array();
+    assert!(
+        actions.is_none_or(|a| a.is_empty()),
+        "expected no parameter actions when the class has more than one constructor: {response:?}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_single_parameter_method_only_offers_remove() {
     const SRC: &str = "public class Widget {\n    public void configure(String a) { }\n}\n";
     let dir = write_fixture_dir("param-reorder-single", &[("Widget.cls", SRC)]);
