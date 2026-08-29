@@ -2276,7 +2276,11 @@ impl<'a> BodyBinder<'a> {
         // otherwise resolve correctly (a real `SchemaObject` reference)
         // but propagate the *object's own* type instead of the describe
         // result's, stranding a further `.getName()`/`.getLabel()`/...
-        // chained off it as `Unresolved`.
+        // chained off it as `Unresolved`. The object name itself rides
+        // along in the returned `Ty`'s own `args` (not a real generic type
+        // argument -- reused as the one place left to carry it) so the
+        // `.fields` handling right below can recover which object a
+        // further `.fields.<field>` hop belongs to.
         if let Some(Ty::System { name: object, .. }) = &target_type {
             if object.eq_ignore_ascii_case("SObjectType") && self.schema.object(name).is_some() {
                 self.refs.set_with_highlight(
@@ -2287,7 +2291,116 @@ impl<'a> BodyBinder<'a> {
                         field: None,
                     })),
                 );
-                return Some(Ty::system("DescribeSObjectResult"));
+                return Some(Ty::system_with_args(
+                    "DescribeSObjectResult",
+                    vec![Ty::system_owned(SmolStr::new(name), Vec::new())],
+                ));
+            }
+        }
+
+        // `<ObjectType>.fields` / `SObjectType.<ObjectType>.fields` -- the
+        // receiver half of Apex's real, dynamic-looking-but-actually-
+        // compile-time-checked `object.fields.<FieldName>` shorthand for a
+        // field describe token. `fields` itself isn't a real field of the
+        // object -- resolved as `Resolution::UnknownSchema` here (matching
+        // exactly what the generic `self.schema.object(&object).is_some()`
+        // fallback further down would already have given it before this
+        // check existed, since `fields` never matches any object's real
+        // field list either way -- intercepting earlier must not silently
+        // downgrade that to plain `Unresolved`, which would just be a
+        // regression on `resolution_regression_baseline.rs`'s pinned
+        // counter for no real behavior change on this specific hop). What
+        // actually matters is the returned `Ty`: two different real result
+        // types depending on how
+        // the receiver itself resolved, confirmed against a real org
+        // (`Schema.SObjectField f = Account.fields.Name;` compiles, but
+        // `Schema.SObjectField f2 = Schema.SObjectType.Account.fields.Name;`
+        // fails with "Illegal assignment from Schema.DescribeFieldResult
+        // to Schema.SObjectField" -- the *same-looking* `.fields.Name`
+        // means something different depending on whether the receiver
+        // before it was the bare object type or an already-described
+        // `Schema.DescribeSObjectResult`). Two internal-only synthetic
+        // `Ty` names carry that distinction (plus the owning object's
+        // name, in `args`, the same reuse the `SObjectType.<ObjectName>`
+        // case above relies on) into the next hop -- safe from ever
+        // colliding with a real class name, since `$` isn't a legal
+        // character in an Apex identifier.
+        if name.eq_ignore_ascii_case("fields") {
+            if let Some(Ty::System { name: object, args }) = &target_type {
+                // `object` (the receiver's own `Ty` name) is either
+                // "DescribeSObjectResult" (describe mode: the receiver
+                // went through the `SObjectType.<ObjectName>` check
+                // above, which -- despite recording the *same*
+                // `Resolution::SchemaObject { field: None }` shape a bare
+                // object-type-name reference does -- is a conceptually
+                // different receiver, so that resolution shape alone
+                // can't tell the two modes apart; `object`'s own name
+                // can) or a real schema object name directly (token
+                // mode).
+                let bare_object_type = !object.eq_ignore_ascii_case("DescribeSObjectResult")
+                    && self.schema.object(object).is_some();
+                let owner = if bare_object_type {
+                    Some(object.clone())
+                } else if object.eq_ignore_ascii_case("DescribeSObjectResult") {
+                    args.first().and_then(|a| match a {
+                        Ty::System { name, .. } => Some(name.clone()),
+                        Ty::Project(_) => None,
+                    })
+                } else {
+                    None
+                };
+                if let Some(owner) = owner {
+                    self.refs.set_with_highlight(
+                        ptr,
+                        highlight,
+                        Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
+                            object: Some(owner.clone()),
+                            field: Some(SmolStr::new_static("fields")),
+                        })),
+                    );
+                    let marker = if bare_object_type {
+                        "$fields_token"
+                    } else {
+                        "$fields_describe"
+                    };
+                    return Some(Ty::system_with_args(marker, vec![Ty::system_owned(owner, Vec::new())]));
+                }
+            }
+        }
+
+        // The actual field-name hop after `.fields` (`object.fields.<FieldName>`),
+        // consuming one of the two synthetic markers the check just above
+        // produces. Resolves the same way a direct `object.<FieldName>`
+        // access does (`SchemaObject`/`UnknownSchema`, keyed by the owning
+        // object recovered from `args`), but the propagated `Ty` differs
+        // by mode: `Schema.SObjectField` for the bare-object-receiver form,
+        // `Schema.DescribeFieldResult` for the already-described form --
+        // see the check above for the org verification behind both.
+        if let Some(Ty::System { name: marker, args }) = &target_type {
+            if marker == "$fields_token" || marker == "$fields_describe" {
+                let owner = args.first().and_then(|a| match a {
+                    Ty::System { name, .. } => Some(name.clone()),
+                    Ty::Project(_) => None,
+                });
+                if let Some(owner) = owner {
+                    let field_schema = self.schema.field(&owner, name);
+                    let resolution = match &field_schema {
+                        Some(_) => Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                            object: owner.clone(),
+                            field: Some(SmolStr::new(name)),
+                        })),
+                        None => Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
+                            object: Some(owner.clone()),
+                            field: Some(SmolStr::new(name)),
+                        })),
+                    };
+                    self.refs.set_with_highlight(ptr, highlight, resolution);
+                    return Some(if marker == "$fields_token" {
+                        Ty::system("SObjectField")
+                    } else {
+                        Ty::system("DescribeFieldResult")
+                    });
+                }
             }
         }
 

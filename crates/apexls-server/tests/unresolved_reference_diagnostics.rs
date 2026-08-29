@@ -463,6 +463,31 @@ fn an_error_and_a_warning_both_appear_in_the_same_publish() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Fifth real-corpus smoke test, for the `object.fields.<FieldName>`
+/// describe-token shorthand specifically: `LVL_LevelEdit_CTRL.cls` builds
+/// a `Set<Schema.SObjectField>` from several `Level__c.fields.<FieldName>`
+/// literals -- the bare-object-receiver ("token") mode of the fix.
+#[test]
+fn a_real_npsp_lvl_level_edit_ctrl_file_has_no_error_severity_diagnostics() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus/npsp");
+    let file = root.join("force-app/main/default/classes/LVL_LevelEdit_CTRL.cls");
+    let root_uri = Url::from_file_path(&root).unwrap();
+    let file_uri = Url::from_file_path(&file).unwrap();
+    let src = std::fs::read_to_string(&file).unwrap();
+
+    let mut session = Session::start(&root_uri, &file_uri, &src);
+
+    let notification = session.next_diagnostics();
+    let diagnostics = notification["params"]["diagnostics"].as_array().unwrap();
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d["severity"] == serde_json::json!(1))
+        .collect();
+    assert!(errors.is_empty(), "expected no ERROR-severity diagnostics: {errors:?}");
+
+    session.shutdown();
+}
+
 /// Real-corpus smoke test, matching this project's own convention of
 /// running whole-NPSP-corpus assertions as normal (not `#[ignore]`d)
 /// tests (see e.g. `rename.rs`'s own real-corpus test): `fflib_QueryFactory.cls`

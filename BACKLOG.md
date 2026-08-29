@@ -1571,6 +1571,41 @@ supports each one.
       `BASELINE_UNRESOLVED`: `6,980` -> `6,643` (`-189` from (a), `-148`
       from (b) on top of it); `BASELINE_RESOLVED`: `206,716` -> `206,740`
       (entry 19).
+
+      **Eighth round: `object.fields.<FieldName>`, the same describe-
+      token family as the seventh round, found the same way (cluster
+      scan, then verified against a real file, `LVL_LevelEdit_CTRL.cls`).**
+      `fields` itself already resolved harmlessly as
+      `Resolution::UnknownSchema` (the generic schema fallback matching
+      any real object name), but propagated no `Ty` at all, so a chained
+      `.fields.<FieldName>` always stayed `Unresolved` -- 300+ occurrences
+      of two different receiver forms each in NPSP. Confirmed against a
+      real org that the *same-looking* `.fields.<FieldName>` means a
+      genuinely different result type depending on the receiver: off a
+      bare object type name it's a real `Schema.SObjectField` token; off
+      the `SObjectType.<ObjectName>` describe-result receiver from the
+      seventh round, it's instead a real `Schema.DescribeFieldResult`
+      (confirmed via a real compile error naming both types when the
+      wrong one is assigned). Fixed with two internal-only synthetic `Ty`
+      names -- never exposed via `Resolution`, safe from ever colliding
+      with a real class name since `$` isn't a legal Apex identifier
+      character -- carrying both which mode applies and the owning
+      object's name forward, reusing `Ty::System`'s existing `args` field
+      the same way the seventh round's own `SObjectType.<ObjectName>` fix
+      already had to. Caught one real disambiguation bug during this
+      round's own real-corpus verification: telling the two receiver
+      modes apart by the receiver's own already-recorded resolution shape
+      (`Resolution::SchemaObject` with no field, the same signal the
+      seventh round's fix reuses) turned out to be genuinely ambiguous --
+      the `SObjectType.<ObjectName>` describe-result receiver records
+      that *exact* same shape for an unrelated reason, so a first version
+      resolved `SObjectType.Account.fields.Name` against the literal
+      string `"DescribeSObjectResult"` as if it were the object name,
+      instead of the real `"Account"`. Fixed by checking the receiver's
+      own `Ty` name directly instead, an unambiguous signal the
+      resolution shape alone couldn't give. `BASELINE_UNRESOLVED`:
+      `6,643` -> `6,231`; `BASELINE_RESOLVED`: `206,740` -> `206,741`
+      (entry 20).
 - [ ] **Duplicate/conflicting-modifier diagnostic -- a real gap, found via
       a user report.** `private private private private void foo() {`
       produces no error anywhere in the pipeline today: `grammar::declarations::modifiers`

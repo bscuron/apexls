@@ -545,8 +545,49 @@ fn corpus_root() -> PathBuf {
 ///     on top of (a) moved `BASELINE_RESOLVED` +1 more (`206_739` ->
 ///     `206_740`) and `BASELINE_UNRESOLVED` -148 more (`6_791` ->
 ///     `6_643`).
-const BASELINE_RESOLVED: usize = 206_740;
-const BASELINE_UNRESOLVED: usize = 6_643;
+/// 20. The `object.fields.<FieldName>` describe-token shorthand, found
+///     the same way as steps 18-19: `examples/unresolved_clusters.rs`'s
+///     top clusters, re-run after step 19 landed (300+ occurrences each
+///     of two related receiver forms). `fields` itself isn't a real
+///     property of anything -- there's no single declaration to point at
+///     -- so `bind_field_expr` already resolved it as
+///     `Resolution::UnknownSchema` via the generic
+///     `self.schema.object(&object).is_some()` fallback, but propagated
+///     no `Ty` at all, so a chained `.fields.<FieldName>` hop always
+///     stayed `Unresolved` regardless of receiver. Confirmed against a
+///     real org that the *same-looking* `.fields.<FieldName>` means a
+///     genuinely different result type depending on the receiver: off a
+///     bare object type name, `Schema.SObjectField f = Account.fields.Name;`
+///     compiles (a real `Schema.SObjectField` token); off the
+///     `SObjectType.<ObjectName>` describe-result receiver from step 19,
+///     `Schema.SObjectField f2 = Schema.SObjectType.Account.fields.Name;`
+///     instead fails with "Illegal assignment from Schema.DescribeFieldResult
+///     to Schema.SObjectField" -- a real `Schema.DescribeFieldResult`.
+///     Fixed with two internal-only synthetic `Ty` names (never exposed
+///     via `Resolution`, safe from ever colliding with a real class name
+///     since `$` isn't a legal Apex identifier character) that carry both
+///     which mode applies and the owning object's name forward from the
+///     `.fields` hop into the next one -- reusing `Ty::System`'s existing
+///     `args` field for that, the same "one field left to carry extra
+///     context" reuse step 19's own `SObjectType.<ObjectName>` fix
+///     needed. Caught one real disambiguation bug during this step's own
+///     verification: a first version distinguished the two receiver
+///     modes by checking the receiver's own already-recorded resolution
+///     shape (`Resolution::SchemaObject` with no field), the same signal
+///     step 19's own fix reuses -- but that signal is genuinely ambiguous
+///     here, since the `SObjectType.<ObjectName>` describe-result
+///     receiver records that *exact* same shape for an unrelated reason,
+///     so a `SObjectType.Account.fields.Name` fixture resolved against
+///     the literal object name `"DescribeSObjectResult"` instead of
+///     `"Account"`. Fixed by checking the receiver's own `Ty` name
+///     directly instead (a real schema object name means token mode;
+///     `"DescribeSObjectResult"` means describe mode, recovering the real
+///     owner from `args`), an unambiguous signal the resolution shape
+///     alone couldn't provide. `BASELINE_UNRESOLVED` dropped -412
+///     (`6_643` -> `6_231`); `BASELINE_RESOLVED` rose +1 (`206_740` ->
+///     `206_741`).
+const BASELINE_RESOLVED: usize = 206_741;
+const BASELINE_UNRESOLVED: usize = 6_231;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {
