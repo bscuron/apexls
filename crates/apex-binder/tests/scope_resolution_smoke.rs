@@ -29,6 +29,7 @@ struct Counts {
     schema_object: usize,
     unknown_schema: usize,
     stdlib_member: usize,
+    label: usize,
     unresolved: usize,
 }
 
@@ -50,6 +51,7 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
             Resolution::SchemaObject(_) => counts.schema_object += 1,
             Resolution::UnknownSchema(_) => counts.unknown_schema += 1,
             Resolution::StdlibMember(_) => counts.stdlib_member += 1,
+            Resolution::Label(_) => counts.label += 1,
             Resolution::Unresolved => counts.unresolved += 1,
         }
     }
@@ -59,6 +61,7 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
         + counts.schema_object
         + counts.unknown_schema
         + counts.stdlib_member
+        + counts.label
         + counts.unresolved;
     assert!(
         total > 200_000,
@@ -98,6 +101,11 @@ fn every_real_npsp_file_binds_and_resolves_a_meaningful_share_of_references() {
         counts.stdlib_member > 60_000,
         "expected >60,000 StdlibMember references, got {}: {counts:?}",
         counts.stdlib_member
+    );
+    assert!(
+        counts.label > 1_000,
+        "expected >1,000 Label references, got {}: {counts:?}",
+        counts.label
     );
 
     let unresolved_ratio = counts.unresolved as f64 / total as f64;

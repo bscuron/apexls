@@ -26,10 +26,12 @@
 //! it determines whether the tool can ever work fully offline.
 
 mod discover;
+mod labels;
 pub mod visualforce;
 mod xml;
 
 pub use discover::{discover_sobjects, sobjects_from_discovery};
+pub use labels::{discover_labels, labels_from_discovery};
 
 use smol_str::SmolStr;
 use std::path::PathBuf;
@@ -84,6 +86,33 @@ pub struct FieldSchema {
     /// local file to jump to, matching `SObjectSchema::object_path`'s
     /// existing `None` case for the same reason.
     pub source_path: Option<PathBuf>,
+}
+
+/// One custom label, from one `<labels>` block inside a
+/// `CustomLabels.labels-meta.xml` file -- accessed in Apex as
+/// `Label.<full_name>`/`System.Label.<full_name>`, always typed `String`.
+/// Unlike `FieldSchema`, `source_path` is never `None`: there's no
+/// bundled-standard-label snapshot equivalent to `apex_stdlib`'s SObject/
+/// field schema for this crate to fall back to (custom labels are, by
+/// definition, entirely project-declared -- there's no such thing as a
+/// "standard" label the way there's a standard object).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabelSchema {
+    /// The label's API name (`<fullName>`), e.g. `fflib_security_error_object_not_insertable`.
+    pub full_name: SmolStr,
+    /// The label's own display text (`<value>`), when the scraped file
+    /// has one -- shown as-is in a hover, not evaluated as a format
+    /// string even when it contains `{0}`-style placeholders (real Apex
+    /// leaves substituting those to `String.format`, called separately
+    /// wherever the label is actually used).
+    pub value: Option<SmolStr>,
+    /// The path to the `.labels-meta.xml` file this label was declared
+    /// in -- a goto-definition target for a `Label.<full_name>` reference.
+    /// Points at the *whole file*, not this specific `<labels>` block:
+    /// like `SchemaObjectRef`'s own `schema_location`,
+    /// `apex_metadata`'s XML parsing doesn't track individual element
+    /// positions.
+    pub source_path: PathBuf,
 }
 
 #[cfg(test)]

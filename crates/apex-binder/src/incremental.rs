@@ -10,6 +10,7 @@
 
 use crate::file_id::FileId;
 use crate::file_table::FileTable;
+use crate::label_index::LabelIndex;
 use crate::ptr::{AstPtr, SyntaxPtr};
 use crate::reference_table::ReferenceTable;
 use crate::schema_index::SchemaIndex;
@@ -102,6 +103,10 @@ pub struct BindCache {
     /// on that limit.
     pub(crate) discovery: Option<Discovery>,
     pub(crate) schema: Option<Arc<SchemaIndex>>,
+    /// Every project-declared custom label, rebuilt alongside `schema` on
+    /// the same `need_fresh_discovery` trigger -- see
+    /// `crate::label_index::LabelIndex`.
+    pub(crate) labels: Option<Arc<LabelIndex>>,
     /// Every class name (lowercased) a real `.page` file's `controller`/
     /// `extensions` attribute names -- rebuilt alongside `schema` on the
     /// same `need_fresh_discovery` trigger, since it's derived from the

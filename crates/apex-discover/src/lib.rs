@@ -56,10 +56,10 @@ pub fn find_apex_files(root: impl AsRef<Path>) -> Vec<PathBuf> {
 }
 
 /// Recursively find every `.cls`/`.trigger`/`.object-meta.xml`/
-/// `.field-meta.xml` file under `root` in a single walk -- what any
-/// caller needing both Apex source and SObject/field schema (a real
-/// apexls invocation) should use instead of `find_apex_files` plus a
-/// separate metadata walk.
+/// `.field-meta.xml`/`.labels-meta.xml` file under `root` in a single
+/// walk -- what any caller needing Apex source plus SObject/field/label
+/// schema (a real apexls invocation) should use instead of
+/// `find_apex_files` plus a separate metadata walk.
 #[hotpath::measure]
 pub fn discover(root: impl AsRef<Path>) -> Discovery {
     walk(
@@ -74,6 +74,8 @@ pub fn discover(root: impl AsRef<Path>) -> Discovery {
                 found.field_meta_files.push(path.to_path_buf());
             } else if is_visualforce_page_file(path) {
                 found.page_files.push(path.to_path_buf());
+            } else if is_labels_meta_file(path) {
+                found.labels_meta_files.push(path.to_path_buf());
             }
         },
     )
@@ -94,18 +96,27 @@ pub struct Discovery {
     /// visibility) that never contains the `controller`/`extensions`
     /// attributes the markup itself carries.
     pub page_files: Vec<PathBuf>,
+    /// `CustomLabels.labels-meta.xml`-shaped files -- unlike
+    /// `.object-meta.xml`/`.field-meta.xml` (one file per object/field),
+    /// a single labels file bundles *every* custom label a package
+    /// declares, so this is deliberately a flat file list, not grouped
+    /// per-label the way `apex_metadata::discover_sobjects` groups by
+    /// object -- there's nothing to group by here, and a real project
+    /// can (and NPSP does) have more than one such file.
+    pub labels_meta_files: Vec<PathBuf>,
 }
 
-/// Whether `path` is one of the five file types [`discover`] indexes
-/// (`.cls`/`.trigger`/`.object-meta.xml`/`.field-meta.xml`/`.page`) --
-/// the per-path check a caller reacting to individual filesystem events
-/// (a watcher) needs, without walking a whole directory tree just to
-/// classify one path.
+/// Whether `path` is one of the six file types [`discover`] indexes
+/// (`.cls`/`.trigger`/`.object-meta.xml`/`.field-meta.xml`/`.page`/
+/// `.labels-meta.xml`) -- the per-path check a caller reacting to
+/// individual filesystem events (a watcher) needs, without walking a
+/// whole directory tree just to classify one path.
 pub fn is_relevant_path(path: &Path) -> bool {
     is_apex_file(path)
         || is_object_meta_file(path)
         || is_field_meta_file(path)
         || is_visualforce_page_file(path)
+        || is_labels_meta_file(path)
 }
 
 fn is_apex_file(path: &Path) -> bool {
@@ -122,6 +133,10 @@ fn is_object_meta_file(path: &Path) -> bool {
 
 fn is_field_meta_file(path: &Path) -> bool {
     !is_hidden(path) && ends_with_ci(path, ".field-meta.xml")
+}
+
+fn is_labels_meta_file(path: &Path) -> bool {
+    !is_hidden(path) && ends_with_ci(path, ".labels-meta.xml")
 }
 
 /// `.page` only -- deliberately not `.page-meta.xml` (`Path::extension()`
@@ -189,6 +204,7 @@ fn walk(
         total.object_meta_files.extend(found.object_meta_files);
         total.field_meta_files.extend(found.field_meta_files);
         total.page_files.extend(found.page_files);
+        total.labels_meta_files.extend(found.labels_meta_files);
     }
     total
 }

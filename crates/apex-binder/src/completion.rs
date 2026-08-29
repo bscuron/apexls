@@ -199,6 +199,7 @@ fn member_access_context(
         &program.symbols,
         &program.schema,
         &program.stdlib,
+        &program.labels,
         file,
         enclosing.enclosing_type,
         enclosing.enclosing_member,

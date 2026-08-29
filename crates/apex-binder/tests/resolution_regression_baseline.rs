@@ -465,8 +465,34 @@ fn corpus_root() -> PathBuf {
 ///     two specifically still need more thought before a safe rename).
 ///     `BASELINE_RESOLVED` rose +88 (`206_627` -> `206_715`);
 ///     `BASELINE_UNRESOLVED` dropped -1,872 (`11_027` -> `9_155`).
-const BASELINE_RESOLVED: usize = 206_715;
-const BASELINE_UNRESOLVED: usize = 9_155;
+/// 17. Custom labels (`.labels-meta.xml`, real Apex `Label.<name>`/
+///     `System.Label.<name>` syntax) were never discovered at all --
+///     `apex-discover`'s prune list skipped the `labels/` directory
+///     outright (unlike `objects`/`fields`/`pages`, which already had a
+///     kept-metadata-dirs exception), so no project ever had its custom
+///     label *names* modeled, even though `Label` itself was already a
+///     real, resolving stdlib class. New `apex_metadata::LabelSchema` +
+///     `apex_binder::LabelIndex` (mirrors `SchemaIndex`'s discovery/build
+///     shape, minus the bundled-standard-snapshot merge `SchemaIndex` has
+///     -- there's no such thing as a "standard" label) wired into
+///     `bind_field_expr`'s existing `Ty::System { name: "Label", .. }`
+///     receiver check. `BASELINE_UNRESOLVED` dropped -2,058 (`9_155` ->
+///     `7_097`): the overwhelming majority of real `Label.<name>` reads in
+///     NPSP now resolve as `Resolution::Label` (untallied here, same as
+///     `StdlibMember`/`SchemaObject`). Deliberately does **not** resolve
+///     the `Label.<namespace>.<name>` cross-package form
+///     (`System.Label.npo02.DefaultHouseholdName`, real Apex syntax for
+///     disambiguating a label declared in a specific installed package) --
+///     confirmed via direct inspection that this remainder is exactly
+///     that shape, not a new gap this change introduced: SFDX's
+///     `.labels-meta.xml` files never record a package's own namespace, so
+///     there's no local metadata to resolve that segment against, the
+///     same class of gap `apex-metadata`'s own module doc comment already
+///     documents for standard schema. `BASELINE_RESOLVED` rose +1
+///     (`206_715` -> `206_716`), the same "argument/chain type newly
+///     known" ripple effect documented in step 1.
+const BASELINE_RESOLVED: usize = 206_716;
+const BASELINE_UNRESOLVED: usize = 7_097;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {
@@ -487,7 +513,8 @@ fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {
             Resolution::Candidates(_)
             | Resolution::SchemaObject(_)
             | Resolution::UnknownSchema(_)
-            | Resolution::StdlibMember(_) => {}
+            | Resolution::StdlibMember(_)
+            | Resolution::Label(_) => {}
         }
     }
 

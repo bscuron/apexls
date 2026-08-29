@@ -6,7 +6,7 @@
 
 use crate::line_index::{LineIndex, PositionEncoding};
 use apex_binder::{
-    BoundProgram, CompletionCandidate, CompletionCandidateKind, FileId, Resolution,
+    BoundProgram, CompletionCandidate, CompletionCandidateKind, FileId, LabelRef, Resolution,
     SchemaObjectRef, StdlibMemberRef, Symbol, SymbolId, SymbolKind, SyntaxPtr, Visibility,
 };
 use apex_syntax::ast::decl::{
@@ -118,6 +118,34 @@ pub(crate) fn schema_location(program: &BoundProgram, r: &SchemaObjectRef) -> Op
     Some(Location {
         uri,
         range: Range::default(),
+    })
+}
+
+/// A `Resolution::Label` resolution's goto-definition target: the
+/// `.labels-meta.xml` file the label was declared in. Always points at the
+/// file's very start -- like `schema_location`, `apex-metadata`'s XML
+/// parsing doesn't track individual `<labels>` element positions, so
+/// landing on the right *file* (out of however many a project has) is the
+/// achievable target here, not the exact `<labels>` block.
+pub(crate) fn label_location(program: &BoundProgram, r: &LabelRef) -> Option<Location> {
+    let label = program.labels.get(&r.full_name)?;
+    let uri = Url::from_file_path(&label.source_path).ok()?;
+    Some(Location {
+        uri,
+        range: Range::default(),
+    })
+}
+
+/// Renders a `Resolution::Label` reference as Markdown hover text: the
+/// label's own declared value (its Apex-visible display text), or just its
+/// API name if the scraped `.labels-meta.xml` had no `<value>` -- the
+/// custom-label equivalent of `describe_stdlib_member`, sourced from
+/// project metadata (`program.labels`) instead of bundled stdlib data.
+pub(crate) fn describe_label(program: &BoundProgram, r: &LabelRef) -> Option<String> {
+    let label = program.labels.get(&r.full_name)?;
+    Some(match &label.value {
+        Some(value) => format!("```apex\nLabel.{}\n```\n\n{value}", label.full_name),
+        None => format!("```apex\nLabel.{}\n```", label.full_name),
     })
 }
 

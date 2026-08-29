@@ -1456,6 +1456,56 @@ supports each one.
       `apex_stdlib::standard_classes`'s own doc comment for why those two
       specifically still need more thought). `BASELINE_UNRESOLVED`:
       `11,027` -> `9,155`.
+
+      **Fifth round: not a single file this time, but a whole missing
+      metadata category, found by the same file-by-file dogfooding
+      (`fflib_SecurityUtils.cls`).** `.labels-meta.xml` (custom labels,
+      real Apex `Label.<name>`/`System.Label.<name>` syntax) was never
+      discovered at all -- `apex-discover`'s prune list skipped the
+      `labels/` directory outright, unlike `objects`/`fields`/`pages`,
+      which already had a kept-metadata-dirs exception for exactly this
+      reason. `Label` itself already resolved fine as a real stdlib class
+      (`System.Label`), so every reference to one of a project's own
+      declared label *names* silently fell through to `Unresolved`
+      instead -- indistinguishable from a genuine typo. Fixed with a new
+      metadata category end to end: `apex_discover::Discovery::labels_meta_files`
+      (kept out of the prune list the same way `objects`/`fields`/`pages`
+      are), `apex_metadata::LabelSchema` (`full_name`/`value`/`source_path`,
+      parsed via `roxmltree` the same way `FieldSchema` already is -- a
+      single file bundles many `<labels>` blocks, unlike one-field-per-file
+      `.field-meta.xml`), and a new `apex_binder::LabelIndex` mirroring
+      `SchemaIndex`'s discovery/build shape, minus the bundled-standard-
+      snapshot merge `SchemaIndex` has (there's no such thing as a
+      "standard" label the way there's a standard object). Wired into
+      `bind_field_expr`'s existing `Ty::System { name: "Label", .. }`
+      receiver check -- both `Label.<name>` (via `bind_name_expr`'s
+      existing bare-stdlib-class fallback) and `System.Label.<name>` (via
+      `bind_field_expr`'s existing `class_in_namespace` fallback one hop
+      up) funnel through the same final `.member` hop, so one check covers
+      both spellings. New `Resolution::Label` variant (an `ExternalKey::Label`
+      counterpart alongside it, so `references`/`documentHighlight` group
+      every reference to the same label together, matching every other
+      external-data variant's shape); `apexls-server::capabilities::describe_label`/
+      `label_location` give it real hover (the label's own declared
+      `value`) and goto-definition (its `.labels-meta.xml` file) support,
+      not just diagnostic silencing. Caught one real bug in review before
+      landing: the first version of the `bind_field_expr` check returned
+      `Ty::system("String")` unconditionally, even when the looked-up name
+      wasn't a real label at all -- silently mistyping a failed lookup as
+      a real `String` and letting a further chained call resolve against
+      the wrong type instead of honestly staying `Unresolved`, the same
+      mistake every other lookup-miss arm in that function already takes
+      care to avoid. Deliberately does not (yet) resolve the
+      `Label.<namespace>.<name>` cross-package form
+      (`System.Label.npo02.DefaultHouseholdName`, real Apex syntax for
+      disambiguating a label declared in a specific installed package):
+      confirmed via direct inspection that NPSP's whole remaining
+      `Unresolved`-label share is exactly this shape, not a new gap this
+      change introduced -- SFDX's `.labels-meta.xml` files never record a
+      package's own namespace, so there's no local metadata to resolve
+      that segment against, the same class of gap `apex-metadata`'s own
+      module doc comment already documents for standard schema.
+      `BASELINE_UNRESOLVED`: `9,155` -> `7,097` (entry 17).
 - [ ] **Duplicate/conflicting-modifier diagnostic -- a real gap, found via
       a user report.** `private private private private void foo() {`
       produces no error anywhere in the pipeline today: `grammar::declarations::modifiers`

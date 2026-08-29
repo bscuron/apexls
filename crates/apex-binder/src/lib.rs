@@ -43,6 +43,7 @@ mod file_table;
 mod generics;
 mod incremental;
 mod inherit;
+mod label_index;
 mod ptr;
 mod reference_table;
 mod resolve;
@@ -61,8 +62,9 @@ pub use file_id::FileId;
 pub use incremental::BindCache;
 pub use ptr::{AstPtr, SyntaxPtr};
 pub use reference_table::{
-    ExternalKey, ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef, UnknownSchemaRef,
+    ExternalKey, LabelRef, ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef, UnknownSchemaRef,
 };
+pub use label_index::LabelIndex;
 pub use schema_index::SchemaIndex;
 pub use stdlib_index::StdlibIndex;
 pub use scope::{Scope, ScopeId, ScopeKind, ScopeTree};
@@ -125,6 +127,12 @@ pub struct BoundProgram {
     /// (`global_stdlib_index`) rather than something `BindCache` rebuilds
     /// alongside a fresh directory walk.
     pub stdlib: Arc<StdlibIndex>,
+    /// Every project-declared custom label (`.labels-meta.xml`), keyed by
+    /// `full_name` -- what `Label.xxx`/`System.Label.xxx` references
+    /// resolve against. `Arc`-wrapped and rebuilt alongside `schema` for
+    /// the same reason: derived from the same directory walk, only
+    /// redone on the same `need_fresh_discovery` trigger.
+    pub labels: Arc<LabelIndex>,
     bodies: FxHashMap<FileId, Arc<FileBodies>>,
     /// Every class name (lowercased) a real `.page` file names as its
     /// `controller`/`extensions` -- `crate::dead_code`'s Visualforce-
@@ -260,8 +268,13 @@ impl BoundProgram {
                 // of back-to-back roughly halves that one-time cold-start
                 // cost. `global_stdlib_index`'s own `OnceLock` makes the
                 // unconditional call below free once this has run.
-                let (schema, _) = rayon::join(
-                    || Arc::new(SchemaIndex::from_discovery(&discovery)),
+                let ((schema, labels), _) = rayon::join(
+                    || {
+                        rayon::join(
+                            || Arc::new(SchemaIndex::from_discovery(&discovery)),
+                            || Arc::new(LabelIndex::from_discovery(&discovery)),
+                        )
+                    },
                     global_stdlib_index,
                 );
                 let vf_referenced_classes = Arc::new(
@@ -269,11 +282,13 @@ impl BoundProgram {
                 );
                 cache.discovery = Some(discovery);
                 cache.schema = Some(schema);
+                cache.labels = Some(labels);
                 cache.vf_referenced_classes = Some(vf_referenced_classes);
             });
         }
         let discovery = cache.discovery.as_ref().unwrap();
         let schema = Arc::clone(cache.schema.as_ref().unwrap());
+        let labels = Arc::clone(cache.labels.as_ref().unwrap());
         let stdlib = global_stdlib_index();
         let vf_referenced_classes = Arc::clone(cache.vf_referenced_classes.as_ref().unwrap());
 
@@ -598,7 +613,7 @@ impl BoundProgram {
                     .par_iter()
                     .flat_map(|(file, id, symbol)| {
                         let root_node = parse_by_file[file].syntax();
-                        bind_symbol_body(&cache.table, &schema, &stdlib, &root_node, *id, symbol)
+                        bind_symbol_body(&cache.table, &schema, &stdlib, &labels, &root_node, *id, symbol)
                             .into_iter()
                             .map(move |(key, body)| (*file, key, body))
                             .collect::<Vec<_>>()
@@ -721,6 +736,7 @@ impl BoundProgram {
             symbols: cache.table.clone(),
             schema,
             stdlib,
+            labels,
             bodies,
             vf_referenced_classes,
         }
@@ -1173,6 +1189,7 @@ fn bind_symbol_body(
     table: &SymbolTable,
     schema: &SchemaIndex,
     stdlib: &StdlibIndex,
+    labels: &LabelIndex,
     root: &SyntaxNode,
     id: SymbolId,
     symbol: &Symbol,
@@ -1210,6 +1227,7 @@ fn bind_symbol_body(
                     table,
                     schema,
                     stdlib,
+                    labels,
                     symbol.file,
                     symbol.container,
                     Some(id),
@@ -1233,6 +1251,7 @@ fn bind_symbol_body(
                 table,
                 schema,
                 stdlib,
+                labels,
                 symbol.file,
                 symbol.container,
                 Some(id),
@@ -1252,6 +1271,7 @@ fn bind_symbol_body(
                         table,
                         schema,
                         stdlib,
+                        labels,
                         symbol.file,
                         symbol.container,
                         None,
@@ -1276,6 +1296,7 @@ fn bind_symbol_body(
                     table,
                     schema,
                     stdlib,
+                    labels,
                     symbol.file,
                     symbol.container,
                     &init,
@@ -1302,8 +1323,15 @@ fn bind_symbol_body(
             }
             if let Some(block) = tu.block() {
                 let key = SyntaxPtr::new(symbol.file, block.syntax());
-                let bound =
-                    resolve::bind_trigger_body(table, schema, stdlib, symbol.file, Some(id), &block);
+                let bound = resolve::bind_trigger_body(
+                    table,
+                    schema,
+                    stdlib,
+                    labels,
+                    symbol.file,
+                    Some(id),
+                    &block,
+                );
                 out.push((Some(key), bound));
             }
             out

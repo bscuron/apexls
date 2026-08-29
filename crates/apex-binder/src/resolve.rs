@@ -51,9 +51,10 @@
 
 use crate::conversions;
 use crate::file_id::FileId;
+use crate::label_index::LabelIndex;
 use crate::ptr::{AstPtr, SyntaxPtr};
 use crate::reference_table::{
-    ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef, UnknownSchemaRef,
+    LabelRef, ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef, UnknownSchemaRef,
 };
 use crate::schema_index::{relationship_field_api_name, SchemaIndex};
 use crate::scope::{ScopeId, ScopeKind, ScopeTree};
@@ -720,6 +721,7 @@ pub(crate) struct BodyBinder<'a> {
     pub(crate) table: &'a SymbolTable,
     pub(crate) schema: &'a SchemaIndex,
     pub(crate) stdlib: &'a StdlibIndex,
+    pub(crate) labels: &'a LabelIndex,
     pub(crate) refs: ReferenceTable,
     pub(crate) scopes: ScopeTree,
     pending_locals: Vec<Symbol>,
@@ -746,6 +748,7 @@ pub(crate) fn bind_body(
     table: &SymbolTable,
     schema: &SchemaIndex,
     stdlib: &StdlibIndex,
+    labels: &LabelIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     enclosing_member: Option<SymbolId>,
@@ -757,6 +760,7 @@ pub(crate) fn bind_body(
         table,
         schema,
         stdlib,
+        labels,
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
@@ -782,6 +786,7 @@ pub(crate) fn bind_trigger_body(
     table: &SymbolTable,
     schema: &SchemaIndex,
     stdlib: &StdlibIndex,
+    labels: &LabelIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     block: &TriggerBlock,
@@ -791,6 +796,7 @@ pub(crate) fn bind_trigger_body(
         table,
         schema,
         stdlib,
+        labels,
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
@@ -814,6 +820,7 @@ pub(crate) fn bind_initializer(
     table: &SymbolTable,
     schema: &SchemaIndex,
     stdlib: &StdlibIndex,
+    labels: &LabelIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     expr: &Expr,
@@ -823,6 +830,7 @@ pub(crate) fn bind_initializer(
         table,
         schema,
         stdlib,
+        labels,
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
@@ -855,6 +863,7 @@ pub(crate) fn body_binder_for_completion<'a>(
     table: &'a SymbolTable,
     schema: &'a SchemaIndex,
     stdlib: &'a StdlibIndex,
+    labels: &'a LabelIndex,
     file: FileId,
     enclosing_type: Option<SymbolId>,
     enclosing_member: Option<SymbolId>,
@@ -864,6 +873,7 @@ pub(crate) fn body_binder_for_completion<'a>(
         table,
         schema,
         stdlib,
+        labels,
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
@@ -2145,6 +2155,51 @@ impl<'a> BodyBinder<'a> {
                     }),
                 );
                 return class.map(|c| Ty::system_owned(c.name.clone(), Vec::new()));
+            }
+        }
+
+        // `Label.<fullName>`/`System.Label.<fullName>` (a custom-label
+        // read, e.g. `System.Label.fflib_security_error_object_not_insertable`)
+        // -- `Label` itself is a real stdlib class (`System.Label`), so
+        // `target_type` is already `Ty::System { name: "Label", .. }` by
+        // the time either spelling reaches here: a bare `Label` receiver
+        // resolves via `bind_name_expr`'s stdlib-class fallback, and
+        // `System.Label` resolves via this same function's own
+        // `class_in_namespace` fallback one level up the chain. Checked
+        // before the stdlib-property lookup below: `Label`'s own scraped
+        // stdlib entry has zero documented properties (real custom label
+        // names are, by definition, never part of any fixed/bundled set
+        // -- see `apex_metadata::LabelSchema`'s doc comment), so there's
+        // no ambiguity to resolve between the two sources. Always types
+        // as `String`: a label reference is never anything else in real
+        // Apex, `{0}`-style placeholders included -- those are substituted
+        // separately via `String.format`, not part of the label's own
+        // type. A name this project has no local `.labels-meta.xml`
+        // declaration for -- most often a namespace segment in the
+        // `Label.<namespace>.<name>` cross-package form (`System.Label.npo02.Foo`,
+        // real Apex syntax for disambiguating a label declared in a
+        // specific installed package; SFDX metadata never records a
+        // package's own namespace in its `.labels-meta.xml` files, so
+        // there's no local data to resolve that segment against) -- stays
+        // honestly `Unresolved` with no propagated type, the same as
+        // every other lookup miss in this function, rather than guessing
+        // `String` anyway and risking a further chained call resolving
+        // against the wrong type.
+        if let Some(Ty::System { name: object, .. }) = &target_type {
+            if object.eq_ignore_ascii_case("Label") {
+                return match self.labels.get(name) {
+                    Some(label) => {
+                        let resolution = Resolution::Label(Box::new(LabelRef {
+                            full_name: label.full_name.clone(),
+                        }));
+                        self.refs.set_with_highlight(ptr, highlight, resolution);
+                        Some(Ty::system("String"))
+                    }
+                    None => {
+                        self.refs.set_with_highlight(ptr, highlight, Resolution::Unresolved);
+                        None
+                    }
+                };
             }
         }
 

@@ -95,6 +95,19 @@ pub struct StdlibMemberRef {
     pub narrowed_param_types: Option<Vec<SmolStr>>,
 }
 
+/// A custom-label reference (`Label.<full_name>`/`System.Label.<full_name>`)
+/// -- sourced from project metadata (`.labels-meta.xml`, via
+/// `crate::label_index::LabelIndex`), not `apex_stdlib`'s bundled
+/// documentation data, the same distinction `SchemaObject` draws against
+/// `StdlibMember`. `full_name` alone is enough identity for a consumer
+/// (hover, goto-definition) to look the rest (`value`, `source_path`) back
+/// up via `LabelIndex`, mirroring `StdlibMemberRef::class_name`'s own
+/// "just the lookup key" shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelRef {
+    pub full_name: SmolStr,
+}
+
 /// `SchemaObject`/`UnknownSchema`/`StdlibMember` box their payload so
 /// their `SmolStr`-carrying fields don't force every other variant -- in
 /// particular the by-far-most-common `Resolved`/`Unresolved`, one entry
@@ -107,6 +120,7 @@ pub enum Resolution {
     SchemaObject(Box<SchemaObjectRef>),
     UnknownSchema(Box<UnknownSchemaRef>),
     StdlibMember(Box<StdlibMemberRef>),
+    Label(Box<LabelRef>),
     Unresolved,
 }
 
@@ -158,6 +172,9 @@ pub enum ExternalKey {
         member: Option<SmolStr>,
         arg_count: Option<usize>,
     },
+    Label {
+        full_name: SmolStr,
+    },
 }
 
 /// `external_key()` calls this for every `SchemaObject`/`UnknownSchema`/
@@ -203,6 +220,7 @@ impl Resolution {
             Resolution::SchemaObject(_)
             | Resolution::UnknownSchema(_)
             | Resolution::StdlibMember(_)
+            | Resolution::Label(_)
             | Resolution::Unresolved => &[],
         }
     }
@@ -247,6 +265,9 @@ impl Resolution {
                 class_name: lower(&r.class_name),
                 member: Some(lower(member)),
                 arg_count: r.arg_count,
+            }),
+            Resolution::Label(r) => Some(ExternalKey::Label {
+                full_name: lower(&r.full_name),
             }),
             Resolution::Resolved(_) | Resolution::Candidates(_) | Resolution::Unresolved => None,
         }
