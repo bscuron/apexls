@@ -802,6 +802,7 @@ pub(crate) enum RenameRefusal {
     NoSymbolHere,
     Ambiguous,
     Trigger,
+    ImplicitValue,
     OverrideChain(&'static str),
     InvalidIdentifier,
     NameCollision,
@@ -816,6 +817,9 @@ impl RenameRefusal {
                 .to_string(),
             RenameRefusal::Trigger => "a trigger's name is tied to its Salesforce object, not a \
                  renameable identifier"
+                .to_string(),
+            RenameRefusal::ImplicitValue => "`value` is a property setter's implicit parameter -- \
+                 it has no declaration in source to rename"
                 .to_string(),
             RenameRefusal::OverrideChain(reason) => {
                 format!("can't safely rename this method: {reason}")
@@ -854,6 +858,21 @@ pub(crate) fn rename_target(
     let symbol = program.symbols.get(id);
     if symbol.kind == SymbolKind::Trigger {
         return Err(RenameRefusal::Trigger);
+    }
+    // A property setter's implicit `value` parameter (`crate::collect`'s
+    // `collect_property`) is a real `Parameter` symbol so ordinary
+    // resolution/hover treat it like any other local, but it's kept under
+    // the *property's* own id as `container` (never a class's) specifically
+    // so it stays invisible everywhere else -- including here, where its
+    // `name_range` points at the `get`/`set` keyword token (there's no real
+    // `value` token in source to point at instead), which a rename would
+    // otherwise silently overwrite.
+    if symbol.kind == SymbolKind::Parameter
+        && symbol
+            .container
+            .is_some_and(|c| program.symbols.get(c).kind == SymbolKind::Property)
+    {
+        return Err(RenameRefusal::ImplicitValue);
     }
     if symbol.kind == SymbolKind::Method {
         check_method_eligible(program, id)?;

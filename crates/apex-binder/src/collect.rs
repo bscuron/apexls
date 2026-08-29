@@ -466,7 +466,7 @@ fn collect_property(out: &mut FileCollection, file: FileId, p: &PropertyDecl, co
         return;
     };
     let (type_ref, type_name, type_args) = type_ptr_and_name(file, p.type_ref());
-    out.push(
+    let property_id = out.push(
         file,
         Symbol {
             kind: SymbolKind::Property,
@@ -476,11 +476,51 @@ fn collect_property(out: &mut FileCollection, file: FileId, p: &PropertyDecl, co
             name_range: name.ident_range(),
             container: Some(container),
             type_ref,
-            type_name,
-            type_args,
+            type_name: type_name.clone(),
+            type_args: type_args.clone(),
             modifiers: ModifierSet::from_modifiers_and_annotations(p.modifiers(), p.annotations()),
         },
     );
+    // A custom `set { ... }` accessor body can reference `value`, an
+    // implicit parameter of the property's own type that Apex declares
+    // for it -- never written in source (real NPSP shape:
+    // `fflib_ApexMocks.DoThrowWhenExceptions`'s setter assigning
+    // `methodReturnValueRecorder.DoThrowWhenExceptions = value;`). Modeled
+    // as an ordinary `Parameter` symbol so `SymbolKind::Property`'s own
+    // body-binding pass (`crate::lib`) can seed it into the setter body's
+    // scope exactly like a real method parameter, via `table.params`
+    // (which already filters `members_of(container)` down to `Parameter`
+    // kind) -- keyed under the *property's* id as container, not the
+    // enclosing class's, so it stays invisible to ordinary member lookup
+    // and arity checks on the class itself. Skipped for the common
+    // `set;` auto-implemented form (no body to bind at all) and for a
+    // `get` accessor (which has no `value` of its own).
+    for accessor in p.accessors() {
+        if !accessor.is_setter() {
+            continue;
+        }
+        let Some(body) = accessor.body() else {
+            continue;
+        };
+        let name_range = accessor
+            .keyword_range()
+            .unwrap_or_else(|| accessor.syntax().text_range());
+        out.push(
+            file,
+            Symbol {
+                kind: SymbolKind::Parameter,
+                name: SmolStr::new_static("value"),
+                file,
+                ptr: SyntaxPtr::new(file, body.syntax()),
+                name_range,
+                container: Some(property_id),
+                type_ref,
+                type_name: type_name.clone(),
+                type_args: type_args.clone(),
+                modifiers: ModifierSet::default(),
+            },
+        );
+    }
 }
 
 fn collect_params(

@@ -609,8 +609,25 @@ fn corpus_root() -> PathBuf {
 ///     eliminating the `Set<String>` overload. `BASELINE_UNRESOLVED`
 ///     dropped -55 (`6_231` -> `6_176`); `BASELINE_RESOLVED` rose +662
 ///     (`206_741` -> `207_403`).
-const BASELINE_RESOLVED: usize = 207_403;
-const BASELINE_UNRESOLVED: usize = 6_176;
+///
+/// 22. A property's custom `set { ... }` accessor body can reference
+///     `value`, an implicit parameter of the property's own type that
+///     real Apex declares for it without it ever appearing in source
+///     (real NPSP shape: `fflib_ApexMocks.DoThrowWhenExceptions`'s setter
+///     assigning `methodReturnValueRecorder.DoThrowWhenExceptions =
+///     value;`) -- previously unmodeled entirely, since
+///     `resolve::bind_symbol_body`'s `SymbolKind::Property` arm always
+///     bound every accessor body with an empty parameter list. Fixed by
+///     collecting `value` as an ordinary `Parameter` symbol
+///     (`collect::collect_property`), kept under the *property's* own id
+///     as `container` (not the enclosing class's) so it stays invisible
+///     to ordinary member lookup, then seeding it into just the `set`
+///     accessor's body scope via the same `table.params` machinery a
+///     real method already uses. `BASELINE_UNRESOLVED` dropped -19
+///     (`6_176` -> `6_157`); `BASELINE_RESOLVED` rose +19 (`207_403` ->
+///     `207_422`).
+const BASELINE_RESOLVED: usize = 207_422;
+const BASELINE_UNRESOLVED: usize = 6_157;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

@@ -90,8 +90,16 @@ fn every_real_npsp_declaration_collects_and_every_pointer_resolves() {
                         | SymbolKind::Enum
                         | SymbolKind::Trigger
                 ),
-                SymbolKind::Parameter
-                | SymbolKind::LocalVar
+                // `Parameter` also legitimately sits under a `Property`:
+                // a `set` accessor's own implicit `value` parameter is
+                // collected under the property's id specifically so it
+                // stays invisible to ordinary member lookup on the
+                // enclosing class (`crate::collect::collect_property`).
+                SymbolKind::Parameter => matches!(
+                    container_kind,
+                    SymbolKind::Method | SymbolKind::Constructor | SymbolKind::Property
+                ),
+                SymbolKind::LocalVar
                 | SymbolKind::CatchVar
                 | SymbolKind::ForEachVar
                 | SymbolKind::SwitchBindingVar => {

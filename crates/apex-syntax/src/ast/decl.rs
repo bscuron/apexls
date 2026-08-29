@@ -312,6 +312,17 @@ impl PropertyAccessor {
     pub fn body(&self) -> Option<Block> {
         support::child(self.syntax())
     }
+
+    /// The `get`/`set` keyword token's own range -- narrower than
+    /// `self.syntax().text_range()` (which also covers the accessor's
+    /// whole body), used as the implicit `value` parameter's
+    /// goto-definition target inside a custom `set` accessor (there's no
+    /// real `value` token in the source to point at instead).
+    pub fn keyword_range(&self) -> Option<rowan::TextRange> {
+        support::token(self.syntax(), SyntaxKind::Get)
+            .or_else(|| support::token(self.syntax(), SyntaxKind::Set))
+            .map(|t| t.text_range())
+    }
 }
 
 impl FormalParamList {

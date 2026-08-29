@@ -1292,10 +1292,19 @@ fn bind_symbol_body(
         SymbolKind::Property => {
             let mut out: Vec<(Option<SyntaxPtr>, resolve::BoundBody)> =
                 declared_type().into_iter().collect();
+            // A `set` accessor's own implicit `value` parameter is
+            // collected under the property's own id as its container
+            // (`crate::collect::collect_property`) specifically so
+            // `table.params` -- which already filters `members_of` down
+            // to `Parameter` kind -- finds it here the same way an
+            // ordinary method body finds its real parameters. A `get`
+            // accessor has none, so this is empty for it.
+            let value_param = table.params(id);
             if let Some(p) = symbol.ptr.to_node(root).and_then(PropertyDecl::cast) {
                 out.extend(p.accessors().filter_map(|accessor| {
                     let body = accessor.body()?;
                     let key = SyntaxPtr::new(symbol.file, body.syntax());
+                    let params: &[SymbolId] = if accessor.is_setter() { &value_param } else { &[] };
                     let bound = resolve::bind_body(
                         table,
                         schema,
@@ -1305,7 +1314,7 @@ fn bind_symbol_body(
                         symbol.file,
                         symbol.container,
                         None,
-                        &[],
+                        params,
                         &body,
                     );
                     Some((Some(key), bound))
