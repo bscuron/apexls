@@ -12,7 +12,7 @@ use apex_binder::{
 };
 use apex_syntax::ast::decl::{
     ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, FormalParam, FormalParamList, HasDocComment,
-    InterfaceDecl, MethodDecl, PropertyDecl, TriggerUnit,
+    InterfaceDecl, MethodDecl, Modifier, PropertyDecl, TriggerUnit,
 };
 use apex_syntax::ast::expr::{ArgList, CallExpr, Expr, MethodCallExpr, NameExpr, NewExpr};
 use apex_syntax::SyntaxKind;
@@ -25,7 +25,7 @@ use lsp_types::{
     Range, SelectionRange, SignatureHelp, SignatureInformation, SymbolInformation,
     SymbolKind as LspSymbolKind, TextEdit, Url, WorkspaceEdit,
 };
-use rowan::ast::AstNode;
+use rowan::ast::{support, AstNode};
 use rowan::{TextRange, TextSize};
 use std::collections::HashMap;
 
@@ -1412,6 +1412,121 @@ pub(crate) fn unknown_schema_diagnostics(
             }
         })
         .collect()
+}
+
+/// `SyntaxKind`s `apex_syntax::ast::decl::HasModifiers` is actually
+/// implemented for -- every declaration shape that can carry `modifier*`.
+const MODIFIER_BEARING_KINDS: &[SyntaxKind] = &[
+    SyntaxKind::ClassDecl,
+    SyntaxKind::InterfaceDecl,
+    SyntaxKind::EnumDecl,
+    SyntaxKind::MethodDecl,
+    SyntaxKind::ConstructorDecl,
+    SyntaxKind::FieldDecl,
+    SyntaxKind::PropertyDecl,
+    SyntaxKind::FormalParam,
+];
+
+fn is_visibility_modifier_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::Public | SyntaxKind::Private | SyntaxKind::Protected | SyntaxKind::Global
+    )
+}
+
+/// `textDocument/publishDiagnostics`: one `ERROR`-severity diagnostic per
+/// duplicate or conflicting modifier on a single declaration -- confirmed
+/// a real, *semantic* (deploy-time) compiler error against a real
+/// Salesforce org, not a syntax-level one (Wayfinder `apex-diagnostics`
+/// map, ticket 02's research): `apex-parser`'s grammar deliberately keeps
+/// parsing `modifier*` as an unconstrained repetition, matching the real
+/// org's own grammar (which accepts the same repetition syntactically and
+/// only rejects it in a later compiler phase), so this stays a semantic
+/// check here rather than a parser-level restriction -- changing the
+/// grammar would diverge from real Apex and would also change error
+/// recovery/AST shape for in-progress, syntactically-tolerant text an LSP
+/// needs to keep serving other features against.
+///
+/// Walks every `MODIFIER_BEARING_KINDS` node directly off the raw syntax
+/// tree via `apex_syntax::ast::support::children::<Modifier>`, which
+/// works on any node regardless of its specific typed wrapper -- so this
+/// doesn't need `HasModifiers`'s per-type trait dispatch, nor the
+/// binder's already-collapsed `apex_binder::symbol::ModifierSet` (which
+/// idempotently discards duplicates, `crates/apex-binder/src/symbol.rs:123-148`
+/// -- exactly the information this diagnostic needs to still see). Two
+/// rules, matching the two shapes generalized from what was actually
+/// confirmed against a real org:
+/// - Any modifier keyword repeated on the same declaration -> `Duplicate
+///   modifier: <keyword>` on each repeat past the first (real message,
+///   confirmed for `private`/`static`: `"Duplicate modifier: private"`;
+///   generalized here to any keyword, since the underlying rule -- a real
+///   compiler rejecting a repeated modifier -- isn't specific to which
+///   one it is).
+/// - More than one distinct visibility keyword (`public`/`private`/
+///   `protected`/`global`) on the same declaration -> `Declarations can
+///   only have one scope` on each one past the first-seen (real message,
+///   verbatim).
+/// A third confirmed shape (`static`+`abstract` -> `"static methods
+/// cannot be abstract"`) is scoped to `MethodDecl` only, deliberately not
+/// generalized: that's the only shape actually verified against a real
+/// org, and `abstract` isn't otherwise meaningful on a field/property/
+/// parameter, so there's no real case elsewhere for it to fire on anyway.
+pub(crate) fn modifier_diagnostics(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<Diagnostic> {
+    let root = program.syntax(file);
+    let text = root.text().to_string();
+    let index = LineIndex::new(&text);
+
+    let diagnostic = |range: TextRange, message: String| Diagnostic {
+        range: Range {
+            start: index.to_position(&text, range.start().into(), encoding),
+            end: index.to_position(&text, range.end().into(), encoding),
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("apexls".to_string()),
+        message,
+        ..Default::default()
+    };
+
+    let mut diagnostics = Vec::new();
+    for node in root.descendants() {
+        if !MODIFIER_BEARING_KINDS.contains(&node.kind()) {
+            continue;
+        }
+        let modifiers: Vec<_> = support::children::<Modifier>(&node)
+            .filter_map(|m| m.keyword())
+            .collect();
+
+        let mut seen_counts: HashMap<SyntaxKind, u32> = HashMap::new();
+        let mut first_visibility: Option<SyntaxKind> = None;
+        for tok in &modifiers {
+            let count = seen_counts.entry(tok.kind()).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                diagnostics.push(diagnostic(tok.text_range(), format!("Duplicate modifier: {}", tok.text())));
+                continue;
+            }
+            if is_visibility_modifier_kind(tok.kind()) {
+                match first_visibility {
+                    None => first_visibility = Some(tok.kind()),
+                    Some(first) if first != tok.kind() => {
+                        diagnostics.push(diagnostic(tok.text_range(), "Declarations can only have one scope".to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if node.kind() == SyntaxKind::MethodDecl && modifiers.iter().any(|t| t.kind() == SyntaxKind::Static) {
+            if let Some(abstract_tok) = modifiers.iter().find(|t| t.kind() == SyntaxKind::Abstract) {
+                diagnostics.push(diagnostic(abstract_tok.text_range(), "static methods cannot be abstract".to_string()));
+            }
+        }
+    }
+    diagnostics
 }
 
 /// `textDocument/publishDiagnostics`: one `WARNING`-severity diagnostic
