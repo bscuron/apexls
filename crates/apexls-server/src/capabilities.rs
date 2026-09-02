@@ -15,7 +15,7 @@ use apex_syntax::ast::decl::{
     InterfaceDecl, MethodDecl, Modifier, PropertyDecl, TriggerUnit,
 };
 use apex_syntax::ast::expr::{ArgList, CallExpr, Expr, MethodCallExpr, NameExpr, NewExpr};
-use apex_syntax::ast::stmt::{DoWhileStmt, ForEachStmt, ForStmt, WhileStmt};
+use apex_syntax::ast::stmt::{Block, DoWhileStmt, ForEachStmt, ForStmt, Stmt, WhileStmt};
 use apex_syntax::{SyntaxKind, SyntaxNode};
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall, CodeAction,
@@ -1682,6 +1682,99 @@ pub(crate) fn bulkification_diagnostics(
                 range,
                 format!("{keyword} inside a loop may exceed governor limits -- move it outside the loop and operate on a bulk collection instead"),
             ));
+        }
+    }
+    diagnostics
+}
+
+/// Whether `stmt` *definitely* transfers control away rather than
+/// falling through to whatever follows it -- the recursive predicate
+/// behind `unreachable_code_diagnostics` (Wayfinder `apex-diagnostics`
+/// map, ticket 05's design). Deliberately narrow (`Block`/`If` only,
+/// per that ticket's own settled v1 scope): `TryStmt`/`SwitchStmt`/every
+/// loop kind fall to the conservative `_ => false` default, even though
+/// some of those *could* soundly terminate in specific shapes (a
+/// `finally` that itself always returns; a `do`-`while` whose body
+/// always returns, since its body unconditionally runs at least once) --
+/// deferred to a follow-on ticket rather than attempted here, since
+/// getting `try`/`switch`/loop reasoning wrong risks a real false
+/// positive, the one thing this whole diagnostic set has never shipped.
+fn stmt_terminates(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        // A block terminates as soon as *any* statement in it does --
+        // once reached, nothing after that statement (inside this same
+        // block) ever executes, so it doesn't matter whether the
+        // terminator is the block's last statement or an earlier one.
+        Stmt::Block(block) => block.statements().any(|s| stmt_terminates(&s)),
+        // Only an `if` with an `else` where *both* branches terminate is
+        // itself a terminator -- no `else`, or a branch that can fall
+        // through, means control can still reach past the whole `if`.
+        Stmt::If(if_stmt) => {
+            let Some(then_branch) = if_stmt.then_branch() else {
+                return false;
+            };
+            let Some(else_branch) = if_stmt.else_branch() else {
+                return false;
+            };
+            stmt_terminates(&then_branch) && stmt_terminates(&else_branch)
+        }
+        _ => false,
+    }
+}
+
+/// `textDocument/publishDiagnostics`: one `ERROR`-severity diagnostic per
+/// statement that's unreachable because an earlier statement in the same
+/// block definitely terminates control flow first (Wayfinder
+/// `apex-diagnostics` map, ticket 05's design/ticket 13's
+/// implementation). `ERROR`, not `WARNING`: unlike bulkification, this is
+/// a certain, provable defect once flagged -- the statement genuinely
+/// cannot execute, full stop, matching `unknown_schema_diagnostics`/
+/// `modifier_diagnostics`'s confidence level.
+///
+/// Walks every `Block` node in the file independently (so a block nested
+/// inside a `TryStmt`/`SwitchStmt`/loop/`IfStmt` branch that itself isn't
+/// treated as a terminator still gets its *own* unreachable code found --
+/// see [`stmt_terminates`]'s own doc comment for why those container
+/// kinds are conservatively never terminators themselves), scanning its
+/// direct statement children in order: the first one [`stmt_terminates`]
+/// confirms terminates flips every statement after it, in that same
+/// block, into "unreachable."
+pub(crate) fn unreachable_code_diagnostics(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<Diagnostic> {
+    let root = program.syntax(file);
+    let text = root.text().to_string();
+    let index = LineIndex::new(&text);
+
+    let diagnostic = |range: TextRange| Diagnostic {
+        range: Range {
+            start: index.to_position(&text, range.start().into(), encoding),
+            end: index.to_position(&text, range.end().into(), encoding),
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("apexls".to_string()),
+        message: "unreachable statement".to_string(),
+        ..Default::default()
+    };
+
+    let mut diagnostics = Vec::new();
+    for node in root.descendants() {
+        if node.kind() != SyntaxKind::Block {
+            continue;
+        }
+        let Some(block) = Block::cast(node) else {
+            continue;
+        };
+        let mut past_terminator = false;
+        for stmt in block.statements() {
+            if past_terminator {
+                diagnostics.push(diagnostic(stmt.syntax().text_range()));
+            } else if stmt_terminates(&stmt) {
+                past_terminator = true;
+            }
         }
     }
     diagnostics
