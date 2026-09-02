@@ -1,5 +1,5 @@
 Type: grilling
-Status: open
+Status: resolved
 Blocked by: 18
 
 ## Question
@@ -10,3 +10,13 @@ Given [ticket 18](18-stdlib-interface-extension-research.md)'s findings, decide 
 - **The `SymbolTable`/`resolve_inheritance` change.** Ticket 18 found `inherit.rs:56-63` already computes the resolved/unresolved split and just discards it via `filter_map` -- the minimal fix is a `partition` instead, recording rejected names via a new `set_unresolved_supertypes` mirroring the existing `set_unresolved_direct_super`. It also found `raw_extends` conflates `extends`/`implements` origin (position-only, fragile) -- does fixing that properly (tagging each name's clause origin at collection time) happen as part of this work, or is the position-based workaround (subtract the already-known direct-`extends` name) acceptable for v1?
 - **The pre-existing nested-interface gap ticket 18 found as a side effect.** A class implementing its *own* nested interface (`fflib_Inheritor`/`fflib_Criteria`/`fflib_MyList` in real NPSP) doesn't resolve today because `resolve_dotted_name_from` never checks a top-level type's own nested members. Small in volume (3 real cases) but a real, separate bug -- fix it in the same pass since it shares the exact code path, or ticket it separately?
 - **Verification strategy**, given ticket 18's own finding that this is inherently unvalidatable via corpus sampling (the real compiler already rejects incomplete stdlib-interface implementations at deploy time, so no real NPSP file can ever exhibit the bug this diagnostic would catch) -- hand-authored fixtures only, mirroring how tickets 14/15 already accepted this same tradeoff for `finally`/`switch`?
+
+## Answer
+
+**Defer.** Not because any single blocker is too big, but because three real costs stack: genuine `apex-binder`-core surgery (a new unresolved-implements signal, clause-origin tagging), a *separate* stdlib-scraper data gap this ticket can't itself close (`Messaging.InboundEmailHandler`/`Database.Stateful`/`Database.AllowsCallouts` entirely unscraped -- 25 of the 202 real candidate sites), and type-aware overload matching for a genuine `execute()` collision across `Schedulable`/`Queueable`/`Finalizer` (arity alone, this project's own established rule for user-defined overloads, isn't enough here). The deciding factor: unlike every other check on this map, this diagnostic's confidence can **never** come from a full real-corpus scan -- the real Apex compiler already rejects the exact bug this check exists to catch before any code can ship, so no already-deployed corpus (NPSP included) can ever demonstrate it's safe. That's a materially different risk profile than "needs more code," matching this map's own established pattern of deferring compound risk (ticket 12).
+
+If reopened later: proper clause-origin tagging (a new enum, three `collect.rs` call sites) over the fragile position-based workaround.
+
+**A real, independent bug found along the way, split out regardless of the deferral above:** a class implementing its own nested interface (`fflib_Inheritor`/`fflib_Criteria`/`fflib_MyList`, 5 real NPSP sites) doesn't resolve today, because `resolve_dotted_name_from` never checks a top-level type's own nested members, only its container's. This is ordinary binder resolution, directly testable the normal way (unlike the stdlib diagnostic itself) -- not structurally unvalidatable, so it doesn't inherit this ticket's own deferral reasoning. Real, present, already-diagnosed root cause, unrelated to whether the stdlib-interface diagnostic ever ships.
+
+**Follow-on:** [Fix the nested-interface resolution gap](22-nested-interface-resolution-fix.md) (`task`, unblocked).
