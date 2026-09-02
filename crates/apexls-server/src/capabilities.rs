@@ -1687,18 +1687,26 @@ pub(crate) fn bulkification_diagnostics(
     diagnostics
 }
 
+/// Whether every statement in `block` runs, in order, at least once --
+/// i.e. whether `block` itself definitely terminates (see
+/// [`stmt_terminates`]'s own doc comment for what that means). Factored
+/// out since three different callers all reduce to "does this `Option<Block>`
+/// terminate": `Stmt::Block` itself, a `TryStmt`'s `finally_clause().body()`,
+/// a `SwitchStmt` arm's `WhenClause::body()`, and a `DoWhileStmt`'s
+/// `body()` -- all four are `Block`, not `Stmt`, at the AST level.
+fn block_terminates(block: &Block) -> bool {
+    block.statements().any(|s| stmt_terminates(&s))
+}
+
 /// Whether `stmt` *definitely* transfers control away rather than
 /// falling through to whatever follows it -- the recursive predicate
 /// behind `unreachable_code_diagnostics` (Wayfinder `apex-diagnostics`
-/// map, ticket 05's design). Deliberately narrow (`Block`/`If` only,
-/// per that ticket's own settled v1 scope): `TryStmt`/`SwitchStmt`/every
-/// loop kind fall to the conservative `_ => false` default, even though
-/// some of those *could* soundly terminate in specific shapes (a
-/// `finally` that itself always returns; a `do`-`while` whose body
-/// always returns, since its body unconditionally runs at least once) --
-/// deferred to a follow-on ticket rather than attempted here, since
-/// getting `try`/`switch`/loop reasoning wrong risks a real false
-/// positive, the one thing this whole diagnostic set has never shipped.
+/// map, ticket 05's/ticket 14's design). `ForStmt`/`ForEachStmt`/
+/// `WhileStmt` still fall to the conservative `_ => false` default
+/// unconditionally -- their conditional entry (the body may run zero
+/// times) makes treating them as terminators unsound regardless of what
+/// their body does, and this binder has no value-range/data-flow
+/// analysis to ever rule that out.
 fn stmt_terminates(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return(_) | Stmt::Throw(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
@@ -1706,7 +1714,7 @@ fn stmt_terminates(stmt: &Stmt) -> bool {
         // once reached, nothing after that statement (inside this same
         // block) ever executes, so it doesn't matter whether the
         // terminator is the block's last statement or an earlier one.
-        Stmt::Block(block) => block.statements().any(|s| stmt_terminates(&s)),
+        Stmt::Block(block) => block_terminates(block),
         // Only an `if` with an `else` where *both* branches terminate is
         // itself a terminator -- no `else`, or a branch that can fall
         // through, means control can still reach past the whole `if`.
@@ -1719,6 +1727,36 @@ fn stmt_terminates(stmt: &Stmt) -> bool {
             };
             stmt_terminates(&then_branch) && stmt_terminates(&else_branch)
         }
+        // `finally` always runs, regardless of how the `try` body or any
+        // `catch` clause completes -- so a `finally` that itself
+        // terminates makes the whole `try` terminate too, independent of
+        // everything else in it. No `finally` at all (or one that
+        // doesn't terminate) -> never a terminator: this deliberately
+        // doesn't attempt full try/catch definite-completion analysis
+        // (would the try body and every catch clause need to terminate?
+        // too gnarly a real false-positive risk for the payoff, per
+        // ticket 14's own decision).
+        Stmt::Try(try_stmt) => try_stmt.finally_clause().and_then(|f| f.body()).is_some_and(|b| block_terminates(&b)),
+        // Genuinely exhaustive (a `when else` arm is present -- Apex's
+        // `switch on` doesn't fall through between arms, so exhaustiveness
+        // is the only way every real path is covered) AND every arm's
+        // own body terminates.
+        Stmt::Switch(switch_stmt) => {
+            let mut clauses = switch_stmt.when_clauses().peekable();
+            if clauses.peek().is_none() {
+                return false;
+            }
+            let has_else_arm = switch_stmt
+                .when_clauses()
+                .any(|w| w.value().is_some_and(|v| v.is_else()));
+            has_else_arm
+                && clauses.all(|w| w.body().is_some_and(|b| block_terminates(&b)))
+        }
+        // Sound specifically because a `do`-`while` body unconditionally
+        // runs at least once, unlike `for`/`foreach`/`while`'s
+        // conditional entry -- see this function's own doc comment for
+        // why those three stay `false` unconditionally.
+        Stmt::DoWhile(do_while) => do_while.body().is_some_and(|b| block_terminates(&b)),
         _ => false,
     }
 }

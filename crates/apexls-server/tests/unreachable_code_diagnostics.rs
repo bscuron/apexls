@@ -289,9 +289,10 @@ fn an_if_else_where_only_one_branch_terminates_does_not_make_following_code_unre
     session.shutdown();
 }
 
-/// A `try`/`catch`'s own `return` must never be treated as making code
-/// after the whole `try` unreachable -- `TryStmt` is conservatively never
-/// a terminator in this v1 slice (see ticket 14's own deferred scope).
+/// A `try`/`catch`'s own `return`, with no `finally` at all, must never
+/// be treated as making code after the whole `try` unreachable -- only a
+/// terminating `finally` does that (see the `finally`-specific tests
+/// below, ticket 14's settled extension); a bare `try`/`catch` never is.
 const TRY_WITH_RETURN_SRC: &str = "public class Foo {\n    public Integer run() {\n        try {\n            return 1;\n        } catch (Exception e) {\n            System.debug(e);\n        }\n        return 2;\n    }\n}\n";
 
 #[test]
@@ -324,5 +325,99 @@ fn normal_code_with_no_early_termination_has_no_unreachable_diagnostics() {
     let notification = session.next_diagnostics();
     let diagnostics = unreachable_diagnostics(&notification);
     assert!(diagnostics.is_empty(), "expected no unreachable diagnostics on clean code: {diagnostics:?}");
+    session.shutdown();
+}
+
+// -- ticket 14/15's three extensions: finally, switch, do-while --
+
+const FINALLY_THAT_TERMINATES_SRC: &str = "public class Foo {\n    public Integer run() {\n        try {\n            System.debug('x');\n        } finally {\n            return 1;\n        }\n        System.debug('dead');\n    }\n}\n";
+
+#[test]
+fn a_finally_clause_that_unconditionally_terminates_makes_code_after_the_try_unreachable() {
+    let mut session = run_fixture("unreachable-finally-terminates", FINALLY_THAT_TERMINATES_SRC);
+    let notification = session.next_diagnostics();
+    let diagnostics = unreachable_diagnostics(&notification);
+    assert_eq!(diagnostics.len(), 1, "expected the statement after the try (with a terminating finally) to be reported: {diagnostics:?}");
+    session.shutdown();
+}
+
+const FINALLY_THAT_DOES_NOT_TERMINATE_SRC: &str = "public class Foo {\n    public Integer run() {\n        try {\n            System.debug('x');\n        } finally {\n            System.debug('cleanup');\n        }\n        return 1;\n    }\n}\n";
+
+#[test]
+fn a_finally_clause_that_does_not_terminate_leaves_code_after_the_try_reachable() {
+    let mut session = run_fixture("unreachable-finally-no-terminate", FINALLY_THAT_DOES_NOT_TERMINATE_SRC);
+    let notification = session.next_diagnostics();
+    let diagnostics = unreachable_diagnostics(&notification);
+    assert!(diagnostics.is_empty(), "expected no unreachable diagnostics: {diagnostics:?}");
+    session.shutdown();
+}
+
+const SWITCH_EXHAUSTIVE_ALL_TERMINATE_SRC: &str = "public class Foo {\n    public Integer run(Integer i) {\n        switch on i {\n            when 1 {\n                return 1;\n            }\n            when 2 {\n                return 2;\n            }\n            when else {\n                return 0;\n            }\n        }\n        System.debug('dead');\n    }\n}\n";
+
+#[test]
+fn an_exhaustive_switch_where_every_arm_terminates_makes_following_code_unreachable() {
+    let mut session = run_fixture("unreachable-switch-exhaustive", SWITCH_EXHAUSTIVE_ALL_TERMINATE_SRC);
+    let notification = session.next_diagnostics();
+    let diagnostics = unreachable_diagnostics(&notification);
+    assert_eq!(diagnostics.len(), 1, "expected the statement after the exhaustive, all-terminating switch to be reported: {diagnostics:?}");
+    session.shutdown();
+}
+
+const SWITCH_MISSING_ELSE_SRC: &str = "public class Foo {\n    public Integer run(Integer i) {\n        switch on i {\n            when 1 {\n                return 1;\n            }\n            when 2 {\n                return 2;\n            }\n        }\n        return 0;\n    }\n}\n";
+
+#[test]
+fn a_switch_missing_a_when_else_arm_does_not_make_following_code_unreachable() {
+    let mut session = run_fixture("unreachable-switch-no-else", SWITCH_MISSING_ELSE_SRC);
+    let notification = session.next_diagnostics();
+    let diagnostics = unreachable_diagnostics(&notification);
+    assert!(diagnostics.is_empty(), "expected no unreachable diagnostics: {diagnostics:?}");
+    session.shutdown();
+}
+
+const SWITCH_ONE_ARM_FALLS_THROUGH_SRC: &str = "public class Foo {\n    public Integer run(Integer i) {\n        switch on i {\n            when 1 {\n                return 1;\n            }\n            when else {\n                System.debug('not a return');\n            }\n        }\n        return 0;\n    }\n}\n";
+
+#[test]
+fn a_switch_where_one_arm_falls_through_does_not_make_following_code_unreachable() {
+    let mut session = run_fixture("unreachable-switch-partial", SWITCH_ONE_ARM_FALLS_THROUGH_SRC);
+    let notification = session.next_diagnostics();
+    let diagnostics = unreachable_diagnostics(&notification);
+    assert!(diagnostics.is_empty(), "expected no unreachable diagnostics: {diagnostics:?}");
+    session.shutdown();
+}
+
+const DO_WHILE_BODY_TERMINATES_SRC: &str = "public class Foo {\n    public Integer run() {\n        do {\n            return 1;\n        } while (false);\n        System.debug('dead');\n    }\n}\n";
+
+#[test]
+fn a_do_while_whose_body_unconditionally_terminates_makes_following_code_unreachable() {
+    let mut session = run_fixture("unreachable-do-while-terminates", DO_WHILE_BODY_TERMINATES_SRC);
+    let notification = session.next_diagnostics();
+    let diagnostics = unreachable_diagnostics(&notification);
+    assert_eq!(diagnostics.len(), 1, "expected the statement after the always-terminating do-while to be reported: {diagnostics:?}");
+    session.shutdown();
+}
+
+const DO_WHILE_BODY_DOES_NOT_TERMINATE_SRC: &str = "public class Foo {\n    public Integer run(Integer i) {\n        do {\n            i--;\n        } while (i > 0);\n        return i;\n    }\n}\n";
+
+#[test]
+fn a_do_while_whose_body_does_not_terminate_leaves_following_code_reachable() {
+    let mut session = run_fixture("unreachable-do-while-no-terminate", DO_WHILE_BODY_DOES_NOT_TERMINATE_SRC);
+    let notification = session.next_diagnostics();
+    let diagnostics = unreachable_diagnostics(&notification);
+    assert!(diagnostics.is_empty(), "expected no unreachable diagnostics: {diagnostics:?}");
+    session.shutdown();
+}
+
+/// A regular `for` loop must never be treated as terminating even if its
+/// body unconditionally returns on what would be the first iteration --
+/// unlike `do`-`while`, its conditional entry means the body might never
+/// run at all (e.g. an empty `xs`), so code after the loop stays reachable.
+const FOR_LOOP_BODY_ALWAYS_RETURNS_SRC: &str = "public class Foo {\n    public Integer run(List<Integer> xs) {\n        for (Integer x : xs) {\n            return x;\n        }\n        return 0;\n    }\n}\n";
+
+#[test]
+fn a_foreach_loop_whose_body_always_returns_does_not_make_following_code_unreachable() {
+    let mut session = run_fixture("unreachable-foreach-always-returns", FOR_LOOP_BODY_ALWAYS_RETURNS_SRC);
+    let notification = session.next_diagnostics();
+    let diagnostics = unreachable_diagnostics(&notification);
+    assert!(diagnostics.is_empty(), "expected no unreachable diagnostics: {diagnostics:?}");
     session.shutdown();
 }
