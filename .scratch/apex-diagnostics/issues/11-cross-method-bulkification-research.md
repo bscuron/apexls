@@ -1,0 +1,13 @@
+Type: research
+Status: claimed
+
+## Question
+
+Investigate what a cross-method (transitive) extension of the DML/SOQL-in-loop diagnostic would actually need, to feed [the architecture-decision ticket](12-cross-method-bulkification-decision.md). `apex-binder` has no call-graph or control/data-flow analysis of any kind today (confirmed while resolving ticket 04 -- grepped the whole crate, only doc-comment caveats explicitly disclaiming a real CFG/data-flow analysis exist), so this is a genuinely new capability, not an extension of an existing one. Establish, concretely:
+
+- **How common is the real shape in practice?** Sample the real NPSP corpus: how often does a loop body call a project-local method (directly, one hop) whose own body contains a DML statement or SOQL query? How deep do these chains typically run in practice (one hop, or several) before hitting a DML/SOQL statement? This bears directly on whether one-hop coverage alone would already catch the overwhelming majority of real cases, or whether skipping full transitive tracing would miss most of them.
+- **Cycle handling.** Does real Apex code (or could it, syntactically) have mutually-recursive or self-recursive call chains that would need cycle detection to avoid an infinite walk? Survey what `apex-binder`'s existing `inherited_chain` (`inherit.rs`) does for its own analogous cycle-guarding on type hierarchies, as a possible existing pattern to reuse for a call-graph walk instead of building cycle detection from scratch.
+- **Virtual/interface dispatch ambiguity.** When a call in the chain resolves to `Resolution::Candidates` (multiple possible concrete methods -- the binder already can't narrow interface/virtual dispatch to one target), what should happen: treat the call as tainted if *any* candidate contains DML/SOQL (higher recall, more false-positive risk), only if *every* candidate does (lower recall, safer), or leave dispatch-ambiguous calls out of this analysis entirely (matching how BACKLOG.md already treats `Resolution::Candidates`-as-error as "too risky against this project's own no-guessing discipline" for an unrelated diagnostic)?
+- **Cost.** Would a whole-project "does method X's body contain DML/SOQL, directly or transitively" fact need to be computed as a new pass (and cached/invalidated on incremental rebuild, matching `apex-binder`'s existing three-pass incremental structure), or could it be computed lazily per query? Rough-estimate the cost against the real NPSP corpus's method count.
+
+This ticket is fact-finding only -- it does not decide the architecture. Its findings feed [the architecture-decision ticket](12-cross-method-bulkification-decision.md).
