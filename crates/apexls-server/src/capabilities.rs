@@ -15,7 +15,8 @@ use apex_syntax::ast::decl::{
     InterfaceDecl, MethodDecl, Modifier, PropertyDecl, TriggerUnit,
 };
 use apex_syntax::ast::expr::{ArgList, CallExpr, Expr, MethodCallExpr, NameExpr, NewExpr};
-use apex_syntax::SyntaxKind;
+use apex_syntax::ast::stmt::{DoWhileStmt, ForEachStmt, ForStmt, WhileStmt};
+use apex_syntax::{SyntaxKind, SyntaxNode};
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall, CodeAction,
     CodeActionKind, CodeActionOrCommand, CompletionItem, CompletionItemKind, CompletionList,
@@ -1524,6 +1525,163 @@ pub(crate) fn modifier_diagnostics(
             if let Some(abstract_tok) = modifiers.iter().find(|t| t.kind() == SyntaxKind::Abstract) {
                 diagnostics.push(diagnostic(abstract_tok.text_range(), "static methods cannot be abstract".to_string()));
             }
+        }
+    }
+    diagnostics
+}
+
+/// Names, case-insensitively, every `Database.<method>` call this
+/// diagnostic treats the same as its keyword-statement equivalent --
+/// mirrors exactly the DML statement kinds/dynamic-SOQL entry points
+/// `crate::resolve` (`crates/apex-binder/src/resolve.rs:3070`) already
+/// recognizes by the identical textual-receiver-name pattern for dynamic-
+/// SOQL bind resolution.
+const DATABASE_BULK_METHOD_NAMES: &[&str] = &[
+    "insert",
+    "update",
+    "delete",
+    "upsert",
+    "undelete",
+    "merge",
+    "query",
+    "countquery",
+    "getquerylocator",
+];
+
+/// Whether `node`'s nearest enclosing loop, if any, wraps it through that
+/// loop's own *body* -- not its condition/init/update/iterable, all of
+/// which run zero or one time per loop execution rather than once per
+/// iteration. This distinction is load-bearing, not pedantic: Apex's
+/// canonical bulkified idiom, the SOQL-for-loop (`for (Account a :
+/// [SELECT ... FROM Account]) { ... }`), embeds its query as the
+/// `ForEachStmt`'s own `iterable()` -- evaluated exactly *once*, before
+/// the loop starts, never per iteration. Treating that position the same
+/// as the loop body would flag the single most common *correctly*
+/// bulkified real-world pattern as if it were the anti-pattern it's
+/// specifically written to avoid.
+///
+/// Keeps climbing past a loop whose non-body position `node` came through
+/// (rather than stopping there) so a query embedded in one loop's
+/// iterable/condition that itself sits inside an *outer* loop's body
+/// still correctly counts -- e.g. `for (a : accounts) { for (c : [SELECT
+/// ... WHERE AccountId = :a.Id]) { ... } }` really is the classic N+1
+/// anti-pattern (the inner query re-runs once per outer iteration), even
+/// though the inner query's own immediate loop only evaluates it once.
+fn is_inside_loop_body(node: &SyntaxNode) -> bool {
+    let mut current = node.clone();
+    while let Some(parent) = current.parent() {
+        let body = match parent.kind() {
+            SyntaxKind::ForStmt => ForStmt::cast(parent.clone()).and_then(|s| s.body()).map(|b| b.syntax().clone()),
+            SyntaxKind::ForEachStmt => ForEachStmt::cast(parent.clone()).and_then(|s| s.body()).map(|b| b.syntax().clone()),
+            SyntaxKind::WhileStmt => WhileStmt::cast(parent.clone()).and_then(|s| s.body()).map(|b| b.syntax().clone()),
+            SyntaxKind::DoWhileStmt => DoWhileStmt::cast(parent.clone()).and_then(|s| s.body()).map(|b| b.syntax().clone()),
+            _ => None,
+        };
+        if body.is_some_and(|b| b == current) {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// `textDocument/publishDiagnostics`: one `WARNING`-severity diagnostic
+/// per DML statement or SOQL/SOSL query found inside a loop body -- the
+/// classic Salesforce governor-limit "bulkification" anti-pattern
+/// (Wayfinder `apex-diagnostics` map, ticket 04's design). `WARNING`, not
+/// `ERROR`: unlike every other diagnostic this server ships, this is a
+/// *runtime* risk (`System.LimitException` only past a real data-volume
+/// threshold), not a certain compile-time defect -- the flagged code
+/// compiles and often runs fine.
+///
+/// Deliberately unconditional once a candidate is confirmed inside a
+/// loop's own body (see [`is_inside_loop_body`]): no exemption for a loop
+/// "provably" single-iteration, and none for the DML/query's own operand
+/// shape -- there's no legitimate already-bulk escape hatch, since the
+/// anti-pattern is the *statement* executing once per iteration
+/// regardless of any one call's row count. Purely syntactic, needing no
+/// new binder capability (matching this whole diagnostic's own design
+/// decision not to build interprocedural/data-flow analysis for it):
+/// three candidate shapes, found directly off the raw syntax tree --
+/// - A keyword-form DML statement (`InsertStmt`/`UpdateStmt`/`DeleteStmt`/
+///   `UndeleteStmt`/`UpsertStmt`/`MergeStmt`).
+/// - A SOQL/SOSL query expression (`SoqlExpr`/`SoslExpr`) -- wherever it
+///   appears as an expression, e.g. a `[SELECT ...]` bracket literal.
+///   Excludes a `ForEachStmt`'s own `iterable()` position via
+///   `is_inside_loop_body`'s own body-vs-non-body distinction, so the
+///   canonical SOQL-for-loop idiom itself is never flagged.
+/// - A programmatic `Database.<method>` call (`DATABASE_BULK_METHOD_NAMES`)
+///   -- recognized the same way `crate::resolve`'s dynamic-SOQL bind
+///   resolution already recognizes `Database.query`/`countQuery`/
+///   `getQueryLocator`, a plain textual check that the call's receiver is
+///   a bare `Database` name (case-insensitive) -- deliberately not routed
+///   through real type resolution (`Ty`'s per-expression chaining is
+///   walker-internal only, never stored on `BoundProgram`, see
+///   `crate::ty`'s own doc comment), an accepted, negligible-risk
+///   simplification: no real Apex project has its own class literally
+///   named `Database` to shadow the stdlib one.
+///
+/// Cross-method (interprocedural) bulkification -- a loop calling a
+/// helper method that itself issues DML/SOQL -- is a real, separate
+/// question the design ticket explicitly split out (needs new call-graph
+/// machinery this binder has nowhere today); not attempted here.
+pub(crate) fn bulkification_diagnostics(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<Diagnostic> {
+    let root = program.syntax(file);
+    let text = root.text().to_string();
+    let index = LineIndex::new(&text);
+
+    let diagnostic = |range: TextRange, message: String| Diagnostic {
+        range: Range {
+            start: index.to_position(&text, range.start().into(), encoding),
+            end: index.to_position(&text, range.end().into(), encoding),
+        },
+        severity: Some(DiagnosticSeverity::WARNING),
+        source: Some("apexls".to_string()),
+        message,
+        ..Default::default()
+    };
+
+    let mut diagnostics = Vec::new();
+    for node in root.descendants() {
+        let (range, keyword) = match node.kind() {
+            SyntaxKind::InsertStmt
+            | SyntaxKind::UpdateStmt
+            | SyntaxKind::DeleteStmt
+            | SyntaxKind::UndeleteStmt
+            | SyntaxKind::UpsertStmt
+            | SyntaxKind::MergeStmt => {
+                let keyword = node.first_token().map(|t| t.text().to_string()).unwrap_or_default();
+                (node.text_range(), format!("'{keyword}' statement"))
+            }
+            SyntaxKind::SoqlExpr | SyntaxKind::SoslExpr => (node.text_range(), "SOQL/SOSL query".to_string()),
+            SyntaxKind::MethodCallExpr => {
+                let Some(mc) = MethodCallExpr::cast(node.clone()) else {
+                    continue;
+                };
+                let is_database_call = matches!(mc.target(), Some(Expr::Name(n)) if n
+                    .name_token()
+                    .is_some_and(|t| t.text().eq_ignore_ascii_case("Database")));
+                let Some(method_tok) = mc.method_name_token() else {
+                    continue;
+                };
+                if !is_database_call
+                    || !DATABASE_BULK_METHOD_NAMES.contains(&method_tok.text().to_ascii_lowercase().as_str())
+                {
+                    continue;
+                }
+                (method_tok.text_range(), format!("'Database.{}' call", method_tok.text()))
+            }
+            _ => continue,
+        };
+        if is_inside_loop_body(&node) {
+            diagnostics.push(diagnostic(
+                range,
+                format!("{keyword} inside a loop may exceed governor limits -- move it outside the loop and operate on a bulk collection instead"),
+            ));
         }
     }
     diagnostics
