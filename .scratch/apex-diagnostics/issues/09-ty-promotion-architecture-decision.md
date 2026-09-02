@@ -1,6 +1,6 @@
 Type: grilling
 Status: open
-Blocked by: 08
+Blocked by: 08, 21
 
 ## Question
 
@@ -11,3 +11,5 @@ Given [the research ticket](08-ty-promotion-research.md)'s findings, decide whet
 - How does this fit into the existing three-pass structure (Collect / Inherit / Resolve) -- does it ride entirely inside the existing Pass 2 walk (`resolve.rs`), or does it need its own pass?
 
 This ticket's resolution determines which specific type-checking-flavored diagnostics (currently fog in the map's "Not yet specified" section) become ticketable next, and in what order relative to the non-inference-needed checks already on this map.
+
+**Newly blocked on [ticket 21](21-salsa-integration-research.md) as well as ticket 08**: ticket 19 decided `apex-binder` should adopt real `salsa` as its incremental engine. Promoting `Ty` into a stored, queryable layer is exactly the shape of new persistent fact that decision affects -- deciding this ticket's storage/invalidation architecture before knowing salsa's actual integration constraints (`Send`/`Sync`, tracked-function shape) risks designing something that has to be redone once ticket 21 lands.
