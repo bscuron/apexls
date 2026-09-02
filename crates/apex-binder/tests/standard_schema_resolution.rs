@@ -63,26 +63,35 @@ fn a_standard_object_field_access_resolves_to_schema_object() {
 }
 
 /// `Account.OwnerId`'s bundled `reference_to: ["User"]` should continue
-/// the `Ty` chain, exactly like a local custom lookup field's
-/// `reference_to` already does -- so `.Username` on the result also
-/// resolves against the (bundled) `User` schema, not `Unresolved`.
+/// the `Ty` chain when accessed by its *relationship* name (`Owner`),
+/// exactly like a local custom lookup field's `__r` relationship access
+/// already does -- so `.Username` on the result also resolves against
+/// the (bundled) `User` schema, not `Unresolved`. Deliberately uses
+/// `Owner`, not `OwnerId`, as the chained hop: confirmed against a real
+/// org that `acct.OwnerId.Username` is itself a real compile error ("A
+/// non foreign key field cannot be referenced in a path expression:
+/// OwnerId") -- a reference field's own literal API name yields just the
+/// `Id` value (also confirmed: `Account a = contact.AccountId;` is a
+/// real `Illegal assignment from Id to Account`), never the related
+/// object, which is only reachable through the separate relationship-name
+/// accessor.
 #[test]
 fn a_standard_lookup_fields_reference_to_continues_the_type_chain() {
     let dir = write_fixture_dir(
         "standard-lookup-chain",
         &[(
             "Foo.cls",
-            "public class Foo { public void run(Account acct) { String u = acct.OwnerId.Username; } }",
+            "public class Foo { public void run(Account acct) { String u = acct.Owner.Username; } }",
         )],
     );
     let program = BoundProgram::from_files(&dir);
     std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(
-        field_expr_resolution(&program, "OwnerId"),
+        field_expr_resolution(&program, "Owner"),
         Some(Resolution::SchemaObject(Box::new(SchemaObjectRef {
             object: "Account".into(),
-            field: Some("OwnerId".into()),
+            field: Some("Owner".into()),
         }))),
     );
     assert_eq!(
@@ -91,6 +100,6 @@ fn a_standard_lookup_fields_reference_to_continues_the_type_chain() {
             object: "User".into(),
             field: Some("Username".into()),
         }))),
-        "acct.OwnerId.Username should resolve past the lookup hop, not stop at Unresolved"
+        "acct.Owner.Username should resolve past the relationship hop, not stop at Unresolved"
     );
 }

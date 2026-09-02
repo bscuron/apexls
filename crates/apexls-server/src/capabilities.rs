@@ -1975,6 +1975,44 @@ pub(crate) fn missing_implementation_diagnostics(
     diagnostics
 }
 
+/// `textDocument/publishDiagnostics`: one `ERROR`-severity diagnostic per
+/// `apex_binder::TypeMismatch` recorded for `file` -- already computed
+/// inline during Pass 2 (Wayfinder `apex-diagnostics` map, ticket 09's
+/// Option B design/ticket 23's implementation: three checkpoints --
+/// a local variable's declared type vs. its initializer, a `return`'s
+/// declared method return type vs. the returned expression, and a
+/// resolved call/`new` expression's declared parameter types vs. its
+/// arguments -- routed through the same, already org-verified
+/// `conversions::type_compatible` every existing overload-resolution/
+/// dead-code check already relies on). Same story as every other
+/// already-computed-elsewhere diagnostic in this file: purely surfacing
+/// data the binder already produced, no new analysis here.
+pub(crate) fn type_mismatch_diagnostics(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<Diagnostic> {
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+    program
+        .type_mismatches(file)
+        .iter()
+        .map(|tm| {
+            let range = program.highlight_range(tm.ptr);
+            Diagnostic {
+                range: Range {
+                    start: index.to_position(&text, range.start().into(), encoding),
+                    end: index.to_position(&text, range.end().into(), encoding),
+                },
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("apexls".to_string()),
+                message: tm.message.clone(),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
 /// `textDocument/publishDiagnostics`: one `WARNING`-severity diagnostic
 /// per symbol `apex_binder::dead_symbols_in_file` proves is dead, tagged
 /// `DiagnosticTag::UNNECESSARY` -- the standard LSP tag for "safe to

@@ -274,6 +274,17 @@ impl NewExpr {
         support::child(self.syntax())
     }
 
+    /// True for the legacy array-sugar form (`new Foo[n]`/`new Foo[]{...}`)
+    /// -- Apex's own shorthand for constructing a `List<Foo>`, the `new`
+    /// counterpart to [`Type::is_array`] on a *declared* type. Unlike
+    /// `Type::is_array`, the grammar never attaches a `[`/`]` pair to
+    /// `type_ref()` itself here (`new_expr`'s own parser function consumes
+    /// them as siblings of the type, not part of it -- see its doc
+    /// comment), so this checks for a direct `[` child token instead.
+    pub fn is_array_new(&self) -> bool {
+        support::token(self.syntax(), SyntaxKind::LBrack).is_some()
+    }
+
     /// `Some` only for the array-size form (`new Foo[n]`).
     pub fn array_size(&self) -> Option<Expr> {
         support::child(self.syntax())

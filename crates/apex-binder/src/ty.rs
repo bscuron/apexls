@@ -120,17 +120,28 @@ impl Ty {
     /// to `op_text` (`BinExpr::operator_tokens()`'s concatenated
     /// `.text()`, since some operators -- merged relational-with-equals,
     /// shifts -- are more than one token). Comparison/logical operators
-    /// always produce `Boolean`, regardless of operand types. Arithmetic/
-    /// bitwise/shift operators and plain/compound assignment propagate an
-    /// operand's own type -- exactly correct for numeric arithmetic and
-    /// assignment, a reasonable best-effort guess for anything else
-    /// (string concatenation via `+` propagates `String`, correctly) --
-    /// never fabricated when neither operand's type is known.
+    /// always produce `Boolean`, regardless of operand types. `+` is
+    /// Apex's overloaded string-concatenation operator: if *either*
+    /// operand is `String`, the result is always `String`, regardless of
+    /// the other operand's own type -- confirmed against a real org
+    /// (`String s = aLongValue + 'suffix';` compiles, concatenating, not
+    /// adding) -- checked before the general arithmetic fallback, since a
+    /// non-`String` left operand (`aLongValue`) would otherwise win via
+    /// plain `lhs.or(rhs)` and wrongly propagate `Long`. Every other
+    /// arithmetic/bitwise/shift operator, and plain/compound assignment,
+    /// propagates an operand's own type -- exactly correct for numeric
+    /// arithmetic and assignment, a reasonable best-effort guess
+    /// otherwise -- never fabricated when neither operand's type is
+    /// known.
     pub(crate) fn for_bin_op(op_text: &str, lhs: Option<Ty>, rhs: Option<Ty>) -> Option<Ty> {
+        fn is_string(ty: &Option<Ty>) -> bool {
+            matches!(ty, Some(Ty::System { name, .. }) if name.eq_ignore_ascii_case("String"))
+        }
         match op_text {
             "<" | ">" | "<=" | ">=" | "==" | "!=" | "===" | "!==" | "<>" | "&&" | "||" => {
                 Some(Ty::boolean())
             }
+            "+" if is_string(&lhs) || is_string(&rhs) => Some(Ty::system("String")),
             "+" | "-" | "*" | "/" | "&" | "|" | "^" | "<<" | ">>" | ">>>" | "??" => lhs.or(rhs),
             "=" | "+=" | "-=" | "*=" | "/=" | "&=" | "|=" | "^=" | "<<=" | ">>=" | ">>>=" => lhs,
             _ => None,
@@ -180,6 +191,34 @@ mod tests {
         assert_eq!(Ty::for_bin_op("+", string_ty.clone(), None), string_ty);
         assert_eq!(Ty::for_bin_op("+", None, string_ty.clone()), string_ty);
         assert_eq!(Ty::for_bin_op("+", None, None), None);
+    }
+
+    /// `+` is Apex's overloaded string-concatenation operator: a `String`
+    /// on *either* side always wins, regardless of the other operand's
+    /// own type -- confirmed against a real org (`String s = aLongValue +
+    /// 'suffix';` compiles, concatenating). Real bug this fixes: `String
+    /// uniqueness = DateTime.now() + ':' + Math.random();` (real
+    /// `fflib_SecurityUtilsTest.cls` shape) used to infer the whole
+    /// expression's type as `Datetime` (the left operand), not `String`,
+    /// since a non-`String` left operand previously won via plain
+    /// `lhs.or(rhs)`.
+    #[test]
+    fn string_concatenation_wins_regardless_of_operand_order() {
+        let string_ty = Some(Ty::system("String"));
+        let long_ty = Some(Ty::system("Long"));
+        let datetime_ty = Some(Ty::system("Datetime"));
+        assert_eq!(
+            Ty::for_bin_op("+", long_ty.clone(), string_ty.clone()),
+            string_ty
+        );
+        assert_eq!(
+            Ty::for_bin_op("+", string_ty.clone(), long_ty.clone()),
+            string_ty
+        );
+        assert_eq!(Ty::for_bin_op("+", datetime_ty, string_ty), Some(Ty::system("String")));
+        // Neither operand `String` -- ordinary arithmetic propagation,
+        // unaffected.
+        assert_eq!(Ty::for_bin_op("+", long_ty.clone(), None), long_ty);
     }
 
     #[test]

@@ -152,6 +152,12 @@ struct RawMethod {
     #[serde(default)]
     params: Vec<RawParam>,
     description: Option<String>,
+    /// The method's real declaration text (`"public static
+    /// List<SObject> query(String queryString)"`), still present in the
+    /// scraped page even where `return_type`/each param's own `type_name`
+    /// lost a generic argument -- see [`parse_signature`]'s own doc
+    /// comment for why this is needed at all.
+    signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -237,20 +243,181 @@ fn to_stdlib_class(raw: RawClass) -> StdlibClass {
 }
 
 fn to_stdlib_method(raw: RawMethod) -> StdlibMethod {
+    let parsed_signature = raw
+        .signature
+        .as_deref()
+        .and_then(|sig| parse_signature(sig, &raw.name, raw.params.len()));
+
+    let return_type = raw.return_type.as_deref().map(normalize_type_string).map(|rt| {
+        if is_bare_collection(&rt) {
+            if let Some(derived) = parsed_signature.as_ref().and_then(|(rt, _)| rt.as_deref()) {
+                return normalize_type_string(derived);
+            }
+        }
+        rt
+    });
+
+    let params = raw
+        .params
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let type_name = p.type_name.as_deref().map(normalize_type_string).map(|tn| {
+                if is_bare_collection(&tn) {
+                    if let Some(derived) = parsed_signature.as_ref().and_then(|(_, params)| params.get(i)) {
+                        return normalize_type_string(derived);
+                    }
+                }
+                tn
+            });
+            StdlibParam {
+                name: p.name.as_deref().map(SmolStr::new),
+                type_name,
+            }
+        })
+        .collect();
+
     StdlibMethod {
         name: SmolStr::new(&raw.name),
         is_static: raw.is_static,
-        return_type: raw.return_type.as_deref().map(normalize_type_string),
-        params: raw
-            .params
-            .into_iter()
-            .map(|p| StdlibParam {
-                name: p.name.as_deref().map(SmolStr::new),
-                type_name: p.type_name.as_deref().map(normalize_type_string),
-            })
-            .collect(),
+        return_type,
+        params,
         description: raw.description.as_deref().map(normalize_description),
     }
+}
+
+/// `true` for a bare `List`/`Set`/`Map` name with no generic argument at
+/// all -- the specific shape [`parse_signature`] is worth consulting for
+/// (a real class name, `Object`, or an already-generic `List<Foo>` never
+/// needs it).
+fn is_bare_collection(type_str: &str) -> bool {
+    matches!(type_str.to_ascii_lowercase().as_str(), "list" | "set" | "map")
+}
+
+/// Recovers a return type's and each parameter's own generic argument
+/// from a method's real signature text, for a confirmed gap in this
+/// crate's separately-scraped `return_type`/param `type_name` fields:
+/// across the whole bundled `apex_reference.json` snapshot, 168 return
+/// types and 132 parameter types came through as a bare `List`/`Set`/
+/// `Map` with no argument at all, even though the very same method's own
+/// `signature` string -- scraped from the same page, never independently
+/// re-derived -- still carries the real, full type (confirmed directly
+/// against the raw JSON: `Database.query`'s `return_type` is literally
+/// `"List"`, but its `signature` reads `"public static List<SObject>
+/// query(String queryString)"`). Real bug this fixes: `SObject x =
+/// Database.query(soql);` (real NPSP shape, `UTIL_CurrencyCache.cls` and
+/// others) inferred `Database.query`'s result as a bare `List`, not
+/// `List<SObject>`, so ticket 23's type-mismatch checkpoints reported the
+/// (also-wrong) message "cannot assign a value of type 'List' to a
+/// variable of type 'SObject'" instead of correctly flagging the
+/// genuinely-wrong element type, or -- for the many `List<Concrete>`-vs-
+/// `List` positions elsewhere -- silently missing a real generic-argument
+/// comparison [`crate::conversions`]'s own collection handling could
+/// otherwise make.
+///
+/// `expected_param_count` guards against a signature this doesn't parse
+/// the way it expects (an unusual layout, a default-value expression with
+/// its own parens, ...): if the number of comma-split parameter pieces
+/// doesn't match how many params the scraper's own `params` array
+/// already found, this returns `None` rather than handing back
+/// misaligned positional types. `None` from any other unrecognized shape
+/// (no parens at all) leaves both fields exactly as they already were --
+/// this only ever *adds* information, never guesses one into existence.
+fn parse_signature(signature: &str, method_name: &str, expected_param_count: usize) -> Option<(Option<String>, Vec<String>)> {
+    let open = signature.find('(')?;
+    let close = signature.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    let before = signature[..open].trim_end();
+    let return_type = before.strip_suffix(method_name).map(|prefix| last_top_level_segment(prefix.trim_end()));
+
+    let params_str = signature[open + 1..close].trim();
+    let param_types: Vec<String> = if params_str.is_empty() {
+        Vec::new()
+    } else {
+        split_top_level(params_str, ',')
+            .into_iter()
+            .map(|p| param_type_from_slice(p.trim()))
+            .collect()
+    };
+    if param_types.len() != expected_param_count {
+        return None;
+    }
+    Some((return_type, param_types))
+}
+
+/// The last whitespace-delimited segment of `s`, where whitespace nested
+/// inside a `<...>` pair (e.g. the space in `Map<String, String>`) never
+/// counts as a boundary -- so `"public static Map<String, String>"`
+/// yields `"Map<String, String>"` as one segment, not two. Scans from the
+/// end since the segment wanted is always the *last* one (a return type,
+/// which always follows every modifier keyword).
+fn last_top_level_segment(s: &str) -> String {
+    let mut depth = 0i32;
+    let mut boundary = 0;
+    for (i, c) in s.char_indices().rev() {
+        match c {
+            '>' => depth += 1,
+            '<' => depth -= 1,
+            c if c.is_whitespace() && depth == 0 => {
+                boundary = i + c.len_utf8();
+                break;
+            }
+            _ => {}
+        }
+    }
+    s[boundary..].trim().to_string()
+}
+
+/// The type portion of one `"Type name"`/bare `"Type"` parameter-list
+/// entry -- the mirror image of [`last_top_level_segment`]: everything
+/// *before* the last top-level whitespace boundary (the parameter's own
+/// name, when the scraper captured one) rather than everything after it.
+/// A parameter with no captured name (confirmed common -- see
+/// [`StdlibParam`]'s own doc comment) has no top-level whitespace at all,
+/// so the whole trimmed slice is already just the type.
+fn param_type_from_slice(s: &str) -> String {
+    let mut depth = 0i32;
+    let mut boundary = None;
+    for (i, c) in s.char_indices().rev() {
+        match c {
+            '>' => depth += 1,
+            '<' => depth -= 1,
+            c if c.is_whitespace() && depth == 0 => {
+                boundary = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    match boundary {
+        Some(i) => s[..i].trim().to_string(),
+        None => s.trim().to_string(),
+    }
+}
+
+/// Splits `s` on every top-level occurrence of `sep`, skipping any that
+/// falls inside a `<...>` pair -- so a parameter list's own generic
+/// argument comma (`Map<String,String> headers, String body`) never gets
+/// mistaken for the parameter separator itself.
+fn split_top_level(s: &str, sep: char) -> Vec<&str> {
+    let mut depth = 0i32;
+    let mut start = 0;
+    let mut parts = Vec::new();
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            c if c == sep && depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 fn to_stdlib_property(raw: RawProperty) -> StdlibProperty {
@@ -410,6 +577,49 @@ mod tests {
         assert_eq!(is_blank.params[0].type_name.as_deref(), Some("String"));
         assert_eq!(is_blank.params[0].name.as_deref(), Some("inputString"));
         assert!(is_blank.description.is_some());
+    }
+
+    /// `Database.query`'s raw scraped `return_type` is a bare `"List"`
+    /// with no generic argument at all (confirmed directly against the
+    /// raw `apex_reference.json`), even though the method's real
+    /// signature is `"public static List<SObject> query(String
+    /// queryString)"` -- `parse_signature` recovers the missing
+    /// `<SObject>` from that signature text instead. Real bug this fixes:
+    /// `SObject x = Database.query(soql);` (real NPSP shape) inferred
+    /// `Database.query`'s result as a bare `List`, not `List<SObject>`.
+    #[test]
+    fn a_bare_collection_return_type_is_enriched_from_the_real_signature() {
+        let classes = standard_classes();
+        let database_class = classes
+            .iter()
+            .find(|c| c.name == "Database" && c.namespace.as_deref() == Some("System"))
+            .expect("Database should be in the bundled snapshot");
+        let query = database_class
+            .methods
+            .iter()
+            .find(|m| m.name == "query" && m.params.len() == 1)
+            .expect("Database.query(String) should be in the bundled snapshot");
+        assert_eq!(query.return_type.as_deref(), Some("List<SObject>"));
+    }
+
+    /// The parameter-side mirror of the return-type case above:
+    /// `StandardController.addFields`'s single parameter scraped as a
+    /// bare `"List"` `type_name`, recovered as `List<String>` from
+    /// `"public Void addFields(List<String> fieldNames)"`.
+    #[test]
+    fn a_bare_collection_param_type_is_enriched_from_the_real_signature() {
+        let classes = standard_classes();
+        let controller_class = classes
+            .iter()
+            .find(|c| c.name == "StandardController")
+            .expect("StandardController should be in the bundled snapshot");
+        let add_fields = controller_class
+            .methods
+            .iter()
+            .find(|m| m.name == "addFields")
+            .expect("StandardController.addFields should be in the bundled snapshot");
+        assert_eq!(add_fields.params.len(), 1);
+        assert_eq!(add_fields.params[0].type_name.as_deref(), Some("List<String>"));
     }
 
     /// `ApexPages.Action.getExpression`'s scraped description is

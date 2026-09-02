@@ -84,6 +84,10 @@ pub(crate) enum Freshness {
 pub(crate) struct FileBodies {
     pub(crate) refs: ReferenceTable,
     pub(crate) scopes: FxHashMap<SyntaxPtr, ScopeTree>,
+    /// Every provable type-checking defect found inline while binding
+    /// this file's bodies -- see `crate::resolve::TypeMismatch`'s own
+    /// doc comment (Wayfinder `apex-diagnostics` map, ticket 23).
+    pub(crate) type_mismatches: Vec<crate::resolve::TypeMismatch>,
 }
 
 #[derive(Default)]

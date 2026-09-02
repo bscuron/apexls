@@ -78,17 +78,13 @@ impl FileCollection {
 /// `Map<K, V>`/`Set<T>`, never user-defined, never nested more than a
 /// project actually chooses to nest collections), so going deeper here
 /// wouldn't pay for its own complexity.
-fn type_ptr_and_name(
+pub(crate) fn type_ptr_and_name(
     file: FileId,
     ty: Option<Type>,
 ) -> (Option<AstPtr<Type>>, Option<SmolStr>, Vec<SmolStr>) {
     match ty {
         Some(ty) => {
             let base_name = ty.text();
-            let args = ty
-                .type_args()
-                .map(|list| list.args().map(|a| a.text()).collect())
-                .unwrap_or_default();
             // Legacy `Type[]` array sugar (`String[]`, `Object[]`, ...) is
             // Apex's own shorthand for `List<Type>` -- interchangeable
             // right down to overload resolution (real NPSP shape:
@@ -99,7 +95,25 @@ fn type_ptr_and_name(
             // doc comments) and it carries no `<...>` of its own, so
             // without this an array-sugared declared type cached here as
             // its bare element name -- indistinguishable from a genuinely
-            // non-generic declaration of that same name.
+            // non-generic declaration of that same name. Applies the same
+            // way one level down: a *type argument* can itself be
+            // array-sugared (real NPSP shape: `Map<String, SObject[]>`),
+            // and without this its name would collapse to the bare element
+            // name (`SObject`) there too -- indistinguishable from a
+            // `Map<String, SObject>` declaration, which is a real, different
+            // type (confirmed false positive: `AdditionalObjectJSON_TEST`'s
+            // `Map<String,SObject[]> widgetData = new
+            // Map<String,SObject[]>();` was flagged as assigning a
+            // `Map<String, List<SObject>>` value to a `Map<String,
+            // SObject>`-typed variable before this).
+            let args = ty
+                .type_args()
+                .map(|list| {
+                    list.args()
+                        .map(|a| if a.is_array() { SmolStr::new_static("List") } else { a.text() })
+                        .collect()
+                })
+                .unwrap_or_default();
             if ty.is_array() {
                 (Some(AstPtr::new(file, &ty)), Some(SmolStr::new_static("List")), vec![base_name])
             } else {

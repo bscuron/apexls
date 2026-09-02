@@ -117,7 +117,12 @@ use smol_str::SmolStr;
 /// `Decimal` when both are applicable, a `Double`-only overload is chosen
 /// over a `Decimal`-only one for the same `Integer` argument, and a
 /// `Decimal` argument does *not* satisfy an `Integer`-only parameter (a
-/// real compile error).
+/// real compile error). The one exception is `Decimal` narrowing to
+/// `Double`, which is real Apex but only for a plain assignment/`return`,
+/// never a call argument -- see [`system_type_compatible`]'s own
+/// dedicated check for that pairing, applied *before* this rank table
+/// (which alone would otherwise call it a real, definite mismatch the
+/// same way `Decimal`-to-`Integer` is).
 fn numeric_rank(name: &str) -> Option<u8> {
     const ORDER: [&str; 4] = ["Integer", "Long", "Double", "Decimal"];
     ORDER
@@ -189,12 +194,59 @@ pub(crate) fn type_compatible(
     if param_name.eq_ignore_ascii_case("Object") {
         return Some(true);
     }
+    // A namespace-qualified declared type (`ApexPages.Message field;`,
+    // real Apex) is captured verbatim from source text, but every
+    // resolved `Ty::System` name elsewhere in this crate is always the
+    // bare class name (`"Message"`, never `"ApexPages.Message"`) --
+    // `type_of_symbol`'s own namespace-qualified fallback strips it the
+    // same way. Without normalizing here first, a value genuinely typed
+    // `ApexPages.Message` compared against a parameter *declared*
+    // `ApexPages.Message` never matched on name at all (`"Message"` vs
+    // `"ApexPages.Message"`), a real false positive confirmed in NPSP
+    // (`ApexPages.Message m = new ApexPages.Message(...);`).
+    let param_name = strip_namespace_prefix(stdlib, param_name);
     match arg {
         Ty::Project(arg_id) => project_arg_compatible(table, param_name, *arg_id),
         Ty::System {
             name: arg_name,
             args: arg_args,
         } => {
+            // The `arg` side's mirror of the same normalization: a scraped
+            // stdlib generic argument (`List<ApexPages.Message>`'s own
+            // `Ty` for the element position, built from a raw scraped type
+            // string, never routed through `resolve_type_ref_base`'s own
+            // namespace-qualified fallback the way a declaration's `Ty`
+            // is) can carry the whole dotted name as one opaque
+            // `Ty::System` name too. Also handles source-text case drift
+            // (`Apexpages.Message` vs `ApexPages.Message`, both real Apex
+            // -- case-insensitive) since `param_name`'s own normalization
+            // above only fixes the *declared*-type spelling, and the two
+            // sides are compared by exact (if case-insensitive) string
+            // match below.
+            let arg_name = strip_namespace_prefix(stdlib, arg_name);
+            // The symmetric case of the `param_name == "Object"` check
+            // above: a bare `Object`-named argument is at least as often
+            // this crate's own "couldn't infer anything more specific"
+            // fallback (an unmodeled stdlib generic substitution, a
+            // dynamic collection access, ...) as it is a value genuinely
+            // *declared* `Object` -- and unlike the parameter side, there
+            // is no way here to tell those two apart. A genuinely declared
+            // `Object` narrowed without a cast is a real compile error
+            // (confirmed against a real org: `Object o; String s = o;` is
+            // a real `Illegal assignment from Object to String`), but
+            // guessing that every bare-`Object` argument is one would
+            // trade a rare true positive for a systematic false one --
+            // real NPSP shape that motivated this: `Id id =
+            // ApexPages.currentPage().getParameters().get('id')` (a real
+            // `Map<String,String>`, but this crate's generics
+            // substitution doesn't track a value type through a chained
+            // stdlib call that far, so the `.get(...)` result fell back to
+            // `Object`) was flagged as assigning `Object` to `Id`. Matches
+            // this module's own "can't prove wrong beats assume wrong"
+            // rule everywhere else.
+            if arg_name.eq_ignore_ascii_case("Object") && arg_args.is_empty() {
+                return None;
+            }
             if table.resolve_dotted_name(param_name).is_some() {
                 // The parameter is project-local (a user class/interface),
                 // the argument is a system value -- no defined conversion
@@ -202,14 +254,56 @@ pub(crate) fn type_compatible(
                 // made to implement a user-defined interface either.
                 return Some(false);
             }
-            system_type_compatible(schema, stdlib, table, param_name, param_args, arg_name, arg_args)
+            system_type_compatible(
+                schema, stdlib, table, param_name, param_args, arg_name, arg_args,
+            )
         }
+    }
+}
+
+/// Reduces a namespace-qualified system-type name (`"ApexPages.Message"`)
+/// to its bare class name (`"Message"`) when `stdlib` confirms it's a
+/// real namespace-qualified class -- both `stdlib.class_in_namespace`'s
+/// own name lookup and its namespace comparison are case-insensitive, so
+/// this also normalizes source-text case drift (`"Apexpages.Message"` and
+/// `"ApexPages.Message"` both resolve to the one real class, since Apex
+/// identifiers are themselves case-insensitive). Only two segments,
+/// matching every other namespace-qualified fallback in this crate
+/// (`resolve_type_ref_base`, `type_of_symbol`) -- a deeper dotted path is
+/// never a real namespace-qualified stdlib shape. Returns `name`
+/// unchanged for anything else (a bare name, a project-local dotted
+/// nested-type path, an unrecognized namespace).
+fn strip_namespace_prefix<'a>(stdlib: &StdlibIndex, name: &'a str) -> &'a str {
+    match name.split_once('.') {
+        Some((namespace, class_name)) if !class_name.contains('.') => stdlib
+            .class_in_namespace(namespace, class_name)
+            .map_or(name, |c| c.name.as_str()),
+        _ => name,
     }
 }
 
 fn project_arg_compatible(table: &SymbolTable, param_name: &str, arg_id: SymbolId) -> Option<bool> {
     if let Some(param_id) = table.resolve_dotted_name(param_name) {
-        return Some(arg_id == param_id || table.inherited_chain(arg_id).contains(&param_id));
+        if arg_id == param_id || table.inherited_chain(arg_id).contains(&param_id) {
+            return Some(true);
+        }
+        // `resolve_dotted_name` has no enclosing-scope context (unlike
+        // `resolve_dotted_name_from`, which correctly favors a lexically-
+        // enclosing nested type over an unrelated same-named top-level one
+        // -- see `resolve_type_ref_base`'s own doc comment on that
+        // precedence), so it can land on the *wrong* one of two same-named
+        // project types when both exist (real NPSP shape:
+        // `PSC_ManageSoftCredits_CTRL` declares its own nested
+        // `SoftCredit`, and the project also has an unrelated top-level
+        // `SoftCredit.cls`). When the two resolved ids differ but share
+        // the exact same simple name, that's a strong signal this is
+        // exactly that ambiguity, not a genuine mismatch -- staying
+        // honestly unresolved (`None`) here is safer than a confident
+        // `Some(false)` that might be comparing a type against itself.
+        if table.get(arg_id).name.eq_ignore_ascii_case(&table.get(param_id).name) {
+            return None;
+        }
+        return Some(false);
     }
     // The parameter's declared type isn't project-local. A project class
     // can never *be* one of Apex's sealed builtin leaf types (`String`,
@@ -236,11 +330,28 @@ fn system_type_compatible(
     arg_args: &[Ty],
 ) -> Option<bool> {
     if param_name.eq_ignore_ascii_case(arg_name) {
-        return if collection_kind(param_name).is_some() {
-            collection_args_compatible(schema, stdlib, table, param_args, arg_args)
+        return if let Some(kind) = collection_kind(param_name) {
+            collection_args_compatible(schema, stdlib, table, kind, param_args, arg_args)
         } else {
             Some(true)
         };
+    }
+    // `Decimal` narrows to `Double` for a plain assignment or a `return`
+    // value -- confirmed against a real org (`Double x = aDecimalValue;`
+    // and `return aDecimalValue;` from a `Double`-declared method both
+    // compile) -- but not as a call argument (`takesDouble(aDecimalValue)`
+    // is a real "Method does not exist or incorrect signature" compile
+    // error). This module has no per-call-site notion of "which check is
+    // this" to model that split precisely (unlike `narrow_by_overload`'s
+    // own candidate-elimination use, which never even reaches this
+    // specific pairing: a real `Double`/`Decimal` overload pair, if one
+    // existed, would need it, but none has been found in practice), so
+    // this stays the conservative `None` for the one pairing that isn't
+    // uniform across every context -- missing the rarer argument-context
+    // error rather than risking the far more common assignment/return
+    // false positive.
+    if arg_name.eq_ignore_ascii_case("Decimal") && param_name.eq_ignore_ascii_case("Double") {
+        return None;
     }
     if let (Some(arg_rank), Some(param_rank)) = (numeric_rank(arg_name), numeric_rank(param_name)) {
         return Some(arg_rank <= param_rank);
@@ -274,6 +385,29 @@ fn system_type_compatible(
         && (arg_name.eq_ignore_ascii_case("SObject") || schema.object(arg_name).is_some())
     {
         return Some(false);
+    }
+    // A `List<SObject>` value assigns to a *scalar* object-typed variable
+    // -- confirmed against a real org, and confirmed narrower than it
+    // first looks: `SObject x = Database.query(soql);` and `Account acc =
+    // Database.query(soql);` both compile, but the *identical* value
+    // already stored in a `List<SObject>`-typed variable does not (`SObject
+    // x = results;`, `results: List<SObject>`, is a real `Illegal
+    // assignment from List<SObject> to SObject` compile error) -- so this
+    // leniency is tied to specific dynamic-SOQL-returning call
+    // expressions this module has no way to recognize syntactically, not
+    // to the *type* `List<SObject>` in general. Rather than guess exactly
+    // which call shapes get it, this stays the conservative `None` --
+    // "can't prove wrong" -- for every `List<SObject>`-into-scalar-object
+    // case uniformly: a real occasional false negative (missing the
+    // `results` case above), never a false positive. `List`-only, matching
+    // every other `List<SObject>`-specific leniency already found this way
+    // (`Set`/`Map` have no confirmed relationship here either).
+    if (param_name.eq_ignore_ascii_case("SObject") || schema.object(param_name).is_some())
+        && collection_kind(arg_name).is_some_and(|k| k.eq_ignore_ascii_case("List"))
+        && arg_args.len() == 1
+        && matches!(&arg_args[0], Ty::System { name, args } if args.is_empty() && (name.eq_ignore_ascii_case("SObject") || schema.object(name).is_some()))
+    {
+        return None;
     }
     // A concrete SObject value is never compatible with a curated
     // *scalar* (`Id`/`String`/`Boolean`/numeric/`Date`/`Datetime`/`Time`/
@@ -345,10 +479,25 @@ fn system_type_compatible(
     // on either side (a typo, or a genuinely unmodeled system type this
     // crate's stdlib snapshot doesn't carry) must keep the honest
     // "can't prove wrong" `None` below, never a guessed elimination.
-    // `Iterable`/`Iterator` aren't in the bundled snapshot at all (no
-    // scraped page with real method/property content), so `List`/`Set`
-    // satisfying them, as already covered by the collection exclusion
-    // above, is unaffected either way.
+    // `Iterator` (unlike `Iterable`, absent from the bundled snapshot) is
+    // a real, scraped `System` interface, with its own doc page saying
+    // outright it "has no built-in implementations -- it's implemented by
+    // a generic Iterator (Iterator<T>) type ... or by a custom class" --
+    // this module has no registry of which stdlib classes implement which
+    // stdlib interfaces (the same gap `project_arg_compatible`'s own doc
+    // comment already accepts for a *project* class implementing an
+    // unmodeled interface), so a `param_name` of `Iterator` specifically
+    // must stay the honest `None` here rather than the guessed elimination
+    // below. Real bug this fixes: `Database.QueryLocator.iterator()`
+    // returns a real `Database.QueryLocatorIterator` (confirmed:
+    // implements `Iterator<SObject>`), assigned to a
+    // `System.Iterator<SObject>`-declared variable in real NPSP
+    // (`fflib_SObjectSelectorTest.cls`) -- two different, both-real
+    // stdlib class names, which the elimination below would otherwise
+    // treat as a definite mismatch.
+    if param_name.eq_ignore_ascii_case("Iterator") {
+        return None;
+    }
     if collection_kind(param_name).is_none()
         && collection_kind(arg_name).is_none()
         && stdlib.class(param_name).is_some()
@@ -371,6 +520,7 @@ fn collection_args_compatible(
     schema: &SchemaIndex,
     stdlib: &StdlibIndex,
     table: &SymbolTable,
+    collection_kind: &str,
     param_args: &[SmolStr],
     arg_args: &[Ty],
 ) -> Option<bool> {
@@ -379,6 +529,22 @@ fn collection_args_compatible(
     }
     let mut all_confirmed = true;
     for (p, a) in param_args.iter().zip(arg_args.iter()) {
+        // `List<SObject>`-into-`List<ConcreteObject>` leniency -- confirmed
+        // against a real org, and confirmed `List`-only (not `Set`/`Map`,
+        // e.g. `Set<Account> s = aSetOfSObject;` is a real `Illegal
+        // assignment from Set<SObject> to Set<Account>` compile error):
+        // `List<Account> accs = aListOfSObject;` compiles in *every*
+        // context this module distinguishes elsewhere (plain local
+        // declaration, a call argument, a `return` value) -- there is no
+        // assignment-vs-argument distinction for this specific shape,
+        // unlike the scalar `SObject`-to-concrete-object rule below, which
+        // stays a real, definite mismatch everywhere.
+        if collection_kind.eq_ignore_ascii_case("List")
+            && matches!(a, Ty::System { name, args } if args.is_empty() && name.eq_ignore_ascii_case("SObject"))
+            && schema.object(p).is_some()
+        {
+            continue;
+        }
         match type_compatible(schema, stdlib, table, p, &[], a) {
             Some(false) => return Some(false),
             Some(true) => {}
@@ -434,7 +600,13 @@ fn ty_arg_name(table: &SymbolTable, ty: &Ty) -> SmolStr {
 /// confirmed is a real Apex compile error in its own right
 /// (`Incompatible types in ternary operator: Boolean, String`), not just
 /// this module being conservative.
-pub(crate) fn widen(schema: &SchemaIndex, stdlib: &StdlibIndex, table: &SymbolTable, a: &Ty, b: &Ty) -> Option<Ty> {
+pub(crate) fn widen(
+    schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
+    table: &SymbolTable,
+    a: &Ty,
+    b: &Ty,
+) -> Option<Ty> {
     if a == b {
         return Some(a.clone());
     }
@@ -525,7 +697,10 @@ pub(crate) fn is_more_specific(
     if b_name.eq_ignore_ascii_case("SObject") && schema.object(a_name).is_some() {
         return true;
     }
-    if let (Some(a_id), Some(b_id)) = (table.resolve_dotted_name(a_name), table.resolve_dotted_name(b_name)) {
+    if let (Some(a_id), Some(b_id)) = (
+        table.resolve_dotted_name(a_name),
+        table.resolve_dotted_name(b_name),
+    ) {
         return a_id != b_id && table.inherited_chain(a_id).contains(&b_id);
     }
     false
@@ -582,7 +757,14 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            type_compatible(&schema, &stdlib, &table, "Object", &[], &Ty::Project(sid(0))),
+            type_compatible(
+                &schema,
+                &stdlib,
+                &table,
+                "Object",
+                &[],
+                &Ty::Project(sid(0))
+            ),
             Some(true)
         );
     }
@@ -631,7 +813,14 @@ mod tests {
         let table = empty_table();
         let stdlib = real_stdlib();
         assert_eq!(
-            type_compatible(&schema, &stdlib, &table, "Comparable", &[], &Ty::Project(sid(0))),
+            type_compatible(
+                &schema,
+                &stdlib,
+                &table,
+                "Comparable",
+                &[],
+                &Ty::Project(sid(0))
+            ),
             None
         );
         // Both names uncurated (`Iterable`/`SObjectField`, neither this
@@ -640,7 +829,14 @@ mod tests {
         // covers below, since neither side is a sealed scalar this
         // module can reason about.
         assert_eq!(
-            type_compatible(&schema, &stdlib, &table, "Iterable", &[], &sys("SObjectField")),
+            type_compatible(
+                &schema,
+                &stdlib,
+                &table,
+                "Iterable",
+                &[],
+                &sys("SObjectField")
+            ),
             None
         );
         // `List` is curated but, unlike a scalar, isn't sealed against an
@@ -676,11 +872,25 @@ mod tests {
         let table = empty_table();
         let stdlib = real_stdlib();
         assert_eq!(
-            type_compatible(&schema, &stdlib, &table, "SObjectField", &[], &sys("String")),
+            type_compatible(
+                &schema,
+                &stdlib,
+                &table,
+                "SObjectField",
+                &[],
+                &sys("String")
+            ),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&schema, &stdlib, &table, "DescribeFieldResult", &[], &sys("String")),
+            type_compatible(
+                &schema,
+                &stdlib,
+                &table,
+                "DescribeFieldResult",
+                &[],
+                &sys("String")
+            ),
             Some(false)
         );
         assert_eq!(
@@ -688,7 +898,14 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            type_compatible(&schema, &stdlib, &table, "String", &[], &sys("SObjectField")),
+            type_compatible(
+                &schema,
+                &stdlib,
+                &table,
+                "String",
+                &[],
+                &sys("SObjectField")
+            ),
             Some(false)
         );
     }
@@ -716,11 +933,25 @@ mod tests {
         let table = empty_table();
         let stdlib = real_stdlib();
         assert_eq!(
-            type_compatible(&schema, &stdlib, &table, "DescribeFieldResult", &[], &sys("SObjectField")),
+            type_compatible(
+                &schema,
+                &stdlib,
+                &table,
+                "DescribeFieldResult",
+                &[],
+                &sys("SObjectField")
+            ),
             Some(false)
         );
         assert_eq!(
-            type_compatible(&schema, &stdlib, &table, "SObjectField", &[], &sys("DescribeFieldResult")),
+            type_compatible(
+                &schema,
+                &stdlib,
+                &table,
+                "SObjectField",
+                &[],
+                &sys("DescribeFieldResult")
+            ),
             Some(false)
         );
     }
@@ -771,8 +1002,22 @@ mod tests {
             type_compatible(&schema, &stdlib, &table, "Time", &[], &sys("Date")),
             Some(false)
         );
-        assert!(is_more_specific(&schema, &table, "Date", &[], "Datetime", &[]));
-        assert!(!is_more_specific(&schema, &table, "Datetime", &[], "Date", &[]));
+        assert!(is_more_specific(
+            &schema,
+            &table,
+            "Date",
+            &[],
+            "Datetime",
+            &[]
+        ));
+        assert!(!is_more_specific(
+            &schema,
+            &table,
+            "Datetime",
+            &[],
+            "Date",
+            &[]
+        ));
     }
 
     /// `Blob` has no implicit conversion with `String` in either
@@ -816,8 +1061,22 @@ mod tests {
             type_compatible(&schema, &stdlib, &table, "Contact", &[], &sys("Account")),
             Some(false)
         );
-        assert!(is_more_specific(&schema, &table, "Account", &[], "SObject", &[]));
-        assert!(!is_more_specific(&schema, &table, "SObject", &[], "Account", &[]));
+        assert!(is_more_specific(
+            &schema,
+            &table,
+            "Account",
+            &[],
+            "SObject",
+            &[]
+        ));
+        assert!(!is_more_specific(
+            &schema,
+            &table,
+            "SObject",
+            &[],
+            "Account",
+            &[]
+        ));
     }
 
     /// `List<Account>` satisfies a `List<SObject>`-only parameter, the
@@ -859,8 +1118,14 @@ mod tests {
         let schema = standard_schema();
         let table = empty_table();
         let stdlib = real_stdlib();
-        assert_eq!(type_compatible(&schema, &stdlib, &table, "Id", &[], &sys("Contact")), Some(false));
-        assert_eq!(type_compatible(&schema, &stdlib, &table, "String", &[], &sys("Contact")), Some(false));
+        assert_eq!(
+            type_compatible(&schema, &stdlib, &table, "Id", &[], &sys("Contact")),
+            Some(false)
+        );
+        assert_eq!(
+            type_compatible(&schema, &stdlib, &table, "String", &[], &sys("Contact")),
+            Some(false)
+        );
         assert_eq!(
             type_compatible(
                 &schema,
@@ -933,10 +1198,38 @@ mod tests {
     fn specificity_prefers_the_exact_and_narrower_type() {
         let schema = empty_schema();
         let table = empty_table();
-        assert!(is_more_specific(&schema, &table, "Integer", &[], "Object", &[]));
-        assert!(!is_more_specific(&schema, &table, "Object", &[], "Integer", &[]));
-        assert!(is_more_specific(&schema, &table, "Integer", &[], "Long", &[]));
-        assert!(!is_more_specific(&schema, &table, "Long", &[], "Integer", &[]));
+        assert!(is_more_specific(
+            &schema,
+            &table,
+            "Integer",
+            &[],
+            "Object",
+            &[]
+        ));
+        assert!(!is_more_specific(
+            &schema,
+            &table,
+            "Object",
+            &[],
+            "Integer",
+            &[]
+        ));
+        assert!(is_more_specific(
+            &schema,
+            &table,
+            "Integer",
+            &[],
+            "Long",
+            &[]
+        ));
+        assert!(!is_more_specific(
+            &schema,
+            &table,
+            "Long",
+            &[],
+            "Integer",
+            &[]
+        ));
         assert!(is_more_specific(
             &schema,
             &table,
@@ -962,7 +1255,10 @@ mod tests {
         let schema = empty_schema();
         let table = empty_table();
         let stdlib = real_stdlib();
-        assert_eq!(widen(&schema, &stdlib, &table, &sys("Integer"), &sys("Integer")), Some(sys("Integer")));
+        assert_eq!(
+            widen(&schema, &stdlib, &table, &sys("Integer"), &sys("Integer")),
+            Some(sys("Integer"))
+        );
     }
 
     #[test]
@@ -970,8 +1266,14 @@ mod tests {
         let schema = empty_schema();
         let table = empty_table();
         let stdlib = real_stdlib();
-        assert_eq!(widen(&schema, &stdlib, &table, &sys("Integer"), &sys("Long")), Some(sys("Long")));
-        assert_eq!(widen(&schema, &stdlib, &table, &sys("Long"), &sys("Integer")), Some(sys("Long")));
+        assert_eq!(
+            widen(&schema, &stdlib, &table, &sys("Integer"), &sys("Long")),
+            Some(sys("Long"))
+        );
+        assert_eq!(
+            widen(&schema, &stdlib, &table, &sys("Long"), &sys("Integer")),
+            Some(sys("Long"))
+        );
     }
 
     #[test]
@@ -979,8 +1281,14 @@ mod tests {
         let schema = empty_schema();
         let table = empty_table();
         let stdlib = real_stdlib();
-        assert_eq!(widen(&schema, &stdlib, &table, &sys("Date"), &sys("Datetime")), Some(sys("Datetime")));
-        assert_eq!(widen(&schema, &stdlib, &table, &sys("Datetime"), &sys("Date")), Some(sys("Datetime")));
+        assert_eq!(
+            widen(&schema, &stdlib, &table, &sys("Date"), &sys("Datetime")),
+            Some(sys("Datetime"))
+        );
+        assert_eq!(
+            widen(&schema, &stdlib, &table, &sys("Datetime"), &sys("Date")),
+            Some(sys("Datetime"))
+        );
     }
 
     /// `Id`/`String` are bidirectionally compatible with no established
@@ -991,7 +1299,10 @@ mod tests {
         let schema = empty_schema();
         let table = empty_table();
         let stdlib = real_stdlib();
-        assert_eq!(widen(&schema, &stdlib, &table, &sys("Id"), &sys("String")), None);
+        assert_eq!(
+            widen(&schema, &stdlib, &table, &sys("Id"), &sys("String")),
+            None
+        );
     }
 
     #[test]
@@ -999,8 +1310,14 @@ mod tests {
         let schema = standard_schema();
         let table = empty_table();
         let stdlib = real_stdlib();
-        assert_eq!(widen(&schema, &stdlib, &table, &sys("Account"), &sys("SObject")), Some(sys("SObject")));
-        assert_eq!(widen(&schema, &stdlib, &table, &sys("SObject"), &sys("Account")), Some(sys("SObject")));
+        assert_eq!(
+            widen(&schema, &stdlib, &table, &sys("Account"), &sys("SObject")),
+            Some(sys("SObject"))
+        );
+        assert_eq!(
+            widen(&schema, &stdlib, &table, &sys("SObject"), &sys("Account")),
+            Some(sys("SObject"))
+        );
     }
 
     #[test]
@@ -1008,7 +1325,10 @@ mod tests {
         let schema = standard_schema();
         let table = empty_table();
         let stdlib = real_stdlib();
-        assert_eq!(widen(&schema, &stdlib, &table, &sys("Account"), &sys("Contact")), None);
+        assert_eq!(
+            widen(&schema, &stdlib, &table, &sys("Account"), &sys("Contact")),
+            None
+        );
     }
 
     #[test]
@@ -1016,7 +1336,10 @@ mod tests {
         let schema = empty_schema();
         let table = empty_table();
         let stdlib = real_stdlib();
-        assert_eq!(widen(&schema, &stdlib, &table, &sys("String"), &sys("Boolean")), None);
+        assert_eq!(
+            widen(&schema, &stdlib, &table, &sys("String"), &sys("Boolean")),
+            None
+        );
     }
 
     #[test]
@@ -1024,6 +1347,15 @@ mod tests {
         let schema = empty_schema();
         let table = empty_table();
         let stdlib = real_stdlib();
-        assert_eq!(widen(&schema, &stdlib, &table, &Ty::Project(sid(0)), &sys("String")), None);
+        assert_eq!(
+            widen(
+                &schema,
+                &stdlib,
+                &table,
+                &Ty::Project(sid(0)),
+                &sys("String")
+            ),
+            None
+        );
     }
 }

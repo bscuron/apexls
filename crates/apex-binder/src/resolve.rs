@@ -61,10 +61,10 @@ use crate::reference_table::{
 use crate::schema_index::{relationship_field_api_name, SchemaIndex};
 use crate::scope::{ScopeId, ScopeKind, ScopeTree};
 use crate::stdlib_index::StdlibIndex;
-use apex_stdlib::{StdlibClass, StdlibMethod};
 use crate::symbol::{ModifierSet, Symbol, SymbolId, SymbolKind};
 use crate::symbol_table::SymbolTable;
 use crate::ty::Ty;
+use apex_stdlib::{StdlibClass, StdlibMethod};
 use apex_syntax::ast::decl::{TriggerBlock, VarDeclarator};
 use apex_syntax::ast::expr::{CallExpr, FieldExpr, Initializer, MethodCallExpr, NameExpr, NewExpr};
 use apex_syntax::ast::stmt::Block;
@@ -244,7 +244,11 @@ fn narrow_stdlib_overload(
         .copied()
         .filter(|m| m.params.len() == arg_types.len())
         .collect();
-    let pool: &[&StdlibMethod] = if by_arity.is_empty() { &overloads } else { &by_arity };
+    let pool: &[&StdlibMethod] = if by_arity.is_empty() {
+        &overloads
+    } else {
+        &by_arity
+    };
 
     match pool {
         [one] => Some(*one),
@@ -284,16 +288,28 @@ fn ty_from_scraped_type(stdlib: &StdlibIndex, type_str: &str) -> Ty {
         Some((ns, name)) if stdlib.class_in_namespace(ns, name).is_some() => SmolStr::new(name),
         _ => base,
     };
-    Ty::system_owned(base, args.into_iter().map(|a| Ty::system_owned(a, Vec::new())).collect())
+    Ty::system_owned(
+        base,
+        args.into_iter()
+            .map(|a| Ty::system_owned(a, Vec::new()))
+            .collect(),
+    )
 }
 
 /// The real Apex type a schema field's *value* has, from its own
 /// metadata `field_type` (Salesforce's `<type>` element text --
 /// `"Picklist"`, `"Currency"`, `"DateTime"`, ... -- see
 /// `apex_metadata::FieldSchema::field_type`'s own doc comment), for a
-/// non-relationship field accessed outside SOQL (`opp.Name`, `opp.Type`
-/// -- a `reference_to`-bearing field already gets its own `Ty` a
-/// different way, via the field's real target object, not this).
+/// field accessed by its own literal API name outside SOQL (`opp.Name`,
+/// `opp.Type` -- a reference field accessed via its *relationship* name
+/// instead, e.g. `contact.Account`/`dataImport.Related__r`, gets its own
+/// `Ty` a different way, via the field's real target object, not this --
+/// see `bind_field_expr`'s own call site). `"reference"` maps to `Id`,
+/// not the related object: confirmed against a real org
+/// (`Account a = contact.AccountId;` is a real `Illegal assignment from
+/// Id to Account` compile error -- a reference field's own API name
+/// always yields just the `Id` value, the related SObject is only ever
+/// reached through the separate `__r`/relationship-name accessor).
 /// Without this, *every* scalar field access had no inferred type at
 /// all, so a chained call on it (`opp.Name.equals(...)`, `opp.Type.startsWith(...)`,
 /// both real fflib_SObjectDomain.cls shapes) stayed `Unresolved`
@@ -308,8 +324,8 @@ fn ty_from_scraped_type(stdlib: &StdlibIndex, type_str: &str) -> Ty {
 /// real org (`sf apex run`), not assumed from memory.
 fn apex_type_for_schema_field_type(field_type: &str) -> Option<&'static str> {
     match field_type.trim().to_ascii_lowercase().as_str() {
-        "string" | "text" | "textarea" | "picklist" | "multipicklist" | "combobox" | "email" | "phone" | "url"
-        | "encryptedstring" | "base64" => Some("String"),
+        "string" | "text" | "textarea" | "picklist" | "multipicklist" | "combobox" | "email"
+        | "phone" | "url" | "encryptedstring" | "base64" | "name" | "autonumber" => Some("String"),
         "boolean" | "check" => Some("Boolean"),
         "date" => Some("Date"),
         "datetime" => Some("Datetime"),
@@ -317,7 +333,7 @@ fn apex_type_for_schema_field_type(field_type: &str) -> Option<&'static str> {
         "currency" | "percent" | "double" | "number" => Some("Decimal"),
         "int" | "integer" => Some("Integer"),
         "long" => Some("Long"),
-        "id" => Some("Id"),
+        "id" | "reference" => Some("Id"),
         _ => None,
     }
 }
@@ -491,14 +507,11 @@ fn most_specific_candidate(
     table: &SymbolTable,
     candidates: &[SymbolId],
 ) -> Option<SymbolId> {
-    candidates
-        .iter()
-        .copied()
-        .find(|&c| {
-            candidates
-                .iter()
-                .all(|&d| d == c || dominates(schema, table, c, d))
-        })
+    candidates.iter().copied().find(|&c| {
+        candidates
+            .iter()
+            .all(|&d| d == c || dominates(schema, table, c, d))
+    })
 }
 
 /// Whether `a`'s declared parameter list is at least as specific as `b`'s
@@ -674,7 +687,10 @@ fn last_assignment_to_local(anchor: &apex_syntax::SyntaxNode, name: &str) -> Opt
             match &stmt {
                 Stmt::LocalVarDecl(decl) => {
                     for d in decl.declarators() {
-                        if d.name().and_then(|n| n.text()).is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+                        if d.name()
+                            .and_then(|n| n.text())
+                            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                        {
                             candidate = d.init();
                         }
                     }
@@ -684,7 +700,9 @@ fn last_assignment_to_local(anchor: &apex_syntax::SyntaxNode, name: &str) -> Opt
                         let op: String = b.operator_tokens().iter().map(|t| t.text()).collect();
                         if op == "=" {
                             if let Some(Expr::Name(n)) = b.lhs() {
-                                if n.name_token().is_some_and(|t| t.text().eq_ignore_ascii_case(name)) {
+                                if n.name_token()
+                                    .is_some_and(|t| t.text().eq_ignore_ascii_case(name))
+                                {
                                     candidate = b.rhs();
                                 }
                             }
@@ -712,6 +730,66 @@ pub(crate) struct BoundBody {
     pub(crate) scopes: ScopeTree,
     pub(crate) pending_locals: Vec<Symbol>,
     pub(crate) refs: ReferenceTable,
+    pub(crate) type_mismatches: Vec<TypeMismatch>,
+}
+
+/// A provable, `ERROR`-severity type-checking defect found inline during
+/// Pass 2 body walking (Wayfinder `apex-diagnostics` map, ticket 09's
+/// design/ticket 23's implementation) -- Option B's "promote the check,
+/// not the type": no general per-expression `Ty` layer is ever stored,
+/// just the handful of findings a comparison actually produces. `ptr`
+/// always points at the specific offending expression (the initializer,
+/// the returned expression, or the whole call/`new` expression for an
+/// argument mismatch), never the declaration/call site as a whole.
+#[derive(Debug, Clone)]
+pub struct TypeMismatch {
+    pub ptr: SyntaxPtr,
+    pub message: String,
+}
+
+/// A human-readable rendering of `ty` for a `TypeMismatch` message --
+/// `Ty::Project`'s own declared name for a project type, or the bare
+/// system name (plus `<args>` if generic) otherwise. Not a general
+/// `Display` impl: `Ty` is deliberately a walker-internal chaining value
+/// (see `crate::ty`'s own module doc comment), so rendering it needs
+/// `table` in hand to resolve a `Ty::Project`'s `SymbolId` back to a
+/// name -- exactly the reason a plain `impl Display for Ty` doesn't fit.
+fn describe_ty(table: &SymbolTable, ty: &Ty) -> String {
+    match ty {
+        Ty::Project(id) => table.get(*id).name.to_string(),
+        Ty::System { name, args } => {
+            if args.is_empty() {
+                name.to_string()
+            } else {
+                let rendered: Vec<String> = args.iter().map(|a| describe_ty(table, a)).collect();
+                format!("{name}<{}>", rendered.join(", "))
+            }
+        }
+    }
+}
+
+/// Mirrors [`describe_ty`] for a declared type's raw name/args (a
+/// parameter's own `type_name`/`type_args`, never itself inferred), so a
+/// diagnostic naming a generic parameter type shows its type arguments
+/// (`List<Account>`) instead of just the bare collection name (`List`).
+fn describe_declared_type(name: &str, args: &[SmolStr]) -> String {
+    if args.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}<{}>", args.join(", "))
+    }
+}
+
+/// A bare decimal-point numeric literal (`123.123`, `SyntaxKind::NumberLiteral`)
+/// -- see [`BodyBinder::check_declared_type_mismatch`]'s own doc comment
+/// for why this specific shape (not a general `Decimal`-typed expression)
+/// gets a narrow `Double`-declaration exception.
+fn is_decimal_literal_expr(e: &Expr) -> bool {
+    let Expr::Literal(lit) = e else {
+        return false;
+    };
+    lit.token()
+        .is_some_and(|t| t.kind() == apex_syntax::SyntaxKind::NumberLiteral)
 }
 
 /// One method/constructor/property-accessor body's binding context:
@@ -728,6 +806,7 @@ pub(crate) struct BodyBinder<'a> {
     pub(crate) refs: ReferenceTable,
     pub(crate) scopes: ScopeTree,
     pending_locals: Vec<Symbol>,
+    type_mismatches: Vec<TypeMismatch>,
     pub(crate) file: FileId,
     /// The enclosing type, for `this`/`super`/unqualified member lookup
     /// fallthrough once local-scope lookup misses. `None` when binding a
@@ -769,6 +848,7 @@ pub(crate) fn bind_body(
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
+        type_mismatches: Vec::new(),
         file,
         enclosing_type,
         enclosing_member,
@@ -808,6 +888,7 @@ pub(crate) fn bind_trigger_body(
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
+        type_mismatches: Vec::new(),
         file,
         enclosing_type,
         enclosing_member: None,
@@ -845,6 +926,7 @@ pub(crate) fn bind_initializer(
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
+        type_mismatches: Vec::new(),
         file,
         enclosing_type,
         enclosing_member: None,
@@ -890,6 +972,7 @@ pub(crate) fn body_binder_for_completion<'a>(
         refs: ReferenceTable::default(),
         scopes,
         pending_locals: Vec::new(),
+        type_mismatches: Vec::new(),
         file,
         enclosing_type,
         enclosing_member,
@@ -910,6 +993,7 @@ pub(crate) fn bind_object_ref(schema: &SchemaIndex, ptr: SyntaxPtr, name: &str) 
         scopes,
         pending_locals: Vec::new(),
         refs,
+        type_mismatches: Vec::new(),
     }
 }
 
@@ -1035,7 +1119,9 @@ fn resolve_type_ref_base(
         .type_args()
         .map(|list| {
             list.args()
-                .filter_map(|arg| resolve_type_ref(table, schema, stdlib, refs, file, enclosing_type, &arg))
+                .filter_map(|arg| {
+                    resolve_type_ref(table, schema, stdlib, refs, file, enclosing_type, &arg)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1301,6 +1387,7 @@ pub(crate) fn bind_type_ref(
         scopes,
         pending_locals: Vec::new(),
         refs,
+        type_mismatches: Vec::new(),
     }
 }
 
@@ -1310,6 +1397,7 @@ impl<'a> BodyBinder<'a> {
             scopes: self.scopes,
             pending_locals: self.pending_locals,
             refs: self.refs,
+            type_mismatches: self.type_mismatches,
         }
     }
 
@@ -1319,16 +1407,16 @@ impl<'a> BodyBinder<'a> {
         name: &Name,
         type_ref: Option<&Type>,
     ) -> SymbolId {
-        let (type_ptr, type_name, type_args) = match type_ref {
-            Some(ty) => {
-                let args = ty
-                    .type_args()
-                    .map(|list| list.args().map(|a| a.text()).collect())
-                    .unwrap_or_default();
-                (Some(AstPtr::new(self.file, ty)), Some(ty.text()), args)
-            }
-            None => (None, None, Vec::new()),
-        };
+        // Delegates to `crate::collect::type_ptr_and_name` (the same
+        // extraction a field/parameter/return type goes through at
+        // collection time) rather than a hand-rolled duplicate, so a
+        // local variable's own declared type gets the same array-sugar
+        // handling (`Type[]` -> `List<Type>`, both at the top level and
+        // nested one level inside a generic argument, e.g. `Map<SObject,
+        // DataImport__c[]>`) instead of a second, independently
+        // maintained copy that silently drifts out of sync with it.
+        let (type_ptr, type_name, type_args) =
+            crate::collect::type_ptr_and_name(self.file, type_ref.cloned());
         self.declare_local_raw(kind, name, type_ptr, type_name, type_args)
     }
 
@@ -1463,31 +1551,33 @@ impl<'a> BodyBinder<'a> {
         let args: Vec<Ty> = symbol
             .type_args
             .iter()
-            .map(|name| match self.table.resolve_dotted_name_from(name, enclosing) {
-                Some(id) => Ty::Project(id),
-                // A namespace-qualified stdlib type as a *generic type
-                // argument* (`Map<System.Type, System.Type> bindings;`) --
-                // the exact same gap the field's own outer `type_name`
-                // gets the `class_in_namespace` fallback for just below,
-                // but never mirrored here for each *argument* name
-                // independently. Without this, `bindings`'s own `Ty`
-                // carried `"System.Type"` (the whole dotted string,
-                // unsplit) as an argument's name -- never a key in
-                // `StdlibIndex`'s by-bare-name map -- so every further
-                // hop off a `.get(...)`-substituted argument type (real
-                // NPSP shape: `this.bindings.get(interfaceType).newInstance()`)
-                // stayed `Unresolved`, even though the field's own
-                // top-level `Map` type resolved fine.
-                None => match name.split_once('.') {
-                    Some((namespace, class_name)) if !class_name.contains('.') => {
-                        match self.stdlib.class_in_namespace(namespace, class_name) {
-                            Some(class) => Ty::system_owned(class.name.clone(), Vec::new()),
-                            None => Ty::system_owned(name.clone(), Vec::new()),
+            .map(
+                |name| match self.table.resolve_dotted_name_from(name, enclosing) {
+                    Some(id) => Ty::Project(id),
+                    // A namespace-qualified stdlib type as a *generic type
+                    // argument* (`Map<System.Type, System.Type> bindings;`) --
+                    // the exact same gap the field's own outer `type_name`
+                    // gets the `class_in_namespace` fallback for just below,
+                    // but never mirrored here for each *argument* name
+                    // independently. Without this, `bindings`'s own `Ty`
+                    // carried `"System.Type"` (the whole dotted string,
+                    // unsplit) as an argument's name -- never a key in
+                    // `StdlibIndex`'s by-bare-name map -- so every further
+                    // hop off a `.get(...)`-substituted argument type (real
+                    // NPSP shape: `this.bindings.get(interfaceType).newInstance()`)
+                    // stayed `Unresolved`, even though the field's own
+                    // top-level `Map` type resolved fine.
+                    None => match name.split_once('.') {
+                        Some((namespace, class_name)) if !class_name.contains('.') => {
+                            match self.stdlib.class_in_namespace(namespace, class_name) {
+                                Some(class) => Ty::system_owned(class.name.clone(), Vec::new()),
+                                None => Ty::system_owned(name.clone(), Vec::new()),
+                            }
                         }
-                    }
-                    _ => Ty::system_owned(name.clone(), Vec::new()),
+                        _ => Ty::system_owned(name.clone(), Vec::new()),
+                    },
                 },
-            })
+            )
             .collect();
         // A stdlib class referenced with its own namespace spelled out as
         // the declared type (`Schema.SObjectField token;`) -- the same
@@ -1567,6 +1657,173 @@ impl<'a> BodyBinder<'a> {
                 Some(first)
             }
             _ => None,
+        }
+    }
+
+    /// Checks a declared type (a local variable's own annotation, raw
+    /// name/args exactly as `Symbol::type_name`/`type_args` would cache
+    /// them -- see `crate::collect::type_ptr_and_name`) against an
+    /// already-inferred `actual` `Ty`, pushing a [`TypeMismatch`] only on
+    /// positively-known incompatibility (`conversions::type_compatible`'s
+    /// own `Some(false)`, never a guess) -- Wayfinder `apex-diagnostics`
+    /// map, ticket 23's implementation of ticket 09's Option B ("promote
+    /// the check, not the type"). `what` names the declared thing in the
+    /// message (`"a variable"`, `"a variable"` for the `for`-loop init
+    /// case too -- both are plain local-variable declarations).
+    ///
+    /// `init_expr` is the initializer expression `actual` was inferred
+    /// from, needed for one narrow literal-leniency exception: a bare
+    /// decimal-point numeric literal (`123.123`) infers as `Decimal`
+    /// (`Ty::for_literal`'s own documented default, "absent any further
+    /// context"), but real Apex allows that exact literal shape to
+    /// initialize a `Double`-declared variable directly, with no cast --
+    /// confirmed against a real org (`Double d = 123.123;` compiles) --
+    /// while a *general* `Decimal`-typed expression genuinely cannot
+    /// (`Illegal assignment from Decimal to Double` for anything that
+    /// isn't a literal), and the same literal narrowing `Integer`/`Long`
+    /// (`Integer i = 5.0;`) is a real, different compile error
+    /// (`Illegal assignment from Decimal to Integer`) -- so this is
+    /// deliberately only a `Decimal`-literal-into-`Double` exception, not
+    /// a general "literals always fit" rule. Real NPSP shape this fixes:
+    /// `Double d1 = 123.123;` (`fflib_ComparatorTest.cls` and others).
+    fn check_declared_type_mismatch(
+        &mut self,
+        declared_name: Option<&str>,
+        declared_args: &[SmolStr],
+        actual: Option<&Ty>,
+        init_expr: &Expr,
+        ptr: SyntaxPtr,
+        what: &str,
+    ) {
+        let (Some(name), Some(actual)) = (declared_name, actual) else {
+            return;
+        };
+        if name.eq_ignore_ascii_case("Double") && is_decimal_literal_expr(init_expr) {
+            return;
+        }
+        // `conversions::project_arg_compatible` resolves `name` via
+        // `SymbolTable::resolve_dotted_name`, which -- unlike
+        // `resolve_dotted_name_from` -- has no enclosing-scope context, so
+        // it can't favor a lexically-enclosing nested type the way real
+        // Apex does over an unrelated same-named top-level one (see
+        // `resolve_type_ref_base`'s own doc comment on this precedence,
+        // fixed there for type *references* but never mirrored into
+        // `conversions.rs`'s name-based comparison). Real bug this
+        // catches: `PSC_ManageSoftCredits_CTRL` declares its own nested
+        // `SoftCredit`, and the project also has an unrelated top-level
+        // `SoftCredit.cls` -- a local declared `SoftCredit` (correctly the
+        // nested one) initialized from a value already known to be that
+        // exact nested type was flagged as a mismatch, because the
+        // declared-type side re-resolved `"SoftCredit"` the *unscoped* way
+        // and landed on the wrong (top-level) class. Resolving `name` here
+        // instead, the same scope-aware way the declaration's own type
+        // annotation already did, and short-circuiting on a match, sidesteps
+        // the gap without changing `conversions.rs`'s own general-purpose
+        // (and far more heavily exercised) resolution.
+        if let Ty::Project(actual_id) = actual {
+            if let Some(declared_id) = self
+                .table
+                .resolve_dotted_name_from(name, self.enclosing_type)
+            {
+                if *actual_id == declared_id
+                    || self
+                        .table
+                        .inherited_chain(*actual_id)
+                        .contains(&declared_id)
+                {
+                    return;
+                }
+            }
+        }
+        if conversions::type_compatible(
+            self.schema,
+            self.stdlib,
+            self.table,
+            name,
+            declared_args,
+            actual,
+        ) == Some(false)
+        {
+            let message = format!(
+                "cannot assign a value of type '{}' to {what} of type '{}'",
+                describe_ty(self.table, actual),
+                describe_declared_type(name, declared_args),
+            );
+            self.type_mismatches.push(TypeMismatch { ptr, message });
+        }
+    }
+
+    /// Checks a resolved method/constructor call's own arguments against
+    /// its declared parameter types, pushing a [`TypeMismatch`] for the
+    /// first positively-known-incompatible one -- ticket 23's third
+    /// checkpoint, and the highest-value one per ticket 08's own
+    /// research: `narrow_by_overload`'s `pool.len() == 1` fast path
+    /// (deliberately left untouched here -- this runs as a separate,
+    /// side-channel check *after* resolution, never changing which
+    /// `Resolution` gets recorded) already skips `is_argument_type_compatible`
+    /// entirely once arity alone leaves one candidate, so a wrong-typed
+    /// argument to a non-overloaded method silently resolved fine before
+    /// this. A no-op for anything but `Resolution::Resolved` naming a
+    /// `Method`/`Constructor` -- `Candidates`/`Unresolved`/etc. have no
+    /// single declared parameter list to check against.
+    fn check_call_argument_types(
+        &mut self,
+        resolution: &Resolution,
+        arg_types: &[Option<Ty>],
+        ptr: SyntaxPtr,
+    ) {
+        let Resolution::Resolved(id) = resolution else {
+            return;
+        };
+        let symbol = self.table.get(*id);
+        if !matches!(symbol.kind, SymbolKind::Method | SymbolKind::Constructor) {
+            return;
+        }
+        let params = self.table.params(*id);
+        for (param, arg_type) in params.iter().zip(arg_types.iter()) {
+            let Some(arg_type) = arg_type else { continue };
+            let param_symbol = self.table.get(*param);
+            let Some(param_type_name) = param_symbol.type_name.clone() else {
+                continue;
+            };
+            let param_type_args = param_symbol.type_args.clone();
+            // Same nested-vs-top-level name-collision gap
+            // `check_declared_type_mismatch` short-circuits for its own
+            // declared-type comparison (see its own doc comment) --
+            // resolved from the *parameter's own* enclosing scope, not the
+            // call site's, since a parameter's declared type name is
+            // scoped to where the method itself is declared.
+            if let Ty::Project(arg_id) = arg_type {
+                let param_enclosing = crate::enclosing_type_of(self.table, param_symbol);
+                if let Some(declared_id) = self
+                    .table
+                    .resolve_dotted_name_from(&param_type_name, param_enclosing)
+                {
+                    if *arg_id == declared_id
+                        || self.table.inherited_chain(*arg_id).contains(&declared_id)
+                    {
+                        continue;
+                    }
+                }
+            }
+            if conversions::type_compatible(
+                self.schema,
+                self.stdlib,
+                self.table,
+                &param_type_name,
+                &param_type_args,
+                arg_type,
+            ) == Some(false)
+            {
+                let message = format!(
+                    "argument of type '{}' does not match '{}''s declared parameter type '{}'",
+                    describe_ty(self.table, arg_type),
+                    self.table.get(*id).name,
+                    describe_declared_type(&param_type_name, &param_type_args),
+                );
+                self.type_mismatches.push(TypeMismatch { ptr, message });
+                return;
+            }
         }
     }
 
@@ -1650,9 +1907,19 @@ impl<'a> BodyBinder<'a> {
                     if let Some(ty) = init.type_ref() {
                         self.resolve_type_ref(&ty);
                     }
+                    let (_, declared_name, declared_args) =
+                        crate::collect::type_ptr_and_name(self.file, init.type_ref());
                     for d in init.declarators() {
                         if let Some(e) = d.init() {
-                            self.bind_expr(child, &e);
+                            let actual = self.bind_expr(child, &e);
+                            self.check_declared_type_mismatch(
+                                declared_name.as_deref(),
+                                &declared_args,
+                                actual.as_ref(),
+                                &e,
+                                SyntaxPtr::new(self.file, e.syntax()),
+                                "a variable",
+                            );
                         }
                         if let Some(name) = d.name() {
                             let sym = self.declare_local(
@@ -1798,7 +2065,42 @@ impl<'a> BodyBinder<'a> {
             }
             Stmt::Return(s) => {
                 if let Some(e) = s.expr() {
-                    self.bind_expr(scope, &e);
+                    let actual = self.bind_expr(scope, &e);
+                    if let (Some(member), Some(actual)) = (self.enclosing_member, &actual) {
+                        let member = self.table.get(member);
+                        if let Some(declared_name) = member.type_name.clone() {
+                            let declared_args = member.type_args.clone();
+                            // Same nested-vs-top-level name-collision gap
+                            // `check_declared_type_mismatch` short-circuits
+                            // for its own declared-type comparison (see its
+                            // own doc comment).
+                            let short_circuit = matches!(actual, Ty::Project(actual_id)
+                                if self.table.resolve_dotted_name_from(&declared_name, self.enclosing_type)
+                                    .is_some_and(|declared_id| *actual_id == declared_id || self.table.inherited_chain(*actual_id).contains(&declared_id)));
+                            if short_circuit {
+                                return;
+                            }
+                            if conversions::type_compatible(
+                                self.schema,
+                                self.stdlib,
+                                self.table,
+                                &declared_name,
+                                &declared_args,
+                                actual,
+                            ) == Some(false)
+                            {
+                                let message = format!(
+                                    "cannot return a value of type '{}' from a method declared to return '{}'",
+                                    describe_ty(self.table, actual),
+                                    describe_declared_type(&declared_name, &declared_args),
+                                );
+                                self.type_mismatches.push(TypeMismatch {
+                                    ptr: SyntaxPtr::new(self.file, e.syntax()),
+                                    message,
+                                });
+                            }
+                        }
+                    }
                 }
             }
             Stmt::Throw(s) => {
@@ -1856,9 +2158,19 @@ impl<'a> BodyBinder<'a> {
                 if let Some(ty) = s.type_ref() {
                     self.resolve_type_ref(&ty);
                 }
+                let (_, declared_name, declared_args) =
+                    crate::collect::type_ptr_and_name(self.file, s.type_ref());
                 for d in s.declarators() {
                     if let Some(e) = d.init() {
-                        self.bind_expr(scope, &e);
+                        let actual = self.bind_expr(scope, &e);
+                        self.check_declared_type_mismatch(
+                            declared_name.as_deref(),
+                            &declared_args,
+                            actual.as_ref(),
+                            &e,
+                            SyntaxPtr::new(self.file, e.syntax()),
+                            "a variable",
+                        );
                     }
                     if let Some(name) = d.name() {
                         let sym =
@@ -1957,7 +2269,9 @@ impl<'a> BodyBinder<'a> {
                 // org -- see its own doc comment); only one side known
                 // still uses that side's type unchanged, never a guess.
                 match (then_ty, else_ty) {
-                    (Some(a), Some(b)) => conversions::widen(self.schema, self.stdlib, self.table, &a, &b),
+                    (Some(a), Some(b)) => {
+                        conversions::widen(self.schema, self.stdlib, self.table, &a, &b)
+                    }
                     (Some(a), None) => Some(a),
                     (None, Some(b)) => Some(b),
                     (None, None) => None,
@@ -1992,7 +2306,9 @@ impl<'a> BodyBinder<'a> {
                 // indexes via `.get(...)`), so this never needs a `Map`
                 // arm the way the method-call table does.
                 match target_ty {
-                    Some(Ty::System { name, args }) if has_real_index && name.eq_ignore_ascii_case("List") => {
+                    Some(Ty::System { name, args })
+                        if has_real_index && name.eq_ignore_ascii_case("List") =>
+                    {
                         args.into_iter().next()
                     }
                     _ => None,
@@ -2168,7 +2484,13 @@ impl<'a> BodyBinder<'a> {
                 ptr,
                 highlight,
                 class.map_or(Resolution::Unresolved, |c| {
-                    Resolution::StdlibMember(Box::new(stdlib_member_ref(c.namespace.clone(), &c.name, None, None, None)))
+                    Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                        c.namespace.clone(),
+                        &c.name,
+                        None,
+                        None,
+                        None,
+                    )))
                 }),
             );
             return class.map(|c| Ty::system_owned(c.name.clone(), Vec::new()));
@@ -2192,7 +2514,13 @@ impl<'a> BodyBinder<'a> {
                     ptr,
                     highlight,
                     class.map_or(Resolution::Unresolved, |c| {
-                        Resolution::StdlibMember(Box::new(stdlib_member_ref(c.namespace.clone(), &c.name, None, None, None)))
+                        Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                            c.namespace.clone(),
+                            &c.name,
+                            None,
+                            None,
+                            None,
+                        )))
                     }),
                 );
                 return class.map(|c| Ty::system_owned(c.name.clone(), Vec::new()));
@@ -2237,7 +2565,8 @@ impl<'a> BodyBinder<'a> {
                         Some(Ty::system("String"))
                     }
                     None => {
-                        self.refs.set_with_highlight(ptr, highlight, Resolution::Unresolved);
+                        self.refs
+                            .set_with_highlight(ptr, highlight, Resolution::Unresolved);
                         None
                     }
                 };
@@ -2270,14 +2599,16 @@ impl<'a> BodyBinder<'a> {
                 {
                     return match self.pages.get(name) {
                         Some(page) => {
-                            let resolution = Resolution::VisualforcePage(Box::new(VisualforcePageRef {
-                                name: page.name.clone(),
-                            }));
+                            let resolution =
+                                Resolution::VisualforcePage(Box::new(VisualforcePageRef {
+                                    name: page.name.clone(),
+                                }));
                             self.refs.set_with_highlight(ptr, highlight, resolution);
                             Some(Ty::system("PageReference"))
                         }
                         None => {
-                            self.refs.set_with_highlight(ptr, highlight, Resolution::Unresolved);
+                            self.refs
+                                .set_with_highlight(ptr, highlight, Resolution::Unresolved);
                             None
                         }
                     };
@@ -2390,7 +2721,10 @@ impl<'a> BodyBinder<'a> {
                     } else {
                         "$fields_describe"
                     };
-                    return Some(Ty::system_with_args(marker, vec![Ty::system_owned(owner, Vec::new())]));
+                    return Some(Ty::system_with_args(
+                        marker,
+                        vec![Ty::system_owned(owner, Vec::new())],
+                    ));
                 }
             }
         }
@@ -2465,17 +2799,23 @@ impl<'a> BodyBinder<'a> {
                 // stdlib-property fallback to reach for either. This is
                 // the one narrow, language-level exception, not a general
                 // "SObject has every field" relaxation.
-                let is_universal_id = object.eq_ignore_ascii_case("SObject") && real_field_name.eq_ignore_ascii_case("Id");
-                if field_schema.is_some() || is_universal_id || self.schema.object(&object).is_some() {
+                let is_universal_id = object.eq_ignore_ascii_case("SObject")
+                    && real_field_name.eq_ignore_ascii_case("Id");
+                if field_schema.is_some()
+                    || is_universal_id
+                    || self.schema.object(&object).is_some()
+                {
                     let resolution = match &field_schema {
                         Some(_) => Resolution::SchemaObject(Box::new(SchemaObjectRef {
                             object: object.clone(),
                             field: Some(SmolStr::new(&real_field_name)),
                         })),
-                        None if is_universal_id => Resolution::SchemaObject(Box::new(SchemaObjectRef {
-                            object: object.clone(),
-                            field: Some(SmolStr::new(&real_field_name)),
-                        })),
+                        None if is_universal_id => {
+                            Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                                object: object.clone(),
+                                field: Some(SmolStr::new(&real_field_name)),
+                            }))
+                        }
                         None => Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
                             object: Some(object.clone()),
                             field: Some(SmolStr::new(&real_field_name)),
@@ -2523,15 +2863,33 @@ impl<'a> BodyBinder<'a> {
                     }
 
                     return field_schema.and_then(|f| {
-                        f.reference_to
-                            .first()
-                            .map(|next| Ty::system_owned(next.clone(), Vec::new()))
-                            .or_else(|| {
-                                f.field_type
-                                    .as_deref()
-                                    .and_then(apex_type_for_schema_field_type)
-                                    .map(|apex_type| Ty::system(apex_type))
-                            })
+                        // A reference field's *relationship*-name access
+                        // (`__r`, or a standard name like `Owner`/`Account`
+                        // that derives to a real `<Name>Id` field via
+                        // `standard_relationship_field`) really does yield
+                        // the related object -- but the field's own literal
+                        // API name (`OwnerId`, `AccountId`,
+                        // `Contact1Imported__c`) yields just the `Id`
+                        // value, never the related SObject, confirmed
+                        // against a real org (`Account a = contact.AccountId;`
+                        // is a real `Illegal assignment from Id to Account`
+                        // compile error). `name` (the originally-accessed
+                        // segment, before `relationship_field_api_name`'s
+                        // `__r` normalization) equal to the *found* field's
+                        // own API name is exactly the "accessed by its own
+                        // name" case; anything else that still resolved to
+                        // this same field got here through a relationship-
+                        // name derivation instead.
+                        if !f.reference_to.is_empty() && !name.eq_ignore_ascii_case(&f.api_name) {
+                            return f
+                                .reference_to
+                                .first()
+                                .map(|next| Ty::system_owned(next.clone(), Vec::new()));
+                        }
+                        f.field_type
+                            .as_deref()
+                            .and_then(apex_type_for_schema_field_type)
+                            .map(|apex_type| Ty::system(apex_type))
                     });
                 }
                 // Not a known SObject/field at all (real or standard) --
@@ -2554,7 +2912,10 @@ impl<'a> BodyBinder<'a> {
                             None,
                         ))),
                     );
-                    return prop.type_name.as_deref().map(|type_name| ty_from_scraped_type(self.stdlib, type_name));
+                    return prop
+                        .type_name
+                        .as_deref()
+                        .map(|type_name| ty_from_scraped_type(self.stdlib, type_name));
                 }
                 // `name` isn't a *property* of `object` -- but `object`
                 // (e.g. `Schema`, itself a real class as well as a real
@@ -2593,8 +2954,19 @@ impl<'a> BodyBinder<'a> {
                 // might still be a real SObject, standard or custom,
                 // reachable the same way a bare `Opportunity` `NameExpr`
                 // already resolves (`bind_name_expr`'s own `self.schema.object`
-                // fallback).
-                if self.schema.object(name).is_some() {
+                // fallback). Requires `object` to actually *be* the
+                // `Schema` namespace, not any receiver whatsoever: without
+                // this, an ordinary field/property access whose member
+                // name happens to collide with a real (if obscure)
+                // registered object name -- confirmed real bug: `Name` is
+                // itself a documented Salesforce object (the compound
+                // Name-field type's own describe page,
+                // `sforce_api_objects_name` in the bundled snapshot) --
+                // misread a plain `someRecord.Name`/`aFieldToken.Name`
+                // member access as "the `Name` SObject type," handing back
+                // a nonsense `Ty` for what's really just an unmodeled
+                // field/property.
+                if object.eq_ignore_ascii_case("Schema") && self.schema.object(name).is_some() {
                     self.refs.set_with_highlight(
                         ptr,
                         highlight,
@@ -2605,7 +2977,8 @@ impl<'a> BodyBinder<'a> {
                     );
                     return Some(Ty::system_owned(SmolStr::new(name), Vec::new()));
                 }
-                self.refs.set_with_highlight(ptr, highlight, Resolution::Unresolved);
+                self.refs
+                    .set_with_highlight(ptr, highlight, Resolution::Unresolved);
                 return None;
             }
             // `target_type` is entirely unknown -- honestly `Unresolved`
@@ -2640,11 +3013,8 @@ impl<'a> BodyBinder<'a> {
                 self.type_of_symbol(*one)
             }
             many => {
-                self.refs.set_with_highlight(
-                    ptr,
-                    highlight,
-                    Resolution::Candidates(many.to_vec()),
-                );
+                self.refs
+                    .set_with_highlight(ptr, highlight, Resolution::Candidates(many.to_vec()));
                 None
             }
         }
@@ -2818,7 +3188,12 @@ impl<'a> BodyBinder<'a> {
     /// more surface and risk than this same-method version, for a
     /// narrower payoff. The current behavior is a false negative only (a
     /// missed reference/goto-target), never a wrong one.
-    fn bind_dynamic_soql_binds(&mut self, scope: ScopeId, call_node: &apex_syntax::SyntaxNode, arg: &Expr) {
+    fn bind_dynamic_soql_binds(
+        &mut self,
+        scope: ScopeId,
+        call_node: &apex_syntax::SyntaxNode,
+        arg: &Expr,
+    ) {
         let tokens = self.dynamic_soql_source_tokens(scope, call_node, arg, 0);
         // The SOQL-shape guard applies to the *whole* reconstructed query,
         // not each collected token individually -- a concatenated query
@@ -2927,9 +3302,21 @@ impl<'a> BodyBinder<'a> {
                 // order `lookup_member`'s own inherited-chain walk
                 // already gives a project ancestor over a further one.
                 let stdlib_fallback = matches!(resolution, Resolution::Unresolved)
-                    .then(|| stdlib_class_via_unresolved_supertype(self.table, self.stdlib, container))
+                    .then(|| {
+                        stdlib_class_via_unresolved_supertype(self.table, self.stdlib, container)
+                    })
                     .flatten()
-                    .and_then(|c| narrow_stdlib_overload(self.schema, self.stdlib, self.table, c, name, &arg_types).map(|m| (c, m)));
+                    .and_then(|c| {
+                        narrow_stdlib_overload(
+                            self.schema,
+                            self.stdlib,
+                            self.table,
+                            c,
+                            name,
+                            &arg_types,
+                        )
+                        .map(|m| (c, m))
+                    });
                 let (resolution, result_type) = match stdlib_fallback {
                     Some((c, winner)) => (
                         Resolution::StdlibMember(Box::new(stdlib_member_ref(
@@ -2959,6 +3346,7 @@ impl<'a> BodyBinder<'a> {
                         (resolution, result_type)
                     }
                 };
+                self.check_call_argument_types(&resolution, &arg_types, ptr);
                 self.refs.set_with_highlight(ptr, highlight, resolution);
                 result_type
             }
@@ -3023,8 +3411,16 @@ impl<'a> BodyBinder<'a> {
                             .flatten()
                             .filter(|c| StdlibIndex::methods_of(c, name).next().is_some())
                     });
-                let winner = method_class
-                    .and_then(|c| narrow_stdlib_overload(self.schema, self.stdlib, self.table, c, name, &arg_types));
+                let winner = method_class.and_then(|c| {
+                    narrow_stdlib_overload(
+                        self.schema,
+                        self.stdlib,
+                        self.table,
+                        c,
+                        name,
+                        &arg_types,
+                    )
+                });
                 // Only worth the `Vec` allocation when arity alone
                 // couldn't already have told a hover/signature-help
                 // consumer which overload this is -- a genuine
@@ -3040,11 +3436,14 @@ impl<'a> BodyBinder<'a> {
                 // below. `None` whenever it doesn't apply, or `winner`
                 // itself is ambiguous or missing a scraped param type.
                 let narrowed_param_types = method_class.zip(winner).and_then(|(c, m)| {
-                    let mut same_arity =
-                        StdlibIndex::methods_of(c, name).filter(|o| o.params.len() == arg_types.len());
+                    let mut same_arity = StdlibIndex::methods_of(c, name)
+                        .filter(|o| o.params.len() == arg_types.len());
                     same_arity.next()?;
                     same_arity.next()?; // fewer than two same-arity candidates -- arity alone already disambiguates
-                    m.params.iter().map(|p| p.type_name.clone()).collect::<Option<Vec<_>>>()
+                    m.params
+                        .iter()
+                        .map(|p| p.type_name.clone())
+                        .collect::<Option<Vec<_>>>()
                 });
                 let resolution = match method_class {
                     Some(c) => Resolution::StdlibMember(Box::new(stdlib_member_ref(
@@ -3067,11 +3466,32 @@ impl<'a> BodyBinder<'a> {
                 // outright wrong, not just unhelpful. See `bind_dynamic_soql_binds`'s
                 // own doc comment for what this actually does.
                 if base.eq_ignore_ascii_case("Database")
-                    && matches!(name.to_ascii_lowercase().as_str(), "query" | "countquery" | "getquerylocator")
+                    && matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "query" | "countquery" | "getquerylocator"
+                    )
                 {
                     if let Some(first_arg) = mc.args().and_then(|a| a.args().next()) {
                         self.bind_dynamic_soql_binds(scope, mc.syntax(), &first_arg);
                     }
+                }
+                // `SObject.clone(...)` called on a *concrete* object
+                // receiver (`anAccount.clone()`) returns that same
+                // concrete type, not the generic `SObject` its scraped
+                // signature declares -- confirmed against a real org
+                // (`Account a2 = anAccount.clone(true);` compiles) and
+                // exactly mirroring `generics.rs`'s own "same type as
+                // receiver" treatment for `List`/`Map`/`Set`'s
+                // `clone`/`deepClone`, just for the one instance member
+                // `SObject` itself declares this way (`getSObject`, the
+                // only other `SObject`-returning member, genuinely can
+                // return a *different* related object, so it's excluded).
+                // Gated on `self.schema.object` (a real object, not a name
+                // guess) so this can't misfire for an unrelated `Ty::System`
+                // receiver that merely reached the `SObject`-class method
+                // fallback some other way.
+                if name.eq_ignore_ascii_case("clone") && self.schema.object(&base).is_some() {
+                    return Some(Ty::system_owned(base.clone(), Vec::new()));
                 }
                 // `generics.rs` handles type-*argument substitution*
                 // (`List<Account>.get(0)` returning `Account`, not
@@ -3183,7 +3603,8 @@ impl<'a> BodyBinder<'a> {
             candidates
         };
 
-        let resolution = narrow_by_overload(self.schema, self.stdlib, self.table, candidates, &arg_types);
+        let resolution =
+            narrow_by_overload(self.schema, self.stdlib, self.table, candidates, &arg_types);
         // Never widened for `want_ctor`: a constructor call always
         // instantiates the exact named type, so there's no dynamic
         // dispatch to expand across (see `widen_for_dynamic_dispatch`'s
@@ -3198,6 +3619,7 @@ impl<'a> BodyBinder<'a> {
         // for the `this(...)`/`super(...)` case without needing a
         // separate `want_ctor` guard here.
         let result_type = self.result_type_of(&resolution);
+        self.check_call_argument_types(&resolution, &arg_types, ptr);
         self.refs.set_with_highlight(ptr, highlight, resolution);
         result_type
     }
@@ -3219,7 +3641,9 @@ impl<'a> BodyBinder<'a> {
         // `new List<Integer>()`'s target is `Ty::System` too, but never
         // takes `field = value` args).
         let sobject_name = match &resolved_type {
-            Some(Ty::System { name, .. }) if self.schema.object(name).is_some() => Some(name.clone()),
+            Some(Ty::System { name, .. }) if self.schema.object(name).is_some() => {
+                Some(name.clone())
+            }
             _ => None,
         };
         if let Some(args) = ne.args() {
@@ -3246,7 +3670,8 @@ impl<'a> BodyBinder<'a> {
                     })
                     .collect();
                 if !ctors.is_empty() {
-                    let resolution = narrow_by_overload(self.schema, self.stdlib, self.table, ctors, &arg_types);
+                    let resolution =
+                        narrow_by_overload(self.schema, self.stdlib, self.table, ctors, &arg_types);
                     // `new Outer.Inner(...)` names its constructor after
                     // the *last* segment (`Inner`) -- the type's own
                     // constructor, never `Outer`'s -- so this narrows to
@@ -3257,11 +3682,9 @@ impl<'a> BodyBinder<'a> {
                         .type_ref()
                         .and_then(|t| t.base_name_tokens().last().map(|tok| tok.text_range()))
                         .unwrap_or_else(|| ne.syntax().text_range());
-                    self.refs.set_with_highlight(
-                        SyntaxPtr::new(self.file, ne.syntax()),
-                        highlight,
-                        resolution,
-                    );
+                    let ptr = SyntaxPtr::new(self.file, ne.syntax());
+                    self.check_call_argument_types(&resolution, &arg_types, ptr);
+                    self.refs.set_with_highlight(ptr, highlight, resolution);
                 }
             }
         }
@@ -3271,7 +3694,20 @@ impl<'a> BodyBinder<'a> {
         if let Some(init) = ne.initializer() {
             self.bind_initializer_expr(scope, &init);
         }
-        resolved_type
+        // Legacy array-sugar `new` (`new Opportunity[0]`, `new
+        // Opportunity[]{...}`) constructs a `List<Opportunity>`, not an
+        // `Opportunity` -- `ne.type_ref()`'s own `Type` node never carries
+        // the `[]` itself here (see `NewExpr::is_array_new`'s doc comment),
+        // so without this `resolved_type` came out as the bare element
+        // type. Real bug this fixes: a `Opportunity[] newOpps1 = new
+        // Opportunity[0];` local declaration (real NPSP shape,
+        // `RLLP_OppRollup_TEST2.cls`) was flagged as assigning a bare
+        // `Opportunity` to a `List<Opportunity>`-typed variable.
+        if ne.is_array_new() {
+            resolved_type.map(|element| Ty::system_owned("List", vec![element]))
+        } else {
+            resolved_type
+        }
     }
 
     /// Resolves `field_name` (an SObject constructor field-init's LHS,

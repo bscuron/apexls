@@ -66,6 +66,7 @@ pub use reference_table::{
     ExternalKey, LabelRef, ReferenceTable, Resolution, SchemaObjectRef, StdlibMemberRef,
     UnknownSchemaRef, VisualforcePageRef,
 };
+pub use resolve::TypeMismatch;
 pub use label_index::LabelIndex;
 pub use page_index::{PageIndex, VisualforcePage};
 pub use schema_index::SchemaIndex;
@@ -718,6 +719,7 @@ impl BoundProgram {
                 let mut file_bodies = incremental::FileBodies {
                     refs: ReferenceTable::default(),
                     scopes: FxHashMap::with_capacity_and_hasher(bodies.len(), Default::default()),
+                    type_mismatches: Vec::new(),
                 };
                 for (key, body) in bodies {
                     let remap = |id: SymbolId| resolve::remap_local_id(id, base);
@@ -727,6 +729,7 @@ impl BoundProgram {
                     if let Some(key) = key {
                         file_bodies.scopes.insert(key, scopes);
                     }
+                    file_bodies.type_mismatches.extend(body.type_mismatches);
                     base += body.pending_locals.len() as u32;
                     extra_symbols.extend(body.pending_locals);
                 }
@@ -809,6 +812,15 @@ impl BoundProgram {
     /// recorded" behavior.
     pub fn syntax_errors(&self, file: FileId) -> &[ParseError] {
         self.parses.get(&file).map_or(&[], |p| &p.errors)
+    }
+
+    /// Every provable type-checking defect found inline while binding
+    /// `file`'s bodies -- see [`resolve::TypeMismatch`]'s own doc comment
+    /// (Wayfinder `apex-diagnostics` map, ticket 23). Empty for a file
+    /// with no bound bodies at all, matching every other `self.bodies`-backed
+    /// lookup's "nothing recorded" behavior.
+    pub fn type_mismatches(&self, file: FileId) -> &[resolve::TypeMismatch] {
+        self.bodies.get(&file).map_or(&[], |fb| &fb.type_mismatches)
     }
 
     pub fn file_count(&self) -> usize {

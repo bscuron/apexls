@@ -92983,10 +92983,10 @@
       {
         "anchor_id": "apex_System_Search_query",
         "name": "query",
-        "signature": "public static sObject[sObject[]] query(String\nquery)",
+        "signature": "public static List<List<SObject>> query(String\nquery)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "sObject",
+        "return_type": "List<List<SObject>>",
         "params": [
           {
             "name": "query",
@@ -93001,7 +93001,7 @@
         "signature": "public static\n          List<List<SObject>> query(String query, System.AccessLevel\n      accessLevel)",
         "is_static": true,
         "visibility": "public",
-        "return_type": "sObject",
+        "return_type": "List<List<SObject>>",
         "params": [
           {
             "name": "query",
