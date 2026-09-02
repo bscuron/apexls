@@ -6,7 +6,7 @@
 //! caller that wants both never pays for reading the same directory
 //! tree twice.
 
-use crate::xml::parse_field_meta;
+use crate::xml::{parse_field_meta, parse_object_meta_name_field};
 use crate::{FieldSchema, SObjectSchema};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -42,6 +42,15 @@ pub fn sobjects_from_discovery(found: &apex_discover::Discovery) -> Vec<SObjectS
             let entry = objects.entry(api_name).or_default();
             entry.is_custom = true;
             entry.object_path = Some(path.clone());
+            // The object's own implicit `Name` field -- see
+            // `parse_object_meta_name_field`'s own doc comment for why
+            // this is the one field never covered by a separate
+            // `fields/*.field-meta.xml` file.
+            if let Some(name_field) =
+                std::fs::read_to_string(path).ok().and_then(|xml| parse_object_meta_name_field(&xml, path.clone()))
+            {
+                entry.fields.push(name_field);
+            }
         }
     }
 

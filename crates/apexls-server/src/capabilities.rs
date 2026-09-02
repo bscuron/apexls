@@ -1350,6 +1350,70 @@ pub(crate) fn unresolved_reference_diagnostics(
         .collect()
 }
 
+/// `textDocument/publishDiagnostics`: one `ERROR`-severity diagnostic per
+/// `Resolution::UnknownSchema` recorded for `file` -- already computed
+/// during Pass 2 (`crate::soql`/`schema_index::resolve_object`) whenever a
+/// SOQL/SOSL query names an object or field with no matching local or
+/// standard schema entry (`FROM Unknown_Object__c`, a bad
+/// `WHERE`/`SELECT`/`ORDER BY` field, an unresolvable `TYPEOF ... WHEN`
+/// type). Same story as `unresolved_reference_diagnostics`: purely
+/// surfacing data the binder already computes, no new analysis.
+///
+/// Scoped specifically to `ptr.kind() == SyntaxKind::SoqlFieldName` --
+/// every genuine SOQL/SOSL object-or-field reference (`SoqlFromList`'s
+/// entries, a select/where/order-by/group-by field name, a
+/// `SoslFieldSpec`'s object, a `TYPEOF ... WHEN`'s type name) is, per
+/// `apex-syntax`'s own AST (`SoqlFromList::entries`/`SoslFieldSpec::object`
+/// both literally return `SoqlFieldName`), that one node kind --
+/// deliberately excluding `Resolution::UnknownSchema`'s two *other*
+/// producers in `crate::resolve`, neither of which is SOQL or an error:
+/// `bind_field_expr`'s `<Object>.fields`/`<Object>.fields.<Field>`
+/// describe-token hop (`fields` is real, compiler-magic Apex syntax, not a
+/// genuine field -- surfacing it here would misfire on every legitimate
+/// `Schema.SObjectField f = Account.fields.Name;`-shaped expression, a
+/// guaranteed false positive) and `bind_sobject_field_init`'s SObject-
+/// constructor field-init check (a real, separate gap, out of this
+/// diagnostic's scope -- see the Wayfinder map's fog for the follow-on).
+pub(crate) fn unknown_schema_diagnostics(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<Diagnostic> {
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+    program
+        .resolutions_in_file(file)
+        .filter(|(ptr, res)| {
+            ptr.kind() == SyntaxKind::SoqlFieldName && matches!(res, Resolution::UnknownSchema(_))
+        })
+        .map(|(ptr, res)| {
+            let Resolution::UnknownSchema(schema_ref) = res else {
+                unreachable!("filtered to Resolution::UnknownSchema above")
+            };
+            let range = program.highlight_range(*ptr);
+            let lsp_range = Range {
+                start: index.to_position(&text, range.start().into(), encoding),
+                end: index.to_position(&text, range.end().into(), encoding),
+            };
+            let message = match (&schema_ref.object, &schema_ref.field) {
+                (Some(object), Some(field)) => {
+                    format!("'{field}' is not a valid field on object '{object}'")
+                }
+                (Some(object), None) => format!("'{object}' is not a valid object"),
+                (None, Some(field)) => format!("'{field}' is not a valid field"),
+                (None, None) => "unresolvable schema reference".to_string(),
+            };
+            Diagnostic {
+                range: lsp_range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("apexls".to_string()),
+                message,
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
 /// `textDocument/publishDiagnostics`: one `WARNING`-severity diagnostic
 /// per symbol `apex_binder::dead_symbols_in_file` proves is dead, tagged
 /// `DiagnosticTag::UNNECESSARY` -- the standard LSP tag for "safe to

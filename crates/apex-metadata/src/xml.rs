@@ -31,6 +31,39 @@ pub(crate) fn parse_field_meta(xml: &str, source_path: PathBuf) -> Option<FieldS
     })
 }
 
+/// A custom object's own implicit `Name` field -- unlike every other
+/// field, Salesforce never gives it its own `fields/Name.field-meta.xml`
+/// file; it's declared once, on the *object*, via `.object-meta.xml`'s
+/// own `<nameField>` block (`<type>Text</type>` or `<type>AutoNumber</type>`),
+/// confirmed directly against a real scraped fixture (`Level__c.object-meta.xml`
+/// in the NPSP corpus: `<nameField><label>Level Name</label><type>Text</type></nameField>`,
+/// no corresponding `fields/Name.field-meta.xml` anywhere under that
+/// object). Every real custom object has exactly one, so this is a real,
+/// always-present field -- distinct from `apex_binder::schema_index`'s
+/// `universal_field` fallback (`Id`/`OwnerId`/...), which is deliberately
+/// scoped to fields absent from *every* object's own real field list
+/// (including standard objects, most of which already declare a real
+/// `Name` entry in the bundled snapshot) -- `Name` isn't one of those,
+/// it's a custom-object-specific gap in what this discovery step reads
+/// out of `.object-meta.xml`, not a truly universal field. `None` for a
+/// standard object's own `.object-meta.xml` (customized standard objects
+/// never redeclare `nameField`) or malformed XML, matching
+/// `parse_field_meta`'s own `None`-on-missing/malformed convention.
+pub(crate) fn parse_object_meta_name_field(xml: &str, source_path: PathBuf) -> Option<FieldSchema> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    let root = doc.root_element();
+    let name_field = root
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "nameField")?;
+    let field_type = child_text(name_field, "type").map(SmolStr::new);
+    Some(FieldSchema {
+        api_name: SmolStr::new_static("Name"),
+        field_type,
+        reference_to: Vec::new(),
+        source_path: Some(source_path),
+    })
+}
+
 /// A `CustomLabels.labels-meta.xml` file's root holds *many* `<labels>`
 /// children, one per declared label -- unlike `.field-meta.xml`, whose
 /// whole document is a single field, so this returns a `Vec` rather than
@@ -160,5 +193,35 @@ mod tests {
     #[test]
     fn malformed_labels_xml_yields_an_empty_vec() {
         assert!(parse_labels_meta("not xml at all", Path::new("x.labels-meta.xml")).is_empty());
+    }
+
+    /// Real shape, from the NPSP corpus's `Level__c.object-meta.xml`.
+    #[test]
+    fn parses_a_custom_objects_implicit_name_field_from_its_name_field_block() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Level</label>
+    <nameField>
+        <label>Level Name</label>
+        <trackHistory>false</trackHistory>
+        <type>Text</type>
+    </nameField>
+    <pluralLabel>Levels</pluralLabel>
+</CustomObject>"#;
+        let field = parse_object_meta_name_field(xml, PathBuf::from("Level__c.object-meta.xml")).unwrap();
+        assert_eq!(field.api_name, "Name");
+        assert_eq!(field.field_type.as_deref(), Some("Text"));
+        assert!(field.reference_to.is_empty());
+    }
+
+    #[test]
+    fn a_standard_objects_object_meta_xml_with_no_name_field_block_yields_none() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fieldSets>
+        <fullName>MyFieldSet</fullName>
+    </fieldSets>
+</CustomObject>"#;
+        assert!(parse_object_meta_name_field(xml, PathBuf::from("Account.object-meta.xml")).is_none());
     }
 }
