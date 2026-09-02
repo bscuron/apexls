@@ -1,0 +1,12 @@
+Type: grilling
+Status: open
+Blocked by: 18
+
+## Question
+
+Given [ticket 18](18-stdlib-interface-extension-research.md)'s findings, decide whether and how to extend [the missing-implementation diagnostic](17-missing-interface-impl-implement-task.md) to standard-library interfaces. Resolve, with the user:
+
+- **Worth it given the real gaps found?** 121 of 324 NPSP classes with an `implements` clause name a real stdlib interface (real payoff), but three concrete blockers exist: the bundled stdlib snapshot is missing `Messaging.InboundEmailHandler`/`Database.Stateful`/`Database.AllowsCallouts` entirely; `StdlibClass` dropped its raw `kind` field so a stdlib interface can't be distinguished from a stdlib class today; and `execute()` collides in name/arity across `Schedulable`/`Queueable`/`Finalizer`, needing type-aware matching. Is this worth taking on now, or does it stay deferred until the scraper/stdlib gaps are closed some other way?
+- **The `SymbolTable`/`resolve_inheritance` change.** Ticket 18 found `inherit.rs:56-63` already computes the resolved/unresolved split and just discards it via `filter_map` -- the minimal fix is a `partition` instead, recording rejected names via a new `set_unresolved_supertypes` mirroring the existing `set_unresolved_direct_super`. It also found `raw_extends` conflates `extends`/`implements` origin (position-only, fragile) -- does fixing that properly (tagging each name's clause origin at collection time) happen as part of this work, or is the position-based workaround (subtract the already-known direct-`extends` name) acceptable for v1?
+- **The pre-existing nested-interface gap ticket 18 found as a side effect.** A class implementing its *own* nested interface (`fflib_Inheritor`/`fflib_Criteria`/`fflib_MyList` in real NPSP) doesn't resolve today because `resolve_dotted_name_from` never checks a top-level type's own nested members. Small in volume (3 real cases) but a real, separate bug -- fix it in the same pass since it shares the exact code path, or ticket it separately?
+- **Verification strategy**, given ticket 18's own finding that this is inherently unvalidatable via corpus sampling (the real compiler already rejects incomplete stdlib-interface implementations at deploy time, so no real NPSP file can ever exhibit the bug this diagnostic would catch) -- hand-authored fixtures only, mirroring how tickets 14/15 already accepted this same tradeoff for `finally`/`switch`?
