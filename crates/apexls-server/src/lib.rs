@@ -556,8 +556,9 @@ fn spawn_rebuild_worker(
 /// Combines every diagnostic source (currently `syntax_error_diagnostics`,
 /// `dead_code_diagnostics`, `unresolved_reference_diagnostics`,
 /// `unknown_schema_diagnostics`, `modifier_diagnostics`,
-/// `bulkification_diagnostics`, and `unreachable_code_diagnostics`) into
-/// *one* notification per file --
+/// `bulkification_diagnostics`, `unreachable_code_diagnostics`, and
+/// `missing_implementation_diagnostics`) into *one* notification per
+/// file --
 /// `textDocument/publishDiagnostics` replaces a client's whole diagnostic
 /// set for a URI on every notification rather than merging with the
 /// previous one, so sending two separate notifications for the same file
@@ -582,6 +583,7 @@ fn publish_diagnostics(bind: &BindState, client: &ClientSocket, encoding: Positi
         diagnostics.extend(capabilities::modifier_diagnostics(program, file, encoding));
         diagnostics.extend(capabilities::bulkification_diagnostics(program, file, encoding));
         diagnostics.extend(capabilities::unreachable_code_diagnostics(program, file, encoding));
+        diagnostics.extend(capabilities::missing_implementation_diagnostics(program, file, encoding));
         let _ = client.notify::<lsp_types::notification::PublishDiagnostics>(PublishDiagnosticsParams {
             uri,
             diagnostics,

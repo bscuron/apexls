@@ -1818,6 +1818,163 @@ pub(crate) fn unreachable_code_diagnostics(
     diagnostics
 }
 
+/// Whether some method reachable from `class_id` (the class itself, or
+/// any ancestor in its `inherited_chain`) already provides the required
+/// `(name_lower, arity)` signature -- the satisfaction half of
+/// `missing_implementation_diagnostics` (Wayfinder `apex-diagnostics`
+/// map, ticket 07's design/ticket 17's implementation). Two different
+/// rules collapse into one scan, gated by `needs_override` (per-key, set
+/// by whichever ancestor(s) require it -- see that function's own
+/// `required` map construction): an interface-required method just needs
+/// *any* real (non-abstract) same-name/same-arity method anywhere in the
+/// chain; an abstract-superclass-required one needs `modifiers.is_override`
+/// specifically, matching Apex's own real asymmetry (confirmed against
+/// this project's existing `dynamic_dispatch_resolution.rs` fixtures: no
+/// real Apex requires `override` to satisfy an `implements`, only an
+/// `extends`). An interface's own member is never itself a satisfier
+/// (it's a requirement, not a provision) -- excluded by skipping any
+/// container whose own `kind` is `Interface` before scanning its members.
+fn has_required_override(
+    program: &BoundProgram,
+    class_id: SymbolId,
+    name_lower: &str,
+    arity: usize,
+    needs_override: bool,
+) -> bool {
+    let mut containers = vec![class_id];
+    containers.extend(program.symbols.inherited_chain(class_id).iter().copied());
+    containers.into_iter().any(|container_id| {
+        if program.symbols.get(container_id).kind == SymbolKind::Interface {
+            return false;
+        }
+        program.symbols.members_of(container_id).iter().any(|&member_id| {
+            let member = program.symbols.get(member_id);
+            member.kind == SymbolKind::Method
+                && !member.modifiers.is_abstract
+                && member.name.eq_ignore_ascii_case(name_lower)
+                && program.symbols.params(member_id).len() == arity
+                && (!needs_override || member.modifiers.is_override)
+        })
+    })
+}
+
+/// `textDocument/publishDiagnostics`: one `ERROR`-severity diagnostic per
+/// abstract/interface method a concrete project-local class fails to
+/// implement (Wayfinder `apex-diagnostics` map, ticket 07's design/
+/// ticket 17's implementation). Scoped to **project-local** interfaces/
+/// abstract classes only -- `SymbolTable` never resolves a standard-
+/// library `implements` target (`Comparable`, `Database.Batchable`, ...)
+/// into `inherited_chain` at all (confirmed in ticket 06's own research),
+/// so this check simply never sees those requirements; a class correctly
+/// implementing (or botching) a stdlib interface is silently outside its
+/// scope either way, never a false positive (see
+/// `crates/apex-diagnostics/issues/18-...` for the follow-on that would
+/// extend coverage there, which needs real `apex-binder`-core changes
+/// this ticket deliberately doesn't attempt).
+///
+/// Bridges from the syntax tree to the symbol table via
+/// `BoundProgram::symbol_at` (a `ClassDecl`'s own name-token offset ->
+/// its `SymbolId`) rather than any `pub(crate)`-only per-file symbol
+/// listing, since this diagnostic -- unlike every other one in this
+/// file -- needs real symbol-table data (`inherited_chain`/`members_of`/
+/// `params`), not just the raw syntax tree.
+///
+/// For each concrete (non-abstract) class, walks `inherited_chain` once
+/// to build a `(name, arity) -> requirement` map (a method is "required"
+/// when `is_abstract || its container is an Interface`, since interface
+/// methods are implicitly abstract without the modifier bit ever being
+/// set -- ticket 06's own finding), tightening `needs_override` to `true`
+/// only for an abstract-class-declared requirement whose own visibility
+/// is explicit (`Public`/`Protected`/`Global`) -- confirmed against a
+/// real org, not assumed: `abstract String run();` with **no** visibility
+/// keyword (a real, common shape -- `fflib_SObjectSelector.cls`'s own
+/// `getSObjectType`/`getSObjectFieldList`, both real NPSP code) can be
+/// overridden with no `override` keyword and deploys cleanly, while the
+/// identical shape with an explicit `public abstract` modifier is
+/// rejected with `"Method must use the override keyword"` if the
+/// override omits it. `ModifierSet`'s own `Visibility::default()` is
+/// `Private` (`crates/apex-binder/src/symbol.rs:73-79`), which is
+/// exactly the value an unmodified declaration already collapses to, so
+/// this reuses that existing signal rather than needing a new one.
+/// Interface-declared requirements never need `override` regardless
+/// (unaffected by this). When a same-signature requirement comes from
+/// *both* an interface and an abstract class (a rare collision), the
+/// stricter (override-requiring) rule wins, the conservative choice.
+/// Method-level dedup across multiple interfaces requiring the same
+/// name+arity falls out for free from keying by `(name, arity)` rather
+/// than per-ancestor.
+pub(crate) fn missing_implementation_diagnostics(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<Diagnostic> {
+    let root = program.syntax(file);
+    let text = root.text().to_string();
+    let index = LineIndex::new(&text);
+
+    let diagnostic = |range: TextRange, message: String| Diagnostic {
+        range: Range {
+            start: index.to_position(&text, range.start().into(), encoding),
+            end: index.to_position(&text, range.end().into(), encoding),
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("apexls".to_string()),
+        message,
+        ..Default::default()
+    };
+
+    let mut diagnostics = Vec::new();
+    for node in root.descendants() {
+        if node.kind() != SyntaxKind::ClassDecl {
+            continue;
+        }
+        let Some(class_decl) = ClassDecl::cast(node) else {
+            continue;
+        };
+        let Some(name_tok) = class_decl.name().and_then(|n| n.token()) else {
+            continue;
+        };
+        let Some(class_id) = program.symbol_at(file, name_tok.text_range().start()) else {
+            continue;
+        };
+        let symbol = program.symbols.get(class_id);
+        if symbol.kind != SymbolKind::Class || symbol.modifiers.is_abstract {
+            continue;
+        }
+
+        // (name_lower, arity) -> (needs_override, ancestor's own name, method's own declared-case name)
+        let mut required: HashMap<(String, usize), (bool, String, String)> = HashMap::new();
+        for &ancestor_id in program.symbols.inherited_chain(class_id) {
+            let ancestor = program.symbols.get(ancestor_id);
+            let from_interface = ancestor.kind == SymbolKind::Interface;
+            for &member_id in program.symbols.members_of(ancestor_id) {
+                let member = program.symbols.get(member_id);
+                if member.kind != SymbolKind::Method || !(member.modifiers.is_abstract || from_interface) {
+                    continue;
+                }
+                let arity = program.symbols.params(member_id).len();
+                let key = (member.name.to_ascii_lowercase(), arity);
+                let needs_override = !from_interface && member.modifiers.visibility != Visibility::Private;
+                required
+                    .entry(key)
+                    .and_modify(|(existing, _, _)| *existing |= needs_override)
+                    .or_insert((needs_override, ancestor.name.to_string(), member.name.to_string()));
+            }
+        }
+
+        for ((name_lower, arity), (needs_override, ancestor_name, method_name)) in &required {
+            if has_required_override(program, class_id, name_lower, *arity, *needs_override) {
+                continue;
+            }
+            diagnostics.push(diagnostic(
+                name_tok.text_range(),
+                format!("'{}' does not implement '{method_name}' required by '{ancestor_name}'", symbol.name),
+            ));
+        }
+    }
+    diagnostics
+}
+
 /// `textDocument/publishDiagnostics`: one `WARNING`-severity diagnostic
 /// per symbol `apex_binder::dead_symbols_in_file` proves is dead, tagged
 /// `DiagnosticTag::UNNECESSARY` -- the standard LSP tag for "safe to
