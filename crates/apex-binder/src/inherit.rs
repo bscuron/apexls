@@ -37,8 +37,7 @@ pub(crate) fn resolve_inheritance(
     let resolved_super: Vec<(SymbolId, Result<SymbolId, SmolStr>)> = raw_super
         .par_iter()
         .map(|(type_id, name)| {
-            let from = table.get(*type_id).container;
-            (*type_id, table.resolve_dotted_name_from(name, from).ok_or_else(|| name.clone()))
+            (*type_id, resolve_supertype_name(table, *type_id, name).ok_or_else(|| name.clone()))
         })
         .collect();
     for (type_id, resolved) in resolved_super {
@@ -56,8 +55,7 @@ pub(crate) fn resolve_inheritance(
     let direct: FxHashMap<SymbolId, Vec<SymbolId>> = raw_extends
         .par_iter()
         .map(|(type_id, names)| {
-            let from = table.get(*type_id).container;
-            let resolved = names.iter().filter_map(|n| table.resolve_dotted_name_from(n, from)).collect();
+            let resolved = names.iter().filter_map(|n| resolve_supertype_name(table, *type_id, n)).collect();
             (*type_id, resolved)
         })
         .collect();
@@ -90,6 +88,37 @@ pub(crate) fn resolve_inheritance(
     for (type_id, chain) in subtypes {
         table.set_subtypes(type_id, chain);
     }
+}
+
+/// Resolves one `extends`/`implements` name declared *on* `type_id`
+/// itself. Checks `type_id`'s own directly-declared nested types first
+/// (a real, confirmed gap this closes: `resolve_dotted_name_from`'s own
+/// upward walk starts at `type_id`'s *container*, so a top-level type
+/// implementing an interface declared as its own nested member --
+/// `class Foo implements Inner { interface Inner {...} }`, real NPSP
+/// shape in `fflib_Inheritor`/`fflib_Criteria`/`fflib_MyList` -- was
+/// previously indistinguishable from a genuinely unresolvable name,
+/// since a top-level type's own `container` is `None`, so the walk
+/// never even starts). Deliberately checked via the direct,
+/// `inherited_chain`-independent [`SymbolTable::nested_type`] rather
+/// than [`SymbolTable::nested_type_visible_from`] (which additionally
+/// consults `inherited_chain`): `inherited_chain` is exactly what this
+/// function's caller, [`resolve_inheritance`], is in the middle of
+/// computing, so it's empty for every type at this point in the
+/// pipeline -- reaching for it here would silently no-op, not search
+/// ancestors. Falls back to the existing `resolve_dotted_name_from`
+/// walk (the type's *container* chain, then a project-wide top-level
+/// lookup) exactly as before when `type_id` has no matching nested type
+/// of its own, or `name` is dotted (a nested type is only ever named
+/// unqualified from within its own declaring type).
+fn resolve_supertype_name(table: &SymbolTable, type_id: SymbolId, name: &str) -> Option<SymbolId> {
+    if !name.contains('.') {
+        if let Some(id) = table.nested_type(type_id, name) {
+            return Some(id);
+        }
+    }
+    let from = table.get(type_id).container;
+    table.resolve_dotted_name_from(name, from)
 }
 
 /// Every `SymbolId` transitively reachable from `type_id` via `direct`,

@@ -318,6 +318,91 @@ fn a_class_implementing_its_own_nested_interface_gets_it_in_its_inherited_chain(
     );
 }
 
+/// The *bare*, unqualified-name counterpart to the test just above --
+/// real NPSP shape (`fflib_Inheritor implements IA, IB, IC`, each a
+/// nested interface declared directly on `fflib_Inheritor` itself),
+/// found via a Wayfinder `apex-diagnostics` map research ticket (18) and
+/// fixed via `inherit::resolve_supertype_name` (ticket 22). Genuinely
+/// different from the qualified (`Outer.Inner`) case: a bare name took
+/// an entirely different code path in `resolve_dotted_name_from` (an
+/// upward walk starting at the type's own *container*, `None` for a
+/// top-level type, so the type's own nested members were never
+/// consulted at all) than a dotted name did (`resolve_dotted_name`'s
+/// segment-by-segment walk, which already worked because the first
+/// segment resolves the class itself via `top_level`).
+#[test]
+fn a_class_implementing_its_own_nested_interface_by_bare_unqualified_name_gets_it_in_its_inherited_chain() {
+    let dir = write_fixture_dir(
+        "nested-interface-self-implements-unqualified",
+        &[(
+            "Foo.cls",
+            "public class Foo implements Inner { \
+             public interface Inner { void run(); } \
+             public void run() { } \
+         }",
+        )],
+    );
+
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let class_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Class && s.name == "Foo")
+        .map(|(id, _)| id)
+        .expect("Foo should have been collected");
+    let iface_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Interface && s.name == "Inner")
+        .map(|(id, _)| id)
+        .expect("Inner should have been collected");
+
+    assert!(
+        program.symbols.inherited_chain(class_id).contains(&iface_id),
+        "Foo's inherited chain should include its own nested Inner interface, referenced unqualified"
+    );
+}
+
+/// Same fix (`inherit::resolve_supertype_name`), the `extends`/`direct_super`
+/// code path instead of `implements`/`inherited_chain` -- a class
+/// extending its own nested abstract class by bare unqualified name.
+#[test]
+fn a_class_extending_its_own_nested_abstract_class_by_bare_unqualified_name_resolves_direct_super() {
+    let dir = write_fixture_dir(
+        "nested-abstract-self-extends-unqualified",
+        &[(
+            "Foo.cls",
+            "public class Foo extends Base { \
+             public abstract class Base { } \
+         }",
+        )],
+    );
+
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let class_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Class && s.name == "Foo")
+        .map(|(id, _)| id)
+        .expect("Foo should have been collected");
+    let base_id = program
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Class && s.name == "Base")
+        .map(|(id, _)| id)
+        .expect("Base should have been collected");
+
+    assert_eq!(
+        program.symbols.direct_super(class_id),
+        Some(base_id),
+        "Foo's direct_super should resolve to its own nested Base class, referenced unqualified"
+    );
+}
+
 /// A call resolved against a plain, non-`virtual`/`abstract`/`override`
 /// concrete method must stay a single `Resolved` -- Apex forbids
 /// overriding such a method at all, so there's no real dynamic-dispatch

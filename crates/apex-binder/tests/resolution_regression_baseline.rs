@@ -698,7 +698,37 @@ fn corpus_root() -> PathBuf {
 ///     `BASELINE_RESOLVED` unaffected (`207_776` unchanged -- a schema
 ///     field/stdlib member reference lands in the untallied
 ///     `Resolution::SchemaObject`/`StdlibMember` bucket, not `Resolved`).
-const BASELINE_RESOLVED: usize = 207_776;
+/// 25. `inherit::resolve_supertype_name` (Wayfinder `apex-diagnostics`
+///     map, ticket 18's research / ticket 22's fix): a class implementing
+///     or extending its own nested type by *bare, unqualified* name
+///     (`class Foo implements Inner { interface Inner {...} }`) previously
+///     resolved as if the name were entirely unknown -- `resolve_dotted_name_from`'s
+///     upward walk starts at the type's own *container*, `None` for a
+///     top-level type, so the type's own nested members were never
+///     consulted. Real NPSP shape, 7 sites across 5 classes:
+///     `fflib_Criteria implements Evaluator`, `UTIL_Currency`/
+///     `UTIL_CurrencyCache implements Interface_x`, `fflib_MyList implements IList`,
+///     `fflib_Inheritor implements IA, IB, IC`. Fixed by checking a
+///     type's own direct nested types first (via the `inherited_chain`-independent
+///     `SymbolTable::nested_type`, since `inherited_chain` is exactly
+///     what this pass is in the middle of computing) before falling back
+///     to the existing container-upward walk.
+///
+///     `BASELINE_RESOLVED` dropped -873 (`207_776` -> `206_903`) --
+///     expected, not a regression, matching entry 8a's own precedent for
+///     a legitimate `Resolved` -> `Candidates` shift: `fflib_Criteria`'s
+///     `Evaluator`/`FormulaEvaluator` composite pattern (a real,
+///     recursively-called tree structure, confirmed in ticket 11's own
+///     research) is now correctly known as one of `Evaluator`'s real
+///     implementors for dynamic-dispatch widening, so calls through an
+///     `Evaluator`-typed value that used to resolve to a single,
+///     artificially-confident candidate (because this binder didn't yet
+///     know `fflib_Criteria` itself implemented the interface it's
+///     recursively built from) now honestly widen to `Resolution::Candidates`
+///     across every real implementor -- more accurate, not less.
+///     `BASELINE_UNRESOLVED` unaffected (confirmed: the shift lands in
+///     `Candidates`, untallied by either counter, not `Unresolved`).
+const BASELINE_RESOLVED: usize = 206_903;
 const BASELINE_UNRESOLVED: usize = 5_538;
 
 #[test]
