@@ -348,6 +348,15 @@ fn value(p: &mut Parser<'_>) -> CompletedMarker {
                 if p.at(SyntaxKind::IntegerLiteral) {
                     p.bump();
                 }
+            } else if p.at(SyntaxKind::NumberLiteral) {
+                // The lexer unconditionally merges a `.` immediately
+                // followed by a digit into one leading-dot `NumberLiteral`
+                // (`lib.rs`'s main dispatch has no lookback to the
+                // preceding token), so the realistic "has cents" case
+                // (`USD100.50`) never actually produces a separate
+                // `Dot`/`IntegerLiteral` pair -- only a currency literal
+                // followed by a bare `.` with nothing after it does.
+                p.bump();
             }
         }
         SyntaxKind::Colon => {

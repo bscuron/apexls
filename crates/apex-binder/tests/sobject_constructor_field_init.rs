@@ -11,7 +11,7 @@
 //! already does for `object.field` access.
 
 use apex_binder::{BoundProgram, Resolution, SchemaObjectRef, UnknownSchemaRef};
-use apex_syntax::ast::expr::NameExpr;
+use apex_syntax::ast::expr::{FieldExpr, NameExpr};
 use rowan::ast::AstNode;
 
 fn write_fixture_dir(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
@@ -225,4 +225,81 @@ fn a_field_name_matching_an_in_scope_local_still_resolves_as_the_schema_field() 
         resolutions.iter().any(|r| matches!(r, Resolution::Resolved(_))),
         "the RHS `CloseDate` local-variable read should still resolve normally: {resolutions:?}"
     );
+}
+
+/// `crate::resolve::sobject_field_init` only ever recognizes a *bare*
+/// identifier LHS (`field = value`) -- a dotted LHS like `acc.Name =
+/// 'x'` isn't valid Apex constructor-sugar syntax, but the shared
+/// `arg_list` grammar still parses it as an ordinary `Expr::Bin`
+/// argument (see this file's own module doc comment on why the grammar
+/// can't distinguish the two shapes itself). `bind_new_expr` must fall
+/// back to binding the whole argument as an ordinary expression in that
+/// case, not treat `Name` as a field-init LHS against the *constructor's*
+/// target object (`Contact`) -- it should instead resolve against `acc`'s
+/// own type (`Account`), the same as any other `object.field` access.
+#[test]
+fn a_dotted_lhs_falls_back_to_ordinary_field_access_against_its_own_receiver() {
+    let dir = write_fixture_dir(
+        "sobject-ctor-dotted-lhs",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+                 public void run() { \
+                     Account acc = new Account(); \
+                     Contact c = new Contact(acc.Name = 'x'); \
+                 } \
+             }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let mut member_resolution = None;
+    'outer: for file in program.files() {
+        let root = program.syntax(file);
+        for fe in root.descendants().filter_map(FieldExpr::cast) {
+            if fe.member_token().is_some_and(|t| t.text() == "Name") {
+                let ptr = apex_binder::SyntaxPtr::new(file, fe.syntax());
+                member_resolution = program.resolution(ptr).cloned();
+                break 'outer;
+            }
+        }
+    }
+
+    assert_eq!(
+        member_resolution,
+        Some(Resolution::SchemaObject(Box::new(SchemaObjectRef {
+            object: "Account".into(),
+            field: Some("Name".into()),
+        }))),
+        "a dotted LHS should resolve against its own receiver's type (Account), \
+         not get swallowed by the field-init sugar against the constructor's \
+         target type (Contact): {member_resolution:?}"
+    );
+}
+
+/// A truncated field-init pair (`field = ` with nothing after the `=`,
+/// e.g. mid-edit in a real editor) must not panic the binder -- the
+/// `BinExpr`'s `rhs()` is genuinely absent from the parsed tree in this
+/// case (error recovery leaves a hole), and `sobject_field_init` needs to
+/// degrade to `None` cleanly rather than unwrapping it.
+#[test]
+fn a_field_init_with_a_missing_rhs_does_not_panic() {
+    let dir = write_fixture_dir(
+        "sobject-ctor-missing-rhs",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+                 public void run() { \
+                     Contact c = new Contact(LastName = ); \
+                 } \
+             }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    // The real assertion is simply that binding the file above didn't
+    // panic; also confirm the file was at least discovered and bound.
+    assert!(program.files().next().is_some());
 }

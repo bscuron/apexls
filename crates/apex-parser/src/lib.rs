@@ -35,8 +35,8 @@ mod grammar;
 mod input;
 mod parser;
 
-pub use errors::{Parse, ParseError};
 pub use apex_syntax::NodeCache;
+pub use errors::{Parse, ParseError};
 
 use input::Input;
 use parser::Parser;
@@ -172,6 +172,54 @@ mod tests {
     use crate::input::Input;
     use crate::parser::Parser;
     use apex_syntax::SyntaxKind;
+
+    /// `Parser::bump_if_no_progress` -- the infinite-loop guard every
+    /// `parse_list`-driven loop relies on for input no sub-parser can
+    /// make progress on. A stray `)` inside a class body reaches it: it
+    /// isn't a `;`/`{`/`static {`, so `class_body_decl` delegates to
+    /// `member_decl`, which fails to parse any member declaration there
+    /// and returns without consuming anything.
+    #[test]
+    fn a_token_no_sub_parser_can_consume_is_force_consumed_as_an_error_node() {
+        let src = "public class Foo { ) }";
+        let parse = parse_compilation_unit(src);
+        assert!(
+            parse
+                .errors
+                .iter()
+                .any(|e| e.message.contains("unexpected")),
+            "expected an \"unexpected ...\" recovery error: {:?}",
+            parse.errors
+        );
+        assert_eq!(
+            parse.syntax().text().to_string(),
+            src,
+            "recovery must still keep the tree lossless"
+        );
+    }
+
+    /// `Parser::prev_token_end`'s `pos == 0` branch -- reached only when
+    /// an `expect` fails as the very first parser action, before
+    /// anything has been consumed yet (so there's no previous token to
+    /// point the "missing token" diagnostic after).
+    #[test]
+    fn a_missing_token_at_the_very_start_of_input_does_not_panic() {
+        let parse = parse_block("");
+        assert!(!parse.errors.is_empty(), "expected a missing-LBrace error");
+    }
+
+    /// `Parse::ok`/its `Debug` impl -- no other test in this crate ever
+    /// calls either directly (everything else inspects `.errors` itself).
+    #[test]
+    fn parse_ok_and_debug_reflect_error_state() {
+        let clean = parse_expression("a");
+        assert!(clean.ok());
+        let broken = parse_expression("a +");
+        assert!(!broken.ok());
+        let debug_text = format!("{broken:?}");
+        assert!(debug_text.contains("Parse"));
+        assert!(debug_text.contains("errors"));
+    }
 
     /// Smoke test for the core machinery (input -> parser -> events ->
     /// sink), independent of any real grammar: parse a single identifier
@@ -341,6 +389,40 @@ mod tests {
         }
     }
 
+    /// A handful of `grammar::expressions`' `p.error(...)` fallback arms,
+    /// hit with deliberately malformed input -- proves each produces its
+    /// documented message and doesn't panic, rather than silently
+    /// accepting garbage.
+    #[test]
+    fn malformed_expressions_report_the_expected_error() {
+        for (src, expected_message) in [
+            ("a instanceof", "expected type after 'instanceof'"),
+            ("new 5", "expected a type after 'new'"),
+            (
+                "new Foo",
+                "expected constructor arguments, array size, or initializer after 'new' type",
+            ),
+            (
+                // The key-expression parse itself fails first (`primary`'s
+                // own catch-all); `map_pair_continue`'s `None` arm must
+                // still recover cleanly from there (its `p.expect(MapTo)`
+                // succeeds since nothing was consumed, so no second error).
+                "new Map<String, Integer>{'a' => 1, => 2}",
+                "expected expression, found MapTo",
+            ),
+        ] {
+            let parse = parse_expression(src);
+            assert!(
+                parse
+                    .errors
+                    .iter()
+                    .any(|e| e.message.contains(expected_message)),
+                "{src:?}: expected an error containing {expected_message:?}, got {:?}",
+                parse.errors
+            );
+        }
+    }
+
     #[test]
     fn statements_round_trip() {
         for src in [
@@ -378,8 +460,51 @@ mod tests {
             "merge a b;",
             "System.runAs(u) { a(); }",
             "switch on x { when 1, 2 { a(); } when Account acc { b(); } when else { c(); } }",
+            // `whenLiteral`'s parenthesized, signed-integer, and negative-
+            // integer forms -- every other `switch` fixture above only
+            // ever uses a bare positive integer literal.
+            "switch on x { when (1) { a(); } }",
+            "switch on x { when -1 { a(); } }",
+            "switch on x { when +1 { a(); } }",
+            // `forUpdate`'s comma-separated multi-expression form.
+            "for (Integer i = 0, j = 0; i < 10; i++, j--) { a(); }",
+            // `catch (final MyException e)` -- genuinely valid Apex
+            // (confirmed against a real org, per `catch_clause`'s own
+            // doc comment), just never exercised by any fixture here.
+            "try { a(); } catch (final MyException e) { b(); }",
         ] {
             assert_stmt_round_trips(src);
+        }
+    }
+
+    /// A handful of `grammar::statements`' `p.error(...)` fallback arms,
+    /// hit with deliberately malformed input.
+    #[test]
+    fn malformed_statements_report_the_expected_error() {
+        for (src, expected_message) in [
+            (
+                "switch on x { when true { a(); } }",
+                "expected when-literal",
+            ),
+            (
+                "try { a(); } catch (5 e) { b(); }",
+                "expected exception type",
+            ),
+            (
+                "insert as bogus a;",
+                "expected 'system' or 'user' after 'as'",
+            ),
+            ("final 5;", "expected a local variable declaration"),
+        ] {
+            let parse = parse_statement(src);
+            assert!(
+                parse
+                    .errors
+                    .iter()
+                    .any(|e| e.message.contains(expected_message)),
+                "{src:?}: expected an error containing {expected_message:?}, got {:?}",
+                parse.errors
+            );
         }
     }
 

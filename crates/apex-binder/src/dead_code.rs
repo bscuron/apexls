@@ -76,13 +76,12 @@ const PLATFORM_INVOCATION_ANNOTATIONS: &[&str] = &[
 
 fn is_dead_code_candidate_kind(symbol: &Symbol) -> bool {
     match symbol.kind {
-        SymbolKind::Method
-        | SymbolKind::Field
-        | SymbolKind::Property
-        | SymbolKind::Constructor => matches!(
-            symbol.modifiers.visibility,
-            Visibility::Private | Visibility::Public
-        ),
+        SymbolKind::Method | SymbolKind::Field | SymbolKind::Property | SymbolKind::Constructor => {
+            matches!(
+                symbol.modifiers.visibility,
+                Visibility::Private | Visibility::Public
+            )
+        }
         SymbolKind::LocalVar => true,
         _ => false,
     }
@@ -144,8 +143,12 @@ fn annotations_of(program: &BoundProgram, symbol: &Symbol) -> Vec<Annotation> {
     };
     let annotated = match symbol.kind {
         SymbolKind::Method => MethodDecl::cast(node).map(|m| m.annotations().collect::<Vec<_>>()),
-        SymbolKind::Property => PropertyDecl::cast(node).map(|p| p.annotations().collect::<Vec<_>>()),
-        SymbolKind::Constructor => ConstructorDecl::cast(node).map(|c| c.annotations().collect::<Vec<_>>()),
+        SymbolKind::Property => {
+            PropertyDecl::cast(node).map(|p| p.annotations().collect::<Vec<_>>())
+        }
+        SymbolKind::Constructor => {
+            ConstructorDecl::cast(node).map(|c| c.annotations().collect::<Vec<_>>())
+        }
         SymbolKind::Field => {
             // `symbol.ptr` for a `Field` is the `VarDeclarator`, not the
             // whole `FieldDecl` -- annotations live on the parent
@@ -160,9 +163,10 @@ fn annotations_of(program: &BoundProgram, symbol: &Symbol) -> Vec<Annotation> {
 }
 
 fn has_annotation(program: &BoundProgram, symbol: &Symbol, name: &str) -> bool {
-    annotations_of(program, symbol)
-        .into_iter()
-        .any(|a| a.name().is_some_and(|tok| tok.text().eq_ignore_ascii_case(name)))
+    annotations_of(program, symbol).into_iter().any(|a| {
+        a.name()
+            .is_some_and(|tok| tok.text().eq_ignore_ascii_case(name))
+    })
 }
 
 /// True for a `public` `Method`/`Field`/`Property` carrying one of
@@ -339,7 +343,10 @@ fn compute_deletion_range(
             let field_decl = FieldDecl::cast(declarator.syntax().parent()?)?;
             let siblings: Vec<VarDeclarator> = field_decl.declarators().collect();
             if siblings.len() == 1 {
-                Some(line_aligned_deletion_range(text, field_decl.syntax().text_range()))
+                Some(line_aligned_deletion_range(
+                    text,
+                    field_decl.syntax().text_range(),
+                ))
             } else {
                 deletion_range_for_declarator(&declarator, &siblings)
             }
@@ -349,7 +356,10 @@ fn compute_deletion_range(
             let stmt = LocalVarDeclStmt::cast(declarator.syntax().parent()?)?;
             let siblings: Vec<VarDeclarator> = stmt.declarators().collect();
             if siblings.len() == 1 {
-                Some(line_aligned_deletion_range(text, stmt.syntax().text_range()))
+                Some(line_aligned_deletion_range(
+                    text,
+                    stmt.syntax().text_range(),
+                ))
             } else {
                 deletion_range_for_declarator(&declarator, &siblings)
             }
@@ -373,7 +383,9 @@ fn deletion_range_for_declarator(
     siblings: &[VarDeclarator],
 ) -> Option<TextRange> {
     let target = declarator.syntax().text_range();
-    let index = siblings.iter().position(|d| d.syntax().text_range() == target)?;
+    let index = siblings
+        .iter()
+        .position(|d| d.syntax().text_range() == target)?;
     if index + 1 < siblings.len() {
         Some(TextRange::new(
             siblings[index].syntax().text_range().start(),
@@ -463,7 +475,11 @@ mod tests {
     /// colliding across tests running in parallel in the same process --
     /// matching this crate's other `tests/*.rs`' own `write_fixture_dir`
     /// convention).
-    fn write_fixture(test_name: &str, src: &str, extra_files: &[(&str, &str)]) -> std::path::PathBuf {
+    fn write_fixture(
+        test_name: &str,
+        src: &str,
+        extra_files: &[(&str, &str)],
+    ) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "apex-binder-dead-code-{test_name}-{}",
             std::process::id()
@@ -494,7 +510,11 @@ mod tests {
     }
 
     fn dead_names(test_name: &str, src: &str) -> Vec<String> {
-        dead_symbols(test_name, src).2.into_iter().map(|d| d.name).collect()
+        dead_symbols(test_name, src)
+            .2
+            .into_iter()
+            .map(|d| d.name)
+            .collect()
     }
 
     fn apply_deletion(text: &str, range: TextRange) -> String {
@@ -511,6 +531,35 @@ mod tests {
     /// actually used.
     const CALLER: &str = "public class Caller {\n    public void go() { new Foo().run(); }\n}\n";
 
+    /// Every `kind_label` arm actually used by `apexls dead`'s report --
+    /// most existing fixtures below only ever exercise `Method`/`Field`
+    /// dead symbols, so `Property`/`Constructor`'s private-visibility
+    /// arms, and their own public arms in `Property`'s case, had never
+    /// been called.
+    #[test]
+    fn kind_label_covers_every_kind_and_visibility_pairing() {
+        assert_eq!(
+            kind_label(SymbolKind::Property, Visibility::Public),
+            "public property"
+        );
+        assert_eq!(
+            kind_label(SymbolKind::Property, Visibility::Private),
+            "private property"
+        );
+        assert_eq!(
+            kind_label(SymbolKind::Constructor, Visibility::Private),
+            "private constructor"
+        );
+        // Any kind/visibility pairing this report never actually
+        // produces (a local variable has no meaningful visibility, for
+        // instance) still degrades to a generic label rather than
+        // panicking.
+        assert_eq!(
+            kind_label(SymbolKind::Interface, Visibility::Public),
+            "declaration"
+        );
+    }
+
     #[test]
     fn unused_private_method_is_flagged() {
         let src = "public class Foo {\n    private void helper() { }\n}\n";
@@ -522,7 +571,11 @@ mod tests {
         let src = "public class Foo {\n    private void helper() { }\n    public void run() { helper(); }\n}\n";
         let (_, _, dead) =
             dead_symbols_with_extra_files("used-private-method", src, &[("Caller.cls", CALLER)]);
-        assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
+        assert!(
+            dead.is_empty(),
+            "expected no dead symbols, got {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -537,7 +590,11 @@ mod tests {
         let caller = "public class Caller {\n    public void run() { new Foo().helper(); }\n}\n";
         let (_, _, dead) =
             dead_symbols_with_extra_files("public-cross-file-ref", src, &[("Caller.cls", caller)]);
-        assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
+        assert!(
+            dead.is_empty(),
+            "expected no dead symbols, got {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -554,7 +611,8 @@ mod tests {
 
     #[test]
     fn invocable_method_is_not_flagged() {
-        let src = "public class Foo {\n    @InvocableMethod\n    public static void helper() { }\n}\n";
+        let src =
+            "public class Foo {\n    @InvocableMethod\n    public static void helper() { }\n}\n";
         assert!(dead_names("invocable-method", src).is_empty());
     }
 
@@ -576,12 +634,17 @@ mod tests {
         let page = "<apex:page controller=\"Foo\">Hello</apex:page>";
         let (_, _, dead) =
             dead_symbols_with_extra_files("vf-referenced", src, &[("Foo.page", page)]);
-        assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
+        assert!(
+            dead.is_empty(),
+            "expected no dead symbols, got {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn protected_and_global_members_are_never_flagged() {
-        let src = "public class Foo {\n    protected void helper() { }\n    global void other() { }\n}\n";
+        let src =
+            "public class Foo {\n    protected void helper() { }\n    global void other() { }\n}\n";
         assert!(dead_names("protected-global", src).is_empty());
     }
 
@@ -609,7 +672,11 @@ mod tests {
         let caller = "public class Caller {\n    public void go() { Foo.make(); }\n}\n";
         let (_, _, dead) =
             dead_symbols_with_extra_files("used-private-ctor", src, &[("Caller.cls", caller)]);
-        assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
+        assert!(
+            dead.is_empty(),
+            "expected no dead symbols, got {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -624,7 +691,11 @@ mod tests {
         let caller = "public class Caller {\n    public void go() { new Foo(); }\n}\n";
         let (_, _, dead) =
             dead_symbols_with_extra_files("used-public-ctor", src, &[("Caller.cls", caller)]);
-        assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
+        assert!(
+            dead.is_empty(),
+            "expected no dead symbols, got {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -636,12 +707,17 @@ mod tests {
         let page = "<apex:page controller=\"Foo\">Hello</apex:page>";
         let (_, _, dead) =
             dead_symbols_with_extra_files("vf-referenced-ctor", src, &[("Foo.page", page)]);
-        assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
+        assert!(
+            dead.is_empty(),
+            "expected no dead symbols, got {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn is_test_annotated_private_method_is_not_flagged() {
-        let src = "public class Foo {\n    @isTest\n    private static void testSomething() { }\n}\n";
+        let src =
+            "public class Foo {\n    @isTest\n    private static void testSomething() { }\n}\n";
         assert!(dead_names("isTest-annotation", src).is_empty());
     }
 
@@ -657,7 +733,11 @@ mod tests {
         let caller = "public class Caller {\n    public void go() { new Foo().run(new List<Integer>()); }\n}\n";
         let (_, _, dead) =
             dead_symbols_with_extra_files("unused-foreach-var", src, &[("Caller.cls", caller)]);
-        assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
+        assert!(
+            dead.is_empty(),
+            "expected no dead symbols, got {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -675,7 +755,10 @@ mod tests {
         let src = "public class Foo {\n    private Integer x, y, z;\n    public void run() { System.debug(x); System.debug(z); }\n}\n";
         let (_, _, dead) =
             dead_symbols_with_extra_files("middle-declarator", src, &[("Caller.cls", CALLER)]);
-        assert_eq!(dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["y"]);
+        assert_eq!(
+            dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["y"]
+        );
         let after = apply_deletion(src, dead[0].deletion_range);
         assert_eq!(
             after,
@@ -688,11 +771,37 @@ mod tests {
         let src = "public class Foo {\n    private Integer x, y;\n    public void run() { System.debug(x); }\n}\n";
         let (_, _, dead) =
             dead_symbols_with_extra_files("last-declarator", src, &[("Caller.cls", CALLER)]);
-        assert_eq!(dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["y"]);
+        assert_eq!(
+            dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["y"]
+        );
         let after = apply_deletion(src, dead[0].deletion_range);
         assert_eq!(
             after,
             "public class Foo {\n    private Integer x;\n    public void run() { System.debug(x); }\n}\n"
+        );
+    }
+
+    /// The `LocalVar` counterpart of `unused_middle_declarator_among_siblings_deletes_only_that_one`
+    /// -- `deletion_range_for_declarator`'s `SymbolKind::LocalVar` call
+    /// site (as opposed to its `Field` one, the only one any other test
+    /// here exercises) had never actually run.
+    #[test]
+    fn unused_middle_local_declarator_among_siblings_deletes_only_that_one() {
+        let src = "public class Foo {\n    public void run() {\n        Integer x = 0, y = 1, z = 2;\n        System.debug(x);\n        System.debug(z);\n    }\n}\n";
+        let (_, _, dead) = dead_symbols_with_extra_files(
+            "middle-local-declarator",
+            src,
+            &[("Caller.cls", CALLER)],
+        );
+        assert_eq!(
+            dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["y"]
+        );
+        let after = apply_deletion(src, dead[0].deletion_range);
+        assert_eq!(
+            after,
+            "public class Foo {\n    public void run() {\n        Integer x = 0, z = 2;\n        System.debug(x);\n        System.debug(z);\n    }\n}\n"
         );
     }
 
@@ -701,7 +810,10 @@ mod tests {
         let src = "public class Foo {\n    public void run() {\n        Integer unused = 5;\n        System.debug('hi');\n    }\n}\n";
         let (_, _, dead) =
             dead_symbols_with_extra_files("unused-local", src, &[("Caller.cls", CALLER)]);
-        assert_eq!(dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["unused"]);
+        assert_eq!(
+            dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["unused"]
+        );
         let after = apply_deletion(src, dead[0].deletion_range);
         assert_eq!(
             after,
@@ -718,7 +830,10 @@ mod tests {
         let src = "public class Foo {\n    public void run() {\n        System.debug('hi');\n        Integer unused = 5;\n    }\n}\n";
         let (_, _, dead) =
             dead_symbols_with_extra_files("unused-local-last-stmt", src, &[("Caller.cls", CALLER)]);
-        assert_eq!(dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["unused"]);
+        assert_eq!(
+            dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["unused"]
+        );
         let after = apply_deletion(src, dead[0].deletion_range);
         assert_eq!(
             after,
@@ -751,9 +866,15 @@ mod tests {
     #[test]
     fn a_local_not_bound_in_any_dynamic_soql_string_is_still_flagged() {
         let src = "public class Foo {\n    public void run() {\n        Integer otherVar = 5;\n        String q = 'SELECT Id FROM Account';\n        Database.query(q);\n    }\n}\n";
-        let (_, _, dead) =
-            dead_symbols_with_extra_files("dynamic-soql-unrelated-local", src, &[("Caller.cls", CALLER)]);
-        assert_eq!(dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), vec!["otherVar"]);
+        let (_, _, dead) = dead_symbols_with_extra_files(
+            "dynamic-soql-unrelated-local",
+            src,
+            &[("Caller.cls", CALLER)],
+        );
+        assert_eq!(
+            dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["otherVar"]
+        );
     }
 
     #[test]
@@ -762,7 +883,11 @@ mod tests {
         let caller = "@isTest\nprivate class Caller {\n    @isTest\n    static void go() { Foo.helper(); }\n}\n";
         let (_, _, dead) =
             dead_symbols_with_extra_files("testvisible-cross-file", src, &[("Caller.cls", caller)]);
-        assert!(dead.is_empty(), "expected no dead symbols, got {:?}", dead.iter().map(|d| &d.name).collect::<Vec<_>>());
+        assert!(
+            dead.is_empty(),
+            "expected no dead symbols, got {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
     }
 
     /// Regression test for a real user report against the NPSP corpus
@@ -871,7 +996,10 @@ mod tests {
             .filter(|(_, s)| is_dead_code_candidate_kind(s))
             .count();
         let files: HashSet<FileId> = program.symbols.iter().map(|(_, s)| s.file).collect();
-        let dead_count: usize = files.iter().map(|&file| dead_symbols_in_file(&program, file).len()).sum();
+        let dead_count: usize = files
+            .iter()
+            .map(|&file| dead_symbols_in_file(&program, file).len())
+            .sum();
         assert!(
             candidate_count > 0,
             "expected at least some eligible methods/fields/properties/locals in a real corpus this size"

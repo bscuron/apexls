@@ -29,7 +29,9 @@ fn file_for_class(program: &BoundProgram, class_name: &str) -> apex_binder::File
 /// source and the byte offset it marked -- far less error-prone than
 /// hand-computing offsets for every fixture.
 fn split_cursor(src: &str) -> (String, u32) {
-    let idx = src.find('|').expect("fixture must contain a `|` cursor marker");
+    let idx = src
+        .find('|')
+        .expect("fixture must contain a `|` cursor marker");
     let mut out = String::with_capacity(src.len() - 1);
     out.push_str(&src[..idx]);
     out.push_str(&src[idx + 1..]);
@@ -68,9 +70,18 @@ fn locals_and_params_are_all_visible_across_nested_scopes() {
         .map(|c| c.label.as_str())
         .collect();
 
-    assert!(locals.contains(&"x"), "param `x` should be visible: {locals:?}");
-    assert!(locals.contains(&"y"), "outer local `y` should be visible: {locals:?}");
-    assert!(locals.contains(&"z"), "innermost local `z` should be visible: {locals:?}");
+    assert!(
+        locals.contains(&"x"),
+        "param `x` should be visible: {locals:?}"
+    );
+    assert!(
+        locals.contains(&"y"),
+        "outer local `y` should be visible: {locals:?}"
+    );
+    assert!(
+        locals.contains(&"z"),
+        "innermost local `z` should be visible: {locals:?}"
+    );
 }
 
 #[test]
@@ -157,7 +168,11 @@ fn an_overridden_method_appears_once_not_twice_and_is_not_flagged_inherited() {
     let file = file_for_class(&program, "Derived");
     let ctx = complete_at(&program, file, offset.into()).expect("should resolve a context");
 
-    let greets: Vec<_> = ctx.candidates.iter().filter(|c| c.label == "greet").collect();
+    let greets: Vec<_> = ctx
+        .candidates
+        .iter()
+        .filter(|c| c.label == "greet")
+        .collect();
     assert_eq!(
         greets.len(),
         1,
@@ -255,10 +270,7 @@ fn project_wide_types_and_keywords_appear_in_a_fresh_bare_identifier_context() {
     let (src, offset) = split_cursor("public class Foo { public void run() { | } }");
     let dir = write_fixture_dir(
         "completion-types-and-keywords",
-        &[
-            ("Foo.cls", &src),
-            ("Bar.cls", "public class Bar { }"),
-        ],
+        &[("Foo.cls", &src), ("Bar.cls", "public class Bar { }")],
     );
     let program = BoundProgram::from_files(&dir);
     std::fs::remove_dir_all(&dir).ok();
@@ -266,9 +278,18 @@ fn project_wide_types_and_keywords_appear_in_a_fresh_bare_identifier_context() {
     let file = file_for_class(&program, "Foo");
     let ctx = complete_at(&program, file, offset.into()).expect("should resolve a context");
     let labels = labels_of(&ctx.candidates);
-    assert!(labels.contains(&"Bar"), "another project type should be offered: {labels:?}");
-    assert!(labels.contains(&"Foo"), "the enclosing type itself should be offered too: {labels:?}");
-    assert!(labels.contains(&"if"), "a general keyword should be offered: {labels:?}");
+    assert!(
+        labels.contains(&"Bar"),
+        "another project type should be offered: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"Foo"),
+        "the enclosing type itself should be offered too: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"if"),
+        "a general keyword should be offered: {labels:?}"
+    );
     assert!(
         !labels.contains(&"select"),
         "a SOQL-only keyword must not be offered -- SOQL completion is out of v1 scope: {labels:?}"
@@ -351,5 +372,157 @@ fn a_partial_member_replaces_its_own_already_typed_span() {
             (offset + 1).into(), // end of `bar`
         ),
         "should replace the whole already-typed member token, not just insert at the cursor"
+    );
+}
+
+/// The method-call counterpart of `a_partial_member_replaces_its_own_already_typed_span`
+/// -- the cursor sits inside an already-fully-parsed *call's* method-name
+/// token (`other.geName|Wat()` re-editing an existing call) rather than a
+/// dangling/partial field access, exercising `ancestor_method_call_with_name`
+/// (never hit by any other fixture in this file, which only ever leaves a
+/// completed call untouched or types a fresh partial field).
+#[test]
+fn a_partial_method_call_name_replaces_its_own_already_typed_span() {
+    let (src, offset) = split_cursor(
+        "public class Foo { \
+             public Integer getName() { return 1; } \
+             public void run() { Foo other = new Foo(); other.ge|tName(); } \
+         }",
+    );
+    let dir = write_fixture_dir("completion-replace-range-method-call", &[("Foo.cls", &src)]);
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for_class(&program, "Foo");
+    let ctx = complete_at(&program, file, offset.into()).expect("should resolve a context");
+    assert_eq!(
+        ctx.replace_range,
+        rowan::TextRange::new(
+            (offset - 2).into(), // start of `getName`
+            (offset + 5).into(), // end of `getName`
+        ),
+        "should replace the whole already-typed method-name token"
+    );
+    assert!(
+        labels_of(&ctx.candidates).contains(&"getName"),
+        "Foo's own members, including getName itself, should be offered: {:?}",
+        labels_of(&ctx.candidates)
+    );
+}
+
+/// `complete_at`'s very first step, `resolve_token_at`, must degrade to
+/// `None` rather than panicking when there's genuinely no token at the
+/// requested offset -- the only realistic way that happens is an empty
+/// file (nothing has been typed yet).
+#[test]
+fn completion_in_an_empty_file_returns_none() {
+    let dir = write_fixture_dir("completion-empty-file", &[("Empty.cls", "")]);
+    let program = BoundProgram::from_files(&dir);
+    let file = program
+        .file_id(&dir.join("Empty.cls"))
+        .expect("the empty file should still have been discovered");
+    let result = complete_at(&program, file, 0.into());
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        result.is_none(),
+        "an empty file has no token to complete at"
+    );
+}
+
+/// A dangling `.` completion off a receiver that never resolves to any
+/// type at all (an undeclared name) should degrade to an empty candidate
+/// list, not panic or fall back to some other context.
+#[test]
+fn member_access_off_an_unresolvable_receiver_offers_no_candidates() {
+    let (src, offset) = split_cursor(
+        "public class Foo { \
+             public void run() { totallyUndeclaredVariable.| } \
+         }",
+    );
+    let dir = write_fixture_dir("completion-unresolvable-receiver", &[("Foo.cls", &src)]);
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for_class(&program, "Foo");
+    let ctx = complete_at(&program, file, offset.into()).expect("should still resolve a context");
+    assert!(
+        ctx.candidates.is_empty(),
+        "an unresolvable receiver has no members to offer: {:?}",
+        labels_of(&ctx.candidates)
+    );
+}
+
+/// `enclosing_context`'s `ConstructorDecl` branch -- every other fixture
+/// in this file completes inside a plain method body.
+#[test]
+fn bare_identifier_completion_works_inside_a_constructor_body() {
+    let (src, offset) = split_cursor(
+        "public class Foo { \
+             public Foo(Integer x) { Integer y = 0; |} \
+         }",
+    );
+    let dir = write_fixture_dir("completion-constructor-body", &[("Foo.cls", &src)]);
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for_class(&program, "Foo");
+    let ctx = complete_at(&program, file, offset.into()).expect("should resolve a context");
+    let locals = labels_of(&ctx.candidates);
+    assert!(
+        locals.contains(&"x"),
+        "constructor param `x` should be visible: {locals:?}"
+    );
+    assert!(
+        locals.contains(&"y"),
+        "constructor-body local `y` should be visible: {locals:?}"
+    );
+}
+
+/// `enclosing_context`'s `PropertyAccessor` branch -- per its own doc
+/// comment, an accessor body's `enclosing_member` is unconditionally
+/// `None`, unlike every other body kind; this at least proves that
+/// doesn't break completion inside one (locals still visible, no panic).
+#[test]
+fn bare_identifier_completion_works_inside_a_property_accessor_body() {
+    let (src, offset) = split_cursor(
+        "public class Foo { \
+             public Integer Count { get { Integer local = 5; |return local; } } \
+         }",
+    );
+    let dir = write_fixture_dir("completion-accessor-body", &[("Foo.cls", &src)]);
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = file_for_class(&program, "Foo");
+    let ctx = complete_at(&program, file, offset.into()).expect("should resolve a context");
+    let locals = labels_of(&ctx.candidates);
+    assert!(
+        locals.contains(&"local"),
+        "the accessor body's own local should be visible: {locals:?}"
+    );
+}
+
+/// `enclosing_context`'s `TriggerUnit` branch -- every other fixture in
+/// this file completes inside a `.cls` class, never a `.trigger` file.
+#[test]
+fn bare_identifier_completion_works_inside_a_trigger_body() {
+    let (src, offset) = split_cursor(
+        "trigger FooTrigger on Account (before insert) { \
+             Integer count = 0; \
+             |\
+         }",
+    );
+    let dir = write_fixture_dir("completion-trigger-body", &[("FooTrigger.trigger", &src)]);
+    let program = BoundProgram::from_files(&dir);
+    let file = program
+        .file_id(&dir.join("FooTrigger.trigger"))
+        .expect("the trigger file should have been discovered");
+    let ctx = complete_at(&program, file, offset.into()).expect("should resolve a context");
+    std::fs::remove_dir_all(&dir).ok();
+
+    let locals = labels_of(&ctx.candidates);
+    assert!(
+        locals.contains(&"count"),
+        "the trigger body's own local should be visible: {locals:?}"
     );
 }

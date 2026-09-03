@@ -243,7 +243,13 @@ fn apply_edits(src: &str, edits: &[serde_json::Value]) -> String {
     lines.join("\n")
 }
 
-fn rename_request(session: &mut Session, uri: &Url, src: &str, needle: &str, new_name: &str) -> serde_json::Value {
+fn rename_request(
+    session: &mut Session,
+    uri: &Url,
+    src: &str,
+    needle: &str,
+    new_name: &str,
+) -> serde_json::Value {
     let (line, character) = position_of(src, needle);
     session.request(
         2,
@@ -305,7 +311,10 @@ fn rename_updates_the_declaration_and_every_cross_file_reference() {
         "public class Base {\n    public void salute() { }\n}\n"
     );
     assert_eq!(
-        apply_edits(CALLER_A_SRC, changes[caller_a_uri.as_str()].as_array().unwrap()),
+        apply_edits(
+            CALLER_A_SRC,
+            changes[caller_a_uri.as_str()].as_array().unwrap()
+        ),
         "public class CallerA {\n    public void run() { new Base().salute(); }\n}\n"
     );
 
@@ -340,7 +349,11 @@ fn renaming_a_class_also_renames_its_own_constructor() {
     );
     let changes = response["result"]["changes"].as_object().unwrap();
 
-    let widget_edits = changes.get(widget_uri.as_str()).unwrap().as_array().unwrap();
+    let widget_edits = changes
+        .get(widget_uri.as_str())
+        .unwrap()
+        .as_array()
+        .unwrap();
     // The class's own name, plus both constructors' names -- 3 sites, all in Widget.cls.
     assert_eq!(
         widget_edits.len(),
@@ -349,9 +362,17 @@ fn renaming_a_class_also_renames_its_own_constructor() {
     );
     assert!(widget_edits.iter().all(|e| e["newText"] == "Gadget"));
 
-    let caller_edits = changes.get(caller_uri.as_str()).unwrap().as_array().unwrap();
+    let caller_edits = changes
+        .get(caller_uri.as_str())
+        .unwrap()
+        .as_array()
+        .unwrap();
     // `Widget w = new Widget();` -- the type reference and the `new` call.
-    assert_eq!(caller_edits.len(), 2, "expected both usages in Caller.cls: {caller_edits:?}");
+    assert_eq!(
+        caller_edits.len(),
+        2,
+        "expected both usages in Caller.cls: {caller_edits:?}"
+    );
 
     assert_eq!(
         apply_edits(SRC, widget_edits),
@@ -387,7 +408,13 @@ fn renaming_a_local_variable_to_a_short_name_does_not_corrupt_the_file() {
 
     let mut session = Session::start(&root_uri, &widget_uri, SRC);
 
-    let response = rename_request(&mut session, &widget_uri, SRC, "accountRecordTypeId = 0", "x");
+    let response = rename_request(
+        &mut session,
+        &widget_uri,
+        SRC,
+        "accountRecordTypeId = 0",
+        "x",
+    );
     assert!(
         response.get("error").is_none(),
         "rename returned an error: {response:?}"
@@ -425,13 +452,57 @@ fn prepare_rename_refuses_a_method_that_overrides_a_base_class_method() {
             "position": { "line": line, "character": character },
         }),
     );
-    let error = response
-        .get("error")
-        .unwrap_or_else(|| panic!("expected prepareRename to refuse an override method: {response:?}"));
+    let error = response.get("error").unwrap_or_else(|| {
+        panic!("expected prepareRename to refuse an override method: {response:?}")
+    });
     let message = error["message"].as_str().unwrap();
     assert!(
         message.contains("override"),
         "expected the refusal message to explain the override-chain risk: {message}"
+    );
+
+    session.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The success path -- every other `prepareRename` fixture in this file
+/// only ever exercises a *refusal*, so `capabilities::prepare_rename_range`
+/// itself (reached only past `rename_target`'s eligibility check
+/// succeeding) never actually ran.
+#[test]
+fn prepare_rename_on_a_renameable_symbol_returns_its_own_range() {
+    const SRC: &str = "public class Widget {\n    public void run() {\n        \
+         Integer count = 0;\n        count = count + 1;\n    }\n}\n";
+    let dir = write_fixture_dir("rename-prepare-success", &[("Widget.cls", SRC)]);
+    let root_uri = Url::from_file_path(&dir).unwrap();
+    let widget_uri = Url::from_file_path(dir.join("Widget.cls")).unwrap();
+
+    let mut session = Session::start(&root_uri, &widget_uri, SRC);
+
+    let (line, character) = position_of(SRC, "count = 0");
+    let response = session.request(
+        2,
+        "textDocument/prepareRename",
+        serde_json::json!({
+            "textDocument": { "uri": widget_uri },
+            "position": { "line": line, "character": character },
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "prepareRename on a plain local should succeed: {response:?}"
+    );
+    let result = &response["result"];
+    assert_eq!(result["start"]["line"].as_u64().unwrap(), line as u64);
+    assert_eq!(
+        result["start"]["character"].as_u64().unwrap(),
+        character as u64
+    );
+    assert_eq!(
+        result["end"]["character"].as_u64().unwrap()
+            - result["start"]["character"].as_u64().unwrap(),
+        "count".len() as u64,
+        "the returned range should cover exactly the identifier `count`: {result:?}"
     );
 
     session.shutdown();
@@ -451,7 +522,10 @@ fn rename_refuses_an_invalid_new_identifier() {
     let error = response
         .get("error")
         .unwrap_or_else(|| panic!("expected rename to refuse an invalid identifier: {response:?}"));
-    assert!(error["message"].as_str().unwrap().contains("valid Apex identifier"));
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("valid Apex identifier"));
 
     session.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -476,7 +550,13 @@ fn rename_a_real_npsp_method_touches_every_real_call_site_without_erroring() {
 
     let mut session = Session::start(&root_uri, &util_describe_uri, &src);
 
-    let response = rename_request(&mut session, &util_describe_uri, &src, "isValidField", "isFieldValid");
+    let response = rename_request(
+        &mut session,
+        &util_describe_uri,
+        &src,
+        "isValidField",
+        "isFieldValid",
+    );
     assert!(
         response.get("error").is_none(),
         "rename on a real NPSP method returned an error: {response:?}"

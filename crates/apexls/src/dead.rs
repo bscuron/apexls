@@ -77,31 +77,66 @@ fn line_col(starts: &[usize], text: &str, offset: usize) -> (usize, usize) {
     (line_idx + 1, col)
 }
 
+#[derive(Debug)]
+struct Finding {
+    path: PathBuf,
+    line: usize,
+    col: usize,
+    message: String,
+}
+
+/// A path argument that doesn't exist, or can't be canonicalized -- the
+/// message to print to stderr, paired with the process exit code to use.
+#[derive(Debug)]
+struct ArgError(String, u8);
+
 pub fn run(paths: &[PathBuf]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let findings = match find_findings(paths, &cwd) {
+        Ok(findings) => findings,
+        Err(ArgError(message, code)) => {
+            eprintln!("{message}");
+            return ExitCode::from(code);
+        }
+    };
+
+    for f in &findings {
+        println!("{}:{}:{}: {}", f.path.display(), f.line, f.col, f.message);
+    }
+
+    if findings.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// The actual report logic, factored out of [`run`] so it's testable
+/// without touching the real process-global CWD (unsafe to mutate from a
+/// parallel test binary) or capturing stdout -- `run` itself stays a thin
+/// CWD-detection-plus-printing shell, the same "protocol-agnostic core,
+/// thin glue" split `apex-binder`'s own capability modules already use.
+fn find_findings(paths: &[PathBuf], cwd: &Path) -> Result<Vec<Finding>, ArgError> {
     for p in paths {
         if !p.exists() {
-            eprintln!("error: path does not exist: {}", p.display());
-            return ExitCode::from(2);
+            return Err(ArgError(
+                format!("error: path does not exist: {}", p.display()),
+                2,
+            ));
         }
     }
     let filters: Vec<PathBuf> = match paths.iter().map(|p| p.canonicalize()).collect() {
         Ok(canon) => canon,
         Err(e) => {
-            eprintln!("error: failed to resolve a path argument: {e}");
-            return ExitCode::from(2);
+            return Err(ArgError(
+                format!("error: failed to resolve a path argument: {e}"),
+                2,
+            ));
         }
     };
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let root = find_project_root(&cwd);
+    let root = find_project_root(cwd);
     let program = BoundProgram::from_files(&root);
-
-    struct Finding {
-        path: PathBuf,
-        line: usize,
-        col: usize,
-        message: String,
-    }
 
     // Each file's report is independent of every other's -- computed
     // once (per-file `dead_symbols_in_file` result) and read-only from
@@ -123,8 +158,9 @@ pub fn run(paths: &[PathBuf]) -> ExitCode {
             // path, so canonicalizing every file up front bought nothing
             // in the (default, no-arguments) whole-project case.
             if !filters.is_empty() {
-                let canon_file_path =
-                    file_path.canonicalize().unwrap_or_else(|_| file_path.to_path_buf());
+                let canon_file_path = file_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| file_path.to_path_buf());
                 if !matches_any(&canon_file_path, &filters) {
                     return None;
                 }
@@ -135,7 +171,7 @@ pub fn run(paths: &[PathBuf]) -> ExitCode {
             }
             let text = program.syntax(file).text().to_string();
             let starts = line_starts(&text);
-            let display_path = file_path.strip_prefix(&cwd).unwrap_or(file_path);
+            let display_path = file_path.strip_prefix(cwd).unwrap_or(file_path);
             Some(
                 dead.into_iter()
                     .map(|d| {
@@ -159,15 +195,7 @@ pub fn run(paths: &[PathBuf]) -> ExitCode {
 
     findings.sort_by(|a, b| (&a.path, a.line, a.col).cmp(&(&b.path, b.line, b.col)));
 
-    for f in &findings {
-        println!("{}:{}:{}: {}", f.path.display(), f.line, f.col, f.message);
-    }
-
-    if findings.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    Ok(findings)
 }
 
 #[cfg(test)]
@@ -175,7 +203,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("apexls-dead-cli-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("apexls-dead-cli-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -195,11 +224,17 @@ mod tests {
     #[test]
     fn directory_match_recurses_but_respects_path_components() {
         let filters = vec![PathBuf::from("/proj/force-app/Foo")];
-        assert!(matches_any(Path::new("/proj/force-app/Foo/Bar.cls"), &filters));
+        assert!(matches_any(
+            Path::new("/proj/force-app/Foo/Bar.cls"),
+            &filters
+        ));
         // `Foo2.cls` must not match a `Foo` directory filter -- this is
         // exactly what `Path::starts_with`'s component-awareness buys
         // over naive string prefixing.
-        assert!(!matches_any(Path::new("/proj/force-app/Foo2.cls"), &filters));
+        assert!(!matches_any(
+            Path::new("/proj/force-app/Foo2.cls"),
+            &filters
+        ));
     }
 
     #[test]
@@ -214,7 +249,11 @@ mod tests {
     fn root_detection_finds_a_nested_sfdx_project_json_from_a_deeper_cwd() {
         let dir = temp_dir("root-detection");
         std::fs::write(dir.join("sfdx-project.json"), "{}").unwrap();
-        let nested = dir.join("force-app").join("main").join("default").join("classes");
+        let nested = dir
+            .join("force-app")
+            .join("main")
+            .join("default")
+            .join("classes");
         std::fs::create_dir_all(&nested).unwrap();
         let found = find_project_root(&nested);
         std::fs::remove_dir_all(&dir).ok();
@@ -227,5 +266,89 @@ mod tests {
         let found = find_project_root(&dir);
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(found, dir);
+    }
+
+    #[test]
+    fn find_findings_reports_a_real_dead_symbol_with_a_correct_location() {
+        let dir = temp_dir("findings-basic");
+        std::fs::write(
+            dir.join("Foo.cls"),
+            "public class Foo {\n    private void helper() { }\n}\n",
+        )
+        .unwrap();
+        let findings = find_findings(&[], &dir).expect("no path arguments to fail on");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(findings.len(), 1, "expected exactly one dead symbol");
+        let f = &findings[0];
+        assert_eq!(f.line, 2);
+        assert!(
+            f.message.contains("helper") && f.message.contains("never used"),
+            "unexpected message: {}",
+            f.message
+        );
+    }
+
+    #[test]
+    fn find_findings_is_empty_when_nothing_is_dead() {
+        let dir = temp_dir("findings-none");
+        std::fs::write(
+            dir.join("Foo.cls"),
+            "public class Foo {\n    @AuraEnabled\n    public static void run() { }\n}\n",
+        )
+        .unwrap();
+        let findings = find_findings(&[], &dir).expect("no path arguments to fail on");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            findings.is_empty(),
+            "a platform-invocation-exempt public method should report nothing: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn find_findings_filters_to_only_the_requested_path() {
+        let dir = temp_dir("findings-filtered");
+        std::fs::create_dir_all(dir.join("included")).unwrap();
+        std::fs::create_dir_all(dir.join("excluded")).unwrap();
+        std::fs::write(
+            dir.join("included").join("Included.cls"),
+            "public class Included {\n    private void deadHere() { }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("excluded").join("Excluded.cls"),
+            "public class Excluded {\n    private void alsoDead() { }\n}\n",
+        )
+        .unwrap();
+
+        let findings =
+            find_findings(&[dir.join("included")], &dir).expect("a real, existing path argument");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected only the filtered-in file's finding: {:?}",
+            findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        );
+        assert!(findings[0].message.contains("deadHere"));
+    }
+
+    #[test]
+    fn find_findings_rejects_a_nonexistent_path_argument() {
+        let dir = temp_dir("findings-bad-path");
+        let missing = dir.join("DoesNotExist.cls");
+        let err = find_findings(std::slice::from_ref(&missing), &dir)
+            .expect_err("a nonexistent path should error");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(err.1, 2);
+        assert!(
+            err.0.contains("does not exist"),
+            "unexpected message: {}",
+            err.0
+        );
     }
 }

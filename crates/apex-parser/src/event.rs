@@ -40,7 +40,12 @@ pub(crate) enum Event {
 /// `apex_parser::parse_compilation_unit_with_cache`'s doc comment for why
 /// a caller building many trees (e.g. `apex-binder`'s project-wide bind)
 /// wants to share one `NodeCache` across them.
-pub(crate) fn build(src: &str, input: &Input, events: Vec<Event>, cache: &mut NodeCache) -> GreenNode {
+pub(crate) fn build(
+    src: &str,
+    input: &Input,
+    events: Vec<Event>,
+    cache: &mut NodeCache,
+) -> GreenNode {
     let raw = &input.raw;
     let mut builder = GreenNodeBuilder::with_cache(cache);
     let mut pos = 0usize;

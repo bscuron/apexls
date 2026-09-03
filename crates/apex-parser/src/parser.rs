@@ -100,7 +100,9 @@ impl<'t> Parser<'t> {
     /// too, just not attempted in the same pass as this method's own
     /// introduction.
     fn error_at_gap(&mut self, message: impl Into<String>) {
-        let offset = self.prev_token_end().unwrap_or_else(|| self.current_token_offset());
+        let offset = self
+            .prev_token_end()
+            .unwrap_or_else(|| self.current_token_offset());
         self.errors.push(ParseError {
             message: message.into(),
             offset,

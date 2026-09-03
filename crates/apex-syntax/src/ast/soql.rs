@@ -590,9 +590,11 @@ impl SoslFieldList {
 
 impl SoslWithClause {
     /// `DIVISION`/`DATA`/`SNIPPET`/`NETWORK`/`PRICEBOOKID`/`METADATA`/
-    /// `HIGHLIGHT`/`USER_MODE`/`SYSTEM_MODE`/`SPELL_CORRECTION`.
+    /// `HIGHLIGHT`/`USER_MODE`/`SYSTEM_MODE`/`SPELL_CORRECTION`. Skips the
+    /// leading `WITH` token itself (index 0), same as the sibling
+    /// `SoqlForClause::kind_token`'s `nth(1)`.
     pub fn kind_token(&self) -> Option<SyntaxToken> {
-        first_non_trivia_token(self.syntax())
+        direct_tokens(self.syntax()).nth(1)
     }
 
     pub fn bound_expr(&self) -> Option<SoqlBoundExpr> {
