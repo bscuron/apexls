@@ -9,7 +9,7 @@ A decision on whether and how to promote `apex-binder`'s walker-internal `Ty` ty
 - Every diagnostic must clear the same zero-false-positive bar `dead_code_diagnostics` already established for this codebase -- never flag unless provably correct. No confidence-graded WARNING/ERROR escape valve (unlike `unresolved_reference_diagnostics`'s existing pattern) unless a specific ticket's own resolution decides otherwise.
 - Consult `apex-grammar-oracle-sf-cli` practice (the `sf` CLI against a connected org) for any disputed real-Apex-compiler-behavior question, same as this project's established norm.
 - Benchmark any new binder pass against the real NPSP corpus before landing, matching `resolution_regression_baseline.rs`'s existing practice -- this is baked into each implementation ticket's own definition of done, not tracked as a separate cross-cutting ticket.
-- BACKLOG.md is to be **deleted entirely** once every ticket on this map is resolved -- it's superseded, messy documentation debt once this map is the live planning surface. (BACKLOG.md section 3, "Further diagnostic sources," was this map's starting reference input.)
+- BACKLOG.md was **deleted** now that every ticket on this map is resolved -- it was superseded, messy documentation debt once this map became the live planning surface. (Its section 3, "Further diagnostic sources," was this map's starting reference input.)
 
 ## Decisions so far
 
