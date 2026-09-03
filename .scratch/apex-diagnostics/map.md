@@ -40,6 +40,8 @@ A decision on whether and how to promote `apex-binder`'s walker-internal `Ty` ty
 
 - **`Resolution::Candidates` as an error diagnostic** -- genuinely unclear shape (not just "not built yet"): under what conditions an unresolved-overload ambiguity in this binder actually corresponds to a real compiler error is not yet phrased sharply enough to ticket. BACKLOG.md flags real false-positive risk against this project's own no-guessing discipline; needs the `Candidates` cases themselves surveyed before even a research question can be stated.
 - **Per-diagnostic opt-out for a specific noisy check** -- e.g. if the bulkification (DML/SOQL-in-loop) check turns out too noisy for some real projects once shipped. Only worth a ticket if and when a specific check's own resolution surfaces this as a real problem; not a general mechanism to build speculatively (see Out of scope).
+- **Salsa migration, Stages 2-4's own implement tickets** (Pass 1/Collect, Pass 1.5/Inherit, Pass 2/Resolve) -- not yet specifiable until [the engine-architecture decision](issues/25-salsa-migration-architecture-decision.md) resolves and splits off Stage 1's implement ticket first, the same design-ticket -> implement-ticket pattern used elsewhere on this map. Each graduates into its own ticket only once its own turn in the sequence actually comes.
+- **Salsa migration, Pass 2 (Resolve)'s per-body-vs-per-file granularity** -- deliberately left undecided rather than locked abstractly during charting; ticket 25 explicitly defers it to a future decision made with real experience from having already migrated Stages 1-3.
 
 ## Out of scope
 
