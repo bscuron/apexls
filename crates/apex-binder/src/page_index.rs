@@ -13,11 +13,16 @@ use smol_str::SmolStr;
 use std::path::{Path, PathBuf};
 
 /// One declared Visualforce page.
+#[derive(Debug, PartialEq)]
 pub struct VisualforcePage {
     pub name: SmolStr,
     pub path: PathBuf,
 }
 
+/// `PartialEq`/`Debug` exist solely for `crate::salsa_stage1_dual_run`'s
+/// dual-run-and-diff comparison (Wayfinder `apex-diagnostics` map, ticket
+/// 26) -- nothing else in this crate compares two `PageIndex`es.
+#[derive(Debug, PartialEq)]
 pub struct PageIndex {
     pages: CiMap<VisualforcePage>,
 }

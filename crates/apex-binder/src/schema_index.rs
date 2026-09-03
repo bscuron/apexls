@@ -13,10 +13,15 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::OnceLock;
 
+/// `PartialEq`/`Debug` exist solely for `crate::salsa_stage1_dual_run`'s
+/// dual-run-and-diff comparison (Wayfinder `apex-diagnostics` map, ticket
+/// 26) -- nothing else in this crate compares two `SchemaIndex`es.
+#[derive(Debug, PartialEq)]
 pub struct SchemaIndex {
     objects: CiMap<ObjectEntry>,
 }
 
+#[derive(Debug, PartialEq)]
 struct ObjectEntry {
     /// Borrowed straight from `apex_stdlib::standard_sobjects()`'s
     /// `'static` slice for the (overwhelming majority of) objects the

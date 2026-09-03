@@ -12,6 +12,10 @@ use crate::ci_key::{CiKey, CiMap, CiQuery};
 use apex_metadata::LabelSchema;
 use std::path::Path;
 
+/// `PartialEq`/`Debug` exist solely for `crate::salsa_stage1_dual_run`'s
+/// dual-run-and-diff comparison (Wayfinder `apex-diagnostics` map, ticket
+/// 26) -- nothing else in this crate compares two `LabelIndex`es.
+#[derive(Debug, PartialEq)]
 pub struct LabelIndex {
     labels: CiMap<LabelSchema>,
 }

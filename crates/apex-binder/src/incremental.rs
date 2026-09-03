@@ -8,13 +8,11 @@
 //! `crate::symbol::SymbolId`'s and `crate::file_table::FileTable`'s doc
 //! comments for the stable-identity foundation this relies on.
 
+use crate::db::{BindDatabase, DiscoveryInput};
 use crate::file_id::FileId;
 use crate::file_table::FileTable;
-use crate::label_index::LabelIndex;
-use crate::page_index::PageIndex;
 use crate::ptr::{AstPtr, SyntaxPtr};
 use crate::reference_table::ReferenceTable;
-use crate::schema_index::SchemaIndex;
 use crate::scope::ScopeTree;
 use crate::symbol::SymbolId;
 use crate::symbol_table::SymbolTable;
@@ -23,7 +21,6 @@ use apex_parser::Parse;
 use apex_syntax::ast::Type;
 use rustc_hash::{FxHashMap, FxHasher};
 use smol_str::SmolStr;
-use std::collections::HashSet;
 use std::hash::Hasher;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -106,23 +103,28 @@ pub struct BindCache {
     /// is the hook a caller with its own out-of-band change signal (a
     /// filesystem watcher) uses to force a fresh walk instead of relying
     /// on that limit.
+    /// **Invariant**: written only from `BoundProgram::from_files_cached`'s
+    /// single `need_fresh_discovery` block, always in the same statement
+    /// group as `discovery_input`/`db` below -- the three stay in lockstep
+    /// by construction (one write site), not by a shared type enforcing
+    /// it. [`Self::invalidate_discovery`] resetting only this field to
+    /// `None` is still sound: it just forces that one write site to fire
+    /// again next call, which re-syncs `discovery_input`/`db` too: it
+    /// never needs its own separate reset.
     pub(crate) discovery: Option<Discovery>,
-    pub(crate) schema: Option<Arc<SchemaIndex>>,
-    /// Every project-declared custom label, rebuilt alongside `schema` on
-    /// the same `need_fresh_discovery` trigger -- see
-    /// `crate::label_index::LabelIndex`.
-    pub(crate) labels: Option<Arc<LabelIndex>>,
-    /// Every project-declared Visualforce page, rebuilt alongside
-    /// `schema`/`labels` on the same `need_fresh_discovery` trigger -- see
-    /// `crate::page_index::PageIndex`.
-    pub(crate) pages: Option<Arc<PageIndex>>,
-    /// Every class name (lowercased) a real `.page` file's `controller`/
-    /// `extensions` attribute names -- rebuilt alongside `schema` on the
-    /// same `need_fresh_discovery` trigger, since it's derived from the
-    /// same directory walk's `Discovery::page_files`. Feeds
-    /// `crate::dead_code`'s Visualforce-exposure check
-    /// (`BoundProgram::vf_referenced_classes`).
-    pub(crate) vf_referenced_classes: Option<Arc<HashSet<String>>>,
+    /// The salsa database backing `SchemaIndex`/`LabelIndex`/`PageIndex`/
+    /// `vf_referenced_classes` (Wayfinder `apex-diagnostics` map, ticket
+    /// 26's Stage 1 cutover -- see `crate::db`'s module doc comment).
+    /// `discovery` above stays the sole staleness authority: this is pure
+    /// memoization downstream of it, synced via `crate::db::sync_discovery_into_db`
+    /// exactly where a fresh walk happens, never invalidated on its own.
+    pub(crate) db: BindDatabase,
+    /// `discovery`'s own salsa-input identity, `None` only before the
+    /// first fresh walk -- reused (its field overwritten, never
+    /// recreated) on every later one so `db`'s tracked queries keep
+    /// memoizing against the same input. Same lockstep invariant as
+    /// `discovery` above -- see its own doc comment.
+    pub(crate) discovery_input: Option<DiscoveryInput>,
     /// Each path's last-seen `(Freshness, Parse)` -- a parse is reused
     /// as-is whenever `Freshness::matches` says nothing changed, skipping
     /// that file's read *and* lex/parse entirely. No separate copy of the

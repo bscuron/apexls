@@ -38,6 +38,7 @@ mod collect;
 mod completion;
 mod conversions;
 mod dead_code;
+mod db;
 mod file_id;
 mod file_table;
 mod generics;
@@ -50,6 +51,8 @@ mod reference_table;
 mod resolve;
 #[cfg(test)]
 mod salsa_smoke;
+#[cfg(test)]
+mod salsa_stage1_dual_run;
 mod schema_index;
 mod scope;
 mod soql;
@@ -121,8 +124,9 @@ pub struct BoundProgram {
     parses: FxHashMap<FileId, Parse>,
     pub symbols: SymbolTable,
     /// `Arc`-wrapped for the same reason `symbols`/`bodies` are cheap to
-    /// clone into each call's snapshot: `cache.schema` is only ever
-    /// rebuilt when the directory walk itself is redone (see
+    /// clone into each call's snapshot: `crate::db::schema_index` only
+    /// ever recomputes when the directory walk itself is redone (Wayfinder
+    /// `apex-diagnostics` map, ticket 26's salsa-backed memoization -- see
     /// `Self::from_files_cached`), so the common case is a pointer clone,
     /// not re-parsing every SFDX metadata XML file.
     pub schema: Arc<SchemaIndex>,
@@ -166,7 +170,8 @@ static ENSURE_LARGE_WORKER_STACKS: std::sync::Once = std::sync::Once::new();
 /// The bundled standard-library index, built once per process and
 /// shared (via cheap `Arc` clones) across every `BoundProgram` --
 /// unlike `SchemaIndex`, nothing about it depends on `root`, so there's
-/// no per-project staleness to track the way `BindCache.schema` has.
+/// no per-project staleness to track the way `crate::db::schema_index`
+/// has.
 fn global_stdlib_index() -> Arc<StdlibIndex> {
     static STDLIB: std::sync::OnceLock<Arc<StdlibIndex>> = std::sync::OnceLock::new();
     Arc::clone(STDLIB.get_or_init(|| Arc::new(StdlibIndex::new())))
@@ -269,46 +274,38 @@ impl BoundProgram {
         if need_fresh_discovery {
             hotpath::measure_block!("discover_and_build_schema", {
                 let discovery = apex_discover::discover(root);
-                // `SchemaIndex::from_discovery` and `global_stdlib_index`
-                // each trigger their own bundled JSON snapshot's one-time
-                // parse (`standard_objects.json`/`apex_reference.json`,
-                // hundreds of thousands of lines combined) the first time
-                // either runs in this process, and neither depends on the
-                // other's output -- running them via `rayon::join` instead
-                // of back-to-back roughly halves that one-time cold-start
-                // cost. `global_stdlib_index`'s own `OnceLock` makes the
-                // unconditional call below free once this has run.
-                let ((schema, labels), _) = rayon::join(
-                    || {
-                        rayon::join(
-                            || Arc::new(SchemaIndex::from_discovery(&discovery)),
-                            || Arc::new(LabelIndex::from_discovery(&discovery)),
-                        )
-                    },
-                    global_stdlib_index,
-                );
-                let vf_referenced_classes = Arc::new(
-                    apex_metadata::visualforce::referenced_controller_classes(&discovery.page_files),
-                );
-                // No `rayon::join` needed here, unlike `schema`/`labels`
-                // above: unlike those, there's no bundled JSON snapshot or
-                // file content to parse at all -- a page's own name is
-                // just its already-in-memory file-stem (see `PageIndex`'s
-                // own doc comment), so building this is effectively free.
-                let pages = Arc::new(PageIndex::from_discovery(&discovery));
+                let discovery_input =
+                    db::sync_discovery_into_db(&mut cache.db, cache.discovery_input, &discovery);
+                cache.discovery_input = Some(discovery_input);
                 cache.discovery = Some(discovery);
-                cache.schema = Some(schema);
-                cache.labels = Some(labels);
-                cache.pages = Some(pages);
-                cache.vf_referenced_classes = Some(vf_referenced_classes);
             });
         }
         let discovery = cache.discovery.as_ref().unwrap();
-        let schema = Arc::clone(cache.schema.as_ref().unwrap());
-        let labels = Arc::clone(cache.labels.as_ref().unwrap());
-        let pages = Arc::clone(cache.pages.as_ref().unwrap());
+        let discovery_input = cache.discovery_input.unwrap();
+        // Every call (not just a fresh-walk one) reads through these
+        // salsa-memoized queries rather than a locally cached `Arc` clone
+        // -- ticket 26's own Stage 1 cutover (Wayfinder `apex-diagnostics`
+        // map) deleted `BindCache`'s (formerly redundant) `schema`/
+        // `labels`/`pages`/`vf_referenced_classes` fields entirely, per
+        // ticket 25's "no permanent shadow copy" rule. Deliberately
+        // sequential, not `rayon::join`-parallelized the way the pre-
+        // salsa build overlapped `SchemaIndex::from_discovery`/
+        // `LabelIndex::from_discovery` with `global_stdlib_index`'s own
+        // one-time JSON parse: a salsa database's thread-local "attached"
+        // state (`salsa::attach`) isn't safe to hand to `rayon`'s
+        // *shared, process-global* worker pool while another, unrelated
+        // `BindDatabase` (a different `BoundProgram::from_files` call
+        // running concurrently -- confirmed via `cargo test`'s parallel
+        // test threads) might already be attached on the same physical
+        // worker thread. A call whose `discovery_input` didn't just
+        // change is a cheap memoized-value lookup in each query below,
+        // not a recompute, so the lost parallelism only costs anything on
+        // the comparatively rare fresh-walk call.
+        let schema = db::schema_index(&cache.db, discovery_input);
+        let labels = db::label_index(&cache.db, discovery_input);
+        let pages = db::page_index(&cache.db, discovery_input);
+        let vf_referenced_classes = db::vf_referenced_classes(&cache.db, discovery_input);
         let stdlib = global_stdlib_index();
-        let vf_referenced_classes = Arc::clone(cache.vf_referenced_classes.as_ref().unwrap());
 
         // Stage 0: resolve every discovered path to a stable `FileId`.
         // This is only a *candidate* list -- Stage 1a below is what
