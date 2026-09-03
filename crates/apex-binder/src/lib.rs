@@ -48,6 +48,8 @@ mod page_index;
 mod ptr;
 mod reference_table;
 mod resolve;
+#[cfg(test)]
+mod salsa_smoke;
 mod schema_index;
 mod scope;
 mod soql;
