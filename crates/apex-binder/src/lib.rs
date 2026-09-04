@@ -92,7 +92,6 @@ use incremental::{FileBodies, Freshness};
 use rayon::prelude::*;
 use rowan::ast::AstNode;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -456,6 +455,13 @@ impl BoundProgram {
             .filter(|id| !current_ids.contains(id))
             .collect();
         let mut declarations_changed = !removed.is_empty();
+        // Whether the *file set itself* changed (added/removed), not
+        // just declarations within already-known files -- Stage 3's own
+        // `db::FileSetInput` (Wayfinder `apex-diagnostics` map, ticket
+        // 30/31) is only re-synced on this narrower trigger, not every
+        // call the way `discovery_input` is, since setting a salsa input
+        // always bumps its own revision regardless of content equality.
+        let mut file_set_changed = !removed.is_empty();
         for file in removed {
             cache.table.remove_file(file);
             cache.raw_extends.remove(&file);
@@ -532,6 +538,9 @@ impl BoundProgram {
         // comparison).
         for (file, parse, collection) in fresh {
             let is_new = !cache.table.has_file(file);
+            if is_new {
+                file_set_changed = true;
+            }
             if is_new
                 || !declarations_equivalent(
                     cache.table.declared_symbols_of_file(file),
@@ -547,19 +556,59 @@ impl BoundProgram {
             cache.file_parses.insert(file, parse);
         }
 
+        // Stage 3 (Wayfinder `apex-diagnostics` map, ticket 30/31):
+        // re-sync `db::FileSetInput` only when the file set itself
+        // changed, sorted by `FileId` for determinism (ticket 26's own
+        // documented hash-map-iteration-order lesson applies here too --
+        // an unsorted `Vec` would make an unchanged project look
+        // "changed" to salsa purely from iteration-order jitter). Every
+        // current file already has a `file_text_inputs` entry by this
+        // point: an unaffected file's persists from a previous call, and
+        // Stage 1a.5 above just created/refreshed every dirty file's
+        // (including any brand-new file's) entry.
+        if file_set_changed {
+            let mut entries: Vec<(FileId, db::FileTextInput)> = current_ids
+                .iter()
+                .filter_map(|&file| cache.file_text_inputs.get(&file).map(|&input| (file, input)))
+                .collect();
+            entries.sort_by_key(|&(file, _)| file);
+            let existing = cache.file_set_input;
+            cache.file_set_input =
+                Some(db::sync_file_set_into_db(&mut cache.db, existing, entries));
+        }
+
         // Pass 1.5 + derived-index rebuild only when something actually
         // declared changed project-wide -- otherwise every index and
         // `inherited_chain`/`direct_super` entry is still exactly
         // correct from the previous call (see `SymbolTable::rebuild_indices`'s
         // doc comment for why skipping this is sound, not just fast).
+        // `resolve_inheritance` itself has its own, narrower trigger one
+        // level down (ticket 30/31): `rebuild_indices` still runs on
+        // every declaration change (member additions/removals need
+        // fresh `members_of`/`members_by_name` too), but re-running
+        // `resolve_inheritance` needs only `db::raw_inheritance_inputs`'s
+        // bundled content to have actually changed -- a strict subset of
+        // what trips `declarations_changed` (a method/field/property
+        // addition with no bearing on any type name or `extends`/
+        // `implements` clause anywhere no longer forces a project-wide
+        // re-flatten). `inherit.rs`/`resolve_inheritance`/`SymbolTable`
+        // are otherwise completely unchanged by this stage.
         if declarations_changed {
             hotpath::measure_block!("pass1_5_inherit_and_rebuild_indices", {
                 cache.table.rebuild_indices();
-                let all_raw_extends: Vec<(SymbolId, Vec<SmolStr>)> =
-                    cache.raw_extends.values().flatten().cloned().collect();
-                let all_raw_super: Vec<(SymbolId, SmolStr)> =
-                    cache.raw_super.values().flatten().cloned().collect();
-                inherit::resolve_inheritance(&mut cache.table, &all_raw_extends, &all_raw_super);
+                let file_set = cache
+                    .file_set_input
+                    .expect("declarations_changed implies at least one known file");
+                let inputs = db::raw_inheritance_inputs(&cache.db, file_set);
+                let inputs_changed = cache.raw_inheritance_inputs.as_deref() != Some(&*inputs);
+                if inputs_changed {
+                    inherit::resolve_inheritance(
+                        &mut cache.table,
+                        &inputs.raw_extends,
+                        &inputs.raw_super,
+                    );
+                }
+                cache.raw_inheritance_inputs = Some(inputs);
             });
         }
 

@@ -8,7 +8,7 @@
 //! `crate::symbol::SymbolId`'s and `crate::file_table::FileTable`'s doc
 //! comments for the stable-identity foundation this relies on.
 
-use crate::db::{BindDatabase, DiscoveryInput, FileTextInput};
+use crate::db::{BindDatabase, DiscoveryInput, FileSetInput, FileTextInput, RawInheritanceInputs};
 use crate::file_id::FileId;
 use crate::file_table::FileTable;
 use crate::ptr::{AstPtr, SyntaxPtr};
@@ -177,6 +177,24 @@ pub struct BindCache {
     /// reused rather than recreated. Only a dirty file's entry is ever
     /// touched.
     pub(crate) file_text_inputs: FxHashMap<FileId, FileTextInput>,
+    /// The current project-wide file set's own salsa-input identity
+    /// (Wayfinder `apex-diagnostics` map, ticket 30/31, Stage 3), `None`
+    /// only before the first call. Reused (its `entries` field
+    /// overwritten, never recreated) the same way `discovery_input`
+    /// above is -- but unlike `discovery_input`, only re-set when the
+    /// file set itself actually changed (a file added/removed), not
+    /// every call. See `crate::db::FileSetInput`'s own doc comment.
+    pub(crate) file_set_input: Option<FileSetInput>,
+    /// The last value [`crate::db::raw_inheritance_inputs`] returned,
+    /// kept so `BoundProgram::from_files_cached` can compare this call's
+    /// freshly-fetched value against it *by content* (not by `Arc`
+    /// pointer -- salsa's own early cutoff means a query body can rerun
+    /// and still return content-equal output, so pointer equality alone
+    /// would under-detect "unchanged") to decide whether
+    /// `crate::inherit::resolve_inheritance` actually needs to rerun,
+    /// replacing `declarations_changed`'s coarser trigger for this one
+    /// decision. `None` only before the first call.
+    pub(crate) raw_inheritance_inputs: Option<Arc<RawInheritanceInputs>>,
     /// The project's declared symbols, persisted and patched file-by-file
     /// across calls rather than rebuilt from nothing -- see
     /// `SymbolTable`'s module doc comment.

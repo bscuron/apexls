@@ -221,13 +221,31 @@ impl SymbolTable {
     /// Rebuilds every project-wide derived index (`members_of`,
     /// `members_by_name`, `top_level`, `by_name_ci`) from scratch against
     /// whatever's currently in `by_file`, replacing [`Self`]'s whole
-    /// [`Indices`] bundle with a fresh `Arc` in one atomic swap. Does
-    /// **not** touch `inherited_chain`/`direct_super` -- those are Pass
-    /// 1.5's job (`crate::inherit::resolve_inheritance`), run separately
-    /// by the caller only when this rebuild indicates declarations
-    /// actually changed.
+    /// [`Indices`] bundle with a fresh `Arc` in one atomic swap.
+    /// `inherited_chain`/`direct_super`/`unresolved_direct_super`/
+    /// `subtypes` are **carried forward unchanged** from the previous
+    /// bundle rather than reset -- those are Pass 1.5's job
+    /// (`crate::inherit::resolve_inheritance`), which the caller may or
+    /// may not run right after this (Wayfinder `apex-diagnostics` map,
+    /// ticket 30/31: `resolve_inheritance` now has its own, narrower
+    /// trigger than this method's `declarations_changed` gate, so the two
+    /// no longer always run back to back the way they used to). Carrying
+    /// the old values forward is what makes that safe: whenever this
+    /// rebuild's caller decides the inheritance data is still valid and
+    /// skips `resolve_inheritance`, that still-valid data survives this
+    /// call instead of silently going empty. When the caller *does* run
+    /// `resolve_inheritance` right after, it overwrites these same
+    /// fields with fresh values via `set_inherited_chain`/`set_direct_super`/
+    /// `set_unresolved_direct_super`/`set_subtypes`, exactly as before --
+    /// this carry-forward is invisible to that path.
     pub(crate) fn rebuild_indices(&mut self) {
-        let mut fresh = Indices::default();
+        let mut fresh = Indices {
+            inherited_chain: self.indices.inherited_chain.clone(),
+            direct_super: self.indices.direct_super.clone(),
+            unresolved_direct_super: self.indices.unresolved_direct_super.clone(),
+            subtypes: self.indices.subtypes.clone(),
+            ..Indices::default()
+        };
 
         let mut files: Vec<FileId> = self.by_file.keys().copied().collect();
         files.sort();

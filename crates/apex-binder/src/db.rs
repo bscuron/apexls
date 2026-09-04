@@ -45,11 +45,13 @@ use crate::file_id::FileId;
 use crate::label_index::LabelIndex;
 use crate::page_index::PageIndex;
 use crate::schema_index::SchemaIndex;
+use crate::symbol::SymbolId;
 use apex_discover::Discovery;
 use apex_parser::{NodeCache, Parse};
 use apex_syntax::ast::decl::{CompilationUnit, TriggerUnit};
 use rowan::ast::AstNode;
 use salsa::Setter;
+use smol_str::SmolStr;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -221,7 +223,17 @@ pub(crate) fn parse_query(db: &dyn salsa::Database, input: FileTextInput) -> Par
 /// `collect_trigger_unit`'s old direct call sites in
 /// `crate::BoundProgram::from_files_cached` exactly, just routed through
 /// this file's tracked [`Parse`] instead of a plain function's local one.
-#[salsa::tracked(no_eq, returns(clone))]
+///
+/// Real equality comparison, not `no_eq` (Wayfinder `apex-diagnostics`
+/// map, ticket 30/31, Stage 3 of the salsa migration): unlike Stage 1's
+/// four indices, whose own trigger already guarantees a real content
+/// change whenever they recompute at all, [`raw_inheritance_inputs`]
+/// below needs to see *this* query's output as unchanged whenever a
+/// dirty file's declarations didn't actually change (a method-body-only
+/// edit) for its own early cutoff to mean anything -- `FileCollection`
+/// already derives `PartialEq` (ticket 29, for that stage's own dual-run
+/// test), so this is the attribute alone.
+#[salsa::tracked(returns(clone))]
 pub(crate) fn collect_query(db: &dyn salsa::Database, input: FileTextInput) -> FileCollection {
     let parse = parse_query(db, input);
     let root = parse.syntax();
@@ -235,4 +247,138 @@ pub(crate) fn collect_query(db: &dyn salsa::Database, input: FileTextInput) -> F
             .map(|cu| crate::collect::collect_compilation_unit(file, &cu))
             .unwrap_or_default()
     }
+}
+
+/// The current project-wide file set, as `(FileId, FileTextInput)` pairs
+/// in `FileId`-sorted order -- Stage 3's own salsa input (Wayfinder
+/// `apex-diagnostics` map, ticket 30/31). Sorted, not insertion-order,
+/// because [`raw_inheritance_inputs`] below needs a *deterministic*
+/// `Vec` for its own early cutoff to work at all: ticket 26 already
+/// found `apex_discover::discover`'s parallel walker returns files in a
+/// run-to-run-nondeterministic order, and building this input the same
+/// unsorted way would make an unchanged project look "changed" to salsa
+/// purely from hash-map iteration order jitter, defeating early cutoff
+/// on every single call rather than only when the file set actually
+/// changes.
+///
+/// Unlike [`DiscoveryInput`]/[`FileTextInput`], this input is set only
+/// when the file set itself changes (a file added or removed) -- not on
+/// every call the way `DiscoveryInput` is, and not per-dirty-file the
+/// way `FileTextInput` is. Setting a `#[salsa::input]` field always
+/// bumps its own revision regardless of content equality (inputs get no
+/// early cutoff of their own, only tracked-fn *outputs* do), so setting
+/// this on every call would force [`raw_inheritance_inputs`] to
+/// re-execute every call even when nothing changed -- the file-set-only
+/// trigger is what lets an ordinary edit (no file added/removed) skip
+/// straight to relying on [`collect_query`]'s own per-file early cutoff
+/// instead.
+#[salsa::input]
+pub(crate) struct FileSetInput {
+    entries: Vec<(FileId, FileTextInput)>,
+}
+
+/// Pushes the current file set into `db`, creating `existing`'s
+/// [`FileSetInput`] the first time this is called and setting its
+/// `entries` field every time after -- called from
+/// `crate::BoundProgram::from_files_cached` only when the file set
+/// actually changed (mirroring [`sync_discovery_into_db`]'s "only
+/// overwrite on a real trigger" shape, not [`sync_file_text_into_db`]'s
+/// "every dirty file, every call" one), with `entries` already sorted
+/// by `FileId` by the caller.
+pub(crate) fn sync_file_set_into_db(
+    db: &mut BindDatabase,
+    existing: Option<FileSetInput>,
+    entries: Vec<(FileId, FileTextInput)>,
+) -> FileSetInput {
+    match existing {
+        Some(input) => {
+            input.set_entries(db).to(entries);
+            input
+        }
+        None => FileSetInput::new(db, entries),
+    }
+}
+
+/// Every currently-known type symbol's raw (unresolved) `extends`/
+/// `implements` names, aggregated project-wide from every file's
+/// [`collect_query`] output -- Pass 1.5's own real input, salsa-tracked
+/// so its early cutoff (real equality, not `no_eq`: [`collect_query`]'s
+/// own real-equality output means this only actually differs from last
+/// time when some file's declared `extends`/`implements` clauses
+/// themselves changed, not on every dirty file) can replace
+/// `declarations_changed`'s coarser "did anything declared anywhere
+/// change" trigger for deciding whether `crate::inherit::resolve_inheritance`
+/// needs to rerun at all. `inherit.rs`/`resolve_inheritance`/
+/// `SymbolTable` themselves are untouched by this stage (Wayfinder
+/// `apex-diagnostics` map, ticket 30's own "final simplification" --
+/// `SymbolTable::rebuild_indices` already rebuilds `top_level`/
+/// `nested_type` synchronously, with no staleness, immediately before
+/// `resolve_inheritance` runs today, so there was no real gap there for
+/// a salsa-tracked name index to close).
+///
+/// Also bundles every currently-declared *type*-kind symbol's own
+/// `(id, name, container)` triple, in addition to `raw_extends`/
+/// `raw_super` themselves -- not just an optimization, a correctness
+/// requirement, and not just for cross-file renames either. Two distinct
+/// hazards, both real:
+///
+/// 1. `resolve_inheritance`'s own name resolution
+///    (`crate::inherit::resolve_supertype_name`, via `SymbolTable::top_level`/
+///    `nested_type`) can resolve an *unchanged* `extends`/`implements`
+///    name to a *different* target when a type elsewhere is added,
+///    removed, or renamed (a same-named top-level class added in another
+///    file now shadows what an existing, textually-unchanged
+///    `extends Foo` clause resolves to) -- comparing `raw_extends`/
+///    `raw_super` content alone would miss exactly that case, since
+///    neither clause's own text changed. The `name`/`container` fields
+///    cover this.
+/// 2. A type-kind symbol's own `SymbolId` is a declaration-order
+///    position (`local`), not a stable-across-edits identity (see
+///    `SymbolId`'s own doc comment) -- adding/removing a *non-type*
+///    declaration (a method, say) earlier in the same file shifts every
+///    later symbol's `local`, including a nested type's, even though
+///    that nested type's own name/container/`extends` clause never
+///    changed. Without the symbol's own `id` in this comparison, that
+///    shift would go undetected (its `name`/`container` compare equal
+///    either way), leaving `SymbolTable`'s carried-forward
+///    `inherited_chain`/`direct_super` entries keyed by a now-stale
+///    `SymbolId` that either doesn't exist anymore or names a *different*
+///    symbol -- a real, if narrow, staleness bug, not merely a missed
+///    optimization.
+#[salsa::tracked(returns(clone))]
+pub(crate) fn raw_inheritance_inputs(
+    db: &dyn salsa::Database,
+    file_set: FileSetInput,
+) -> Arc<RawInheritanceInputs> {
+    let mut raw_extends = Vec::new();
+    let mut raw_super = Vec::new();
+    let mut type_names = Vec::new();
+    for &(file, input) in file_set.entries(db).iter() {
+        let collection = collect_query(db, input);
+        for (local, symbol) in collection.symbols.iter().enumerate() {
+            if symbol.kind.is_type() {
+                let id = SymbolId::new(file, local as u32);
+                type_names.push((id, symbol.name.clone(), symbol.container));
+            }
+        }
+        raw_extends.extend(collection.raw_extends);
+        raw_super.extend(collection.raw_super);
+    }
+    Arc::new(RawInheritanceInputs { raw_extends, raw_super, type_names })
+}
+
+/// [`raw_inheritance_inputs`]'s bundled return value. `PartialEq`
+/// (derived) is what gives that query's early cutoff its actual
+/// meaning: two calls whose rebuilt `Vec`s compare equal mean salsa
+/// never has to consider any downstream reader "possibly changed" at
+/// all, even though the aggregation itself reran.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct RawInheritanceInputs {
+    pub(crate) raw_extends: Vec<(SymbolId, Vec<SmolStr>)>,
+    pub(crate) raw_super: Vec<(SymbolId, SmolStr)>,
+    /// Every declared type-kind symbol's own `(id, name, container)` --
+    /// see this struct's own producer's doc comment for why all three
+    /// fields (not just `name`/`container`) have to be part of the
+    /// comparison.
+    pub(crate) type_names: Vec<(SymbolId, SmolStr, Option<SymbolId>)>,
 }

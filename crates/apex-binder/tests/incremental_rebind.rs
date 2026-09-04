@@ -222,6 +222,104 @@ fn deleting_a_file_leaves_no_stale_symbols_even_with_a_stale_cached_walk() {
     );
 }
 
+fn corpus_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus/npsp")
+}
+
+/// Real-corpus-scale version of
+/// [`declaration_changing_edit_via_incremental_cache_matches_a_cold_rebuild`]
+/// above, targeting the exact bug class ticket 30/31 (Wayfinder
+/// `apex-diagnostics` map, Stage 3 of the salsa migration) found and
+/// fixed while implementing: `crate::inherit::resolve_inheritance` gained
+/// a narrower trigger than `SymbolTable::rebuild_indices`'s own
+/// `declarations_changed` gate, and the first version of that change let
+/// `rebuild_indices` wipe already-correct `inherited_chain`/`direct_super`
+/// data whenever `resolve_inheritance` was (correctly) skipped that
+/// round. The small synthetic fixture above caught it first; this
+/// re-runs the same shape at real scale (a real NPSP class's chain, a
+/// real NPSP file edited) as this stage's own corpus validation, per
+/// this map's Notes.
+#[test]
+fn a_real_npsp_classs_inherited_chain_survives_an_unrelated_declaration_change_in_another_file() {
+    let root = corpus_root();
+    assert!(
+        root.exists(),
+        "no NPSP corpus found at {root:?}; is the submodule checked out? \
+         (git submodule update --init --recursive)"
+    );
+
+    let mut warm_cache = BindCache::default();
+    let baseline = BoundProgram::from_files_cached(&root, &HashMap::new(), &mut warm_cache);
+
+    // A real class with a non-empty `inherited_chain`, plus a *different*
+    // class (in a different file) to edit -- ancestor names are compared
+    // by name, not `SymbolId`, since the two further builds below number
+    // files independently and could legitimately disagree on raw ids.
+    let (probe_name, probe_file, ancestor_names_baseline) = baseline
+        .symbols
+        .iter()
+        .find_map(|(id, s)| {
+            let chain = baseline.symbols.inherited_chain(id);
+            (s.kind == SymbolKind::Class && !chain.is_empty()).then(|| {
+                let names: Vec<String> =
+                    chain.iter().map(|&a| baseline.symbols.get(a).name.to_string()).collect();
+                (s.name.to_string(), s.file, names)
+            })
+        })
+        .expect("expected at least one real NPSP class with a non-empty inherited_chain");
+
+    let edited_file = baseline
+        .symbols
+        .iter()
+        .find(|(_, s)| s.kind == SymbolKind::Class && s.file != probe_file)
+        .map(|(_, s)| s.file)
+        .expect("expected at least one other real NPSP class in a different file");
+    let edited_path = baseline.file_path(edited_file).to_path_buf();
+
+    // A brand-new, declaration-changing method appended to that other
+    // class's body -- forces `declarations_changed` (so `rebuild_indices`
+    // runs) without touching any type's own declared name or
+    // `extends`/`implements` clause anywhere, so the narrower
+    // `resolve_inheritance` trigger should correctly decide it doesn't
+    // need to rerun, and `probe_name`'s already-correct chain must
+    // survive that skip intact.
+    let original_text = std::fs::read_to_string(&edited_path).unwrap();
+    let edited_text = original_text.replacen('{', "{ public void __stage3_probe_zzz() { } ", 1);
+    let mut overrides = HashMap::new();
+    overrides.insert(edited_path, edited_text);
+
+    let warm = BoundProgram::from_files_cached(&root, &overrides, &mut warm_cache);
+    let cold = BoundProgram::from_files_with_overrides(&root, &overrides);
+
+    let ancestor_names_of = |program: &BoundProgram| -> Vec<String> {
+        let id = program
+            .symbols
+            .iter()
+            .find(|(_, s)| s.kind == SymbolKind::Class && s.name == probe_name)
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| panic!("{probe_name} should still be collected"));
+        program
+            .symbols
+            .inherited_chain(id)
+            .iter()
+            .map(|&a| program.symbols.get(a).name.to_string())
+            .collect()
+    };
+
+    assert_eq!(
+        ancestor_names_of(&warm),
+        ancestor_names_baseline,
+        "the probe class's inherited_chain changed across an edit to an unrelated file -- \
+         it shouldn't have"
+    );
+    assert_eq!(
+        ancestor_names_of(&warm),
+        ancestor_names_of(&cold),
+        "warm incremental rebind's inherited_chain for {probe_name} disagreed with a cold \
+         rebuild after an unrelated declaration change in a different file"
+    );
+}
+
 /// The inverse case: a file created *and opened* after the first call
 /// (its content arrives only via `overrides`, exactly like a real
 /// editor's `didOpen` for a brand-new file) must still get bound on the
