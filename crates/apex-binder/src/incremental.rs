@@ -8,7 +8,7 @@
 //! `crate::symbol::SymbolId`'s and `crate::file_table::FileTable`'s doc
 //! comments for the stable-identity foundation this relies on.
 
-use crate::db::{BindDatabase, DiscoveryInput};
+use crate::db::{BindDatabase, DiscoveryInput, FileTextInput};
 use crate::file_id::FileId;
 use crate::file_table::FileTable;
 use crate::ptr::{AstPtr, SyntaxPtr};
@@ -125,14 +125,19 @@ pub struct BindCache {
     /// memoizing against the same input. Same lockstep invariant as
     /// `discovery` above -- see its own doc comment.
     pub(crate) discovery_input: Option<DiscoveryInput>,
-    /// Each path's last-seen `(Freshness, Parse)` -- a parse is reused
-    /// as-is whenever `Freshness::matches` says nothing changed, skipping
-    /// that file's read *and* lex/parse entirely. No separate copy of the
-    /// content itself is kept here (real, measured memory cost -- see
-    /// `examples/mem_profile.rs`): see [`Freshness`]'s doc comment for
-    /// what's compared instead, and the two attempts before it (a stored
-    /// `String`, then a content hash) that this superseded.
-    pub(crate) parses: FxHashMap<PathBuf, (Freshness, Parse)>,
+    /// Each path's last-seen [`Freshness`] -- a file is skipped (no read,
+    /// no salsa input write, no reparse) whenever this call's freshly
+    /// computed `Freshness` still matches. Ticket 29 (Wayfinder
+    /// `apex-diagnostics` map, Stage 2 of the salsa migration) narrowed
+    /// this from the old `parses` field's `(Freshness, Parse)` pair down
+    /// to `Freshness` alone: the actual `Parse` this used to also cache
+    /// is now `crate::db::parse_query`'s own salsa-memoized job (see
+    /// [`Self::file_text_inputs`]) -- keeping a second, redundant copy
+    /// here would just be two caches doing the same job. No separate copy
+    /// of the content itself is kept here either (real, measured memory
+    /// cost -- see `examples/mem_profile.rs`): see [`Freshness`]'s doc
+    /// comment for what's compared instead.
+    pub(crate) freshness: FxHashMap<PathBuf, Freshness>,
     /// Every currently-live file's path, keyed by its stable `FileId` --
     /// persisted and patched file-by-file (dirty/removed only) across
     /// calls, same discipline as `table`/`bodies` below, so
@@ -146,15 +151,32 @@ pub struct BindCache {
     /// Reverse of `paths`, patched alongside it.
     pub(crate) path_ids: FxHashMap<PathBuf, FileId>,
     /// Every currently-live file's last-bound `Parse`, keyed by `FileId`
-    /// -- the `BoundProgram`-facing counterpart to `parses` above (which
-    /// is keyed by `PathBuf` and paired with a `Freshness` purely for
-    /// that field's own staleness check). Kept as a separate map rather
-    /// than merged into `parses` since the two serve different call
-    /// sites with no clean shared shape; duplicating one cheap `Parse`
-    /// clone (`Arc`-backed `GreenNode`, see `apex_parser::Parse`'s doc
-    /// comment) across two maps is a fair trade for not reworking the
-    /// path-keyed freshness check to be `FileId`-keyed instead.
+    /// -- the `BoundProgram`-facing counterpart to `freshness` above
+    /// (which is keyed by `PathBuf`, purely for that field's own
+    /// staleness check). Patched only for dirty files each call, exactly
+    /// like `table`/`bodies` below -- an unaffected file's entry is
+    /// already correct and never re-queried. Ticket 29 deliberately
+    /// keeps this field despite its own text calling for its deletion:
+    /// `crate::BoundProgram::from_files_cached`'s Pass 2 needs *every*
+    /// current file's `Parse` on hand for the conservative "declarations
+    /// changed somewhere, rebind everything" case, and sweeping all
+    /// ~1,070 corpus files through a salsa query every single call (most
+    /// of them just a memoized-value fetch) measured slower than this
+    /// persisted map's near-free `.clone()` on the warm single-edit path
+    /// -- the exact case this migration's own done-bar protects. A dirty
+    /// file's entry is now populated from `crate::db::parse_query`'s
+    /// salsa-memoized output (see [`Self::file_text_inputs`]) rather than
+    /// `parse_one`'s direct computation, but the field's role is
+    /// otherwise unchanged.
     pub(crate) file_parses: FxHashMap<FileId, Parse>,
+    /// Each currently-known file's own [`FileTextInput`] identity --
+    /// created once (`crate::db::sync_file_text_into_db`) and reused
+    /// (its `text` field overwritten, never recreated) so `db`'s
+    /// `parse_query`/`collect_query` keep memoizing against the same
+    /// input across calls, the same reason `discovery_input` above is
+    /// reused rather than recreated. Only a dirty file's entry is ever
+    /// touched.
+    pub(crate) file_text_inputs: FxHashMap<FileId, FileTextInput>,
     /// The project's declared symbols, persisted and patched file-by-file
     /// across calls rather than rebuilt from nothing -- see
     /// `SymbolTable`'s module doc comment.

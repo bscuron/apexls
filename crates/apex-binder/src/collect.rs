@@ -29,7 +29,12 @@ use smol_str::SmolStr;
 
 /// One file's collected declarations, already carrying final, stable
 /// `SymbolId`s (see the module doc comment).
-#[derive(Default, Clone)]
+///
+/// `PartialEq`/`Debug` (ticket 29) solely so `salsa_stage2_dual_run.rs`'s
+/// corpus-wide dual-run test can `assert_eq!` two instances directly,
+/// matching `SchemaIndex`/`LabelIndex`/`PageIndex`'s own ticket-26
+/// precedent.
+#[derive(Default, Clone, PartialEq, Debug)]
 pub(crate) struct FileCollection {
     pub(crate) symbols: Vec<Symbol>,
     /// `(a type symbol's id, unresolved extends/implements supertype

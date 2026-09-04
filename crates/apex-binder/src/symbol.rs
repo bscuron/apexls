@@ -171,7 +171,13 @@ impl ModifierSet {
 /// One declared name: a class, interface, enum, enum constant, method,
 /// constructor, field, property, parameter, or (added in Pass 2) local
 /// binding.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` (ticket 29, Wayfinder `apex-diagnostics` map) solely so
+/// `salsa_stage2_dual_run.rs`'s corpus-wide dual-run test can `assert_eq!`
+/// two `FileCollection`s directly -- nothing else in the crate compares
+/// two `Symbol`s, matching `SchemaIndex`/`LabelIndex`/`PageIndex`'s own
+/// ticket-26 precedent.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Symbol {
     pub kind: SymbolKind,
     /// As declared, case preserved -- Apex identifiers are

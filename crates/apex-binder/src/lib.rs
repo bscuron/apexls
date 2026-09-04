@@ -53,6 +53,8 @@ mod resolve;
 mod salsa_smoke;
 #[cfg(test)]
 mod salsa_stage1_dual_run;
+#[cfg(test)]
+mod salsa_stage2_dual_run;
 mod schema_index;
 mod scope;
 mod soql;
@@ -83,7 +85,7 @@ pub use apex_parser::ParseError;
 
 use apex_parser::Parse;
 use apex_syntax::ast::decl::{
-    CompilationUnit, ConstructorDecl, MethodDecl, PropertyDecl, TriggerUnit, VarDeclarator,
+    ConstructorDecl, MethodDecl, PropertyDecl, TriggerUnit, VarDeclarator,
 };
 use apex_syntax::SyntaxNode;
 use incremental::{FileBodies, Freshness};
@@ -319,196 +321,134 @@ impl BoundProgram {
             .map(|path| (path.clone(), cache.files.id_for(path)))
             .collect();
 
-        // Stage 1a (parallel): read (or reuse an override's in-memory
-        // content) and parse (or reuse a byte-identical cache hit's
-        // already-built tree) every candidate file independently. A
+        // Stage 1a (parallel): check each candidate's on-disk/`overrides`
+        // freshness (a stat, or an override's content hash) against
+        // `cache.freshness`'s last-seen value -- cheap enough to run for
+        // every candidate every call, and what decides which files are
+        // actually dirty this call without reading, let alone parsing,
+        // anything unaffected (ticket 29, Wayfinder `apex-diagnostics`
+        // map: parsing itself moved to `crate::db::parse_query`, a
+        // per-file salsa-tracked query -- see Stage 1b below -- so this
+        // stage's only job now is deciding *which* files need one). A
         // candidate that fails to read (deleted since the walk that
         // produced it, a permissions race, ...) is silently dropped
         // here, exactly as it always was -- and that silent drop is
         // *also* this function's only signal that a file was removed
         // (see `current_ids` below), so a deletion self-corrects without
         // ever needing a fresh walk, only a genuinely new file does.
-        struct ParsedFile {
+        struct CandidateFile {
             path: PathBuf,
             file: FileId,
             trigger: bool,
             dirty: bool,
             freshness: Freshness,
-            parse: Parse,
+            /// Only `Some` for a dirty file -- the freshly-read text that
+            /// file's salsa input needs. An unaffected file's input is
+            /// never touched: ticket 27's confirmed load-bearing gotcha
+            /// (writing a salsa input cancels every other in-flight
+            /// query on every other clone of the database) makes this a
+            /// correctness requirement here, not just an optimization.
+            text: Option<String>,
         }
-        // Every file `rayon` groups into the same fold segment (its own
-        // adaptive work-stealing split, not a fixed size this crate
-        // picks) shares one `NodeCache` instead of each file getting its
-        // own, empty one: `apex_parser::parse_compilation_unit_with_cache`'s
-        // doc comment explains why that matters (identical keyword/
-        // punctuation/small-node text across files interns into one
-        // `Arc`-shared allocation instead of a fresh one per file --
-        // measured as a real, if modest, share of steady-state memory,
-        // see `crates/apex-binder/examples/mem_profile.rs` and
-        // `BACKLOG.md`). `fold` (not a hand-chosen chunk size fed through
-        // `.chunks()`) is what makes this scale to any machine rather
-        // than one tuned to a specific core count: a first attempt
-        // pre-partitioned `candidates` into fixed 64-item chunks via
-        // `.chunks(64).flat_map(...)`, which pays for materializing a
-        // `Vec` per chunk *and* a `Vec` of per-chunk results before
-        // flattening -- fine for the memory-dominated cold-project case,
-        // but that fixed per-call overhead regressed the far more latency-
-        // sensitive warm single-file-edit rebind by ~47% (measured via
-        // `cargo bench -p apex-binder`), since nearly all of its ~1044
-        // candidates never parse at all (a cache/stat hit) and pay pure
-        // grouping overhead for no benefit. `fold`'s accumulator
-        // (`(NodeCache, Vec<ParsedFile>)`, built up in place per segment)
-        // has no such fixed cost -- confirmed via the same benchmark to
-        // leave warm-rebind's timing within its usual run-to-run noise.
-        // The `NodeCache` in a fold segment is discarded when that
-        // segment's accumulator is consumed by `flat_map` below, so
-        // (same as the rejected chunking approach) nothing about it can
-        // grow unbounded across an editing session.
-        let parse_one = |path: PathBuf, file: FileId, node_cache: &mut apex_parser::NodeCache| -> Option<ParsedFile> {
-                    let trigger = path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
+        let check_freshness = |path: PathBuf, file: FileId| -> Option<CandidateFile> {
+            let trigger = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
 
-                    // An `overrides` entry (an unsaved editor buffer) has no
-                    // filesystem metadata to stat -- content is already in
-                    // memory (the caller supplied it, no disk I/O either
-                    // way), so it's compared by content hash, same as
-                    // before. In practice this is at most a handful of
-                    // files per call (whatever's actually being edited).
-                    // `path` moves into whichever `ParsedFile` this
-                    // invocation actually returns (one `PathBuf` per
-                    // candidate, not the extra clone an owned-vs-borrowed
-                    // mismatch used to force here) -- see the `hotpath`-
-                    // measured finding in `BACKLOG.md` §2 this targets.
-                    if let Some(content) = overrides.get(&path) {
-                        let freshness =
-                            Freshness::ContentHash(incremental::content_fingerprint(content));
-                        if let Some((cached, cached_parse)) = cache.parses.get(&path) {
-                            if *cached == freshness {
-                                return Some(ParsedFile {
-                                    path,
-                                    file,
-                                    trigger,
-                                    dirty: false,
-                                    freshness,
-                                    parse: cached_parse.clone(),
-                                });
-                            }
-                        }
-                        let parse = if trigger {
-                            apex_parser::parse_trigger_unit_with_cache(content, node_cache)
-                        } else {
-                            apex_parser::parse_compilation_unit_with_cache(content, node_cache)
-                        };
-                        return Some(ParsedFile {
-                            path,
-                            file,
-                            trigger,
-                            dirty: true,
-                            freshness,
-                            parse,
-                        });
-                    }
-
-                    // No override: stat the file *before* reading it -- a
-                    // size+mtime match against the cached entry means the
-                    // read (not just the reparse) can be skipped entirely,
-                    // which is the common case for every file besides the
-                    // one actually being edited. See `Freshness::Stat`'s
-                    // doc comment for the honest staleness caveat this
-                    // trades for that.
-                    let metadata = std::fs::metadata(&path).ok()?;
-                    let stat_freshness = metadata.modified().ok().map(|modified| Freshness::Stat {
-                        len: metadata.len(),
-                        modified,
-                    });
-                    if let Some(freshness) = &stat_freshness {
-                        if let Some((cached, cached_parse)) = cache.parses.get(&path) {
-                            if cached == freshness {
-                                return Some(ParsedFile {
-                                    path,
-                                    file,
-                                    trigger,
-                                    dirty: false,
-                                    freshness: freshness.clone(),
-                                    parse: cached_parse.clone(),
-                                });
-                            }
-                        }
-                    }
-                    let content = std::fs::read_to_string(&path).ok()?;
-                    let parse = if trigger {
-                        apex_parser::parse_trigger_unit_with_cache(&content, node_cache)
-                    } else {
-                        apex_parser::parse_compilation_unit_with_cache(&content, node_cache)
-                    };
-                    // `metadata().modified()` failing at all is rare and
-                    // platform-dependent -- fall back to a content hash so
-                    // this file still gets *some* freshness check next call,
-                    // just not the read-skipping kind.
-                    let freshness = stat_freshness.unwrap_or_else(|| {
-                        Freshness::ContentHash(incremental::content_fingerprint(&content))
-                    });
-                    Some(ParsedFile {
+            // An `overrides` entry (an unsaved editor buffer) has no
+            // filesystem metadata to stat -- content is already in
+            // memory (the caller supplied it, no disk I/O either way),
+            // so it's compared by content hash, same as before. In
+            // practice this is at most a handful of files per call
+            // (whatever's actually being edited).
+            if let Some(content) = overrides.get(&path) {
+                let freshness =
+                    Freshness::ContentHash(incremental::content_fingerprint(content));
+                if cache.freshness.get(&path) == Some(&freshness) {
+                    return Some(CandidateFile {
                         path,
                         file,
                         trigger,
-                        dirty: true,
+                        dirty: false,
                         freshness,
-                        parse,
-                    })
+                        text: None,
+                    });
+                }
+                return Some(CandidateFile {
+                    path,
+                    file,
+                    trigger,
+                    dirty: true,
+                    freshness,
+                    text: Some(content.clone()),
+                });
+            }
+
+            // No override: stat the file *before* reading it -- a
+            // size+mtime match against the cached entry means the read
+            // can be skipped entirely, which is the common case for
+            // every file besides the one actually being edited. See
+            // `Freshness::Stat`'s doc comment for the honest staleness
+            // caveat this trades for that.
+            let metadata = std::fs::metadata(&path).ok()?;
+            let stat_freshness = metadata.modified().ok().map(|modified| Freshness::Stat {
+                len: metadata.len(),
+                modified,
+            });
+            if let Some(freshness) = &stat_freshness {
+                if cache.freshness.get(&path) == Some(freshness) {
+                    return Some(CandidateFile {
+                        path,
+                        file,
+                        trigger,
+                        dirty: false,
+                        freshness: freshness.clone(),
+                        text: None,
+                    });
+                }
+            }
+            let content = std::fs::read_to_string(&path).ok()?;
+            // `metadata().modified()` failing at all is rare and
+            // platform-dependent -- fall back to a content hash so this
+            // file still gets *some* freshness check next call, just not
+            // the read-skipping kind.
+            let freshness = stat_freshness.unwrap_or_else(|| {
+                Freshness::ContentHash(incremental::content_fingerprint(&content))
+            });
+            Some(CandidateFile {
+                path,
+                file,
+                trigger,
+                dirty: true,
+                freshness,
+                text: Some(content),
+            })
         };
-        let parsed: Vec<ParsedFile> = hotpath::measure_block!("stage_1a_read_and_parse", {
+        let checked: Vec<CandidateFile> = hotpath::measure_block!("stage_1a_check_freshness", {
             candidates
                 .into_par_iter()
-                // `rayon`'s default adaptive splitting favors near-perfect
-                // load balance over grouping -- left alone, it split this
-                // source finely enough that `fold`'s segments barely
-                // grouped any files together at all (measured: almost no
-                // memory win over no sharing whatsoever). `with_min_len`
-                // is a workload property, not a machine-specific tuning
-                // knob: it just says "don't bother splitting a group of
-                // candidates smaller than this," and `rayon` still freely
-                // decides *how many* such groups to make (as many as it
-                // wants, capped by however many threads/cores the running
-                // machine actually has) -- unlike a fixed chunk count or
-                // count derived from `rayon::current_num_threads()`, nothing
-                // here is tuned to any particular machine.
-                .with_min_len(64)
-                .fold(
-                    || (apex_parser::NodeCache::default(), Vec::new()),
-                    |(mut node_cache, mut out), (path, file)| {
-                        if let Some(parsed_file) = parse_one(path, file, &mut node_cache) {
-                            out.push(parsed_file);
-                        }
-                        (node_cache, out)
-                    },
-                )
-                .flat_map(|(_, files)| files)
+                .filter_map(|(path, file)| check_freshness(path, file))
                 .collect()
         });
 
-        // Refresh the parse cache for dirty files only -- an unchanged
-        // file's entry is already correct.
-        for p in parsed.iter().filter(|p| p.dirty) {
-            cache
-                .parses
-                .insert(p.path.clone(), (p.freshness.clone(), p.parse.clone()));
-            cache.paths.insert(p.file, p.path.clone());
-            cache.path_ids.insert(p.path.clone(), p.file);
-            cache.file_parses.insert(p.file, p.parse.clone());
+        // Refresh the freshness cache for dirty files only -- an
+        // unchanged file's entry is already correct.
+        for c in checked.iter().filter(|c| c.dirty) {
+            cache.freshness.insert(c.path.clone(), c.freshness.clone());
+            cache.paths.insert(c.file, c.path.clone());
+            cache.path_ids.insert(c.path.clone(), c.file);
         }
 
         // The *actual* current file set is whatever was just
-        // successfully read above, not `discovery`'s candidate list --
+        // successfully checked above, not `discovery`'s candidate list --
         // this is what makes a deleted file self-correct even when
         // `discovery` itself is stale (reused from an earlier call): it
-        // simply isn't in `parsed`. A removal changes the project-wide
+        // simply isn't in `checked`. A removal changes the project-wide
         // namespace just as much as an addition does, so it also forces
         // the conservative "declarations changed" path below.
-        let current_ids: FxHashSet<FileId> = parsed.iter().map(|p| p.file).collect();
-        let current_paths: FxHashSet<&Path> = parsed.iter().map(|p| p.path.as_path()).collect();
+        let current_ids: FxHashSet<FileId> = checked.iter().map(|c| c.file).collect();
+        let current_paths: FxHashSet<&Path> = checked.iter().map(|c| c.path.as_path()).collect();
 
         let removed: Vec<FileId> = cache
             .table
@@ -526,41 +466,71 @@ impl BoundProgram {
                 cache.path_ids.remove(&path);
             }
             cache.file_parses.remove(&file);
+            cache.file_text_inputs.remove(&file);
         }
         cache
-            .parses
+            .freshness
             .retain(|path, _| current_paths.contains(path.as_path()));
 
-        // Stage 1b (parallel): Pass 1 declaration collection, but only
-        // for dirty files -- an unchanged file's declarations are still
-        // exactly what `cache.table`/`cache.raw_extends`/`cache.raw_super`
-        // already hold.
-        let fresh: Vec<(FileId, collect::FileCollection)> =
+        // Stage 1a.5 (sequential): push each dirty file's freshly-read
+        // text into its own salsa `FileTextInput`, creating it the first
+        // time a file's seen and reusing it (its `text` field
+        // overwritten) every time after. Every dirty file's input gets
+        // set here, sequentially, strictly before Stage 1b's parallel
+        // salsa reads below ever begin -- never interleaved with them,
+        // per ticket 27's confirmed load-bearing gotcha.
+        let dirty_inputs: Vec<(FileId, db::FileTextInput)> = checked
+            .iter()
+            .filter(|c| c.dirty)
+            .map(|c| {
+                let existing = cache.file_text_inputs.get(&c.file).copied();
+                let input = db::sync_file_text_into_db(
+                    &mut cache.db,
+                    existing,
+                    c.file,
+                    c.trigger,
+                    c.text
+                        .clone()
+                        .expect("dirty candidate always carries fresh text"),
+                );
+                cache.file_text_inputs.insert(c.file, input);
+                (c.file, input)
+            })
+            .collect();
+
+        // Stage 1b (parallel): Pass 1 parsing + declaration collection
+        // for dirty files only, routed through `crate::db`'s salsa-
+        // tracked `parse_query`/`collect_query` (ticket 29) -- an
+        // unchanged file's `Parse`/declarations are still exactly what
+        // `cache.file_parses`/`cache.table`/`cache.raw_extends`/
+        // `cache.raw_super` already hold. `Storage<Db>` isn't `Sync`
+        // (confirmed, ticket 28), so every task below gets its own
+        // already-cloned `BindDatabase` handed in by value, never a
+        // shared reference to one outer `db` cloned from inside the
+        // closure -- the working pattern salsa's own parallel tests use.
+        let fresh: Vec<(FileId, Parse, collect::FileCollection)> =
             hotpath::measure_block!("pass1_collect_dirty_files", {
-                parsed
-                    .par_iter()
-                    .filter(|p| p.dirty)
-                    .map(|p| {
-                        let root_node = p.parse.syntax();
-                        let collection = if p.trigger {
-                            TriggerUnit::cast(root_node.clone())
-                                .map(|tu| collect::collect_trigger_unit(p.file, &tu))
-                        } else {
-                            CompilationUnit::cast(root_node.clone())
-                                .map(|cu| collect::collect_compilation_unit(p.file, &cu))
-                        }
-                        .unwrap_or_default();
-                        (p.file, collection)
+                let owned: Vec<(FileId, db::FileTextInput, db::BindDatabase)> = dirty_inputs
+                    .iter()
+                    .map(|&(file, input)| (file, input, cache.db.clone()))
+                    .collect();
+                owned
+                    .into_par_iter()
+                    .map(|(file, input, db)| {
+                        let parse = db::parse_query(&db, input);
+                        let collection = db::collect_query(&db, input);
+                        (file, parse, collection)
                     })
                     .collect()
             });
 
         // Sequential merge: patch each dirty file's slice of the
-        // persistent `SymbolTable`/Pass-1.5 inputs, tracking whether any
-        // file's *declared shape* actually changed. Cheap (no parsing/
-        // tree-walking left to do here, just moving already-built
-        // `Symbol`s and a same-length field-by-field comparison).
-        for (file, collection) in fresh {
+        // persistent `SymbolTable`/Pass-1.5 inputs (plus its cached
+        // `Parse`), tracking whether any file's *declared shape* actually
+        // changed. Cheap (no parsing/tree-walking left to do here, just
+        // moving already-built `Symbol`s and a same-length field-by-field
+        // comparison).
+        for (file, parse, collection) in fresh {
             let is_new = !cache.table.has_file(file);
             if is_new
                 || !declarations_equivalent(
@@ -574,6 +544,7 @@ impl BoundProgram {
             cache.raw_extends.insert(file, collection.raw_extends);
             cache.raw_super.insert(file, collection.raw_super);
             cache.supertype_ptrs.insert(file, collection.supertype_ptrs);
+            cache.file_parses.insert(file, parse);
         }
 
         // Pass 1.5 + derived-index rebuild only when something actually
@@ -601,12 +572,14 @@ impl BoundProgram {
         // so `SyntaxNode` itself is neither `Send` nor `Sync`) -- each
         // parallel closure below calls `.syntax()` itself to build its
         // own thread-local node from the shared `Parse`.
-        let parse_by_file: FxHashMap<FileId, &Parse> =
-            parsed.iter().map(|p| (p.file, &p.parse)).collect();
+        let parse_by_file: FxHashMap<FileId, &Parse> = current_ids
+            .iter()
+            .filter_map(|&file| cache.file_parses.get(&file).map(|parse| (file, parse)))
+            .collect();
         let files_to_rebind: Vec<FileId> = if declarations_changed {
             current_ids.iter().copied().collect()
         } else {
-            parsed.iter().filter(|p| p.dirty).map(|p| p.file).collect()
+            checked.iter().filter(|c| c.dirty).map(|c| c.file).collect()
         };
         // Borrows straight from `cache.table` instead of cloning each
         // `Symbol` -- `bind_symbol_body` only ever needs `&Symbol`, and
