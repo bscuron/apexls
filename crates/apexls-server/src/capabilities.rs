@@ -1151,6 +1151,7 @@ pub(crate) fn diagnostics_for_file(
     diagnostics.extend(unreachable_code_diagnostics(program, file, encoding));
     diagnostics.extend(missing_implementation_diagnostics(program, file, encoding));
     diagnostics.extend(type_mismatch_diagnostics(program, file, encoding));
+    diagnostics.extend(visibility_narrowing_diagnostics(program, file, encoding));
     diagnostics
 }
 
@@ -2008,6 +2009,63 @@ pub(crate) fn missing_implementation_diagnostics(
 /// dead-code check already relies on). Same story as every other
 /// already-computed-elsewhere diagnostic in this file: purely surfacing
 /// data the binder already produced, no new analysis here.
+fn visibility_keyword(visibility: Visibility) -> &'static str {
+    match visibility {
+        Visibility::Private => "private",
+        Visibility::Protected => "protected",
+        Visibility::Public => "public",
+        Visibility::Global => "global",
+    }
+}
+
+fn narrowing_kind_label(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Method => "Method",
+        SymbolKind::Field => "Field",
+        SymbolKind::Property => "Property",
+        SymbolKind::Constructor => "Constructor",
+        _ => "Declaration",
+    }
+}
+
+/// `textDocument/publishDiagnostics`: one `WARNING`-severity diagnostic
+/// per member `apex_binder::narrowing_candidates_in_file` proves is
+/// declared more broadly than its real usage needs -- the mirror image of
+/// `dead_code_diagnostics` (used-nowhere): this is "used, but too
+/// broadly." No `DiagnosticTag`: unlike a dead symbol, nothing here is
+/// safe to delete, so `UNNECESSARY` (rust-analyzer's own "safe to remove"
+/// tag) would be the wrong signal.
+pub(crate) fn visibility_narrowing_diagnostics(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<Diagnostic> {
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+    apex_binder::narrowing_candidates_in_file(program, file)
+        .into_iter()
+        .map(|candidate| {
+            let range = Range {
+                start: index.to_position(&text, candidate.name_range.start().into(), encoding),
+                end: index.to_position(&text, candidate.name_range.end().into(), encoding),
+            };
+            Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::WARNING),
+                source: Some("apexls".to_string()),
+                message: format!(
+                    "{} '{}' is declared '{}' but could be '{}'",
+                    narrowing_kind_label(candidate.kind),
+                    candidate.name,
+                    visibility_keyword(candidate.current),
+                    visibility_keyword(candidate.required),
+                ),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn type_mismatch_diagnostics(
     program: &BoundProgram,
     file: FileId,

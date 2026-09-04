@@ -62,6 +62,7 @@ mod stdlib_index;
 mod symbol;
 mod symbol_table;
 mod ty;
+mod visibility_narrowing;
 
 pub use call_hierarchy::{incoming_calls, is_callable, outgoing_calls, IncomingCall, OutgoingCall};
 pub use completion::{complete_at, CompletionCandidate, CompletionCandidateKind, CompletionContext};
@@ -81,6 +82,7 @@ pub use stdlib_index::StdlibIndex;
 pub use scope::{Scope, ScopeId, ScopeKind, ScopeTree};
 pub use symbol::{ModifierSet, Sharing, Symbol, SymbolId, SymbolKind, Visibility};
 pub use symbol_table::SymbolTable;
+pub use visibility_narrowing::{narrowing_candidates_in_file, NarrowingCandidate};
 pub use apex_parser::ParseError;
 
 use apex_parser::Parse;
