@@ -424,7 +424,7 @@ impl BoundProgram {
                 text: Some(content),
             })
         };
-        let checked: Vec<CandidateFile> = hotpath::measure_block!("stage_1a_check_freshness", {
+        let mut checked: Vec<CandidateFile> = hotpath::measure_block!("stage_1a_check_freshness", {
             candidates
                 .into_par_iter()
                 .filter_map(|(path, file)| check_freshness(path, file))
@@ -486,7 +486,7 @@ impl BoundProgram {
         // salsa reads below ever begin -- never interleaved with them,
         // per ticket 27's confirmed load-bearing gotcha.
         let dirty_inputs: Vec<(FileId, db::FileTextInput)> = checked
-            .iter()
+            .iter_mut()
             .filter(|c| c.dirty)
             .map(|c| {
                 let existing = cache.file_text_inputs.get(&c.file).copied();
@@ -495,9 +495,7 @@ impl BoundProgram {
                     existing,
                     c.file,
                     c.trigger,
-                    c.text
-                        .clone()
-                        .expect("dirty candidate always carries fresh text"),
+                    c.text.take().expect("dirty candidate always carries fresh text"),
                 );
                 cache.file_text_inputs.insert(c.file, input);
                 (c.file, input)
