@@ -1,5 +1,5 @@
 Type: task
-Status: open
+Status: resolved
 Blocked by: 33
 
 ## Question
@@ -21,3 +21,14 @@ Definition of done, per this map's own standing practice (see Notes):
 - Follows ticket 33's locked message wording, severity (`WARNING`, no tag), and reference-bucketing algorithm exactly.
 
 ## Answer
+
+Shipped exactly per ticket 33's locked design, in a new branch/worktree (`feature/visibility-narrowing-diagnostic`) since another session was active on `master`.
+
+**What shipped**: `crates/apex-binder/src/visibility_narrowing.rs` (`narrowing_candidates_in_file`/`NarrowingCandidate`, mirroring `dead_symbols_in_file`'s shape), reusing `dead_code.rs`'s three exemption checks (promoted to `pub(crate)` rather than duplicated -- avoids drift on any future change to e.g. `PLATFORM_INVOCATION_ANNOTATIONS`) plus a locally-reimplemented `top_level_container` (per `dead_code.rs:208-217`'s own precedent) and a new `overrides_or_implements`/`declaring_type_of_reference` pair. Wired into `apexls-server::capabilities::visibility_narrowing_diagnostics` and `publish_diagnostics`, `WARNING` severity, no tag, message `"{kind} '{name}' is declared '{current}' but could be '{required}'"` exactly as locked.
+
+**Two real gaps found via TDD, neither anticipated by ticket 33's own design**:
+
+1. **An interface's own abstract method declaration could itself be misjudged as a narrowing candidate.** Apex forbids an explicit access modifier on an interface method (always implicitly `public`), and this binder's collector correctly defaults an unmodified interface method to `Public` -- but without an explicit exclusion, a same-class unqualified call that resolves ambiguously against both a concrete override and the interface's own abstract declaration (recording a reference against both) made the interface's own declaration look narrowable too. Fixed by excluding any member whose direct container is `SymbolKind::Interface` from candidacy at all -- caught by a new `interface_own_method_declaration_is_never_a_candidate` test, found only because the original `interface_implementing_method_is_never_flagged_even_if_narrowly_used` test asserted `!found.iter().any(|c| c.name == "greet")` rather than `found.is_empty()`, which would have silently missed the second `greet` candidate.
+2. **A redundant, dead branch found by `/code-review`**: `required_visibility`'s `Public` arm originally checked `from == declaring || subtype_set.contains(&from)`, but `from == declaring` is unreachable -- `top_level_container(from) == top_level_container(declaring)` is trivially true whenever `from == declaring` (same input, same pure walk), so the same-family `continue` above always fires first. Removed; `required_visibility` no longer needs its own `declaring: SymbolId` parameter at all.
+
+**Verification**: 18 unit tests in `apex-binder` (including the real-NPSP-corpus sweep, conservative-ratio regression guard matching `dead_code.rs`'s own precedent) and 4 protocol-level tests in `apexls-server` (message wording, `WARNING` severity, no tag, real end-to-end wiring), all passing. Full `cargo check --workspace` and `cargo test -p apex-binder --lib` (114 tests) / `cargo test -p apexls-server` (all test files) pass clean. No disputed real-Apex-compiler-behavior question came up during implementation needing the `sf` CLI oracle -- ticket 32's research had already settled the one that mattered (same-file nested-class access).

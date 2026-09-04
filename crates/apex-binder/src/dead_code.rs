@@ -97,7 +97,7 @@ fn is_dead_code_candidate_kind(symbol: &Symbol) -> bool {
 /// visibility to actually work), Apex test methods are routinely
 /// `private` and are still invoked directly by the platform's test
 /// runner, never by other Apex.
-fn is_platform_invoked_test_method(program: &BoundProgram, symbol: &Symbol) -> bool {
+pub(crate) fn is_platform_invoked_test_method(program: &BoundProgram, symbol: &Symbol) -> bool {
     if symbol.kind != SymbolKind::Method {
         return false;
     }
@@ -172,7 +172,7 @@ fn has_annotation(program: &BoundProgram, symbol: &Symbol, name: &str) -> bool {
 /// True for a `public` `Method`/`Field`/`Property` carrying one of
 /// `PLATFORM_INVOCATION_ANNOTATIONS` -- see this module's own doc
 /// comment and that constant's for why each one matters.
-fn has_platform_invocation_annotation(program: &BoundProgram, symbol: &Symbol) -> bool {
+pub(crate) fn has_platform_invocation_annotation(program: &BoundProgram, symbol: &Symbol) -> bool {
     annotations_of(program, symbol).into_iter().any(|a| {
         a.name().is_some_and(|tok| {
             let text = tok.text();
@@ -226,7 +226,7 @@ fn top_level_container(program: &BoundProgram, id: SymbolId) -> SymbolId {
 /// `controller`/`extensions` attributes, and this project's own
 /// convention (e.g. rename's refusal-over-guessing) is to stay
 /// conservative rather than guess.
-fn is_visualforce_referenced(program: &BoundProgram, symbol: &Symbol) -> bool {
+pub(crate) fn is_visualforce_referenced(program: &BoundProgram, symbol: &Symbol) -> bool {
     let Some(container) = symbol.container else {
         return false;
     };
