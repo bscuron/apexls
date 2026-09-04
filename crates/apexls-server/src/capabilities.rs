@@ -1133,6 +1133,27 @@ fn doc_comment_for(program: &BoundProgram, id: SymbolId) -> Option<String> {
 /// the parser's own `"expected RParen, found Dot"`-style text already
 /// states what was expected and what was found, without a separate
 /// humanization layer translating token names to their real spelling.
+/// Every diagnostic source for one file, merged in the same order
+/// `crate::publish_diagnostics` (push) and `Backend::document_diagnostic`
+/// (pull) both need -- the two transports differ only in *when* they call
+/// this and how they wrap the result, never in what diagnostics a file gets.
+pub(crate) fn diagnostics_for_file(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = syntax_error_diagnostics(program, file, encoding);
+    diagnostics.extend(dead_code_diagnostics(program, file, encoding));
+    diagnostics.extend(unresolved_reference_diagnostics(program, file, encoding));
+    diagnostics.extend(unknown_schema_diagnostics(program, file, encoding));
+    diagnostics.extend(modifier_diagnostics(program, file, encoding));
+    diagnostics.extend(bulkification_diagnostics(program, file, encoding));
+    diagnostics.extend(unreachable_code_diagnostics(program, file, encoding));
+    diagnostics.extend(missing_implementation_diagnostics(program, file, encoding));
+    diagnostics.extend(type_mismatch_diagnostics(program, file, encoding));
+    diagnostics
+}
+
 pub(crate) fn syntax_error_diagnostics(
     program: &BoundProgram,
     file: FileId,

@@ -90,14 +90,15 @@ use lsp_types::{
     CallHierarchyOptions, CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
     CallHierarchyPrepareParams, CallHierarchyServerCapability, CodeActionKind, CodeActionOptions, CodeActionParams, CodeActionProviderCapability,
     CodeActionResponse, CompletionOptions, CompletionParams, CompletionResponse,
-    DidChangeConfigurationParams, DidChangeTextDocumentParams,
+    DiagnosticOptions, DiagnosticServerCapabilities, DidChangeConfigurationParams, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
     DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
-    FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams,
+    FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, FullDocumentDiagnosticReport, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, InlayHint,
     InlayHintParams, InitializeParams, InitializeResult, InitializedParams, Location,
     MarkupContent, MarkupKind, OneOf, PrepareRenameResponse, PublishDiagnosticsParams,
-    ReferenceParams, RenameOptions,
+    ReferenceParams, RelatedFullDocumentDiagnosticReport, RenameOptions,
     RenameParams, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
     ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
     TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
@@ -582,16 +583,13 @@ fn spawn_rebuild_worker(
 /// error) would leave its stale squiggle on screen forever, since nothing
 /// else would ever tell the client to clear it.
 ///
-/// Combines every diagnostic source (currently `syntax_error_diagnostics`,
-/// `dead_code_diagnostics`, `unresolved_reference_diagnostics`,
-/// `unknown_schema_diagnostics`, `modifier_diagnostics`,
-/// `bulkification_diagnostics`, `unreachable_code_diagnostics`,
-/// `missing_implementation_diagnostics`, and `type_mismatch_diagnostics`)
-/// into *one* notification per file --
-/// `textDocument/publishDiagnostics` replaces a client's whole diagnostic
-/// set for a URI on every notification rather than merging with the
-/// previous one, so sending two separate notifications for the same file
-/// would make the second one silently wipe out the first.
+/// Combines every diagnostic source (`capabilities::diagnostics_for_file`,
+/// shared with the pull-model `Backend::document_diagnostic` below) into
+/// *one* notification per file -- `textDocument/publishDiagnostics`
+/// replaces a client's whole diagnostic set for a URI on every
+/// notification rather than merging with the previous one, so sending two
+/// separate notifications for the same file would make the second one
+/// silently wipe out the first.
 fn publish_diagnostics(bind: &BindState, client: &ClientSocket, encoding: PositionEncoding) {
     let program_guard = bind.program.read();
     let Some(program) = program_guard.as_ref() else {
@@ -605,15 +603,7 @@ fn publish_diagnostics(bind: &BindState, client: &ClientSocket, encoding: Positi
         let Some(file) = program.file_id(&path) else {
             continue;
         };
-        let mut diagnostics = capabilities::syntax_error_diagnostics(program, file, encoding);
-        diagnostics.extend(capabilities::dead_code_diagnostics(program, file, encoding));
-        diagnostics.extend(capabilities::unresolved_reference_diagnostics(program, file, encoding));
-        diagnostics.extend(capabilities::unknown_schema_diagnostics(program, file, encoding));
-        diagnostics.extend(capabilities::modifier_diagnostics(program, file, encoding));
-        diagnostics.extend(capabilities::bulkification_diagnostics(program, file, encoding));
-        diagnostics.extend(capabilities::unreachable_code_diagnostics(program, file, encoding));
-        diagnostics.extend(capabilities::missing_implementation_diagnostics(program, file, encoding));
-        diagnostics.extend(capabilities::type_mismatch_diagnostics(program, file, encoding));
+        let diagnostics = capabilities::diagnostics_for_file(program, file, encoding);
         let _ = client.notify::<lsp_types::notification::PublishDiagnostics>(PublishDiagnosticsParams {
             uri,
             diagnostics,
@@ -736,6 +726,35 @@ impl LanguageServer for Backend {
                         resolve_provider: Some(false),
                         ..Default::default()
                     }),
+                    // Pull diagnostics (`Backend::document_diagnostic`),
+                    // alongside the existing unconditional push
+                    // (`publish_diagnostics`) -- both read the exact same
+                    // `capabilities::diagnostics_for_file` merge, so
+                    // advertising this costs nothing a client couldn't
+                    // already get, it just lets a client (or another tool
+                    // driving apexls, e.g. an agent) ask synchronously
+                    // instead of waiting on the next push. No caching: no
+                    // `identifier`, and every response is a fresh `Full`
+                    // report rather than ever using `previous_result_id`
+                    // to answer `Unchanged` -- the merge is cheap enough
+                    // (same cost `publish_diagnostics` already pays per
+                    // rebuild) that result-id bookkeeping isn't earning
+                    // its complexity yet. `inter_file_dependencies: true`
+                    // because Apex resolution genuinely is cross-file
+                    // (e.g. `missing_implementation_diagnostics`/
+                    // `type_mismatch_diagnostics` depend on another
+                    // file's declarations) -- `false` here would be a
+                    // lie a client could reasonably rely on.
+                    // `workspace_diagnostics: false`: `workspace/diagnostic`
+                    // itself isn't implemented.
+                    diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                        DiagnosticOptions {
+                            identifier: None,
+                            inter_file_dependencies: true,
+                            workspace_diagnostics: false,
+                            work_done_progress_options: Default::default(),
+                        },
+                    )),
                     ..ServerCapabilities::default()
                 },
                 server_info: Some(ServerInfo {
@@ -1269,6 +1288,48 @@ impl LanguageServer for Backend {
             };
             let symbols = capabilities::document_symbols(program, file, encoding);
             Ok((!symbols.is_empty()).then_some(DocumentSymbolResponse::Nested(symbols)))
+        })
+    }
+
+    /// The pull-model counterpart to `publish_diagnostics`: a client (or
+    /// another tool driving apexls) can ask for one file's diagnostics
+    /// synchronously instead of waiting for the next background-rebuild
+    /// push. Shares `capabilities::diagnostics_for_file` with the push
+    /// path so the two transports can never disagree about what a file's
+    /// diagnostics are. Always answers with a fresh `Full` report --
+    /// `previous_result_id`/`Unchanged` caching isn't implemented (see
+    /// `diagnostic_provider`'s own doc comment in `initialize`) -- and an
+    /// unknown/not-yet-bound file gets an empty `Full` report (`items:
+    /// vec![]`) rather than an error, the same "no diagnostics known yet"
+    /// default `publish_diagnostics` itself uses by skipping such files.
+    fn document_diagnostic(
+        &mut self,
+        params: DocumentDiagnosticParams,
+    ) -> BoxFuture<'static, Result<DocumentDiagnosticReportResult, Self::Error>> {
+        let uri = params.text_document.uri;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read();
+            let items = program_guard
+                .as_ref()
+                .and_then(|program| {
+                    let path = uri.to_file_path().ok()?;
+                    let file = program.file_id(&path)?;
+                    Some(capabilities::diagnostics_for_file(program, file, encoding))
+                })
+                .unwrap_or_default();
+            Ok(DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+                RelatedFullDocumentDiagnosticReport {
+                    related_documents: None,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items,
+                    },
+                },
+            )))
         })
     }
 
