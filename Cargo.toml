@@ -19,6 +19,29 @@ edition = "2021"
 version = "0.1.0"
 license = "MIT"
 
+# Shipped binaries (`apexls`, `apexls-server`) are compiled once and run
+# many times, so trading compile-time parallelism for cross-crate
+# inlining is the right call here -- unlike Cargo's stock release
+# profile (codegen-units = 16, no LTO), which optimizes for fast
+# iteration, not runtime speed. `lto = "thin"` over `"fat"` to avoid
+# `"fat"`'s occasional inlining-heuristic regressions and larger link
+# times; re-baseline with `cargo bench` before considering `"fat"`.
+# `panic` deliberately left at its default (`unwind`): apexls-server is
+# a long-running LSP process and a panic inside one request/rebuild
+# should not be able to abort the whole server.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# Line-table-only debug info: negligible runtime cost (it's not full
+# `-g`, just enough for a symbolizer/backtrace/profiler to map an
+# address back to a function+line), but without it a release build's
+# call stacks resolve to the nearest exported symbol instead of the
+# real one -- confirmed needed the hard way, profiling
+# `crates/apex-binder/examples/mem_profile.rs` with this unset produced
+# nonsensical interleaved stacks (e.g. `regex_syntax::ast::ClassSet as
+# Drop::drop` shown as a caller of `rowan::NodeCache::node`).
+debug = "line-tables-only"
+
 [workspace.dependencies]
 apex-binder = { path = "crates/apex-binder" }
 apex-discover = { path = "crates/apex-discover" }

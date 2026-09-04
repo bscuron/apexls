@@ -12,6 +12,13 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+// See `apexls-server/src/main.rs`'s matching allocator for why: the
+// binder's rayon-parallelized passes are a concurrent, many-small-
+// allocations workload mimalloc handles better than the system
+// allocator.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "apexls")]
 struct Cli {

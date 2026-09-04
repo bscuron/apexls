@@ -528,7 +528,36 @@ fn spawn_rebuild_worker(
                 Ok(file_count) => {
                     bind.bound_version.send_replace(version);
                     info!(file_count, "rebuild complete");
-                    publish_diagnostics(&bind, &client, encoding);
+                    // Only publish if `version` is still current: two
+                    // `schedule_rebuild` calls that land back-to-back
+                    // (e.g. `initialized`'s own unconditional call
+                    // immediately followed by the first `did_open`) don't
+                    // always coalesce into the single `Notify` permit the
+                    // struct doc comment describes -- tokio's scheduler
+                    // can poll this task's first `.notified().await` (via
+                    // its LIFO-slot fast path for a just-spawned task)
+                    // *before* a second, already-queued notification's own
+                    // handler has run, so the second `notify_one()` still
+                    // lands on an already-consumed permit and queues a
+                    // real second loop iteration. Both rebuilds are
+                    // otherwise correct (each reads a genuinely fresh
+                    // `bind.documents` snapshot at its own wake time), but
+                    // without this check their two `publish_diagnostics`
+                    // calls race: if the *earlier*, now-superseded
+                    // rebuild's publish lands after the later one's, the
+                    // client's diagnostics silently regress to stale data
+                    // -- observed live as `unknown_schema_diagnostics.rs`'s
+                    // `fixing_a_bad_soql_from_object_clears_the_diagnostic`
+                    // flaking. Skipping a stale publish never loses a
+                    // diagnostic update: `documents.version` only ever
+                    // moves forward via a mutation that itself calls
+                    // `schedule_rebuild`, so a version bump past this
+                    // rebuild's own guarantees at least one more loop
+                    // iteration -- reflecting *that* version -- still to
+                    // come.
+                    if bind.documents.lock().version == version {
+                        publish_diagnostics(&bind, &client, encoding);
+                    }
                 }
                 Err(join_error) => {
                     bind.bound_version.send_replace(version);
