@@ -1,0 +1,18 @@
+# Task routing: maps effort levels to models.
+# Fixes "no model configured" spawn failures that caused the 75% success rate.
+default_model: claude-sonnet-5
+
+effort_model_map:
+  max: claude-opus-5
+  high: claude-sonnet-5
+  medium: claude-sonnet-5
+  low: claude-haiku-4-5-20251001
+
+role_model_overrides:
+  manager:
+    max: claude-opus-5
+  backend:
+    max: claude-sonnet-5
+    high: claude-sonnet-5
+  qa:
+    max: claude-sonnet-5
