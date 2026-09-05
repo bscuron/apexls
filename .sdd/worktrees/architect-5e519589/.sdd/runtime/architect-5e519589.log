@@ -1,0 +1,50 @@
+[Bash] {'command': 'ls .scratch/apex-diagnostics/issues/ 2>/dev/null; ls .scratch/apex-lsp-gaps/ 2>/dev/null; ls crates/apexls-server/tests/ 2>/dev/null | he
+I'll skip the persona-walkthrough script — this task is a spec-writing job. Reading the research and the reference sources.
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\.scratch\\apex-lsp-gaps\\research.md'}
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\.scratch\\apex-diagnostics\\issues\\03-modifier-dia
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\.scratch\\apex-diagnostics\\issues\\17-missing-inte
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\.scratch\\apex-diagnostics\\issues\\34-visibility-n
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apex-binder\\src\\symbol.rs', 'offset': 1, 
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apex-binder\\src\\reference_table.rs', 'off
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apex-binder\\src\\reference_table.rs', 'off
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apexls-server\\src\\lib.rs', 'offset': 1230
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apexls-server\\src\\lib.rs', 'offset': 629,
+[Bash] {'command': 'git grep -n "pub(crate) fn " crates/apexls-server/src/capabilities.rs | head -60', 'description': 'List pub(crate) fns in capabilities.rs
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apexls-server\\src\\capabilities.rs', 'offs
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apexls-server\\src\\capabilities.rs', 'offs
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apexls-server\\src\\capabilities.rs', 'offs
+[Bash] {'command': 'git grep -n "pub fn" crates/apex-binder/src/reference_table.rs | head -30; echo "---"; git grep -n "references_in_file\\|references_in\\|
+[Bash] {'command': 'git grep -n "pub fn.*references\\|iter_references\\|references_in\\|pub fn.*symbols\\|pub fn symbol_at" crates/apex-binder/src/lib.rs | h
+[Bash] {'command': 'git grep -n "pub fn references_iter\\|refs_in_file\\|iter_all_references\\|references_of_file\\|iter_in_file" crates/apex-binder/src/; ec
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apex-binder\\src\\lib.rs', 'offset': 1055, 
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apex-binder\\src\\symbol.rs', 'offset': 180
+[Bash] {'command': "ls crates/apexls-server/tests/ | grep -i 'document_symbol\\|folding'", 'description': 'Confirm listed test file names'}
+[Bash] {'command': 'ls crates/apexls-server/tests/', 'description': 'Confirm test dir contents'}
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apexls-server\\tests\\inlay_hints.rs', 'off
+[Bash] {'command': 'git grep -n "pub fn\\|pub struct\\|pub enum" crates/apexls-server/src/line_index.rs | head -20', 'description': 'line_index API surface'}
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apexls-server\\src\\line_index.rs', 'offset
+[Bash] {'command': 'git grep -n "req::\\|fn document_symbol\\|fn folding_range\\|fn selection_range\\|router\\|route\\.request\\|LanguageServer" crates/apexl
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\architect-5e519589\\crates\\apexls-server\\src\\main.rs'}
+[Bash] {'command': 'ls crates/apexls-server/src/; echo "---"; git grep -n "run_server\\|LspService\\|router\\|MainLoop" crates/apexls-server/src/lib.rs | hea
+[Bash] {'command': 'pwd; ls crates/', 'description': 'Check working dir'}
+[Bash] {'command': 'ls -la; echo "---"; ls .. 2>/dev/null | head', 'description': 'Inspect worktree contents'}
+[Bash] {'command': 'ls -la .sdd/worktrees/ 2>/dev/null; echo ---; ls -la ../ 2>/dev/null; echo ===; ls -la /c/Users/bscur/Documents/projects/apexls/ 2>/dev/n
+[Bash] {'command': 'ls /c/Users/bscur/Documents/projects/apexls/crates/apexls-server/src/', 'description': 'List real server src'}
+[Read] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\crates\\apexls-server\\src\\main.rs'}
+[Bash] {'command': 'git grep -n "run_server\\|MainLoop\\|router.\\|Router::\\|LspService\\|::request::\\|request::<" /c/Users/bscur/Documents/projects/apexls
+Enough research. Writing the spec now.
+[Write] {'file_path': 'C:\\Users\\bscur\\Documents\\projects\\apexls\\.scratch\\apex-lsp-gaps\\issues\\01-semantic-tokens-implement.md', 'content': 'Type: tas
+[Bash] {'command': 'git -C /c/Users/bscur/Documents/projects/apexls status --short 2>&1 | head -15; echo ---; git -C /c/Users/bscur/Documents/projects/apexls
+[Bash] {'command': 'git worktree list 2>&1; echo ---; git rev-parse --show-toplevel 2>&1; git rev-parse --absolute-git-dir 2>&1', 'description': 'Where is th
+[Bash] {'command': 'git branch -a | head; echo ---; git log --oneline -3', 'description': 'Check branches'}
+[Bash] {'command': 'git checkout agent/architect-5e519589 2>&1 | tail -5; echo ---; git status --short 2>&1 | head', 'description': 'Switch to agent branch'}
+[Bash] {'command': 'git -C /c/Users/bscur/Documents/projects/apexls add .scratch/apex-lsp-gaps/issues/01-semantic-tokens-implement.md && git -C /c/Users/bscu
+[Bash] {'command': 'bernstein task complete d416253d0c47 --summary "Wrote implementation spec for semantic tokens." 2>&1 | tail -10', 'description': 'Mark ta
+Spec committed as `8421cd3` on `agent/architect-5e519589` and task marked done.
+
+`.scratch/apex-lsp-gaps/issues/01-semantic-tokens-implement.md` — 234 lines, ten required sections plus non-goals: legend (9 types, 9 modifiers incl. 4 custom visibility bits), full SymbolKind→type table, per-Resolution-variant reference mapping (including the stdlib property/method disambiguation via `program.stdlib.property()` to match `describe_stdlib_member`), modifier mapping, `SemanticTokensOptions { full: true, range: true }` capability placement between `selection_range_provider` and `signature_help_provider`, delta-encoding rules that reuse `LineIndex::to_position`, handler shape mirroring `Backend::document_symbol`, `pub(crate) fn semantic_tokens_full`/`_range` placement after `selection_range_at` in `capabilities.rs`, and 12 concrete test cases in a new `crates/apexls-server/tests/semantic_tokens.rs` (with a correction: the task-hint's `document_symbol*.rs`/`folding_range*.rs` don't exist -- the actual style precedents are `inlay_hints.rs`/`signature_help.rs`/`references_highlight.rs`).
+
+Skipped: delta encoding, dynamic registration, non-visibility custom modifiers, semantic-tokens refresh, TextMate re-implementation — all listed as explicit non-goals so scope creep is easy to spot in review.
+[StructuredOutput] {'status': 'done', 'summary': "Wrote .scratch/apex-lsp-gaps/issues/01-semantic-tokens-implement.md and committed it (8421cd3) on agent/architect-5e519
+{"status":"done","summary":"Wrote .scratch/apex-lsp-gaps/issues/01-semantic-tokens-implement.md and committed it (8421cd3) on agent/architect-5e519589. Spec covers all 10 required sections: SemanticTokensLegend (9 LSP-standard types, 5 standard modifiers + 4 custom visibility modifiers), SymbolKind->type declaration mapping, Resolution->type reference mapping including the stdlib property/method disambiguation via program.stdlib.property() (reusing describe_stdlib_member's precedent), ModifierSet->modifier-bit mapping, capability advertisement (full:true + range:true, no delta), LSP delta encoding respecting negotiated PositionEncoding, handler shape mirroring Backend::document_symbol, pub(crate) fn semantic_tokens_full/_range placement in capabilities.rs, 12 concrete tests in a new tests/semantic_tokens.rs, plus acceptance criteria and explicit non-goals. Corrected the task hint about document_symbol*.rs / folding_range*.rs test files (they don't exist -- style precedents are inlay_hints.rs / signature_help.rs / references_highlight.rs). Task marked complete on Bernstein.","files_changed":[".scratch/apex-lsp-gaps/issues/01-semantic-tokens-implement.md"]}
+[RESULT] subtype=success cost=$3.8813 turns=42 duration=451717ms

@@ -1,0 +1,30 @@
+[
+  {
+    "file_path": ".scratch/apex-lsp-gaps/issues/01-semantic-tokens-implement.md",
+    "agent_id": "architect-5e519589",
+    "task_id": "d416253d0c47",
+    "task_title": "Write semantic-tokens implementation spec",
+    "locked_at": 1788584985.1017072
+  },
+  {
+    "file_path": "crates/apexls-server/src/lib.rs",
+    "agent_id": "backend-daf0e81f",
+    "task_id": "01ebe22cbb5f",
+    "task_title": "Implement semantic tokens (LSP semanticTokensProvider)",
+    "locked_at": 1788585431.782931
+  },
+  {
+    "file_path": "crates/apexls-server/tests/semantic_tokens.rs",
+    "agent_id": "backend-daf0e81f",
+    "task_id": "01ebe22cbb5f",
+    "task_title": "Implement semantic tokens (LSP semanticTokensProvider)",
+    "locked_at": 1788585431.782931
+  },
+  {
+    "file_path": "crates/apexls-server/src/capabilities.rs",
+    "agent_id": "backend-daf0e81f",
+    "task_id": "01ebe22cbb5f",
+    "task_title": "Implement semantic tokens (LSP semanticTokensProvider)",
+    "locked_at": 1788585431.782931
+  }
+]

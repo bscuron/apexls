@@ -1,0 +1,53 @@
+{
+  "updated_at": 1788585433.995206,
+  "members": [
+    {
+      "agent_id": "manager-4177e23b",
+      "role": "manager",
+      "name": "manager-4177e23b",
+      "model": "opus",
+      "color": "",
+      "mode": "",
+      "status": "starting",
+      "is_active": true,
+      "task_ids": [
+        "c93b7dc523e2"
+      ],
+      "spawned_at": 1788584804.4162984,
+      "finished_at": 0.0,
+      "provider": ""
+    },
+    {
+      "agent_id": "architect-5e519589",
+      "role": "architect",
+      "name": "architect-5e519589",
+      "model": "opus",
+      "color": "",
+      "mode": "",
+      "status": "dead",
+      "is_active": false,
+      "task_ids": [
+        "d416253d0c47"
+      ],
+      "spawned_at": 1788584985.1156526,
+      "finished_at": 1788585433.995205,
+      "provider": ""
+    },
+    {
+      "agent_id": "backend-daf0e81f",
+      "role": "backend",
+      "name": "backend-daf0e81f",
+      "model": "sonnet",
+      "color": "",
+      "mode": "",
+      "status": "starting",
+      "is_active": true,
+      "task_ids": [
+        "01ebe22cbb5f"
+      ],
+      "spawned_at": 1788585431.7939286,
+      "finished_at": 0.0,
+      "provider": ""
+    }
+  ]
+}

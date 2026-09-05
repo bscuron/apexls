@@ -1,0 +1,1 @@
+{"path": ".scratch/apex-lsp-gaps/issues/01-semantic-tokens-implement.md", "complexity_score": 80, "bug_density_score": 100, "coverage_score": 70, "churn_score": 95, "coupling_score": 80, "total": 86, "grade": "B", "failure_touches": 0, "success_touches": 1, "last_updated": 1788585412.1846201, "flagged": false}

@@ -1,0 +1,6 @@
+# SHUTDOWN - Save and exit
+Reason: task_already_resolved
+You have 30 seconds to:
+1. Save all current work (git add + commit "[WIP] d416253d0c47")
+2. Report partial progress to task server
+3. Exit cleanly

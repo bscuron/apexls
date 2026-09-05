@@ -1,0 +1,2 @@
+{"timestamp": 1788584760.3696775, "task_id": "78759c747c70", "role": "manager", "model": null, "provider": null, "duration_seconds": 0.0, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0.0, "janitor_passed": true, "files_modified": 0, "lines_added": 0, "lines_deleted": 0}
+{"timestamp": 1788585034.822782, "task_id": "c93b7dc523e2", "role": "manager", "model": "opus", "provider": null, "duration_seconds": 230.4, "tokens_prompt": 0, "tokens_completion": 0, "cost_usd": 0.0, "janitor_passed": true, "files_modified": 0, "lines_added": 0, "lines_deleted": 0}

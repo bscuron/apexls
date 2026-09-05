@@ -1,0 +1,15 @@
+{
+  "run_id": "20260905-050555",
+  "tasks_completed": 0,
+  "tasks_total": 1,
+  "tasks_failed": 1,
+  "wall_clock_seconds": 4.6158201694488525,
+  "total_cost_usd": 0,
+  "quality_score": null,
+  "sequential_time_seconds": null,
+  "cost_per_task_usd": 0.0,
+  "routing_savings_usd": 0.0,
+  "isolation_downgrades": [],
+  "timestamp": 1788584760.3998945,
+  "estimated_time_saved_seconds": 9.231640338897705
+}

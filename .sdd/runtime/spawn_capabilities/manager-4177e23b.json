@@ -1,0 +1,46 @@
+{
+  "agent_id": "manager-4177e23b",
+  "role": "manager",
+  "timestamp": "2026-09-05T05:06:29.572697+00:00",
+  "tools": [
+    "adapter.Claude Code",
+    "WebFetch",
+    "WebSearch",
+    "Read",
+    "Write",
+    "Edit"
+  ],
+  "evaluated": [],
+  "held_out": [
+    {
+      "tool": "adapter.Claude Code",
+      "reason": "outer-envelope"
+    },
+    {
+      "tool": "WebFetch",
+      "reason": "undeclared-tool"
+    },
+    {
+      "tool": "WebSearch",
+      "reason": "undeclared-tool"
+    },
+    {
+      "tool": "Read",
+      "reason": "undeclared-tool"
+    },
+    {
+      "tool": "Write",
+      "reason": "undeclared-tool"
+    },
+    {
+      "tool": "Edit",
+      "reason": "undeclared-tool"
+    }
+  ],
+  "triggered": [],
+  "allowed": true,
+  "reason": "capability chain ok",
+  "mode": "enforce",
+  "unknown_tools": [],
+  "offending_tools": []
+}

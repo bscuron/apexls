@@ -1,0 +1,1 @@
+{"timestamp": 1788585034.8159916, "metric_type": "task_completion_time", "value": 230.3974781036377, "labels": {"task_id": "c93b7dc523e2", "role": "manager", "model": "opus", "success": "True", "tenant_id": "default"}}
