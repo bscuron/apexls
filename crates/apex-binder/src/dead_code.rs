@@ -1,6 +1,6 @@
 //! Provably-dead-declaration detection: the analysis backing both
 //! `apexls-server`'s `textDocument/publishDiagnostics`/`textDocument/codeAction`
-//! and the `apexls dead` CLI subcommand. Deliberately conservative --
+//! and the `apexls check` CLI subcommand. Deliberately conservative --
 //! Apex's platform (Flow, Aura/LWC, REST, Visualforce) can invoke code
 //! with zero textual Apex call sites, so this only ever flags a
 //! declaration when it can rule out every channel it knows about; see
@@ -236,7 +236,7 @@ pub(crate) fn is_visualforce_referenced(program: &BoundProgram, symbol: &Symbol)
 }
 
 /// One provably-dead declaration in a file: everything both
-/// `apexls-server`'s LSP wrappers and `apexls dead` need, computed once
+/// `apexls-server`'s LSP wrappers and `apexls check` need, computed once
 /// and shared between them. `visibility` exists specifically so
 /// `kind_label` can distinguish "private method" from "public method" --
 /// `kind` alone (`SymbolKind`) doesn't carry that.
@@ -531,7 +531,7 @@ mod tests {
     /// actually used.
     const CALLER: &str = "public class Caller {\n    public void go() { new Foo().run(); }\n}\n";
 
-    /// Every `kind_label` arm actually used by `apexls dead`'s report --
+    /// Every `kind_label` arm actually used by `apexls check`'s report --
     /// most existing fixtures below only ever exercise `Method`/`Field`
     /// dead symbols, so `Property`/`Constructor`'s private-visibility
     /// arms, and their own public arms in `Property`'s case, had never

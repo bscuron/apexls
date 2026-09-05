@@ -1463,6 +1463,50 @@ impl LanguageServer for Backend {
     }
 }
 
+/// A single diagnostic in `apexls check`'s plain-text-report shape:
+/// byte-offset-derived `line`/`col` (1-based, `col` counted in `char`s --
+/// `apexls dead`'s own convention before it was folded into `check`)
+/// rather than an LSP `Position`, so the CLI binary doesn't need
+/// `lsp-types` as its own dependency just to print a report.
+pub struct CliDiagnostic {
+    pub line: usize,
+    pub col: usize,
+    pub severity: &'static str,
+    pub message: String,
+}
+
+/// Every diagnostic in `file` -- syntax errors, dead code, unresolved
+/// references, type mismatches, and everything else
+/// `capabilities::diagnostics_for_file` combines for
+/// `textDocument/publishDiagnostics` -- converted to [`CliDiagnostic`]'s
+/// plain-text shape. The CLI analogue of `publish_diagnostics`'s per-file
+/// call to the same underlying function.
+pub fn diagnostics_for_file(program: &BoundProgram, file: apex_binder::FileId) -> Vec<CliDiagnostic> {
+    let text = program.syntax(file).text().to_string();
+    let index = line_index::LineIndex::new(&text);
+    capabilities::diagnostics_for_file(program, file, PositionEncoding::Utf8)
+        .into_iter()
+        .map(|d| {
+            let offset = index
+                .to_offset(&text, d.range.start, PositionEncoding::Utf8)
+                .unwrap_or(0);
+            let (line, col) = index.line_col(&text, offset);
+            let severity = match d.severity {
+                Some(lsp_types::DiagnosticSeverity::WARNING) => "warning",
+                Some(lsp_types::DiagnosticSeverity::INFORMATION) => "info",
+                Some(lsp_types::DiagnosticSeverity::HINT) => "hint",
+                _ => "error",
+            };
+            CliDiagnostic {
+                line,
+                col,
+                severity,
+                message: d.message,
+            }
+        })
+        .collect()
+}
+
 /// Runs the LSP server to completion over stdio -- the whole behavior of
 /// both the `apexls-server` compatibility binary and `apexls server`.
 /// Callers provide their own async runtime (both entry points use a

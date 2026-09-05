@@ -798,7 +798,7 @@ impl BoundProgram {
     /// cheap (one entry per symbol, not per file, but still a tiny
     /// fraction of a project's total symbol count) and avoids a
     /// dedicated file-list field nothing else needs; a batch caller
-    /// wanting "every file" (`apexls dead`'s whole-project scan) is the
+    /// wanting "every file" (`apexls check`'s whole-project scan) is the
     /// only consumer.
     pub fn files(&self) -> impl Iterator<Item = FileId> + '_ {
         self.symbols

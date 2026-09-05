@@ -159,6 +159,18 @@ impl LineIndex {
             Err(next_line) => next_line - 1,
         }
     }
+
+    /// 1-based `(line, column)` for `offset`, column counted in `char`s --
+    /// the convention `apexls check`'s plain-text report uses, distinct
+    /// from `to_position`'s LSP `Position` (0-based, encoding-dependent
+    /// `character`).
+    pub fn line_col(&self, text: &str, offset: u32) -> (usize, usize) {
+        let offset = offset.min(text.len() as u32);
+        let line = self.line_of_offset(offset);
+        let line_start = self.line_starts[line];
+        let col = text[line_start as usize..offset as usize].chars().count() + 1;
+        (line + 1, col)
+    }
 }
 
 #[cfg(test)]

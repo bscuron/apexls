@@ -1,7 +1,10 @@
-//! `apexls dead [paths...]`: batch dead-code reporting, reusing exactly
-//! the analysis `apexls-server`'s `textDocument/publishDiagnostics`/
-//! `textDocument/codeAction` are built on (`apex_binder::dead_symbols_in_file`),
-//! now shared instead of living only inside an LSP session.
+//! `apexls check [paths...]`: batch, cargo-check-style diagnostics report
+//! for the whole project, reusing exactly the analysis
+//! `apexls-server`'s `textDocument/publishDiagnostics` is built on
+//! (`apexls_server::diagnostics_for_file`) -- syntax errors, dead code,
+//! unresolved references, type mismatches, and everything else that
+//! combines into, now shared instead of living only inside an LSP
+//! session.
 //!
 //! Always binds the *whole* detected project -- there's no `--root` flag
 //! and no partial-project bind. `paths` (zero or more files/directories)
@@ -50,38 +53,12 @@ fn matches_any(file_path: &Path, filters: &[PathBuf]) -> bool {
     filters.is_empty() || filters.iter().any(|f| file_path.starts_with(f))
 }
 
-/// Byte offsets of the start of every line in `text`, `text[0..]`'s own
-/// start included -- built once per file and reused across every finding
-/// in it, rather than rescanning the file per finding.
-fn line_starts(text: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (i, b) in text.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    starts
-}
-
-/// `offset`'s 1-based line/column against `starts` (from `line_starts`) --
-/// column counted in `char`s, not bytes/UTF-16 code units, the
-/// conventional choice for a plain-text CLI report (unlike the LSP
-/// server, which must match whatever encoding the client negotiated).
-fn line_col(starts: &[usize], text: &str, offset: usize) -> (usize, usize) {
-    let line_idx = match starts.binary_search(&offset) {
-        Ok(i) => i,
-        Err(i) => i - 1,
-    };
-    let line_start = starts[line_idx];
-    let col = text[line_start..offset].chars().count() + 1;
-    (line_idx + 1, col)
-}
-
 #[derive(Debug)]
 struct Finding {
     path: PathBuf,
     line: usize,
     col: usize,
+    severity: &'static str,
     message: String,
 }
 
@@ -101,13 +78,22 @@ pub fn run(paths: &[PathBuf]) -> ExitCode {
     };
 
     for f in &findings {
-        println!("{}:{}:{}: {}", f.path.display(), f.line, f.col, f.message);
+        println!(
+            "{}:{}:{}: {}: {}",
+            f.path.display(),
+            f.line,
+            f.col,
+            f.severity,
+            f.message
+        );
     }
 
-    if findings.is_empty() {
-        ExitCode::SUCCESS
-    } else {
+    // Matches `cargo check`'s own exit convention: warnings are printed
+    // but don't fail the run, only an actual error does.
+    if findings.iter().any(|f| f.severity == "error") {
         ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -138,10 +124,9 @@ fn find_findings(paths: &[PathBuf], cwd: &Path) -> Result<Vec<Finding>, ArgError
     let root = find_project_root(cwd);
     let program = BoundProgram::from_files(&root);
 
-    // Each file's report is independent of every other's -- computed
-    // once (per-file `dead_symbols_in_file` result) and read-only from
-    // there, so `program`'s per-file work parallelizes over `rayon`
-    // exactly like the bind that built it already does. The `Vec<Finding>`
+    // Each file's report is independent of every other's, so it
+    // parallelizes over `rayon` exactly like `apexls dead` used to and
+    // the bind that built `program` already does. The `Vec<Finding>`
     // -per-file results are flattened and globally sorted below rather
     // than printed as they land, since `program.files()`'s own order is
     // hash-set-derived, not path order -- streaming would make output
@@ -165,27 +150,20 @@ fn find_findings(paths: &[PathBuf], cwd: &Path) -> Result<Vec<Finding>, ArgError
                     return None;
                 }
             }
-            let dead = apex_binder::dead_symbols_in_file(&program, file);
-            if dead.is_empty() {
+            let diagnostics = apexls_server::diagnostics_for_file(&program, file);
+            if diagnostics.is_empty() {
                 return None;
             }
-            let text = program.syntax(file).text().to_string();
-            let starts = line_starts(&text);
             let display_path = file_path.strip_prefix(cwd).unwrap_or(file_path);
             Some(
-                dead.into_iter()
-                    .map(|d| {
-                        let (line, col) = line_col(&starts, &text, d.name_range.start().into());
-                        Finding {
-                            path: display_path.to_path_buf(),
-                            line,
-                            col,
-                            message: format!(
-                                "{} '{}' is never used",
-                                apex_binder::kind_label(d.kind, d.visibility),
-                                d.name
-                            ),
-                        }
+                diagnostics
+                    .into_iter()
+                    .map(|d| Finding {
+                        path: display_path.to_path_buf(),
+                        line: d.line,
+                        col: d.col,
+                        severity: d.severity,
+                        message: d.message,
                     })
                     .collect::<Vec<Finding>>(),
             )
@@ -204,7 +182,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("apexls-dead-cli-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("apexls-check-cli-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -238,14 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn line_col_finds_the_right_line_and_char_column() {
-        let text = "public class Foo {\n    private void helper() { }\n}\n";
-        let starts = line_starts(text);
-        let offset = text.find("helper").unwrap();
-        assert_eq!(line_col(&starts, text, offset), (2, 18));
-    }
-
-    #[test]
     fn root_detection_finds_a_nested_sfdx_project_json_from_a_deeper_cwd() {
         let dir = temp_dir("root-detection");
         std::fs::write(dir.join("sfdx-project.json"), "{}").unwrap();
@@ -269,8 +239,19 @@ mod tests {
     }
 
     #[test]
-    fn find_findings_reports_a_real_dead_symbol_with_a_correct_location() {
+    fn find_findings_reports_a_syntax_error_with_a_correct_location() {
         let dir = temp_dir("findings-basic");
+        std::fs::write(dir.join("Foo.cls"), "public class Foo {\n").unwrap();
+        let findings = find_findings(&[], &dir).expect("no path arguments to fail on");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(!findings.is_empty(), "expected at least one diagnostic");
+        assert!(findings.iter().any(|f| f.severity == "error"));
+    }
+
+    #[test]
+    fn find_findings_reports_dead_code_as_a_warning() {
+        let dir = temp_dir("findings-dead");
         std::fs::write(
             dir.join("Foo.cls"),
             "public class Foo {\n    private void helper() { }\n}\n",
@@ -279,9 +260,10 @@ mod tests {
         let findings = find_findings(&[], &dir).expect("no path arguments to fail on");
         std::fs::remove_dir_all(&dir).ok();
 
-        assert_eq!(findings.len(), 1, "expected exactly one dead symbol");
+        assert_eq!(findings.len(), 1, "expected exactly one diagnostic");
         let f = &findings[0];
         assert_eq!(f.line, 2);
+        assert_eq!(f.severity, "warning");
         assert!(
             f.message.contains("helper") && f.message.contains("never used"),
             "unexpected message: {}",
@@ -290,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn find_findings_is_empty_when_nothing_is_dead() {
+    fn find_findings_is_empty_when_nothing_is_wrong() {
         let dir = temp_dir("findings-none");
         std::fs::write(
             dir.join("Foo.cls"),

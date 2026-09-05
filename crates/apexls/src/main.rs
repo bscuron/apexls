@@ -1,12 +1,13 @@
 //! `apexls`: the single binary bundling every non-editor-invoked apexls
-//! entry point -- `ast` (parse-and-dump a file), `dead` (batch dead-code
-//! report), and `server` (the LSP server, also reachable as its own
-//! `apexls-server` binary -- kept separate so existing editor configs
-//! that invoke `apexls-server` directly by name, over stdio, need zero
-//! changes; see `apexls_server::run_server`'s own doc comment).
+//! entry point -- `ast` (parse-and-dump a file), `check` (batch
+//! diagnostics report), and `server` (the LSP server, also reachable as
+//! its own `apexls-server` binary -- kept separate so existing editor
+//! configs that invoke `apexls-server` directly by name, over stdio,
+//! need zero changes; see `apexls_server::run_server`'s own doc
+//! comment).
 
 mod ast;
-mod dead;
+mod check;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -32,8 +33,8 @@ enum Command {
     Server,
     /// Parse a file and dump its syntax tree.
     Ast { file: PathBuf },
-    /// Report provably-dead declarations across the project.
-    Dead { paths: Vec<PathBuf> },
+    /// Report every diagnostic across the project, cargo-check-style.
+    Check { paths: Vec<PathBuf> },
 }
 
 fn main() -> ExitCode {
@@ -47,6 +48,6 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Command::Ast { file } => ast::run(&file),
-        Command::Dead { paths } => dead::run(&paths),
+        Command::Check { paths } => check::run(&paths),
     }
 }
