@@ -47,7 +47,7 @@ pub(crate) fn resolve_position(
     // consistent with whichever `program` snapshot is actually in hand,
     // even if a newer edit is mid-rebuild against a still-in-flight
     // `BindCache`.
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let offset = LineIndex::new(&text).to_offset(&text, position, encoding)?;
     Some((file, offset.into()))
 }
@@ -62,7 +62,7 @@ pub(crate) fn symbol_location(
 ) -> Option<Location> {
     let symbol = program.symbols.get(id);
     let uri = Url::from_file_path(program.file_path(symbol.file)).ok()?;
-    let text = program.syntax(symbol.file).text().to_string();
+    let text = program.source_text(symbol.file);
     let index = LineIndex::new(&text);
     let range = symbol.name_range;
     let start = index.to_position(&text, range.start().into(), encoding);
@@ -90,7 +90,7 @@ pub(crate) fn ptr_location(
     encoding: PositionEncoding,
 ) -> Option<Location> {
     let uri = Url::from_file_path(program.file_path(ptr.file())).ok()?;
-    let text = program.syntax(ptr.file()).text().to_string();
+    let text = program.source_text(ptr.file());
     let index = LineIndex::new(&text);
     let range = program.highlight_range(ptr);
     let start = index.to_position(&text, range.start().into(), encoding);
@@ -468,7 +468,7 @@ pub(crate) fn document_symbols(
     encoding: PositionEncoding,
 ) -> Vec<DocumentSymbol> {
     let root = program.syntax(file);
-    let text = root.text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     let to_range = |r: TextRange| Range {
         start: index.to_position(&text, r.start().into(), encoding),
@@ -721,7 +721,7 @@ pub(crate) fn folding_ranges(program: &BoundProgram, file: FileId) -> Vec<Foldin
         apex_syntax::SyntaxKind::SetInitializer,
         apex_syntax::SyntaxKind::MapInitializer,
     ];
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     // The encoding passed here only ever affects `Position::character`,
     // which a line-granular folding range never reports -- `Utf8` is an
@@ -764,7 +764,7 @@ pub(crate) fn selection_range_at(
     offset: TextSize,
     encoding: PositionEncoding,
 ) -> Option<SelectionRange> {
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     let to_range = |r: TextRange| Range {
         start: index.to_position(&text, r.start().into(), encoding),
@@ -821,8 +821,7 @@ pub(crate) fn run_test_lenses(
     file: FileId,
     encoding: PositionEncoding,
 ) -> Vec<CodeLens> {
-    let root = program.syntax(file);
-    let text = root.text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     let to_range = |r: TextRange| Range {
         start: index.to_position(&text, r.start().into(), encoding),
@@ -1039,9 +1038,8 @@ fn reference_token(program: &BoundProgram, resolution: &Resolution) -> Option<(u
 }
 
 /// The one walk both `semantic_tokens_full`/`_range` delegate to: every
-/// declaration in `file` (`program.symbols`, filtered by `file` -- the
-/// `SymbolTable`'s own per-file slice is crate-private to `apex-binder`,
-/// so filtering the flat iterator is this crate's only option) plus every
+/// declaration in `file` (`program.symbols_in_file`, an O(file symbols)
+/// per-file accessor) plus every
 /// reference (`program.resolutions_in_file`), converted to `(line,
 /// start_char, length)` via `program.highlight_range`/`LineIndex` (the
 /// same identifier-only range goto-definition/document-highlight already
@@ -1061,8 +1059,8 @@ fn reference_token(program: &BoundProgram, resolution: &Resolution) -> Option<(u
 /// concrete override at one call site (`visibility_narrowing_diagnostics`'s
 /// ticket 34 hit the identical shape).
 fn collect_tokens(program: &BoundProgram, file: FileId, filter: Option<TextRange>, encoding: PositionEncoding) -> SemanticTokens {
-    let text = program.syntax(file).text().to_string();
-    let index = LineIndex::new(&text);
+    let text = program.source_text(file);
+    let index = LineIndex::new(text);
 
     let to_token = |range: TextRange| -> Option<(u32, u32, u32)> {
         if filter.is_some_and(|f| !f.contains_range(range)) {
@@ -1079,7 +1077,7 @@ fn collect_tokens(program: &BoundProgram, file: FileId, filter: Option<TextRange
     // (line, start_char, length, type_idx, modifier_bits).
     let mut tokens: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
 
-    for (_, symbol) in program.symbols.iter().filter(|(_, s)| s.file == file) {
+    for symbol in program.symbols_in_file(file) {
         let Some((line, col, len)) = to_token(symbol.name_range) else { continue };
         let bits = modifier_bits_from(&symbol.modifiers) | modifier_bit(&SemanticTokenModifier::DECLARATION);
         tokens.push((line, col, len, token_type_index(&symbol_kind_type(symbol.kind)), bits));
@@ -1357,7 +1355,7 @@ pub(crate) fn prepare_rename_range(
             }
         }
     };
-    let text = root.text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     let range = token.text_range();
     Some(Range {
@@ -1419,9 +1417,9 @@ pub(crate) fn rename_edits(
             let Some(uri) = Url::from_file_path(program.file_path(site_file)).ok() else {
                 continue;
             };
-            let text = program.syntax(site_file).text().to_string();
-            let index = LineIndex::new(&text);
-            e.insert((uri, text, index));
+            let text = program.source_text(site_file);
+            let index = LineIndex::new(text);
+            e.insert((uri, text.to_string(), index));
         }
         let Some((uri, text, index)) = per_file.get(&site_file) else {
             continue;
@@ -1500,7 +1498,7 @@ pub(crate) fn syntax_error_diagnostics(
     file: FileId,
     encoding: PositionEncoding,
 ) -> Vec<Diagnostic> {
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     let len = text.len() as u32;
     program
@@ -1677,7 +1675,7 @@ pub(crate) fn unresolved_reference_diagnostics(
     file: FileId,
     encoding: PositionEncoding,
 ) -> Vec<Diagnostic> {
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     program
         .resolutions_in_file(file)
@@ -1742,7 +1740,7 @@ pub(crate) fn unknown_schema_diagnostics(
     file: FileId,
     encoding: PositionEncoding,
 ) -> Vec<Diagnostic> {
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     program
         .resolutions_in_file(file)
@@ -1840,7 +1838,7 @@ pub(crate) fn modifier_diagnostics(
     encoding: PositionEncoding,
 ) -> Vec<Diagnostic> {
     let root = program.syntax(file);
-    let text = root.text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
 
     let diagnostic = |range: TextRange, message: String| Diagnostic {
@@ -1993,7 +1991,7 @@ pub(crate) fn bulkification_diagnostics(
     encoding: PositionEncoding,
 ) -> Vec<Diagnostic> {
     let root = program.syntax(file);
-    let text = root.text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
 
     let diagnostic = |range: TextRange, message: String| Diagnostic {
@@ -2146,7 +2144,7 @@ pub(crate) fn unreachable_code_diagnostics(
     encoding: PositionEncoding,
 ) -> Vec<Diagnostic> {
     let root = program.syntax(file);
-    let text = root.text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
 
     let diagnostic = |range: TextRange| Diagnostic {
@@ -2271,7 +2269,7 @@ pub(crate) fn missing_implementation_diagnostics(
     encoding: PositionEncoding,
 ) -> Vec<Diagnostic> {
     let root = program.syntax(file);
-    let text = root.text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
 
     let diagnostic = |range: TextRange, message: String| Diagnostic {
@@ -2383,7 +2381,7 @@ pub(crate) fn visibility_narrowing_diagnostics(
     file: FileId,
     encoding: PositionEncoding,
 ) -> Vec<Diagnostic> {
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     apex_binder::narrowing_candidates_in_file(program, file)
         .into_iter()
@@ -2415,7 +2413,7 @@ pub(crate) fn type_mismatch_diagnostics(
     file: FileId,
     encoding: PositionEncoding,
 ) -> Vec<Diagnostic> {
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     program
         .type_mismatches(file)
@@ -2447,7 +2445,7 @@ pub(crate) fn dead_code_diagnostics(
     file: FileId,
     encoding: PositionEncoding,
 ) -> Vec<Diagnostic> {
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     apex_binder::dead_symbols_in_file(program, file)
         .into_iter()
@@ -2498,7 +2496,7 @@ pub(crate) fn dead_code_actions(
     let Ok(uri) = Url::from_file_path(program.file_path(file)) else {
         return Vec::new();
     };
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     apex_binder::dead_symbols_in_file(program, file)
         .into_iter()
@@ -2666,9 +2664,9 @@ fn parameter_op_workspace_edit(
             let Some(uri) = Url::from_file_path(program.file_path(site_file)).ok() else {
                 continue;
             };
-            let text = program.syntax(site_file).text().to_string();
-            let index = LineIndex::new(&text);
-            e.insert((uri, text, index));
+            let text = program.source_text(site_file);
+            let index = LineIndex::new(text);
+            e.insert((uri, text.to_string(), index));
         }
         let Some((uri, text, index)) = per_file.get(&site_file) else {
             continue;
@@ -2747,7 +2745,7 @@ pub(crate) fn parameter_reorder_actions(
     encoding: PositionEncoding,
 ) -> Vec<CodeActionOrCommand> {
     let root = program.syntax(file);
-    let text = root.text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     let Some(offset) = index.to_offset(&text, range.start, encoding) else {
         return Vec::new();
@@ -2869,7 +2867,7 @@ fn call_hierarchy_item(
     let symbol = program.symbols.get(id);
     let uri = Url::from_file_path(program.file_path(symbol.file)).ok()?;
     let root = program.syntax(symbol.file);
-    let text = root.text().to_string();
+    let text = program.source_text(symbol.file);
     let index = LineIndex::new(&text);
     let to_range = |r: TextRange| Range {
         start: index.to_position(&text, r.start().into(), encoding),
@@ -2942,8 +2940,7 @@ pub(crate) fn incoming_calls(
                 // classes, so a caller's own body can never span files --
                 // so one `LineIndex`, built once, covers the whole group.
                 let caller_file = program.symbols.get(call.from).file;
-                let root = program.syntax(caller_file);
-                let text = root.text().to_string();
+                let text = program.source_text(caller_file);
                 let index = LineIndex::new(&text);
                 let from_ranges = call
                     .call_sites
@@ -2977,8 +2974,7 @@ pub(crate) fn outgoing_calls(
         return None;
     }
     let caller_file = program.symbols.get(id).file;
-    let root = program.syntax(caller_file);
-    let text = root.text().to_string();
+    let text = program.source_text(caller_file);
     let index = LineIndex::new(&text);
     Some(
         apex_binder::outgoing_calls(program, id)
@@ -3275,7 +3271,7 @@ pub(crate) fn completion(
     encoding: PositionEncoding,
 ) -> Option<CompletionResponse> {
     let ctx = apex_binder::complete_at(program, file, offset)?;
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     let range = Range {
         start: index.to_position(&text, ctx.replace_range.start().into(), encoding),
@@ -3408,7 +3404,7 @@ pub(crate) fn inlay_hints(
     let byte_range = TextRange::new(start, end);
 
     let root = program.syntax(file);
-    let text = root.text().to_string();
+    let text = program.source_text(file);
     let index = LineIndex::new(&text);
     let make_hint = |arg: &Expr, name: &str| -> Option<InlayHint> {
         if argument_repeats_param_name(arg, name) {

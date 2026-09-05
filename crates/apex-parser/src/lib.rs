@@ -38,6 +38,8 @@ mod parser;
 pub use apex_syntax::NodeCache;
 pub use errors::{Parse, ParseError};
 
+use std::sync::Arc;
+
 use input::Input;
 use parser::Parser;
 
@@ -147,7 +149,7 @@ fn parse_root(
     f(&mut p);
     let (events, errors) = p.finish();
     let green = event::build(src, &input, events, cache);
-    Parse { green, errors }
+    Parse { green, errors, text: Arc::from(src) }
 }
 
 fn parse_with(
@@ -163,7 +165,7 @@ fn parse_with(
     m.complete(&mut p, root_kind);
     let (events, errors) = p.finish();
     let green = event::build(src, &input, events, cache);
-    Parse { green, errors }
+    Parse { green, errors, text: Arc::from(src) }
 }
 
 #[cfg(test)]
@@ -240,6 +242,7 @@ mod tests {
         let parse = Parse {
             green,
             errors: Vec::new(),
+            text: Arc::from(src),
         };
         assert_eq!(parse.syntax().text().to_string(), src);
     }
@@ -281,6 +284,7 @@ mod tests {
         let parse = Parse {
             green,
             errors: Vec::new(),
+            text: Arc::from(src),
         };
         let tree = parse.syntax();
         assert_eq!(tree.text().to_string(), src);

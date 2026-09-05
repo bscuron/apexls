@@ -825,6 +825,15 @@ impl BoundProgram {
         self.parses[&file].syntax()
     }
 
+    /// `file`'s exact source text -- a reference fetch into the `Parse`
+    /// already retained for `file`, not a `SyntaxNode::text().to_string()`
+    /// tree walk. Callers building a `LineIndex` (hover, completion,
+    /// rename, semantic-tokens, ...) should use this instead of
+    /// `self.syntax(file).text().to_string()`.
+    pub fn source_text(&self, file: FileId) -> &str {
+        self.parses[&file].text()
+    }
+
     /// Every `apex_parser::ParseError` recorded while parsing `file` --
     /// the parser's own "never panics on malformed input, always records
     /// an error plus a best-effort tree" guarantee
@@ -1049,6 +1058,15 @@ impl BoundProgram {
             .enumerate()
             .find(|(_, symbol)| symbol.name_range.contains(offset))
             .map(|(local, _)| SymbolId::new(file, local as u32))
+    }
+
+    /// Every symbol declared in `file` -- an O(1) per-file accessor
+    /// (`SymbolTable::symbols_of_file`) instead of flat-mapping
+    /// `SymbolTable::iter()` over every file in the project and filtering
+    /// by `s.file == file`, which costs O(project symbols) instead of
+    /// O(file symbols). Matches [`Self::resolutions_in_file`]'s shape.
+    pub fn symbols_in_file(&self, file: FileId) -> &[Symbol] {
+        self.symbols.symbols_of_file(file)
     }
 
     /// Every reference's `SyntaxPtr` and its `Resolution`, across every

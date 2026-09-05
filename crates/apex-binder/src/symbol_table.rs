@@ -298,7 +298,7 @@ impl SymbolTable {
     /// call appended on top -- use [`Self::declared_symbols_of_file`]/
     /// [`Self::declared_len`] instead when only the Pass-1 declared
     /// portion is wanted.
-    pub(crate) fn symbols_of_file(&self, file: FileId) -> &[Symbol] {
+    pub fn symbols_of_file(&self, file: FileId) -> &[Symbol] {
         self.by_file.get(&file).map_or(&[], |v| v.as_slice())
     }
 

@@ -1676,7 +1676,7 @@ impl LanguageServer for Backend {
             let Some(file) = program.file_id(&path) else {
                 return Ok(None);
             };
-            let text = program.syntax(file).text().to_string();
+            let text = program.source_text(file);
             let index = LineIndex::new(&text);
             let Some(start) = index.to_offset(&text, lsp_range.start, encoding) else {
                 return Ok(None);
@@ -1943,7 +1943,7 @@ pub struct CliDiagnostic {
 /// plain-text shape. The CLI analogue of `publish_diagnostics`'s per-file
 /// call to the same underlying function.
 pub fn diagnostics_for_file(program: &BoundProgram, file: apex_binder::FileId) -> Vec<CliDiagnostic> {
-    let text = program.syntax(file).text().to_string();
+    let text = program.source_text(file);
     let index = line_index::LineIndex::new(&text);
     capabilities::diagnostics_for_file(program, file, PositionEncoding::Utf8)
         .into_iter()
