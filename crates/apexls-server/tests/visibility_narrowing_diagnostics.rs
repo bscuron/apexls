@@ -257,6 +257,22 @@ fn a_zero_reference_public_method_is_not_reported_defers_to_dead_code() {
     session.shutdown();
 }
 
+const NARROWABLE_PUBLIC_NESTED_CLASS_SRC: &str =
+    "public class Foo {\n    public class Nested { }\n    public void run() { Nested n = new Nested(); }\n}\n";
+
+#[test]
+fn a_public_nested_class_used_only_within_its_own_top_level_is_reported() {
+    let mut session = run_fixture("narrowing-public-nested-class", &[("Foo.cls", NARROWABLE_PUBLIC_NESTED_CLASS_SRC)]);
+    let notification = session.next_diagnostics();
+    let diagnostics = narrowing_diagnostics(&notification);
+    assert_eq!(diagnostics.len(), 1, "expected exactly one narrowing diagnostic: {diagnostics:?}");
+    assert_eq!(
+        diagnostics[0]["message"],
+        serde_json::json!("Class 'Nested' is declared 'public' but could be 'private'")
+    );
+    session.shutdown();
+}
+
 const GENUINELY_PUBLIC_METHOD_SRC: &str = "public class Foo {\n    public void helper() { }\n}\n";
 
 #[test]

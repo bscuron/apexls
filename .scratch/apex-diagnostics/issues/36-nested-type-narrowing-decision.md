@@ -1,5 +1,5 @@
 Type: grilling
-Status: open
+Status: resolved
 Blocked by: 35
 
 ## Question
@@ -26,3 +26,34 @@ Resolve, with the user:
 Out of scope: nested-type dead-code detection (a separate, differently-shaped gap ticket 35 also researched -- see [ticket 37](37-nested-type-dead-code-decision.md)); re-litigating any of ticket 35's own settled findings above; `Global` nested-type narrowing (out of scope, matching the member-level check's own settled scope).
 
 ## Answer
+
+**Candidate-kind filter**: locked exactly as ticket 35 sketched -- `matches!(symbol.kind, Class | Interface | Enum) && symbol.container.is_some() && symbol.modifiers.visibility == Visibility::Public`. Checked whether the member-level filter's interface-body exclusion (`!container.is_some_and(|c| ... == Interface)`, `visibility_narrowing.rs:61-63`) needs a type-level equivalent: it doesn't -- Apex's interface bodies may only declare abstract method signatures, a nested type declaration inside an interface is not a legal shape at all, so there's nothing to exclude.
+
+**`required_visibility` for a type candidate collapses to a genuine two-way check, no `subtype_set` parameter at all.** Built and ran a real fixture (`crates/apex-binder/src/visibility_narrowing.rs`, throwaway `#[test]`, deleted after, per this map's own ticket-11/32/35 precedent for fact-finding scans) mirroring ticket 35's own interface-dispatch probe: a `private class SecretNested implements PubInterface` accessed externally only via `Outer.makeSecretNested().secretValue()` (the accessor's declared return type is the public interface, never the concrete type). Confirmed concretely via `program.references_to(secret_nested_id)`: the only recorded references are same-file (the `new SecretNested()` call and the `implements` clause); the external caller produces **zero** references to `SecretNested`'s own `SymbolId`. This confirms §2's hypothesis is correct for free -- `references_to(type_id)` already only ever sees a reference when the type's own name is textually written down, so dispatch-through-a-public-type structurally can never produce an external reference to the concrete type, with no new interface-aware logic required.
+
+Since `Protected` is never a legal target for a nested type (ticket 35 §1), the member-level function's three-way `subtype_set` disjunction (same-family / reachable-via-subtypes-only / anything-else) has no type-level equivalent to port -- there is no "needs at least the inheritance-only tier" outcome to compute, since that tier doesn't legally exist for a type. The locked shape:
+
+```rust
+fn required_visibility_for_type(
+    program: &BoundProgram,
+    id: SymbolId,
+    declaring_top_level: SymbolId,
+) -> Option<Visibility> {
+    for reference in program.references_to(id) {
+        let from = declaring_type_of_reference(program, reference)?;
+        if top_level_container(program, from) != declaring_top_level {
+            return None; // any external reference at all -> stays Public, not narrowable
+        }
+    }
+    Some(Visibility::Private)
+}
+```
+
+No `subtype_set` parameter -- deliberately not kept unused "for signature symmetry" with the member-level `required_visibility`; these are two genuinely different questions (member narrowing has a legal intermediate tier, type narrowing does not) and should have two genuinely different signatures rather than one dead parameter inviting a future incorrect reintroduction.
+
+**Module/function placement**: same `visibility_narrowing.rs` module, but a **sibling function**, not a folded-in pass inside `narrowing_candidates_in_file` itself -- e.g. `type_narrowing_candidates_in_file(program: &BoundProgram, file: FileId) -> Vec<NarrowingCandidate>`, reusing the existing `NarrowingCandidate` struct unchanged (its `kind: SymbolKind` field already accepts `Class`/`Interface`/`Enum`). The caller (`apexls-server::capabilities::visibility_narrowing_diagnostics`) merges both functions' output into one `Vec<Diagnostic>`. Rejected folding into one function: the candidate-kind filter, exemption chain (no `overrides_or_implements`, no platform-invocation/VF/test-method exemptions at all per ticket 35 §4), and `required_visibility` computation all differ enough between member and type candidates that one function covering both would need `if is_type { .. } else { .. }` branching throughout its body rather than two small, independently-readable functions.
+
+**Message wording**: unchanged, ticket 33's existing format (`"{kind} '{name}' is declared '{current}' but could be '{required}'"`) applies verbatim -- e.g. `"Class 'Foo' is declared 'public' but could be 'private'"`. Considered a distinct, stronger-worded message given the real breaking-change hazard ticket 35 confirmed, but rejected: the diagnostic's job is to state a proven fact (real usage proves a narrower visibility is legally sufficient), the same guarantee for both member and type candidates -- it should not editorialize about risk the proof itself already accounts for. `WARNING` severity, no `DiagnosticTag`, matching the existing diagnostic (already settled on the map, not reopened here).
+
+**Implement ticket**: split off as [ticket 38](38-nested-type-narrowing-implement.md).
+

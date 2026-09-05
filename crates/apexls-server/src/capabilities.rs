@@ -2024,6 +2024,9 @@ fn narrowing_kind_label(kind: SymbolKind) -> &'static str {
         SymbolKind::Field => "Field",
         SymbolKind::Property => "Property",
         SymbolKind::Constructor => "Constructor",
+        SymbolKind::Class => "Class",
+        SymbolKind::Interface => "Interface",
+        SymbolKind::Enum => "Enum",
         _ => "Declaration",
     }
 }
@@ -2044,6 +2047,7 @@ pub(crate) fn visibility_narrowing_diagnostics(
     let index = LineIndex::new(&text);
     apex_binder::narrowing_candidates_in_file(program, file)
         .into_iter()
+        .chain(apex_binder::type_narrowing_candidates_in_file(program, file))
         .map(|candidate| {
             let range = Range {
                 start: index.to_position(&text, candidate.name_range.start().into(), encoding),
