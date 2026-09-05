@@ -1,1 +1,2 @@
 {"timestamp": 1788585031.4351964, "metric_type": "merge_result", "value": 1.0, "labels": {"task_id": "c93b7dc523e2", "success": "True", "tenant_id": "default"}}
+{"timestamp": 1788585898.3524997, "metric_type": "merge_result", "value": 1.0, "labels": {"task_id": "01ebe22cbb5f", "success": "True", "tenant_id": "default"}}

@@ -1,0 +1,36 @@
+{
+  "receipt": {
+    "adapter": "Claude Code",
+    "admission_ttl_seconds": 86400,
+    "allowed_capabilities": [],
+    "binary": "Claude Code",
+    "binary_path": null,
+    "canary_verdict": "unknown",
+    "conformance_detail": "no contract",
+    "conformance_run_id": "331f88775d0122314c31d8ed11df485e",
+    "conformance_verdict": "skip",
+    "contract_hash": "",
+    "forbidden_capabilities": [
+      "agents_md",
+      "computer_use",
+      "local_models",
+      "mcp_client",
+      "mcp_server",
+      "native_subagents",
+      "spawn",
+      "vision"
+    ],
+    "generated_at": "2026-09-05T05:24:38.291082+00:00",
+    "installed_version": null,
+    "kind": "adapter.admission_gate_receipt",
+    "probe_hash": "sha256:40541f09b5b48c837e2ac7d0fcce986319417f0c034427766a9e043a9b013348",
+    "profile_hash": "",
+    "reason": "no_contract",
+    "remediation": "Add tests/contract/contracts/Claude Code.yaml pinning the flags and subcommands the adapter passes, then re-run `bernstein adapters verify Claude Code --seal`.",
+    "replay_fingerprint": "sha256:fcfededc763df69c74e735347447d6a8a41abad5bb16488524af675dbd4152d6",
+    "schema_version": 1,
+    "transcripts": [],
+    "verdict": "refuse"
+  },
+  "receipt_sha256": "78da88edd082604fe78bb17777a39c16b9910b35e39a5c8c568c9225034b40d5"
+}

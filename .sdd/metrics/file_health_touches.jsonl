@@ -1,1 +1,7 @@
 {"timestamp": 1788585412.1846201, "task_id": "d416253d0c47", "path": ".scratch/apex-lsp-gaps/issues/01-semantic-tokens-implement.md", "outcome": "success", "previous_total": 0, "new_total": 86, "flagged": false}
+{"timestamp": 1788585897.8755276, "task_id": "01ebe22cbb5f", "path": "crates/apexls-server/src/capabilities.rs", "outcome": "failure", "previous_total": 0, "new_total": 42, "flagged": true}
+{"timestamp": 1788585897.9076278, "task_id": "01ebe22cbb5f", "path": "crates/apexls-server/src/lib.rs", "outcome": "failure", "previous_total": 0, "new_total": 42, "flagged": true}
+{"timestamp": 1788585897.9390135, "task_id": "01ebe22cbb5f", "path": "crates/apexls-server/tests/semantic_tokens.rs", "outcome": "failure", "previous_total": 0, "new_total": 57, "flagged": true}
+{"timestamp": 1788586321.6167502, "task_id": "4412daca4985", "path": "crates/apexls-server/src/capabilities.rs", "outcome": "failure", "previous_total": 42, "new_total": 42, "flagged": true}
+{"timestamp": 1788586321.6692631, "task_id": "4412daca4985", "path": "crates/apexls-server/src/lib.rs", "outcome": "failure", "previous_total": 42, "new_total": 42, "flagged": true}
+{"timestamp": 1788586321.72718, "task_id": "4412daca4985", "path": "crates/apexls-server/tests/semantic_tokens.rs", "outcome": "failure", "previous_total": 57, "new_total": 57, "flagged": true}

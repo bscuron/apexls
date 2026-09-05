@@ -1,5 +1,5 @@
 {
-  "updated_at": 1788585433.995206,
+  "updated_at": 1788586336.5334268,
   "members": [
     {
       "agent_id": "manager-4177e23b",
@@ -46,6 +46,54 @@
         "01ebe22cbb5f"
       ],
       "spawned_at": 1788585431.7939286,
+      "finished_at": 0.0,
+      "provider": ""
+    },
+    {
+      "agent_id": "reviewer-f24dc20d",
+      "role": "reviewer",
+      "name": "reviewer-f24dc20d",
+      "model": "sonnet",
+      "color": "",
+      "mode": "",
+      "status": "dead",
+      "is_active": false,
+      "task_ids": [
+        "a26df07506c7"
+      ],
+      "spawned_at": 1788585886.4031742,
+      "finished_at": 1788585964.8501806,
+      "provider": ""
+    },
+    {
+      "agent_id": "backend-fc11a860",
+      "role": "backend",
+      "name": "backend-fc11a860",
+      "model": "opus",
+      "color": "",
+      "mode": "",
+      "status": "dead",
+      "is_active": false,
+      "task_ids": [
+        "4412daca4985"
+      ],
+      "spawned_at": 1788585934.1797948,
+      "finished_at": 1788586314.6281729,
+      "provider": ""
+    },
+    {
+      "agent_id": "backend-resume-6899b423",
+      "role": "backend",
+      "name": "backend-resume-6899b423",
+      "model": "sonnet",
+      "color": "",
+      "mode": "",
+      "status": "starting",
+      "is_active": true,
+      "task_ids": [
+        "01ebe22cbb5f"
+      ],
+      "spawned_at": 1788586336.5334234,
       "finished_at": 0.0,
       "provider": ""
     }

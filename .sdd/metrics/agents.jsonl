@@ -1,0 +1,2 @@
+{"timestamp": 1788585462.2935321, "task_id": null, "role": "architect", "agent_id": "architect-5e519589", "lifetime_seconds": 485.76, "tasks_completed": 1, "heartbeat_failures": 0, "sleep_incidents": 0, "context_tokens": 0}
+{"timestamp": 1788585972.5948136, "task_id": null, "role": "reviewer", "agent_id": "reviewer-f24dc20d", "lifetime_seconds": 97.23, "tasks_completed": 1, "heartbeat_failures": 0, "sleep_incidents": 0, "context_tokens": 0}

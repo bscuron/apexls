@@ -6,9 +6,9 @@
 
 use crate::line_index::{LineIndex, PositionEncoding};
 use apex_binder::{
-    BoundProgram, CompletionCandidate, CompletionCandidateKind, FileId, LabelRef, Resolution,
-    SchemaObjectRef, StdlibMemberRef, Symbol, SymbolId, SymbolKind, SyntaxPtr, Visibility,
-    VisualforcePageRef,
+    BoundProgram, CompletionCandidate, CompletionCandidateKind, FileId, LabelRef, ModifierSet,
+    Resolution, SchemaObjectRef, StdlibMemberRef, Symbol, SymbolId, SymbolKind, SyntaxPtr,
+    Visibility, VisualforcePageRef,
 };
 use apex_syntax::ast::decl::{
     ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, FormalParam, FormalParamList, HasDocComment,
@@ -23,7 +23,8 @@ use lsp_types::{
     CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity, DiagnosticTag,
     Documentation, DocumentHighlight, DocumentSymbol, FoldingRange, InlayHint, InlayHintKind,
     InlayHintLabel, InsertTextFormat, Location, ParameterInformation, ParameterLabel, Position,
-    Range, SelectionRange, SignatureHelp, SignatureInformation, SymbolInformation,
+    Range, SelectionRange, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
+    SignatureHelp, SignatureInformation, SymbolInformation,
     SymbolKind as LspSymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 use rowan::ast::{support, AstNode};
@@ -792,6 +793,186 @@ pub(crate) fn selection_range_at(
     }
     result
 }
+
+// ── Semantic tokens ────────────────────────────────────────────────────────
+
+/// Token-type legend: index = type index baked into each emitted token.
+/// Must match the `token_types` array in `lib.rs`'s `semantic_tokens_provider`
+/// declaration exactly -- both reference this constant so they can't drift.
+pub(crate) const LEGEND_TYPES: &[SemanticTokenType] = &[
+    SemanticTokenType::CLASS,       // 0
+    SemanticTokenType::INTERFACE,   // 1
+    SemanticTokenType::ENUM,        // 2
+    SemanticTokenType::ENUM_MEMBER, // 3
+    SemanticTokenType::PROPERTY,    // 4
+    SemanticTokenType::METHOD,      // 5
+    SemanticTokenType::PARAMETER,   // 6
+    SemanticTokenType::VARIABLE,    // 7
+    SemanticTokenType::TYPE,        // 8
+];
+
+/// Modifier-bit legend: bit N = 1 << N in the emitted modifier u32.
+/// Custom visibility modifiers follow the five standard LSP ones.
+pub(crate) const LEGEND_MODIFIERS: &[SemanticTokenModifier] = &[
+    SemanticTokenModifier::DECLARATION,     // bit 0
+    SemanticTokenModifier::READONLY,        // bit 1
+    SemanticTokenModifier::STATIC,          // bit 2
+    SemanticTokenModifier::ABSTRACT,        // bit 3
+    SemanticTokenModifier::DEFAULT_LIBRARY, // bit 4
+    SemanticTokenModifier(std::borrow::Cow::Borrowed("public")),    // bit 5
+    SemanticTokenModifier(std::borrow::Cow::Borrowed("private")),   // bit 6
+    SemanticTokenModifier(std::borrow::Cow::Borrowed("protected")), // bit 7
+    SemanticTokenModifier(std::borrow::Cow::Borrowed("global")),    // bit 8
+];
+
+fn symbol_kind_to_type_idx(kind: SymbolKind) -> u32 {
+    match kind {
+        SymbolKind::Class | SymbolKind::Trigger => 0,
+        SymbolKind::Interface => 1,
+        SymbolKind::Enum => 2,
+        SymbolKind::EnumConstant => 3,
+        SymbolKind::Field | SymbolKind::Property => 4,
+        SymbolKind::Method | SymbolKind::Constructor => 5,
+        SymbolKind::Parameter => 6,
+        SymbolKind::LocalVar
+        | SymbolKind::CatchVar
+        | SymbolKind::ForEachVar
+        | SymbolKind::SwitchBindingVar => 7,
+    }
+}
+
+fn modifier_bits_from(m: &ModifierSet) -> u32 {
+    let mut bits = 0u32;
+    if m.is_static { bits |= 1 << 2; }
+    if m.is_final { bits |= 1 << 1; }
+    if m.is_abstract { bits |= 1 << 3; }
+    match m.visibility {
+        Visibility::Public => bits |= 1 << 5,
+        Visibility::Private => bits |= 1 << 6,
+        Visibility::Protected => bits |= 1 << 7,
+        Visibility::Global => bits |= 1 << 8,
+    }
+    bits
+}
+
+/// Walk `file`'s declarations and references once, emit delta-encoded tokens.
+/// `filter`: when `Some`, only tokens whose name byte-offset start falls within
+/// the range are emitted (for `semantic_tokens_range`); `None` emits all.
+fn collect_tokens(
+    program: &BoundProgram,
+    file: FileId,
+    filter: Option<TextRange>,
+    encoding: PositionEncoding,
+) -> SemanticTokens {
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+
+    // Convert a TextRange to (line, start_char, length) in the negotiated encoding.
+    // Returns None for multi-line tokens or tokens outside the filter.
+    let pos_of = |range: TextRange| -> Option<(u32, u32, u32)> {
+        if let Some(f) = filter {
+            if !f.contains(range.start()) {
+                return None;
+            }
+        }
+        let start = index.to_position(&text, range.start().into(), encoding);
+        let end = index.to_position(&text, range.end().into(), encoding);
+        if start.line != end.line {
+            return None; // LSP semantic tokens are single-line only
+        }
+        Some((start.line, start.character, end.character.saturating_sub(start.character)))
+    };
+
+    // (line, start_char, length, type_idx, modifier_bits)
+    let mut tokens: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
+
+    // Declaration sites first (so stable sort keeps them before reference-site
+    // tokens at the same position, satisfying the de-dup preference for decls).
+    for (_, s) in program.symbols.iter().filter(|(_, s)| s.file == file) {
+        let Some((line, col, len)) = pos_of(s.name_range) else { continue };
+        let type_idx = symbol_kind_to_type_idx(s.kind);
+        let bits = modifier_bits_from(&s.modifiers) | 1; // bit 0 = DECLARATION
+        tokens.push((line, col, len, type_idx, bits));
+    }
+
+    // Reference sites (no DECLARATION bit).
+    for (ptr, resolution) in program.resolutions_in_file(file) {
+        let range = program.highlight_range(*ptr);
+        let Some((line, col, len)) = pos_of(range) else { continue };
+        let (type_idx, bits): (u32, u32) = match resolution {
+            Resolution::Unresolved => continue,
+            Resolution::Resolved(id) => {
+                let s = program.symbols.get(*id);
+                (symbol_kind_to_type_idx(s.kind), modifier_bits_from(&s.modifiers))
+            }
+            Resolution::Candidates(ids) => {
+                let Some(id) = ids.first() else { continue };
+                let s = program.symbols.get(*id);
+                (symbol_kind_to_type_idx(s.kind), modifier_bits_from(&s.modifiers))
+            }
+            Resolution::SchemaObject(r) => {
+                let type_idx = if r.field.is_some() { 4 } else { 8 };
+                (type_idx, 1 << 4) // DEFAULT_LIBRARY
+            }
+            Resolution::UnknownSchema(r) => {
+                let type_idx = if r.field.is_some() { 4 } else { 8 };
+                (type_idx, 1 << 4) // DEFAULT_LIBRARY
+            }
+            Resolution::StdlibMember(r) => {
+                let type_idx = match &r.member {
+                    None => 0, // CLASS
+                    Some(m) if program.stdlib.property(&r.class_name, m).is_some() => 4, // PROPERTY
+                    _ => 5, // METHOD
+                };
+                (type_idx, 1 << 4) // DEFAULT_LIBRARY
+            }
+            Resolution::Label(_) => (7, (1 << 4) | (1 << 1)), // VARIABLE + DEFAULT_LIBRARY + READONLY
+            Resolution::VisualforcePage(_) => (0, 1 << 4),    // CLASS + DEFAULT_LIBRARY
+        };
+        tokens.push((line, col, len, type_idx, bits));
+    }
+
+    // Stable sort by (line, col): declarations stay before references at the
+    // same position, so the first-wins dedup picks the declaration.
+    tokens.sort_by_key(|&(line, col, ..)| (line, col));
+    tokens.dedup_by_key(|t| (t.0, t.1));
+
+    // Delta-encode: 5 u32s per token per LSP spec.
+    let mut data = Vec::with_capacity(tokens.len() * 5);
+    let mut prev_line = 0u32;
+    let mut prev_col = 0u32;
+    for (line, col, len, type_idx, mod_bits) in tokens {
+        let delta_line = line - prev_line;
+        let delta_start = if delta_line == 0 { col - prev_col } else { col };
+        data.extend_from_slice(&[delta_line, delta_start, len, type_idx, mod_bits]);
+        prev_line = line;
+        prev_col = col;
+    }
+
+    SemanticTokens { result_id: None, data }
+}
+
+/// `textDocument/semanticTokens/full`: all tokens in `file`.
+pub(crate) fn semantic_tokens_full(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> SemanticTokens {
+    collect_tokens(program, file, None, encoding)
+}
+
+/// `textDocument/semanticTokens/range`: tokens whose name-range start falls
+/// within `range` (byte-offset TextRange, already converted by the handler).
+pub(crate) fn semantic_tokens_range(
+    program: &BoundProgram,
+    file: FileId,
+    range: TextRange,
+    encoding: PositionEncoding,
+) -> SemanticTokens {
+    collect_tokens(program, file, Some(range), encoding)
+}
+
+// ── End semantic tokens ────────────────────────────────────────────────────
 
 /// Why `textDocument/rename`/`prepareRename` refused a target -- every
 /// variant becomes a `ResponseError` message in `main.rs`, never a

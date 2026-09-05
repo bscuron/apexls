@@ -1,0 +1,2 @@
+{"timestamp": 1788585462.2925417, "metric_type": "agent_success", "value": 1.0, "labels": {"agent_id": "architect-5e519589", "role": "architect", "model": "opus", "tenant_id": "default"}}
+{"timestamp": 1788585972.5934126, "metric_type": "agent_success", "value": 1.0, "labels": {"agent_id": "reviewer-f24dc20d", "role": "reviewer", "model": "sonnet", "tenant_id": "default"}}

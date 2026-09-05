@@ -4,5 +4,17 @@
     "retry_count": 0,
     "total_attempts": 2,
     "total_cost_usd": 0.0
+  },
+  "Watchdog triage: Heartbeat stale for task Implement semantic tokens (LSP semanticTokensProvider)": {
+    "fix_count": 0,
+    "retry_count": 0,
+    "total_attempts": 1,
+    "total_cost_usd": 0.0
+  },
+  "Write semantic-tokens implementation spec": {
+    "fix_count": 0,
+    "retry_count": 0,
+    "total_attempts": 1,
+    "total_cost_usd": 0.0
   }
 }

@@ -1,9 +1,15 @@
 {
   "nodes": [
     {
-      "id": "01ebe22cbb5f",
+      "id": "64af3e97095a",
       "role": "backend",
       "status": "open",
+      "estimated_minutes": 720
+    },
+    {
+      "id": "01ebe22cbb5f",
+      "role": "backend",
+      "status": "claimed",
       "estimated_minutes": 120
     },
     {
@@ -19,25 +25,65 @@
       "estimated_minutes": 120
     },
     {
+      "id": "a26df07506c7",
+      "role": "reviewer",
+      "status": "done",
+      "estimated_minutes": 15
+    },
+    {
       "id": "78759c747c70",
       "role": "manager",
       "status": "failed",
       "estimated_minutes": 10
+    },
+    {
+      "id": "4412daca4985",
+      "role": "backend",
+      "status": "failed",
+      "estimated_minutes": 240
     }
   ],
   "edges": [
     {
       "from": "d416253d0c47",
+      "to": "64af3e97095a",
+      "type": "depends_on",
+      "semantic_type": "blocks"
+    },
+    {
+      "from": "d416253d0c47",
       "to": "01ebe22cbb5f",
       "type": "depends_on",
+      "semantic_type": "blocks"
+    },
+    {
+      "from": "d416253d0c47",
+      "to": "4412daca4985",
+      "type": "depends_on",
+      "semantic_type": "blocks"
+    },
+    {
+      "from": "01ebe22cbb5f",
+      "to": "4412daca4985",
+      "type": "file_overlap",
+      "semantic_type": "blocks"
+    },
+    {
+      "from": "4412daca4985",
+      "to": "64af3e97095a",
+      "type": "file_overlap",
       "semantic_type": "blocks"
     }
   ],
   "critical_path": [
     "d416253d0c47",
-    "01ebe22cbb5f"
+    "01ebe22cbb5f",
+    "4412daca4985",
+    "64af3e97095a"
   ],
-  "critical_path_minutes": 240,
-  "parallel_width": 3,
-  "bottlenecks": []
+  "critical_path_minutes": 1200,
+  "parallel_width": 4,
+  "bottlenecks": [
+    "01ebe22cbb5f"
+  ]
 }

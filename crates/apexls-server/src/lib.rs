@@ -101,9 +101,13 @@ use lsp_types::{
     ReferenceParams, RelatedFullDocumentDiagnosticReport, RenameOptions,
     RenameParams, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
     ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    SemanticTokensResult, SemanticTokensServerCapabilities,
     TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
     WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
+use rowan::{TextRange, TextSize};
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use tower::ServiceBuilder;
@@ -112,7 +116,7 @@ use tracing::{info, warn, Level};
 mod capabilities;
 mod line_index;
 
-use line_index::PositionEncoding;
+use line_index::{LineIndex, PositionEncoding};
 
 /// The server's whole mutable state: the single resolved project root
 /// (see the module doc comment's "single-root only" section) plus
@@ -698,6 +702,19 @@ impl LanguageServer for Backend {
                     workspace_symbol_provider: Some(OneOf::Left(true)),
                     folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                     selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                    semantic_tokens_provider: Some(
+                        SemanticTokensServerCapabilities::SemanticTokensOptions(
+                            SemanticTokensOptions {
+                                work_done_progress_options: Default::default(),
+                                legend: SemanticTokensLegend {
+                                    token_types: capabilities::LEGEND_TYPES.to_vec(),
+                                    token_modifiers: capabilities::LEGEND_MODIFIERS.to_vec(),
+                                },
+                                range: Some(true),
+                                full: Some(SemanticTokensFullOptions::Bool(true)),
+                            },
+                        ),
+                    ),
                     // `QUICKFIX` (`capabilities::dead_code_actions`) and
                     // `REFACTOR_REWRITE` (`capabilities::parameter_reorder_actions`)
                     // -- the only two kinds `code_action` ever returns today.
@@ -1459,6 +1476,56 @@ impl LanguageServer for Backend {
                 program, file, range, encoding,
             ));
             Ok((!actions.is_empty()).then_some(actions))
+        })
+    }
+
+    fn semantic_tokens_full(
+        &mut self,
+        params: SemanticTokensParams,
+    ) -> BoxFuture<'static, Result<Option<SemanticTokensResult>, Self::Error>> {
+        let uri = params.text_document.uri;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read();
+            let Some(program) = program_guard.as_ref() else { return Ok(None) };
+            let Some(path) = uri.to_file_path().ok() else { return Ok(None) };
+            let Some(file) = program.file_id(&path) else { return Ok(None) };
+            Ok(Some(SemanticTokensResult::Tokens(
+                capabilities::semantic_tokens_full(program, file, encoding),
+            )))
+        })
+    }
+
+    fn semantic_tokens_range(
+        &mut self,
+        params: SemanticTokensRangeParams,
+    ) -> BoxFuture<'static, Result<Option<SemanticTokensRangeResult>, Self::Error>> {
+        let uri = params.text_document.uri;
+        let lsp_range = params.range;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read();
+            let Some(program) = program_guard.as_ref() else { return Ok(None) };
+            let Some(path) = uri.to_file_path().ok() else { return Ok(None) };
+            let Some(file) = program.file_id(&path) else { return Ok(None) };
+            let text = program.syntax(file).text().to_string();
+            let index = LineIndex::new(&text);
+            let Some(start) = index.to_offset(&text, lsp_range.start, encoding) else {
+                return Ok(None);
+            };
+            let Some(end) = index.to_offset(&text, lsp_range.end, encoding) else {
+                return Ok(None);
+            };
+            let range = TextRange::new(TextSize::from(start), TextSize::from(end));
+            Ok(Some(SemanticTokensRangeResult::Tokens(
+                capabilities::semantic_tokens_range(program, file, range, encoding),
+            )))
         })
     }
 }

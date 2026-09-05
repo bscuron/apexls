@@ -1,0 +1,21 @@
+{
+  "agent_id": "reviewer-f24dc20d",
+  "role": "reviewer",
+  "timestamp": "2026-09-05T05:24:30.045137+00:00",
+  "tools": [
+    "adapter.Claude Code"
+  ],
+  "evaluated": [],
+  "held_out": [
+    {
+      "tool": "adapter.Claude Code",
+      "reason": "outer-envelope"
+    }
+  ],
+  "triggered": [],
+  "allowed": true,
+  "reason": "capability chain ok",
+  "mode": "enforce",
+  "unknown_tools": [],
+  "offending_tools": []
+}
