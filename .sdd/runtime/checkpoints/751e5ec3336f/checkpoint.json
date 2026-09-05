@@ -1,0 +1,19 @@
+{
+  "adapter": "Claude Code",
+  "adapter_session_id": "backend-2c9fbdc7",
+  "created_at": "2026-09-05T06:45:45.971397+00:00",
+  "last_completed_step_id": "751e5ec3336f",
+  "merge_cursor": null,
+  "meta": {
+    "adapter_name": "Claude Code"
+  },
+  "resume_count": 0,
+  "schema_version": 1,
+  "scratchpad_path": "C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\backend-2c9fbdc7\\.scratchpad.md",
+  "scratchpad_sha256": null,
+  "stall_reason": null,
+  "task_id": "751e5ec3336f",
+  "trace_cursor": 5459,
+  "updated_at": "2026-09-05T06:45:45.971423+00:00",
+  "worktree_path": "C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\backend-2c9fbdc7"
+}

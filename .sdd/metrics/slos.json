@@ -4,7 +4,7 @@
       "name": "task_success",
       "description": "Task success rate >= 90%",
       "target": 0.9,
-      "current": 0.3333,
+      "current": 0.25,
       "status": "red",
       "met": false
     },
@@ -12,7 +12,7 @@
       "name": "merge_success",
       "description": "Merge success rate >= 95%",
       "target": 0.95,
-      "current": 0.3333,
+      "current": 0.25,
       "status": "red",
       "met": false
     },
@@ -26,15 +26,19 @@
     }
   ],
   "error_budget": {
-    "total_tasks": 3,
-    "failed_tasks": 2,
+    "total_tasks": 4,
+    "failed_tasks": 3,
     "budget_total": 3,
-    "budget_remaining": 1,
-    "budget_fraction": 0.3333,
-    "burn_rate": 6.6667,
-    "time_to_exhaustion_tasks": 1,
-    "is_depleted": false,
-    "status": "yellow"
+    "budget_remaining": 0,
+    "budget_fraction": 0.0,
+    "burn_rate": 7.5,
+    "time_to_exhaustion_tasks": 0,
+    "is_depleted": true,
+    "status": "red"
   },
-  "actions": []
+  "actions": [
+    "reduce_agents",
+    "upgrade_model",
+    "increase_review"
+  ]
 }

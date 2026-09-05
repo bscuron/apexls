@@ -1,5 +1,5 @@
 {
-  "updated_at": 1788589908.9567432,
+  "updated_at": 1788590744.2056408,
   "members": [
     {
       "agent_id": "manager-440b80c0",
@@ -46,6 +46,22 @@
         "e8a5cdff48a2"
       ],
       "spawned_at": 1788589908.9567404,
+      "finished_at": 0.0,
+      "provider": ""
+    },
+    {
+      "agent_id": "backend-3c078e37",
+      "role": "backend",
+      "name": "backend-3c078e37",
+      "model": "opus",
+      "color": "",
+      "mode": "",
+      "status": "starting",
+      "is_active": true,
+      "task_ids": [
+        "5953badcb184"
+      ],
+      "spawned_at": 1788590744.2056375,
       "finished_at": 0.0,
       "provider": ""
     }

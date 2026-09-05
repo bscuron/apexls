@@ -1,1 +1,16 @@
-[]
+[
+  {
+    "file_path": "crates/apexls-server/src/capabilities.rs",
+    "agent_id": "backend-3c078e37",
+    "task_id": "5953badcb184",
+    "task_title": "Implement LSP semantic tokens (full-document) for apexls",
+    "locked_at": 1788590744.1907737
+  },
+  {
+    "file_path": "crates/apexls-server/src/lib.rs",
+    "agent_id": "backend-3c078e37",
+    "task_id": "5953badcb184",
+    "task_title": "Implement LSP semantic tokens (full-document) for apexls",
+    "locked_at": 1788590744.1907737
+  }
+]
