@@ -19,7 +19,8 @@ use apex_syntax::ast::stmt::{Block, DoWhileStmt, ForEachStmt, ForStmt, Stmt, Whi
 use apex_syntax::{SyntaxKind, SyntaxNode};
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall, CodeAction,
-    CodeActionKind, CodeActionOrCommand, CompletionItem, CompletionItemKind, CompletionList,
+    CodeActionKind, CodeActionOrCommand, CodeLens, Command, CompletionItem, CompletionItemKind,
+    CompletionList,
     CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity, DiagnosticTag,
     Documentation, DocumentHighlight, DocumentSymbol, FoldingRange, InlayHint, InlayHintKind,
     InlayHintLabel, InsertTextFormat, Location, ParameterInformation, ParameterLabel, Position,
@@ -792,6 +793,74 @@ pub(crate) fn selection_range_at(
         });
     }
     result
+}
+
+/// One `CodeLens` above every `@isTest` class and every `@isTest`/
+/// `@TestSetup`/legacy-`testMethod` method in `file` (ticket 02/03,
+/// `.scratch/apex-lsp-gaps/issues/02-run-test-lens-decision.md`), each
+/// wired to the server-side `apexls.runTest` command
+/// (`Backend::execute_command`) with the *top-level* Apex class name --
+/// the only name `sf apex run test --tests` recognizes, since an inner
+/// class isn't its own compiled `ApexClass` record -- and, for a
+/// method-level lens, the method name too. A class-level lens's
+/// `arguments` is `[className]` (runs every method in the class); a
+/// method-level lens's is `[className, methodName]` (runs just that
+/// one), matching `sf`'s own `--tests ClassName`/`--tests
+/// ClassName.methodName` argument shapes.
+pub(crate) fn run_test_lenses(
+    program: &BoundProgram,
+    file: FileId,
+    encoding: PositionEncoding,
+) -> Vec<CodeLens> {
+    let root = program.syntax(file);
+    let text = root.text().to_string();
+    let index = LineIndex::new(&text);
+    let to_range = |r: TextRange| Range {
+        start: index.to_position(&text, r.start().into(), encoding),
+        end: index.to_position(&text, r.end().into(), encoding),
+    };
+
+    let mut lenses = Vec::new();
+    for (id, symbol) in program.symbols.iter().filter(|(_, s)| s.file == file) {
+        let arguments = match symbol.kind {
+            SymbolKind::Class if apex_binder::is_test_class(program, symbol) => {
+                vec![serde_json::Value::String(top_level_class_name(
+                    program, id,
+                ))]
+            }
+            SymbolKind::Method if apex_binder::is_platform_invoked_test_method(program, symbol) => {
+                vec![
+                    serde_json::Value::String(top_level_class_name(program, id)),
+                    serde_json::Value::String(symbol.name.to_string()),
+                ]
+            }
+            _ => continue,
+        };
+        lenses.push(CodeLens {
+            range: to_range(symbol.name_range),
+            command: Some(Command {
+                title: "Run Test".into(),
+                command: "apexls.runTest".into(),
+                arguments: Some(arguments),
+            }),
+            data: None,
+        });
+    }
+    lenses
+}
+
+/// Walks `id` up through `Symbol::container` to the outermost enclosing
+/// type -- for a top-level class this is `id` itself; for a method (or a
+/// class) nested inside an outer class, the outer class's own id.
+/// Reimplemented locally rather than reusing `apex-binder::dead_code`'s
+/// private `top_level_container` (same three-line walk, not worth
+/// exposing as new crate-wide surface for the one caller here).
+fn top_level_class_name(program: &BoundProgram, id: SymbolId) -> String {
+    let mut current = id;
+    while let Some(parent) = program.symbols.get(current).container {
+        current = parent;
+    }
+    program.symbols.get(current).name.to_string()
 }
 
 // ── Semantic tokens ────────────────────────────────────────────────────────

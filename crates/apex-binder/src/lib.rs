@@ -64,7 +64,9 @@ mod visibility_narrowing;
 
 pub use call_hierarchy::{incoming_calls, is_callable, outgoing_calls, IncomingCall, OutgoingCall};
 pub use completion::{complete_at, CompletionCandidate, CompletionCandidateKind, CompletionContext};
-pub use dead_code::{kind_label, dead_symbols_in_file, DeadSymbol};
+pub use dead_code::{
+    kind_label, dead_symbols_in_file, is_platform_invoked_test_method, is_test_class, DeadSymbol,
+};
 pub use file_id::FileId;
 pub use incremental::BindCache;
 pub use ptr::{AstPtr, SyntaxPtr};

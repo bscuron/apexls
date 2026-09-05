@@ -43,7 +43,8 @@ use crate::file_id::FileId;
 use crate::symbol::{Symbol, SymbolId, SymbolKind, Visibility};
 use crate::BoundProgram;
 use apex_syntax::ast::decl::{
-    Annotation, ConstructorDecl, FieldDecl, HasModifiers, MethodDecl, PropertyDecl, VarDeclarator,
+    Annotation, ClassDecl, ConstructorDecl, FieldDecl, HasModifiers, MethodDecl, PropertyDecl,
+    VarDeclarator,
 };
 use apex_syntax::ast::stmt::LocalVarDeclStmt;
 use rowan::ast::AstNode;
@@ -97,7 +98,11 @@ fn is_dead_code_candidate_kind(symbol: &Symbol) -> bool {
 /// visibility to actually work), Apex test methods are routinely
 /// `private` and are still invoked directly by the platform's test
 /// runner, never by other Apex.
-pub(crate) fn is_platform_invoked_test_method(program: &BoundProgram, symbol: &Symbol) -> bool {
+///
+/// `pub`, not `pub(crate)`: also the Run Test code lens's own
+/// method-level detection (`apexls-server`'s `capabilities::run_test_lenses`),
+/// re-exported from `apex-binder`'s crate root.
+pub fn is_platform_invoked_test_method(program: &BoundProgram, symbol: &Symbol) -> bool {
     if symbol.kind != SymbolKind::Method {
         return false;
     }
@@ -133,7 +138,11 @@ fn annotations_of(program: &BoundProgram, symbol: &Symbol) -> Vec<Annotation> {
     // entirely rather than just falling through the match below.
     if !matches!(
         symbol.kind,
-        SymbolKind::Method | SymbolKind::Property | SymbolKind::Constructor | SymbolKind::Field
+        SymbolKind::Method
+            | SymbolKind::Property
+            | SymbolKind::Constructor
+            | SymbolKind::Field
+            | SymbolKind::Class
     ) {
         return Vec::new();
     }
@@ -157,6 +166,7 @@ fn annotations_of(program: &BoundProgram, symbol: &Symbol) -> Vec<Annotation> {
                 .and_then(FieldDecl::cast)
                 .map(|f| f.annotations().collect::<Vec<_>>())
         }
+        SymbolKind::Class => ClassDecl::cast(node).map(|c| c.annotations().collect::<Vec<_>>()),
         _ => return Vec::new(),
     };
     annotated.unwrap_or_default()
@@ -203,6 +213,18 @@ pub(crate) fn has_platform_invocation_annotation(program: &BoundProgram, symbol:
 /// does, rather than being exempted from the reference check altogether.
 fn is_test_visible(program: &BoundProgram, symbol: &Symbol) -> bool {
     has_annotation(program, symbol, "TestVisible")
+}
+
+/// True for a `Class` symbol carrying its own `@isTest` annotation --
+/// the Run Test code lens's class-level detection
+/// (`apexls-server`'s `capabilities::run_test_lenses`). Checks the
+/// class's own annotation only, not an enclosing outer class's (an inner
+/// class nested inside an `@isTest` outer class doesn't itself need the
+/// annotation to hold test methods, but this function isn't answering
+/// that question -- callers needing "is this method's test class"
+/// already have `is_platform_invoked_test_method` for the method itself).
+pub fn is_test_class(program: &BoundProgram, symbol: &Symbol) -> bool {
+    symbol.kind == SymbolKind::Class && has_annotation(program, symbol, "isTest")
 }
 
 /// Walks `id` up to its outermost enclosing type (mirroring
@@ -725,6 +747,30 @@ mod tests {
     fn legacy_testmethod_modifier_is_not_flagged() {
         let src = "public class Foo {\n    private static testMethod void testSomething() { }\n}\n";
         assert!(dead_names("legacy-testmethod", src).is_empty());
+    }
+
+    #[test]
+    fn is_test_class_true_for_istest_annotated_class() {
+        let src = "@isTest\nprivate class Foo {\n    @isTest\n    static void testSomething() { }\n}\n";
+        let (program, file, _) = dead_symbols("is-test-class-true", src);
+        let (_, class) = program
+            .symbols
+            .iter()
+            .find(|(_, s)| s.file == file && s.kind == SymbolKind::Class)
+            .expect("class symbol");
+        assert!(is_test_class(&program, class));
+    }
+
+    #[test]
+    fn is_test_class_false_for_ordinary_class() {
+        let src = "public class Foo {\n    public void doWork() { }\n}\n";
+        let (program, file, _) = dead_symbols("is-test-class-false", src);
+        let (_, class) = program
+            .symbols
+            .iter()
+            .find(|(_, s)| s.file == file && s.kind == SymbolKind::Class)
+            .expect("class symbol");
+        assert!(!is_test_class(&program, class));
     }
 
     #[test]

@@ -89,22 +89,23 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOptions, CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
     CallHierarchyPrepareParams, CallHierarchyServerCapability, CodeActionKind, CodeActionOptions, CodeActionParams, CodeActionProviderCapability,
-    CodeActionResponse, CompletionOptions, CompletionParams, CompletionResponse,
+    CodeActionResponse, CodeLens, CodeLensOptions, CodeLensParams, CompletionOptions, CompletionParams, CompletionResponse,
     DiagnosticOptions, DiagnosticServerCapabilities, DidChangeConfigurationParams, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
     DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse,
+    ExecuteCommandOptions, ExecuteCommandParams,
     FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, FullDocumentDiagnosticReport, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, InlayHint,
     InlayHintParams, InitializeParams, InitializeResult, InitializedParams, Location,
-    MarkupContent, MarkupKind, NumberOrString, OneOf, PrepareRenameResponse, ProgressParams,
+    MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, PrepareRenameResponse, ProgressParams,
     ProgressParamsValue, PublishDiagnosticsParams,
     ReferenceParams, RelatedFullDocumentDiagnosticReport, RenameOptions,
     RenameParams, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
     SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
     SemanticTokensServerCapabilities,
-    ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    ServerCapabilities, ServerInfo, ShowMessageParams, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
     TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
     WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
     WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
@@ -342,6 +343,73 @@ mod tests {
         // panic too (poisoned forever). With `parking_lot`, they don't.
         assert!(bind.program.read().is_none());
         *bind.program.write() = None;
+    }
+
+    /// The three real shapes `sf apex run test --result-format json
+    /// --json` actually produces (confirmed live against a connected org
+    /// per the decision ticket -- these are exact captured payloads, not
+    /// guessed): an all-passing run, a run with a failing test, and a
+    /// CLI-level rejection before anything ran.
+    #[test]
+    fn summarize_apex_test_output_reports_a_passing_run_as_info() {
+        let stdout = br#"{
+            "status": 0,
+            "result": {
+                "summary": { "outcome": "Passed", "passing": 1, "failing": 0, "testsRan": 1 },
+                "tests": [{ "FullName": "FooTest.testBar", "Outcome": "Pass", "Message": null }]
+            },
+            "warnings": []
+        }"#;
+        let (message_type, message) = summarize_apex_test_output("FooTest", stdout);
+        assert_eq!(message_type, MessageType::INFO);
+        assert!(message.contains("Passed"), "expected the outcome in the message: {message}");
+        assert!(!message.contains("testBar"), "a passing run shouldn't list per-test detail");
+    }
+
+    #[test]
+    fn summarize_apex_test_output_reports_a_failing_run_as_error_with_detail() {
+        let stdout = br#"{
+            "status": 100,
+            "result": {
+                "summary": { "outcome": "Failed", "passing": 0, "failing": 1, "testsRan": 1 },
+                "tests": [{
+                    "FullName": "LispValueTest.null",
+                    "Outcome": "Fail",
+                    "Message": "line 7, column 23: Variable is not visible: LispValue.TAG_FIXNUM"
+                }]
+            },
+            "warnings": []
+        }"#;
+        let (message_type, message) = summarize_apex_test_output("LispValueTest", stdout);
+        assert_eq!(message_type, MessageType::ERROR);
+        assert!(message.contains("LispValueTest.null"), "expected the failing test named: {message}");
+        assert!(
+            message.contains("Variable is not visible"),
+            "expected the failure message included: {message}"
+        );
+    }
+
+    #[test]
+    fn summarize_apex_test_output_reports_a_cli_level_rejection_as_error() {
+        let stdout = br#"{
+            "name": "INVALID_INPUT",
+            "message": "This class name's value is invalid: Bogus. Provide the name of an Apex class that has test methods.",
+            "exitCode": 1,
+            "status": 1
+        }"#;
+        let (message_type, message) = summarize_apex_test_output("Bogus", stdout);
+        assert_eq!(message_type, MessageType::ERROR);
+        assert!(
+            message.contains("This class name's value is invalid"),
+            "expected the CLI's own rejection message surfaced: {message}"
+        );
+    }
+
+    #[test]
+    fn summarize_apex_test_output_reports_unparseable_stdout_as_error() {
+        let (message_type, message) = summarize_apex_test_output("FooTest", b"not json");
+        assert_eq!(message_type, MessageType::ERROR);
+        assert!(message.starts_with("apexls: "), "expected an apexls-prefixed message: {message}");
     }
 }
 
@@ -868,6 +936,22 @@ impl LanguageServer for Backend {
                             work_done_progress_options: Default::default(),
                         },
                     )),
+                    // Run Test lens (ticket 02/03,
+                    // `.scratch/apex-lsp-gaps/issues/02-run-test-lens-decision.md`).
+                    // `resolve_provider: None` -- `capabilities::run_test_lenses`
+                    // already computes each lens's full `Command` eagerly,
+                    // no separate `codeLens/resolve` round-trip needed.
+                    code_lens_provider: Some(CodeLensOptions {
+                        resolve_provider: None,
+                    }),
+                    // `apexls.runTest` is the lens's own command (see
+                    // `Backend::execute_command`) -- server-side, not a
+                    // client-owned command id, so the lens works in any
+                    // LSP client without a matching editor extension.
+                    execute_command_provider: Some(ExecuteCommandOptions {
+                        commands: vec!["apexls.runTest".into()],
+                        work_done_progress_options: Default::default(),
+                    }),
                     ..ServerCapabilities::default()
                 },
                 server_info: Some(ServerInfo {
@@ -1647,6 +1731,197 @@ impl LanguageServer for Backend {
             Ok((!actions.is_empty()).then_some(actions))
         })
     }
+
+    /// Run Test lens (ticket 02/03). Same snapshot + `wait_for_rebuild`
+    /// shape every other capability uses -- `capabilities::run_test_lenses`
+    /// is a pure read over the already-bound `SymbolTable`, no `sf`
+    /// invocation happens here (that's `execute_command`, only once the
+    /// user actually clicks a lens).
+    fn code_lens(
+        &mut self,
+        params: CodeLensParams,
+    ) -> BoxFuture<'static, Result<Option<Vec<CodeLens>>, Self::Error>> {
+        let uri = params.text_document.uri;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some(path) = uri.to_file_path().ok() else {
+                return Ok(None);
+            };
+            let Some(file) = program.file_id(&path) else {
+                return Ok(None);
+            };
+            let lenses = capabilities::run_test_lenses(program, file, encoding);
+            Ok((!lenses.is_empty()).then_some(lenses))
+        })
+    }
+
+    /// `apexls.runTest` (the Run Test lens's own command, ticket 02's
+    /// decision): shells out to `sf apex run test` itself rather than
+    /// naming a client-owned command, so the lens works in any LSP
+    /// client with no editor-extension glue. Never passes `-o`/
+    /// `--target-org` -- `sf` resolves its own already-authenticated
+    /// default org exactly as it would from a terminal, so apexls needs
+    /// no org-config logic of its own (see the decision ticket's "Org
+    /// resolution" section for why this was confirmed safe rather than
+    /// assumed). Any other `command` name answers `Ok(None)` untouched --
+    /// `apexls.runTest` is the only command this server ever registers.
+    fn execute_command(
+        &mut self,
+        params: ExecuteCommandParams,
+    ) -> BoxFuture<'static, Result<Option<serde_json::Value>, Self::Error>> {
+        if params.command != "apexls.runTest" {
+            return Box::pin(async move { Ok(None) });
+        }
+        let mut args = params.arguments.into_iter();
+        let Some(class_name) = args.next().and_then(|v| v.as_str().map(str::to_owned)) else {
+            return Box::pin(async move { Ok(None) });
+        };
+        let method_name = args.next().and_then(|v| v.as_str().map(str::to_owned));
+        let client = self.client.clone();
+        // `sf` resolves both the SFDX project (`sfdx-project.json`) and
+        // its own default-org config relative to its current directory --
+        // an LSP client's own process cwd is not guaranteed to be (and
+        // usually isn't) the workspace root, so `sf` must be run from
+        // `self.root` explicitly rather than inheriting whatever cwd
+        // apexls itself happened to be launched from.
+        let root = self.root.as_ref().and_then(|url| url.to_file_path().ok());
+        Box::pin(async move {
+            run_apex_test(&client, root.as_deref(), &class_name, method_name.as_deref()).await;
+            Ok(None)
+        })
+    }
+}
+
+/// Runs `sf apex run test --tests <target>` for the Run Test lens
+/// (`target` is `class_name` alone for a class-level lens, or
+/// `class_name.method_name` for a method-level one -- see
+/// `capabilities::run_test_lenses`) and surfaces the outcome via
+/// `window/showMessage`. `tokio::process::Command`'s own `.wait_with_output().await`
+/// doesn't block the executor (it's not CPU-bound work, unlike the
+/// rebuild worker's `spawn_blocking` calls), so other requests keep
+/// being serviced while a test run is in flight.
+///
+/// Both `--result-format json` (the test result itself) and the
+/// top-level `--json` (the CLI's own success/error envelope) are passed
+/// together: confirmed live against a connected org (see the decision
+/// ticket) that this combination gives one uniform top-level shape for
+/// both an executed run (`{"status", "result": {"summary", "tests"},
+/// "warnings"}`) and a CLI-level rejection before anything ran
+/// (`{"status", "message", "name", ...}`, no `result` key) -- so parsing
+/// never needs a text-scraping fallback for the error case. `-o`/
+/// `--target-org` is deliberately never passed (see `execute_command`'s
+/// doc comment). `--synchronous` is valid because every invocation
+/// targets exactly one class, `sf`'s own restriction for that flag.
+async fn run_apex_test(
+    client: &ClientSocket,
+    root: Option<&std::path::Path>,
+    class_name: &str,
+    method_name: Option<&str>,
+) {
+    let target = match method_name {
+        Some(method) => format!("{class_name}.{method}"),
+        None => class_name.to_string(),
+    };
+    let mut command = tokio::process::Command::new("sf");
+    // `sf` resolves the SFDX project and its own default-org config
+    // relative to its current directory -- must be the workspace root,
+    // not whatever cwd apexls itself inherited at launch (see
+    // `execute_command`'s doc comment).
+    if let Some(root) = root {
+        command.current_dir(root);
+    }
+    let output = command
+        .args([
+            "apex",
+            "run",
+            "test",
+            "--tests",
+            &target,
+            "--result-format",
+            "json",
+            "--json",
+            "--synchronous",
+        ])
+        .output()
+        .await;
+    let (message_type, message) = match output {
+        Ok(output) => summarize_apex_test_output(&target, &output.stdout),
+        Err(err) => (
+            MessageType::ERROR,
+            format!("apexls: couldn't run `sf apex run test --tests {target}`: {err}"),
+        ),
+    };
+    let _ = client.notify::<lsp_types::notification::ShowMessage>(ShowMessageParams {
+        typ: message_type,
+        message,
+    });
+}
+
+/// Parses `sf apex run test`'s combined `--result-format json --json`
+/// stdout (see `run_apex_test`'s doc comment for the two shapes this
+/// handles) into a `(MessageType, message)` pair -- `ERROR` for a
+/// failing/uninterpretable/CLI-rejected run, `INFO` only when every test
+/// actually passed.
+fn summarize_apex_test_output(target: &str, stdout: &[u8]) -> (MessageType, String) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(stdout) else {
+        return (
+            MessageType::ERROR,
+            format!("apexls: `sf apex run test --tests {target}` produced no parseable output"),
+        );
+    };
+    if let Some(summary) = value.pointer("/result/summary") {
+        let outcome = summary
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown");
+        let passing = summary.get("passing").and_then(|v| v.as_i64()).unwrap_or(0);
+        let failing = summary.get("failing").and_then(|v| v.as_i64()).unwrap_or(0);
+        let tests_ran = summary
+            .get("testsRan")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let mut message =
+            format!("{target}: {outcome} ({passing} passing, {failing} failing, {tests_ran} ran)");
+        if failing > 0 {
+            if let Some(tests) = value.pointer("/result/tests").and_then(|v| v.as_array()) {
+                for test in tests {
+                    if test.get("Outcome").and_then(|v| v.as_str()) != Some("Fail") {
+                        continue;
+                    }
+                    let name = test
+                        .get("FullName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(target);
+                    let msg = test
+                        .get("Message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no message)");
+                    message.push_str(&format!("\n  {name}: {msg}"));
+                }
+            }
+        }
+        let message_type = if outcome == "Passed" {
+            MessageType::INFO
+        } else {
+            MessageType::ERROR
+        };
+        return (message_type, message);
+    }
+    let cli_message = value
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown error");
+    (
+        MessageType::ERROR,
+        format!("apexls: `sf apex run test --tests {target}` failed: {cli_message}"),
+    )
 }
 
 /// A single diagnostic in `apexls check`'s plain-text-report shape:
