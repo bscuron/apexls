@@ -6,7 +6,17 @@ use crate::ptr::SyntaxPtr;
 use crate::symbol::SymbolId;
 use rowan::TextRange;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use smol_str::SmolStr;
+
+/// The value type of `ReferenceTable::by_symbol`/`by_external`: almost
+/// every distinct symbol/external-key referenced anywhere in a real project
+/// has only a handful of references (confirmed by ticket 08 of
+/// `.scratch/apex-performance/`), so storing the common one-reference case
+/// inline avoids a separate heap allocation per key entirely -- a key with
+/// more references than the inline capacity falls back to a heap `Vec`
+/// exactly like the plain `Vec<SyntaxPtr>` this replaces.
+type RefVec = SmallVec<[SyntaxPtr; 1]>;
 
 /// What a reference (an unqualified name, a `.member` access, a SOQL
 /// object/field path segment, ...) resolved to. Deliberately more than
@@ -178,17 +188,25 @@ pub enum ExternalKey {
         object: SmolStr,
         field: Option<SmolStr>,
     },
-    Stdlib {
-        class_name: SmolStr,
-        member: Option<SmolStr>,
-        arg_count: Option<usize>,
-    },
+    Stdlib(Box<StdlibKey>),
     Label {
         full_name: SmolStr,
     },
     VisualforcePage {
         name: SmolStr,
     },
+}
+
+/// `ExternalKey::Stdlib`'s payload, boxed because it's this enum's largest
+/// variant (`class_name` + `member` + `arg_count`, 64 bytes unboxed) --
+/// exactly the same size-inflation `Resolution`'s own doc comment already
+/// explains boxing away for its large variants, just never applied here
+/// until ticket 09 of `.scratch/apex-performance/` found it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StdlibKey {
+    pub class_name: SmolStr,
+    pub member: Option<SmolStr>,
+    pub arg_count: Option<usize>,
 }
 
 /// `external_key()` calls this for every `SchemaObject`/`UnknownSchema`/
@@ -276,10 +294,12 @@ impl Resolution {
             // for a handful of extremely hot class names. A specific
             // member (`String.isBlank`) keeps its existing, real
             // find-references value and stays indexed.
-            Resolution::StdlibMember(r) => r.member.as_deref().map(|member| ExternalKey::Stdlib {
-                class_name: lower(&r.class_name),
-                member: Some(lower(member)),
-                arg_count: r.arg_count,
+            Resolution::StdlibMember(r) => r.member.as_deref().map(|member| {
+                ExternalKey::Stdlib(Box::new(StdlibKey {
+                    class_name: lower(&r.class_name),
+                    member: Some(lower(member)),
+                    arg_count: r.arg_count,
+                }))
             }),
             Resolution::Label(r) => Some(ExternalKey::Label {
                 full_name: lower(&r.full_name),
@@ -306,14 +326,14 @@ pub struct ReferenceTable {
     /// replaced wholesale, never patched in place -- see its doc
     /// comment) -- there's no persistent-across-rebuilds mutation or
     /// stale-entry cleanup to reason about, same as `resolutions` itself.
-    by_symbol: FxHashMap<SymbolId, Vec<SyntaxPtr>>,
+    by_symbol: FxHashMap<SymbolId, RefVec>,
     /// Reverse of `resolutions`, the `ExternalKey` counterpart of
     /// `by_symbol` -- every `SyntaxPtr` whose `Resolution` names the same
     /// real Salesforce object/field or stdlib class/member, for the
     /// three `Resolution` variants that have no `SymbolId` to key by
     /// (`SchemaObject`/`UnknownSchema`/`StdlibMember`). Maintained
     /// incrementally the same way and for the same reason as `by_symbol`.
-    by_external: FxHashMap<ExternalKey, Vec<SyntaxPtr>>,
+    by_external: FxHashMap<ExternalKey, RefVec>,
     /// Narrower highlight range for a reference whose own `SyntaxPtr::range()`
     /// spans more than just its identifying token -- a method/constructor
     /// call node's range covers target-through-closing-paren, a
