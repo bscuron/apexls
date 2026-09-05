@@ -1,1 +1,29 @@
-[]
+[
+  {
+    "id": "UPG-0001",
+    "title": "Improve task success rate",
+    "category": "model_routing",
+    "description": "Current success rate is 75.0%, target is 80%",
+    "status": "pending",
+    "confidence": 0.8,
+    "created_at": 1788590052.7248526
+  },
+  {
+    "id": "UPG-0002",
+    "title": "Improve task success rate",
+    "category": "model_routing",
+    "description": "Current success rate is 75.0%, target is 80%",
+    "status": "pending",
+    "confidence": 0.8,
+    "created_at": 1788590167.5506043
+  },
+  {
+    "id": "UPG-0003",
+    "title": "Improve task success rate",
+    "category": "model_routing",
+    "description": "Current success rate is 75.0%, target is 80%",
+    "status": "pending",
+    "confidence": 0.8,
+    "created_at": 1788590263.1232517
+  }
+]

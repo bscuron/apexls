@@ -7,10 +7,16 @@
       "estimated_minutes": 120
     },
     {
-      "id": "816051c0dec2",
+      "id": "751e5ec3336f",
+      "role": "backend",
+      "status": "open",
+      "estimated_minutes": 30
+    },
+    {
+      "id": "e8a5cdff48a2",
       "role": "backend",
       "status": "claimed",
-      "estimated_minutes": 120
+      "estimated_minutes": 240
     },
     {
       "id": "d2e95ab1df26",
@@ -23,6 +29,12 @@
       "role": "manager",
       "status": "failed",
       "estimated_minutes": 10
+    },
+    {
+      "id": "816051c0dec2",
+      "role": "backend",
+      "status": "failed",
+      "estimated_minutes": 120
     }
   ],
   "edges": [
@@ -31,13 +43,19 @@
       "to": "f4052b714d97",
       "type": "depends_on",
       "semantic_type": "blocks"
+    },
+    {
+      "from": "816051c0dec2",
+      "to": "e8a5cdff48a2",
+      "type": "file_overlap",
+      "semantic_type": "blocks"
     }
   ],
   "critical_path": [
     "816051c0dec2",
-    "f4052b714d97"
+    "e8a5cdff48a2"
   ],
-  "critical_path_minutes": 240,
-  "parallel_width": 3,
+  "critical_path_minutes": 360,
+  "parallel_width": 4,
   "bottlenecks": []
 }

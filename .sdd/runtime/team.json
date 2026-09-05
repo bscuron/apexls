@@ -1,5 +1,5 @@
 {
-  "updated_at": 1788589072.107679,
+  "updated_at": 1788589908.9567432,
   "members": [
     {
       "agent_id": "manager-440b80c0",
@@ -30,6 +30,22 @@
         "816051c0dec2"
       ],
       "spawned_at": 1788589065.2910564,
+      "finished_at": 0.0,
+      "provider": ""
+    },
+    {
+      "agent_id": "backend-6b07651f",
+      "role": "backend",
+      "name": "backend-6b07651f",
+      "model": "sonnet",
+      "color": "",
+      "mode": "",
+      "status": "starting",
+      "is_active": true,
+      "task_ids": [
+        "e8a5cdff48a2"
+      ],
+      "spawned_at": 1788589908.9567404,
       "finished_at": 0.0,
       "provider": ""
     }

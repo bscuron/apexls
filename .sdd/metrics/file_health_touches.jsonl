@@ -1,2 +1,4 @@
 {"timestamp": 1788589841.399963, "task_id": "816051c0dec2", "path": "crates/apexls-server/src/lib.rs", "outcome": "failure", "previous_total": 0, "new_total": 42, "flagged": true}
 {"timestamp": 1788589841.4372478, "task_id": "816051c0dec2", "path": "crates/apexls-server/src/capabilities.rs", "outcome": "failure", "previous_total": 0, "new_total": 42, "flagged": true}
+{"timestamp": 1788590348.0194583, "task_id": "e8a5cdff48a2", "path": "crates/apexls-server/src/lib.rs", "outcome": "failure", "previous_total": 42, "new_total": 42, "flagged": true}
+{"timestamp": 1788590348.051847, "task_id": "e8a5cdff48a2", "path": "crates/apexls-server/src/capabilities.rs", "outcome": "failure", "previous_total": 42, "new_total": 42, "flagged": true}
