@@ -496,7 +496,16 @@ pub(crate) fn document_symbols(
                 // `deprecated` field, superseded by `tags` -- neither used here
                 DocumentSymbol {
                     name: s.name.to_string(),
-                    detail: s.type_name.as_ref().map(|t| t.to_string()),
+                    // `Trigger`'s own `type_name` isn't a real declared
+                    // type the way it is for every other outline kind --
+                    // `crate::collect::collect_trigger_unit` repurposes
+                    // the field to carry the trigger's `ON <Object>` text
+                    // through to `apex_binder::resolve`'s `Trigger.new`
+                    // narrowing (see ticket 09's Answer), an internal
+                    // binder concern this outline never asked to show.
+                    detail: (s.kind != SymbolKind::Trigger)
+                        .then(|| s.type_name.as_ref().map(|t| t.to_string()))
+                        .flatten(),
                     kind: lsp_symbol_kind(s.kind),
                     tags: None,
                     deprecated: None,
@@ -3482,5 +3491,51 @@ fn argument_repeats_param_name(arg: &Expr, param_name: &str) -> bool {
     NameExpr::cast(arg.syntax().clone())
         .and_then(|n| n.name_token())
         .is_some_and(|tok| tok.text().eq_ignore_ascii_case(param_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::line_index::PositionEncoding;
+
+    /// `apex_binder::collect::collect_trigger_unit` repurposes a
+    /// `Trigger` symbol's `type_name` to carry its `ON <Object>` text
+    /// through to the `Trigger.new` narrowing in `apex_binder::resolve`
+    /// (ticket 09's Answer) -- not a real declared type the way it is for
+    /// every other outline kind. Without excluding `Trigger` here,
+    /// `document_symbols` would start showing that object name as the
+    /// outline's `detail` for every `.trigger` file, an unrelated and
+    /// untested UI change caught in review before landing.
+    #[test]
+    fn a_triggers_outline_entry_has_no_detail_despite_its_repurposed_type_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "apexls-server-document-symbols-trigger-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("AccTrigger.trigger"),
+            "trigger AccTrigger on Account (before insert) {}",
+        )
+        .unwrap();
+        let program = BoundProgram::from_files(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let file = program
+            .files()
+            .find(|&f| program.file_path(f).ends_with("AccTrigger.trigger"))
+            .expect("expected the trigger file to be discovered");
+        let symbols = document_symbols(&program, file, PositionEncoding::Utf16);
+        let trigger_symbol = symbols
+            .iter()
+            .find(|s| s.name == "AccTrigger")
+            .expect("expected the trigger itself in the outline");
+        assert_eq!(
+            trigger_symbol.detail, None,
+            "a trigger's outline entry should have no detail, even though \
+             its underlying Symbol::type_name is now populated with the \
+             declared object name for narrowing purposes"
+        );
+    }
 }
 

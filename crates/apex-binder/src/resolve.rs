@@ -1489,6 +1489,44 @@ impl<'a> BodyBinder<'a> {
         }
     }
 
+    /// The narrowed `Ty` for `Trigger.<member>` (`new`/`old`/`newMap`/
+    /// `oldMap`, case-insensitive) when this body is binding inside a
+    /// trigger whose own declared `ON <Object>` is known and real --
+    /// `None` for any other member name, or when `self.enclosing_type`
+    /// isn't a real trigger with a resolvable object, in which case the
+    /// caller falls through to the generic stdlib-scraped type.
+    /// `self.enclosing_type` is the trigger's own `SymbolId` directly
+    /// (never `None`, never a further-nested container) whenever binding
+    /// happens inside a trigger's body: `lib.rs`'s `SymbolKind::Trigger`
+    /// arm and `completion.rs`'s `SyntaxKind::TriggerUnit` arm both set
+    /// it that way. See `bind_field_expr`'s own call site for the
+    /// real-org verification behind this.
+    fn narrowed_trigger_context_ty(&self, member: &str) -> Option<Ty> {
+        let trigger_id = self.enclosing_type?;
+        let trigger = self.table.get(trigger_id);
+        if trigger.kind != SymbolKind::Trigger {
+            return None;
+        }
+        let object = trigger.type_name.as_deref()?;
+        self.schema.object(object)?;
+        if member.eq_ignore_ascii_case("new") || member.eq_ignore_ascii_case("old") {
+            Some(Ty::system_with_args(
+                "List",
+                vec![Ty::system_owned(SmolStr::new(object), Vec::new())],
+            ))
+        } else if member.eq_ignore_ascii_case("newMap") || member.eq_ignore_ascii_case("oldMap") {
+            Some(Ty::system_with_args(
+                "Map",
+                vec![
+                    Ty::system("Id"),
+                    Ty::system_owned(SmolStr::new(object), Vec::new()),
+                ],
+            ))
+        } else {
+            None
+        }
+    }
+
     /// `symbol`'s declared type, as a [`Ty`] -- the "type of this
     /// expression" chaining `FieldExpr`/`MethodCallExpr` target
     /// resolution needs. `Ty::Project` when the declared type is a
@@ -2891,6 +2929,49 @@ impl<'a> BodyBinder<'a> {
                             .and_then(apex_type_for_schema_field_type)
                             .map(|apex_type| Ty::system(apex_type))
                     });
+                }
+                // `Trigger.new`/`.old`/`.newMap`/`.oldMap` -- narrows to
+                // the trigger's own declared `ON <Object>` type instead
+                // of falling through to the generic stdlib-scraped
+                // `List<SObject>`/`Map<Id,SObject>` property type below.
+                // Confirmed against a real org: `Trigger.new[0].Email`
+                // (`Email` is a real field, just not on `Account`) fails
+                // to compile on an `on Account` trigger with "Variable
+                // does not exist: Email", proving the compiler checks
+                // field access against the trigger's own object, not a
+                // generic `SObject` -- see ticket 09's Answer for the
+                // full probe. Only intercepts when the trigger's own
+                // object is both known (`self.enclosing_type` names a
+                // `Trigger` symbol whose `type_name` -- populated by
+                // `crate::collect::collect_trigger_unit` from the `ON
+                // <Object>` token -- is set) and real
+                // (`self.schema.object(..)` finds it); falls through to
+                // today's generic behavior otherwise, same as every other
+                // "can't prove it, don't guess" fallback in this
+                // function. The `Resolution` recorded is unchanged from
+                // the generic path below (still a plain `Trigger.new`
+                // `StdlibMember` reference, for hover/goto-definition) --
+                // only the *propagated type* narrows, which
+                // `Expr::Index`/`crate::generics`'s `Map` arm (both
+                // already generic over a `Ty::System`'s own `args`) then
+                // carry through `Trigger.new[0]`/`Trigger.newMap.values()[0]`
+                // for free, no further changes needed.
+                if object.eq_ignore_ascii_case("Trigger") {
+                    if let Some(narrowed) = self.narrowed_trigger_context_ty(name) {
+                        let class = self.stdlib.class("Trigger");
+                        self.refs.set_with_highlight(
+                            ptr,
+                            highlight,
+                            Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                                class.and_then(|c| c.namespace.clone()),
+                                "Trigger",
+                                Some(name),
+                                None,
+                                None,
+                            ))),
+                        );
+                        return Some(narrowed);
+                    }
                 }
                 // Not a known SObject/field at all (real or standard) --
                 // try a stdlib class property before finally giving up

@@ -151,6 +151,14 @@ pub(crate) fn collect_trigger_unit(file: FileId, tu: &TriggerUnit) -> FileCollec
     let Some(name_text) = name.text() else {
         return out;
     };
+    // The trigger's own `ON <object>` reference, reused as `type_name`
+    // purely to carry the declared object's name through to
+    // `crate::resolve::BodyBinder`'s `Trigger.new`/`.old`/`.newMap`/
+    // `.oldMap` narrowing (see its own doc comment) -- not a real
+    // "declared type" the way it is for a field/parameter, but the field
+    // already exists on every `Symbol` for exactly this "declared type
+    // text" purpose, so no new field is needed.
+    let object_name = tu.object_ref().map(|t| SmolStr::new(t.text()));
     let trigger_id = out.push(
         file,
         Symbol {
@@ -161,7 +169,7 @@ pub(crate) fn collect_trigger_unit(file: FileId, tu: &TriggerUnit) -> FileCollec
             name_range: name.ident_range(),
             container: None,
             type_ref: None,
-            type_name: None,
+            type_name: object_name,
             type_args: Vec::new(),
             modifiers: ModifierSet::default(),
         },
