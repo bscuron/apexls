@@ -7,6 +7,8 @@ Investigate, against primary sources (apexls's own `apexls-server`/`apex-binder`
 
 ## Answer
 
+> **Amendment (2026-09-05):** two items below have since moved. **Pull diagnostics** (§2a) was implemented on `master` in `c5cf1ab`, the same commit that added this file -- the bullet below was never updated to reflect it. **Semantic tokens**, ranked #1 in the §3 synthesis, has a ticket spec (`8421cd3`, "spec: semantic-tokens ticket 01") and an in-progress implementation on branch `salvage/backend-fc11a860` (not yet merged to `master`). The rest of this document, including the §3 ranking otherwise, reflects the state as originally researched and has not been re-verified since.
+
 ### 1. apexls's current LSP capability surface (grounded in source)
 
 apexls is built on `async-lsp` + `lsp-types = "0.95.0"` (`crates/apexls-server/Cargo.toml`), chosen explicitly over `tower-lsp`/`tower-lsp-server` because `async-lsp` processes notifications *synchronously*, matching what the spec requires for ordering (`crates/apexls-server/src/lib.rs:1-11`). There is no `handshake.rs`/`hover_definition.rs`/etc. file split as separate modules -- the whole LSP crate is four files: `lib.rs` (1454 lines, the `Backend`/`LanguageServer` impl and document-sync/rebuild-worker plumbing), `capabilities.rs` (3072 lines, every capability's pure-analysis-to-LSP-type translation, one `pub(crate) fn` per feature), `line_index.rs` (UTF-8/UTF-16/UTF-32 position-encoding negotiation and conversion), and `main.rs` (18 lines, entry point).
