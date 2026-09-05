@@ -1,10 +1,9 @@
 //! Byte-offset <-> LSP `Position` conversion, parameterized by the
 //! negotiated position encoding (see `PositionEncoding::negotiate`,
-//! used by `main.rs`'s `initialize`). Not consumed by any capability
-//! yet -- there isn't one -- but this is exactly the kind of
-//! feature-independent infrastructure worth building ahead of its
-//! first consumer, the same way `apex-binder`'s `AstPtr`/`SyntaxPtr`
-//! were built before anything needed goto-definition.
+//! used by `main.rs`'s `initialize`). Used throughout
+//! `capabilities.rs` to translate between this project's own
+//! byte-offset-based `TextSize`/`TextRange` (`rowan`/`apex-syntax`)
+//! and LSP's `Position`.
 
 use lsp_types::{Position, PositionEncodingKind};
 
@@ -55,18 +54,11 @@ impl From<PositionEncoding> for PositionEncodingKind {
 /// single cheap linear scan, not worth the cache-invalidation
 /// complexity of keeping one synchronized across edits before anything
 /// actually needs to.
-///
-/// Not constructed anywhere outside its own unit tests yet -- no
-/// capability consumes a position yet to need it -- hence the blanket
-/// `allow` below rather than per-method ones; see the module doc
-/// comment.
-#[allow(dead_code)]
 pub struct LineIndex {
     /// Byte offset of the start of each line; `line_starts[0] == 0`.
     line_starts: Vec<u32>,
 }
 
-#[allow(dead_code)]
 impl LineIndex {
     pub fn new(text: &str) -> Self {
         let mut line_starts = vec![0u32];

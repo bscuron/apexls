@@ -50,8 +50,6 @@ mod ptr;
 mod reference_table;
 mod resolve;
 #[cfg(test)]
-mod salsa_smoke;
-#[cfg(test)]
 mod salsa_stage1_dual_run;
 #[cfg(test)]
 mod salsa_stage2_dual_run;
