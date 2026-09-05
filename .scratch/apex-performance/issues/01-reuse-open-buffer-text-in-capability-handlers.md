@@ -10,9 +10,14 @@ Don't change `LineIndex::new`'s own per-call recomputation — its doc comment a
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done (2026-09-05) -- implemented via fix shape (b): `Parse` now retains
+`text: Arc<str>` alongside its `GreenNode` (`apex-parser/src/errors.rs`), populated
+once at parse time (`apex-parser/src/lib.rs`'s `parse_root`/`parse_with`).
+`BoundProgram::source_text(file)` (`apex-binder/src/lib.rs`) exposes it as a cheap
+`&str` reference fetch. Every whole-file-text call site in `capabilities.rs`/`lib.rs`
+now uses it instead of `program.syntax(file).text().to_string()`.
 
-- [ ] A request against a currently-open file no longer triggers a `SyntaxNode::text().to_string()` tree walk to recover that file's source
-- [ ] A request against a closed-but-referenced file still works correctly (falls back to deriving text from the tree)
-- [ ] Existing LSP capability tests (hover, completion, rename, semantic-tokens, etc.) still pass
-- [ ] No new `.clone()` of the full `BoundProgram` or a whole-file `SyntaxNode` is introduced as part of the fix
+- [x] A request against a currently-open file no longer triggers a `SyntaxNode::text().to_string()` tree walk to recover that file's source
+- [x] A request against a closed-but-referenced file still works correctly (falls back to deriving text from the tree) -- no separate fallback needed: `Parse::text` is populated for every parsed file, open or not, so both cases are the same cheap path
+- [x] Existing LSP capability tests (hover, completion, rename, semantic-tokens, etc.) still pass
+- [x] No new `.clone()` of the full `BoundProgram` or a whole-file `SyntaxNode` is introduced as part of the fix

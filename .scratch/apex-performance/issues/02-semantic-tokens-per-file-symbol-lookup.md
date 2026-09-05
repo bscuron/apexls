@@ -6,9 +6,12 @@ After this ticket, semantic-tokens' declaration-collection step looks up a file'
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done (2026-09-05) -- `SymbolTable::symbols_of_file` widened to `pub`,
+exposed as `BoundProgram::symbols_in_file(file)` (matching `resolutions_in_file`'s
+shape), and `collect_tokens` (`capabilities.rs`) now uses it instead of
+`program.symbols.iter().filter(|(_, s)| s.file == file)`.
 
-- [ ] `collect_tokens` looks up a file's symbols via a per-file accessor instead of iterating + filtering `SymbolTable::iter()`
-- [ ] The newly-exposed accessor follows the existing visibility/naming pattern of comparable per-file `BoundProgram` accessors (e.g. `resolutions_in_file`)
-- [ ] Both `semantic_tokens_full` and `semantic_tokens_range` use the fixed lookup
-- [ ] Existing semantic-tokens tests still pass and produce identical token output to before the change
+- [x] `collect_tokens` looks up a file's symbols via a per-file accessor instead of iterating + filtering `SymbolTable::iter()`
+- [x] The newly-exposed accessor follows the existing visibility/naming pattern of comparable per-file `BoundProgram` accessors (e.g. `resolutions_in_file`)
+- [x] Both `semantic_tokens_full` and `semantic_tokens_range` use the fixed lookup
+- [x] Existing semantic-tokens tests still pass and produce identical token output to before the change

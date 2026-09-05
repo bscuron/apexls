@@ -6,7 +6,17 @@ This ticket's exact shape depends entirely on ticket 03's findings — don't pre
 
 **Blocked by:** 03 (Quantify the BindCache/BoundProgram memory duplication)
 
-**Status:** ready-for-agent
+**Status:** closed, not-applicable (2026-09-05) -- see `.scratch/apex-performance/dhat-breakdown.md`.
+Ticket 03's `dhat-heap.json` breakdown found the `BindCache` -> `BoundProgram`
+`.clone()` assembly (`files`/`file_ids`/`parses`/`bodies`/`symbols`) retains
+only ~660KB total (0.3% of the ~204MB steady-state footprint), already fully
+`Arc`-shared, not independently duplicated -- exactly this ticket's own
+"if ticket 03 finds the overlap isn't actually shareable... close as
+not-applicable" bail-out clause, just for the mirror-image reason (it's
+already shared, so there's nothing left to de-duplicate). The real ~204MB is
+dominated by rowan syntax trees (~37%) and Pass-2 reference/body-merge
+structures (~25%), neither of which a `BindCache`/`BoundProgram` restructuring
+would touch.
 
 - [ ] The specific duplication ticket 03 identified is eliminated (shared via `Arc` or equivalent, not independently materialized twice)
 - [ ] `mem_profile` re-run against the real NPSP corpus shows a measurable reduction in steady-state resident memory

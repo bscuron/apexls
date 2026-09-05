@@ -6,8 +6,8 @@ No source code changes are expected from this ticket — it produces a written f
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done (2026-09-05) -- see `.scratch/apex-performance/dhat-breakdown.md`.
 
-- [ ] `mem_profile` example run against the real NPSP corpus and its `dhat-heap.json` captured
-- [ ] Written breakdown identifying which allocation sites/data structures in `BindCache` and `BoundProgram` overlap, with approximate memory attributed to each
-- [ ] Breakdown explicitly states whether the overlap is shareable (e.g. via `Arc`) or is independently-owned data that happens to look similar
+- [x] `mem_profile` example run against the real NPSP corpus and its `dhat-heap.json` captured
+- [x] Written breakdown identifying which allocation sites/data structures in `BindCache` and `BoundProgram` overlap, with approximate memory attributed to each
+- [x] Breakdown explicitly states whether the overlap is shareable (e.g. via `Arc`) or is independently-owned data that happens to look similar
