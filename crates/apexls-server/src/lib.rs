@@ -70,7 +70,7 @@
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,11 +97,13 @@ use lsp_types::{
     FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, FullDocumentDiagnosticReport, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, InlayHint,
     InlayHintParams, InitializeParams, InitializeResult, InitializedParams, Location,
-    MarkupContent, MarkupKind, OneOf, PrepareRenameResponse, PublishDiagnosticsParams,
+    MarkupContent, MarkupKind, NumberOrString, OneOf, PrepareRenameResponse, ProgressParams,
+    ProgressParamsValue, PublishDiagnosticsParams,
     ReferenceParams, RelatedFullDocumentDiagnosticReport, RenameOptions,
     RenameParams, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
     ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
     TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
     WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
@@ -142,6 +144,12 @@ struct Backend {
     /// standard-library-stub toggle, no metadata-root override) --
     /// see `BACKLOG.md` §4 for what those settings will eventually be.
     config: Option<serde_json::Value>,
+    /// Negotiated once in `initialize` from `ClientCapabilities.window.work_done_progress`
+    /// (spec 3.15's `window/workDoneProgress`). When `false` (an older or
+    /// minimal client), `spawn_rebuild_worker` skips the whole
+    /// create/begin/end progress dance rather than sending notifications
+    /// a client that never asked for them would just discard.
+    work_done_progress_supported: bool,
     /// The current `apex-binder` bind, rebuilt in the background by a
     /// single persistent worker task (`spawn_rebuild_worker`) after
     /// `initialized` and every document-sync notification
@@ -263,6 +271,14 @@ struct BindState {
     /// there is no "two rebuilds raced and one landed out of order"
     /// scenario left to guard against.
     rebuild_requested: tokio::sync::Notify,
+    /// A monotonically increasing counter minting a fresh `$/progress`
+    /// token for each rebuild (`spawn_rebuild_worker`) -- the LSP spec's
+    /// `window/workDoneProgress/create` -> begin -> end lifecycle is
+    /// per-token, so reusing one token across rebuilds would leave a
+    /// client that already saw that token's `end` unsure whether a later
+    /// `begin` on the same token starts a new operation or malformedly
+    /// continues the old one.
+    progress_seq: AtomicU64,
     /// Kept alive only so the watch stays active -- `Debouncer` stops
     /// watching on drop. `None` until `Backend::start_watcher`'s
     /// `spawn_blocking` task finishes registering it, and permanently
@@ -289,6 +305,7 @@ impl Default for BindState {
             bound_version: tokio::sync::watch::channel(0).0,
             worker_active: AtomicBool::new(false),
             rebuild_requested: tokio::sync::Notify::default(),
+            progress_seq: AtomicU64::new(0),
             watcher: Mutex::default(),
         }
     }
@@ -470,6 +487,7 @@ fn spawn_rebuild_worker(
     bind: Arc<BindState>,
     client: ClientSocket,
     encoding: PositionEncoding,
+    work_done_progress_supported: bool,
 ) {
     tokio::spawn(async move {
         loop {
@@ -493,6 +511,32 @@ fn spawn_rebuild_worker(
                     .collect();
                 (documents.version, overrides)
             };
+            // Progress reporting runs as its own detached task, never
+            // awaited by this loop: the actual rebuild below must never
+            // wait on a client's `window/workDoneProgress/create`
+            // round-trip before starting (or on its `end` progress
+            // notification before publishing) -- an unresponsive client
+            // would otherwise turn a UX nicety into a stalled rebuild
+            // pipeline. This task independently begins progress, then
+            // reuses `wait_for_rebuild` (the same mechanism every
+            // request handler already uses) to learn when *this*
+            // rebuild's `version` has published, and ends progress then.
+            if work_done_progress_supported {
+                let progress_bind = Arc::clone(&bind);
+                let progress_client = client.clone();
+                tokio::spawn(async move {
+                    let Some(token) = begin_rebuild_progress(&progress_bind, &progress_client).await else {
+                        return;
+                    };
+                    wait_for_rebuild(&progress_bind, version).await;
+                    let _ = progress_client.notify::<lsp_types::notification::Progress>(ProgressParams {
+                        token,
+                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
+                            message: None,
+                        })),
+                    });
+                });
+            }
             let rebuild_bind = Arc::clone(&bind);
             let result = tokio::task::spawn_blocking(move || {
                 let mut cache = rebuild_bind.cache.lock();
@@ -612,6 +656,40 @@ fn publish_diagnostics(bind: &BindState, client: &ClientSocket, encoding: Positi
     }
 }
 
+/// Starts one `$/progress` reporting cycle for a rebuild. Only called when
+/// the client already declared `window.workDoneProgress` support at
+/// `initialize` time (see `spawn_rebuild_worker`'s guard and
+/// `Backend::work_done_progress_supported`'s doc comment) -- sending
+/// progress notifications a client never asked for would just be
+/// discarded. Per spec, a server must first ask the client to create a
+/// token (`window/workDoneProgress/create`) before reporting against it;
+/// a fresh token per rebuild (`BindState::progress_seq`) keeps each
+/// rebuild's begin/end pair unambiguous to the client. Returns `None` if
+/// the create request itself errors (e.g. the client claims support but
+/// refuses), so the caller knows to skip sending `end` too -- doing so
+/// for a token the client never agreed to create would be a protocol
+/// violation, not just a wasted notification.
+async fn begin_rebuild_progress(bind: &BindState, client: &ClientSocket) -> Option<NumberOrString> {
+    let seq = bind.progress_seq.fetch_add(1, Ordering::SeqCst);
+    let token = NumberOrString::String(format!("apexls/rebuild-{seq}"));
+    client
+        .request::<lsp_types::request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+            token: token.clone(),
+        })
+        .await
+        .ok()?;
+    let _ = client.notify::<lsp_types::notification::Progress>(ProgressParams {
+        token: token.clone(),
+        value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(WorkDoneProgressBegin {
+            title: "apexls: rebuilding".into(),
+            cancellable: Some(false),
+            message: None,
+            percentage: None,
+        })),
+    });
+    Some(token)
+}
+
 impl LanguageServer for Backend {
     type Error = ResponseError;
     type NotifyResult = ControlFlow<async_lsp::Result<()>>;
@@ -635,6 +713,12 @@ impl LanguageServer for Backend {
             .as_ref()
             .and_then(|g| g.position_encodings.as_deref());
         let position_encoding = PositionEncoding::negotiate(client_encodings);
+        let work_done_progress_supported = params
+            .capabilities
+            .window
+            .as_ref()
+            .and_then(|w| w.work_done_progress)
+            .unwrap_or(false);
 
         info!(
             ?root,
@@ -652,6 +736,7 @@ impl LanguageServer for Backend {
         }
         self.root = root;
         self.position_encoding = position_encoding;
+        self.work_done_progress_supported = work_done_progress_supported;
         self.config = params.initialization_options;
 
         Box::pin(async move {
@@ -789,6 +874,7 @@ impl LanguageServer for Backend {
                 Arc::clone(&self.bind),
                 self.client.clone(),
                 self.position_encoding,
+                self.work_done_progress_supported,
             );
             Backend::start_watcher(root, Arc::clone(&self.bind));
         }
@@ -1527,6 +1613,7 @@ pub async fn run_server() {
             client: client.clone(),
             root: None,
             position_encoding: PositionEncoding::Utf16,
+            work_done_progress_supported: false,
             config: None,
             bind: Arc::new(BindState::default()),
         });
