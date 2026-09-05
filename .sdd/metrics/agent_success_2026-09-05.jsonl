@@ -1,0 +1,1 @@
+{"timestamp": 1788589079.4892092, "metric_type": "agent_success", "value": 1.0, "labels": {"agent_id": "manager-440b80c0", "role": "manager", "model": "opus", "tenant_id": "default"}}

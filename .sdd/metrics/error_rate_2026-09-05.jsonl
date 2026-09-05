@@ -1,0 +1,2 @@
+{"timestamp": 1788588573.7081437, "metric_type": "error_rate", "value": 1.0, "labels": {"error_type": "agent_spawn_failed:unknown", "provider": "default", "model": "", "role": "manager", "tenant_id": "default"}}
+{"timestamp": 1788588797.5167959, "metric_type": "error_rate", "value": 1.0, "labels": {"error_type": "agent_spawn_failed:unknown", "provider": "default", "model": "", "role": "manager", "tenant_id": "default"}}

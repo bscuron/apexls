@@ -1,0 +1,5 @@
+*.pid
+*.log
+tasks.jsonl
+session.json
+auth.token

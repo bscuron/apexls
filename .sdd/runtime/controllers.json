@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "adaptive_parallelism": {
+    "configured_max": 6,
+    "current_max": 6,
+    "slo_constrained_max": null,
+    "last_adjustment_reason": "initial",
+    "low_error_since_epoch": 1788588797.2528691
+  },
+  "claim_conflict_state": {},
+  "saved_at_epoch": 1788589270.3371522
+}

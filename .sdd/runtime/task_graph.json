@@ -1,0 +1,43 @@
+{
+  "nodes": [
+    {
+      "id": "f4052b714d97",
+      "role": "qa",
+      "status": "open",
+      "estimated_minutes": 120
+    },
+    {
+      "id": "816051c0dec2",
+      "role": "backend",
+      "status": "claimed",
+      "estimated_minutes": 120
+    },
+    {
+      "id": "d2e95ab1df26",
+      "role": "manager",
+      "status": "done",
+      "estimated_minutes": 20
+    },
+    {
+      "id": "27dcb41bba19",
+      "role": "manager",
+      "status": "failed",
+      "estimated_minutes": 10
+    }
+  ],
+  "edges": [
+    {
+      "from": "816051c0dec2",
+      "to": "f4052b714d97",
+      "type": "depends_on",
+      "semantic_type": "blocks"
+    }
+  ],
+  "critical_path": [
+    "816051c0dec2",
+    "f4052b714d97"
+  ],
+  "critical_path_minutes": 240,
+  "parallel_width": 3,
+  "bottlenecks": []
+}

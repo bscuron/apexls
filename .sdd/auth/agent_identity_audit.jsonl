@@ -1,0 +1,5 @@
+{"timestamp": 1788588842.289553, "identity_id": "manager-440b80c0", "action": "created", "actor": "spawner", "details": {"role": "manager", "permissions": ["agents:read", "agents:spawn", "files:read", "files:write", "status:read", "tasks:read", "tasks:write"], "parent_identity_id": null, "token_type": "jwt", "task_ids": ["d2e95ab1df26"], "has_file_scope": false}}
+{"timestamp": 1788588933.803159, "identity_id": "manager-440b80c0", "action": "authenticated", "actor": "auth", "details": {"token_type": "jwt"}}
+{"timestamp": 1788589017.5771759, "identity_id": "manager-440b80c0", "action": "authenticated", "actor": "auth", "details": {"token_type": "jwt"}}
+{"timestamp": 1788589043.1734133, "identity_id": "manager-440b80c0", "action": "authenticated", "actor": "auth", "details": {"token_type": "jwt"}}
+{"timestamp": 1788589053.8782704, "identity_id": "backend-2292e2df", "action": "created", "actor": "spawner", "details": {"role": "backend", "permissions": ["files:read", "files:write", "status:read", "tasks:claim", "tasks:read", "tests:run"], "parent_identity_id": null, "token_type": "jwt", "task_ids": ["816051c0dec2"], "has_file_scope": false}}

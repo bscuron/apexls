@@ -1,0 +1,4 @@
+# Bernstein workspace config
+server_port: 8052
+max_workers: 4
+default_effort: max

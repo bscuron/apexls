@@ -1,0 +1,14 @@
+{
+  "run_id": "20260905-060933",
+  "budget_usd": 0.0,
+  "hard_budget_usd": 0.0,
+  "spent_usd": 0.0,
+  "warn_threshold": 0.8,
+  "critical_threshold": 0.95,
+  "hard_stop_threshold": 1.0,
+  "usages": [],
+  "cumulative_tokens": {},
+  "envelopes": {},
+  "spent_by_envelope": {},
+  "calls_by_envelope": {}
+}

@@ -1,0 +1,43 @@
+{
+  "agent_adapter": {
+    "cli": "Claude Code",
+    "max_agents": 6,
+    "max_tasks_per_agent": 2,
+    "model": null
+  },
+  "approval_gates": {
+    "mode": "auto",
+    "plan_mode": false
+  },
+  "budget_ceiling_usd": 0.0,
+  "manifest_hash": "b33150ca645db417314033888feedf90f3fcf50cca366fe29ff5e680ec581fae",
+  "model_routing": {
+    "allowed_providers": [],
+    "default_model": null,
+    "denied_providers": []
+  },
+  "orchestrator_config": {
+    "approval": "auto",
+    "auto_merge": true,
+    "budget_usd": 0.0,
+    "dry_run": false,
+    "evolution_enabled": true,
+    "max_agent_runtime_s": 1800,
+    "max_agents": 6,
+    "max_task_retries": 2,
+    "max_tasks_per_agent": 2,
+    "merge_strategy": "pr",
+    "plan_mode": false,
+    "poll_interval_s": 3,
+    "recovery": "resume",
+    "workflow": null
+  },
+  "provenance": {
+    "commit_sha": "38c47cc919ef667907440c1d20ca8b9d59bc1ce3",
+    "triggered_at_iso": "2026-09-05T06:09:33.338802+00:00",
+    "triggered_by": "bscur"
+  },
+  "run_id": "20260905-060933",
+  "workflow_definition_hash": "",
+  "workflow_name": ""
+}

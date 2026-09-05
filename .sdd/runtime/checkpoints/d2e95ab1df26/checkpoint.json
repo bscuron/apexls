@@ -1,0 +1,19 @@
+{
+  "adapter": "Claude Code",
+  "adapter_session_id": "manager-440b80c0",
+  "created_at": "2026-09-05T06:17:52.153725+00:00",
+  "last_completed_step_id": "d2e95ab1df26",
+  "merge_cursor": null,
+  "meta": {
+    "adapter_name": "Claude Code"
+  },
+  "resume_count": 0,
+  "schema_version": 1,
+  "scratchpad_path": "C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\manager-440b80c0\\.scratchpad.md",
+  "scratchpad_sha256": null,
+  "stall_reason": null,
+  "task_id": "d2e95ab1df26",
+  "trace_cursor": 4689,
+  "updated_at": "2026-09-05T06:17:52.153756+00:00",
+  "worktree_path": "C:\\Users\\bscur\\Documents\\projects\\apexls\\.sdd\\worktrees\\manager-440b80c0"
+}

@@ -1,0 +1,2 @@
+{"path": "crates/apexls-server/src/lib.rs", "complexity_score": 80, "bug_density_score": 0, "coverage_score": 70, "churn_score": 0, "coupling_score": 80, "total": 42, "grade": "F", "failure_touches": 1, "success_touches": 0, "last_updated": 1788589841.399963, "flagged": true}
+{"path": "crates/apexls-server/src/capabilities.rs", "complexity_score": 80, "bug_density_score": 0, "coverage_score": 70, "churn_score": 0, "coupling_score": 80, "total": 42, "grade": "F", "failure_touches": 1, "success_touches": 0, "last_updated": 1788589841.4372478, "flagged": true}
