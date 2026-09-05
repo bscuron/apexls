@@ -101,11 +101,15 @@ use lsp_types::{
     ProgressParamsValue, PublishDiagnosticsParams,
     ReferenceParams, RelatedFullDocumentDiagnosticReport, RenameOptions,
     RenameParams, SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+    SemanticTokensServerCapabilities,
     ServerCapabilities, ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
     TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
     WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
     WorkspaceEdit, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
+use rowan::{TextRange, TextSize};
 use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use tower::ServiceBuilder;
@@ -114,7 +118,7 @@ use tracing::{info, warn, Level};
 mod capabilities;
 mod line_index;
 
-use line_index::PositionEncoding;
+use line_index::{LineIndex, PositionEncoding};
 
 /// The server's whole mutable state: the single resolved project root
 /// (see the module doc comment's "single-root only" section) plus
@@ -783,6 +787,30 @@ impl LanguageServer for Backend {
                     workspace_symbol_provider: Some(OneOf::Left(true)),
                     folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                     selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                    // Legend reused verbatim from `capabilities::LEGEND_TYPES`/
+                    // `LEGEND_MODIFIERS` -- see that module's doc comment for
+                    // why those arrays are this legend's single source of
+                    // truth. `full: Bool(true)`, not `Delta`: delta encoding
+                    // (`textDocument/semanticTokens/full/delta`) isn't
+                    // implemented in v1 -- the walker's output is already
+                    // sorted/deduped, so a diff between two runs would be
+                    // mechanical to add if a real client (or a real perf
+                    // number) ever asks for it. `range: true` because a
+                    // range request is the same walk filtered by
+                    // `TextRange::contains_range`, materially cheaper than
+                    // always producing the whole file's tokens when a client
+                    // only wants the visible viewport.
+                    semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            work_done_progress_options: Default::default(),
+                            legend: SemanticTokensLegend {
+                                token_types: capabilities::LEGEND_TYPES.to_vec(),
+                                token_modifiers: capabilities::LEGEND_MODIFIERS.to_vec(),
+                            },
+                            range: Some(true),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                        },
+                    )),
                     // `QUICKFIX` (`capabilities::dead_code_actions`) and
                     // `REFACTOR_REWRITE` (`capabilities::parameter_reorder_actions`)
                     // -- the only two kinds `code_action` ever returns today.
@@ -1504,6 +1532,78 @@ impl LanguageServer for Backend {
                 })
                 .collect();
             Ok(Some(ranges))
+        })
+    }
+
+    /// The whole file's semantic tokens (`capabilities::semantic_tokens_full`).
+    /// `None` for a file the bind doesn't know about, matching every other
+    /// handler's own "unbound file" behavior rather than an empty array --
+    /// the two mean different things to a client (nothing to highlight vs.
+    /// this server has no opinion yet).
+    fn semantic_tokens_full(
+        &mut self,
+        params: SemanticTokensParams,
+    ) -> BoxFuture<'static, Result<Option<SemanticTokensResult>, Self::Error>> {
+        let uri = params.text_document.uri;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some(path) = uri.to_file_path().ok() else {
+                return Ok(None);
+            };
+            let Some(file) = program.file_id(&path) else {
+                return Ok(None);
+            };
+            Ok(Some(SemanticTokensResult::Tokens(capabilities::semantic_tokens_full(
+                program, file, encoding,
+            ))))
+        })
+    }
+
+    /// `params.range`'s tokens only (`capabilities::semantic_tokens_range`).
+    /// A `range` that no longer fits `file`'s current text (a stale request
+    /// against a since-shortened file) resolves no tokens rather than
+    /// erroring -- same defensive shape `resolve_position` already uses
+    /// elsewhere for a position past the end of a file.
+    fn semantic_tokens_range(
+        &mut self,
+        params: SemanticTokensRangeParams,
+    ) -> BoxFuture<'static, Result<Option<SemanticTokensRangeResult>, Self::Error>> {
+        let uri = params.text_document.uri;
+        let lsp_range = params.range;
+        let encoding = self.position_encoding;
+        let target_version = self.bind.documents.lock().version;
+        let bind = Arc::clone(&self.bind);
+        Box::pin(async move {
+            wait_for_rebuild(&bind, target_version).await;
+            let program_guard = bind.program.read();
+            let Some(program) = program_guard.as_ref() else {
+                return Ok(None);
+            };
+            let Some(path) = uri.to_file_path().ok() else {
+                return Ok(None);
+            };
+            let Some(file) = program.file_id(&path) else {
+                return Ok(None);
+            };
+            let text = program.syntax(file).text().to_string();
+            let index = LineIndex::new(&text);
+            let Some(start) = index.to_offset(&text, lsp_range.start, encoding) else {
+                return Ok(None);
+            };
+            let Some(end) = index.to_offset(&text, lsp_range.end, encoding) else {
+                return Ok(None);
+            };
+            let range = TextRange::new(TextSize::from(start), TextSize::from(end));
+            Ok(Some(SemanticTokensRangeResult::Tokens(capabilities::semantic_tokens_range(
+                program, file, range, encoding,
+            ))))
         })
     }
 

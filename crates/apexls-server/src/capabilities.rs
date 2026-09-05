@@ -6,9 +6,9 @@
 
 use crate::line_index::{LineIndex, PositionEncoding};
 use apex_binder::{
-    BoundProgram, CompletionCandidate, CompletionCandidateKind, FileId, LabelRef, Resolution,
-    SchemaObjectRef, StdlibMemberRef, Symbol, SymbolId, SymbolKind, SyntaxPtr, Visibility,
-    VisualforcePageRef,
+    BoundProgram, CompletionCandidate, CompletionCandidateKind, FileId, LabelRef, ModifierSet,
+    Resolution, SchemaObjectRef, StdlibMemberRef, Symbol, SymbolId, SymbolKind, SyntaxPtr,
+    Visibility, VisualforcePageRef,
 };
 use apex_syntax::ast::decl::{
     ClassDecl, ConstructorDecl, EnumDecl, FieldDecl, FormalParam, FormalParamList, HasDocComment,
@@ -23,7 +23,8 @@ use lsp_types::{
     CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity, DiagnosticTag,
     Documentation, DocumentHighlight, DocumentSymbol, FoldingRange, InlayHint, InlayHintKind,
     InlayHintLabel, InsertTextFormat, Location, ParameterInformation, ParameterLabel, Position,
-    Range, SelectionRange, SignatureHelp, SignatureInformation, SymbolInformation,
+    Range, SelectionRange, SemanticToken, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokens, SignatureHelp, SignatureInformation, SymbolInformation,
     SymbolKind as LspSymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 use rowan::ast::{support, AstNode};
@@ -792,6 +793,267 @@ pub(crate) fn selection_range_at(
     }
     result
 }
+
+// ── Semantic tokens ────────────────────────────────────────────────────────
+//
+// `textDocument/semanticTokens/full`+`/range` (ticket 01,
+// `.scratch/apex-lsp-gaps/issues/01-semantic-tokens-implement.md`): a
+// highlighting layer keyed off the binder's already-resolved
+// `SymbolTable`/`Resolution` data, not a TextMate grammar guess. No new
+// binder work -- this is a walk over data every other capability already
+// reads.
+
+/// Token-type legend: a token's `type_idx` is this array's *position* for
+/// whichever `SemanticTokenType` it names, always looked up via
+/// `token_type_index` -- never a bare integer literal below. That's what
+/// makes this array the legend's single source of truth (also reused
+/// verbatim in `lib.rs`'s `initialize` response): reordering it can never
+/// desync from what a token actually carries, because nothing else names
+/// a position independently.
+pub(crate) const LEGEND_TYPES: &[SemanticTokenType] = &[
+    SemanticTokenType::CLASS,
+    SemanticTokenType::INTERFACE,
+    SemanticTokenType::ENUM,
+    SemanticTokenType::ENUM_MEMBER,
+    SemanticTokenType::PROPERTY,
+    SemanticTokenType::METHOD,
+    SemanticTokenType::PARAMETER,
+    SemanticTokenType::VARIABLE,
+    SemanticTokenType::TYPE,
+];
+
+/// Modifier-bit legend: a token's modifier bitset ORs together
+/// `1 << position` for each modifier in this array it carries, always via
+/// `modifier_bit` -- same "position is the only source of truth" property
+/// as `LEGEND_TYPES`. The four visibility modifiers are custom names
+/// (permitted by LSP 3.17's legend contract -- the standard set only
+/// enumerates *encouraged* names); no LSP-standard modifier expresses
+/// Apex visibility, and dropping it would lose information Apex users
+/// actively care about (a `global` method reads differently from a
+/// `public` one in a managed-package context).
+pub(crate) const LEGEND_MODIFIERS: &[SemanticTokenModifier] = &[
+    SemanticTokenModifier::DECLARATION,
+    SemanticTokenModifier::READONLY,
+    SemanticTokenModifier::STATIC,
+    SemanticTokenModifier::ABSTRACT,
+    SemanticTokenModifier::DEFAULT_LIBRARY,
+    SemanticTokenModifier::new("public"),
+    SemanticTokenModifier::new("private"),
+    SemanticTokenModifier::new("protected"),
+    SemanticTokenModifier::new("global"),
+];
+
+/// Looks `ty` up by its position in `LEGEND_TYPES` -- the only place a
+/// token's numeric `type_idx` is ever produced, so a legend reorder can
+/// never silently desync from what gets emitted.
+fn token_type_index(ty: &SemanticTokenType) -> u32 {
+    LEGEND_TYPES
+        .iter()
+        .position(|t| t == ty)
+        .expect("every SemanticTokenType this walker emits must be listed in LEGEND_TYPES") as u32
+}
+
+/// Looks `modifier` up by its position in `LEGEND_MODIFIERS` and returns
+/// its bit (`1 << position`) -- the only place a modifier bit is ever
+/// produced, for the same reason `token_type_index` exists.
+fn modifier_bit(modifier: &SemanticTokenModifier) -> u32 {
+    let position = LEGEND_MODIFIERS
+        .iter()
+        .position(|m| m == modifier)
+        .expect("every SemanticTokenModifier this walker emits must be listed in LEGEND_MODIFIERS");
+    1 << position
+}
+
+/// `SymbolKind` -> token type at a declaration site (also reused for a
+/// reference that resolved straight to a `SymbolId`, since the two share
+/// the same kind-to-type mapping). `Trigger` has no LSP-standard
+/// counterpart (`event` was rejected -- Apex has nothing event-shaped);
+/// a trigger's name reads as class-shaped for coloring purposes.
+/// `Constructor`/`Field` have no dedicated LSP type either: `METHOD`
+/// matches how rust-analyzer/clangd/gopls all render constructors, and
+/// `PROPERTY` is VS Code's own built-in scope for a member variable.
+fn symbol_kind_type(kind: SymbolKind) -> SemanticTokenType {
+    match kind {
+        SymbolKind::Class | SymbolKind::Trigger => SemanticTokenType::CLASS,
+        SymbolKind::Interface => SemanticTokenType::INTERFACE,
+        SymbolKind::Enum => SemanticTokenType::ENUM,
+        SymbolKind::EnumConstant => SemanticTokenType::ENUM_MEMBER,
+        SymbolKind::Field | SymbolKind::Property => SemanticTokenType::PROPERTY,
+        SymbolKind::Method | SymbolKind::Constructor => SemanticTokenType::METHOD,
+        SymbolKind::Parameter => SemanticTokenType::PARAMETER,
+        SymbolKind::LocalVar
+        | SymbolKind::CatchVar
+        | SymbolKind::ForEachVar
+        | SymbolKind::SwitchBindingVar => SemanticTokenType::VARIABLE,
+    }
+}
+
+/// `ModifierSet` -> the modifier bits every declaration/resolved-reference
+/// token carries in common (`DECLARATION` is added separately, only at
+/// declaration sites -- see `collect_tokens`). Every other `ModifierSet`
+/// field (`is_virtual`, `is_override`, `is_testmethod`, `is_transient`,
+/// `is_webservice`, `is_test_visible`, `sharing`) stays unencoded in v1;
+/// none has an LSP-standard modifier to map to, and none is worth a
+/// custom one yet.
+fn modifier_bits_from(modifiers: &ModifierSet) -> u32 {
+    let mut bits = 0u32;
+    if modifiers.is_static {
+        bits |= modifier_bit(&SemanticTokenModifier::STATIC);
+    }
+    if modifiers.is_final {
+        bits |= modifier_bit(&SemanticTokenModifier::READONLY);
+    }
+    if modifiers.is_abstract {
+        bits |= modifier_bit(&SemanticTokenModifier::ABSTRACT);
+    }
+    bits |= match modifiers.visibility {
+        Visibility::Public => modifier_bit(&SemanticTokenModifier::new("public")),
+        Visibility::Private => modifier_bit(&SemanticTokenModifier::new("private")),
+        Visibility::Protected => modifier_bit(&SemanticTokenModifier::new("protected")),
+        Visibility::Global => modifier_bit(&SemanticTokenModifier::new("global")),
+    };
+    bits
+}
+
+/// A reference site's token type + modifiers, or `None` to emit no token
+/// at all -- `Unresolved` (the client's own TextMate grammar is the
+/// correct fallback, matching rust-analyzer's own choice) and an empty
+/// `Candidates` (shouldn't happen; defensive, not a real fixture case).
+/// `SchemaObject`/`UnknownSchema` share one mapping: `apex-metadata`'s
+/// local-schema availability is invisible to the client, so the two look
+/// identical at the token layer. `StdlibMember`'s property/method split
+/// reuses the exact same `program.stdlib.property` lookup
+/// `describe_stdlib_member` (hover) already performs, so the two features
+/// can't disagree about what a given stdlib name is.
+fn reference_token(program: &BoundProgram, resolution: &Resolution) -> Option<(u32, u32)> {
+    let default_library = modifier_bit(&SemanticTokenModifier::DEFAULT_LIBRARY);
+    match resolution {
+        Resolution::Unresolved => None,
+        Resolution::Resolved(id) => {
+            let symbol = program.symbols.get(*id);
+            Some((token_type_index(&symbol_kind_type(symbol.kind)), modifier_bits_from(&symbol.modifiers)))
+        }
+        Resolution::Candidates(ids) => {
+            let symbol = program.symbols.get(*ids.first()?);
+            Some((token_type_index(&symbol_kind_type(symbol.kind)), modifier_bits_from(&symbol.modifiers)))
+        }
+        Resolution::SchemaObject(r) => {
+            let ty = if r.field.is_some() { SemanticTokenType::PROPERTY } else { SemanticTokenType::TYPE };
+            Some((token_type_index(&ty), default_library))
+        }
+        Resolution::UnknownSchema(r) => {
+            let ty = if r.field.is_some() { SemanticTokenType::PROPERTY } else { SemanticTokenType::TYPE };
+            Some((token_type_index(&ty), default_library))
+        }
+        Resolution::StdlibMember(r) => {
+            let ty = match &r.member {
+                None => SemanticTokenType::CLASS,
+                Some(m) if program.stdlib.property(&r.class_name, m).is_some() => SemanticTokenType::PROPERTY,
+                _ => SemanticTokenType::METHOD,
+            };
+            Some((token_type_index(&ty), default_library))
+        }
+        Resolution::Label(_) => {
+            Some((token_type_index(&SemanticTokenType::VARIABLE), default_library | modifier_bit(&SemanticTokenModifier::READONLY)))
+        }
+        Resolution::VisualforcePage(_) => Some((token_type_index(&SemanticTokenType::CLASS), default_library)),
+    }
+}
+
+/// The one walk both `semantic_tokens_full`/`_range` delegate to: every
+/// declaration in `file` (`program.symbols`, filtered by `file` -- the
+/// `SymbolTable`'s own per-file slice is crate-private to `apex-binder`,
+/// so filtering the flat iterator is this crate's only option) plus every
+/// reference (`program.resolutions_in_file`), converted to `(line,
+/// start_char, length)` via `program.highlight_range`/`LineIndex` (the
+/// same identifier-only range goto-definition/document-highlight already
+/// use, so a dotted access never over-highlights its receiver chain).
+/// `filter`: `Some(range)` restricts to tokens whose start falls inside it
+/// (`semantic_tokens_range`); `None` emits the whole file
+/// (`semantic_tokens_full`). A token whose range spans more than one line
+/// (a dotted access wrapped across a linebreak) is skipped outright -- LSP
+/// semantic tokens are single-line by spec, the same limit rust-analyzer
+/// honors.
+///
+/// Declarations are pushed before references, then a *stable* sort by
+/// `(line, start_char)` followed by a `(line, start_char)` dedup keeps
+/// whichever token was pushed first at any position two collide on --
+/// always the declaration, matching real shapes like an interface method
+/// resolving against both its own abstract declaration and a same-name
+/// concrete override at one call site (`visibility_narrowing_diagnostics`'s
+/// ticket 34 hit the identical shape).
+fn collect_tokens(program: &BoundProgram, file: FileId, filter: Option<TextRange>, encoding: PositionEncoding) -> SemanticTokens {
+    let text = program.syntax(file).text().to_string();
+    let index = LineIndex::new(&text);
+
+    let to_token = |range: TextRange| -> Option<(u32, u32, u32)> {
+        if filter.is_some_and(|f| !f.contains_range(range)) {
+            return None;
+        }
+        let start = index.to_position(&text, range.start().into(), encoding);
+        let end = index.to_position(&text, range.end().into(), encoding);
+        if start.line != end.line {
+            return None;
+        }
+        Some((start.line, start.character, end.character.saturating_sub(start.character)))
+    };
+
+    // (line, start_char, length, type_idx, modifier_bits).
+    let mut tokens: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
+
+    for (_, symbol) in program.symbols.iter().filter(|(_, s)| s.file == file) {
+        let Some((line, col, len)) = to_token(symbol.name_range) else { continue };
+        let bits = modifier_bits_from(&symbol.modifiers) | modifier_bit(&SemanticTokenModifier::DECLARATION);
+        tokens.push((line, col, len, token_type_index(&symbol_kind_type(symbol.kind)), bits));
+    }
+
+    for (ptr, resolution) in program.resolutions_in_file(file) {
+        let Some((line, col, len)) = to_token(program.highlight_range(*ptr)) else { continue };
+        let Some((type_idx, bits)) = reference_token(program, resolution) else { continue };
+        tokens.push((line, col, len, type_idx, bits));
+    }
+
+    tokens.sort_by_key(|&(line, col, ..)| (line, col));
+    tokens.dedup_by_key(|t| (t.0, t.1));
+
+    // Delta-encode per LSP spec: each token's line/start is relative to
+    // the *previous emitted token's own original* (line, start), with
+    // `delta_start` resetting to the absolute start whenever `delta_line`
+    // is nonzero.
+    let mut data = Vec::with_capacity(tokens.len());
+    let (mut prev_line, mut prev_col) = (0u32, 0u32);
+    for (line, col, len, type_idx, modifiers) in tokens {
+        let delta_line = line - prev_line;
+        let delta_start = if delta_line == 0 { col - prev_col } else { col };
+        data.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: len,
+            token_type: type_idx,
+            token_modifiers_bitset: modifiers,
+        });
+        prev_line = line;
+        prev_col = col;
+    }
+    SemanticTokens { result_id: None, data }
+}
+
+pub(crate) fn semantic_tokens_full(program: &BoundProgram, file: FileId, encoding: PositionEncoding) -> SemanticTokens {
+    collect_tokens(program, file, None, encoding)
+}
+
+/// `range`'s tokens only -- materially cheaper than always producing the
+/// whole file's tokens when a client only wants the visible viewport.
+pub(crate) fn semantic_tokens_range(
+    program: &BoundProgram,
+    file: FileId,
+    range: TextRange,
+    encoding: PositionEncoding,
+) -> SemanticTokens {
+    collect_tokens(program, file, Some(range), encoding)
+}
+
+// ── End semantic tokens ────────────────────────────────────────────────────
 
 /// Why `textDocument/rename`/`prepareRename` refused a target -- every
 /// variant becomes a `ResponseError` message in `main.rs`, never a
