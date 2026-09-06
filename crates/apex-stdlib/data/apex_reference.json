@@ -75273,6 +75273,46 @@
     ]
   },
   {
+    "page_id": "apex_class_Schema_SObjectType_Fields",
+    "name": "SObjectTypeFields",
+    "kind": "Class",
+    "namespace": "Schema",
+    "description": "Represents the field describe tokens for an SObject type, returned by the compiler-recognized `object.fields`/`Schema.SObjectType.<Object>.fields` shorthand.",
+    "methods": [
+      {
+        "anchor_id": "apex_Schema_SObjectTypeFields_getMap",
+        "name": "getMap",
+        "signature": "public Map<String, Schema.SObjectField> getMap()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "Map<String, Schema.SObjectField>",
+        "params": [],
+        "description": "Returns a map of all fields for the associated SObject type, keyed by field name in all lowercase."
+      }
+    ],
+    "properties": []
+  },
+  {
+    "page_id": "apex_class_Schema_SObjectType_FieldSets",
+    "name": "SObjectTypeFieldSets",
+    "kind": "Class",
+    "namespace": "Schema",
+    "description": "Represents the field sets for an SObject type, returned by the compiler-recognized `object.fieldSets`/`Schema.SObjectType.<Object>.fieldSets` shorthand.",
+    "methods": [
+      {
+        "anchor_id": "apex_Schema_SObjectTypeFieldSets_getMap",
+        "name": "getMap",
+        "signature": "public Map<String, Schema.FieldSet> getMap()",
+        "is_static": false,
+        "visibility": "public",
+        "return_type": "Map<String, Schema.FieldSet>",
+        "params": [],
+        "description": "Returns a map of all field sets for the associated SObject type, keyed by field set name in all lowercase."
+      }
+    ],
+    "properties": []
+  },
+  {
     "page_id": "apex_class_schema_describetabresult",
     "name": "DescribeTabResult",
     "kind": "Class",

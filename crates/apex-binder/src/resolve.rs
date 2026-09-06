@@ -2788,15 +2788,33 @@ impl<'a> BodyBinder<'a> {
                 } else {
                     None
                 };
-                if let Some(owner) = owner {
-                    self.refs.set_with_highlight(
-                        ptr,
-                        highlight,
-                        Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
-                            object: Some(owner.clone()),
-                            field: Some(SmolStr::new(name)),
-                        })),
-                    );
+                if described_object || bare_object_type {
+                    // `owner` is only ever `None` here for the
+                    // already-described mode when `args` didn't carry an
+                    // object name -- most commonly a `Schema.DescribeSObjectResult`-
+                    // typed local/property assigned from an arbitrary
+                    // earlier expression (real NPSP shape,
+                    // `fflib_SObjectDescribe.cls:43-54`'s own lazy-load
+                    // `describe` property, then `describe.fields.getMap()`),
+                    // not one of the two receiver chains that actually
+                    // thread an object name through. Still a real,
+                    // resolvable `.fields`/`.fieldSets` access either way --
+                    // just nothing to key an `UnknownSchema`/bare-field-name
+                    // lookup off, so that diagnostic is skipped (left
+                    // exactly as unresolved as before, no regression) while
+                    // the marker `Ty` itself still propagates, which is all
+                    // a real method call chained directly off it
+                    // (`.getMap()`, needing no owner at all) requires.
+                    if let Some(owner) = &owner {
+                        self.refs.set_with_highlight(
+                            ptr,
+                            highlight,
+                            Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
+                                object: Some(owner.clone()),
+                                field: Some(SmolStr::new(name)),
+                            })),
+                        );
+                    }
                     let is_field_sets = name.eq_ignore_ascii_case("fieldSets");
                     let marker = match (is_field_sets, bare_object_type) {
                         (true, true) => "$fieldsets_token",
@@ -2806,7 +2824,7 @@ impl<'a> BodyBinder<'a> {
                     };
                     return Some(Ty::system_with_args(
                         marker,
-                        vec![Ty::system_owned(owner, Vec::new())],
+                        owner.map_or_else(Vec::new, |o| vec![Ty::system_owned(o, Vec::new())]),
                     ));
                 }
             }
@@ -3514,7 +3532,31 @@ impl<'a> BodyBinder<'a> {
                 // genuine typo stays distinguishable from a real call --
                 // see `crate::reference_table::Resolution`'s own doc
                 // comment on why that distinction exists at all.
-                let class = self.stdlib.class(&base);
+                // `.fields`/`.fieldSets`'s own owner-recovery (above, in
+                // `bind_field_expr`) only ever handles the one-hop
+                // `.fields.<FieldName>`/`.fieldSets.<FieldSetName>` token
+                // shorthand, consuming its synthetic `$fields_*`/
+                // `$fieldsets_*` marker itself -- a real *method* call
+                // chained directly off `.fields`/`.fieldSets` instead
+                // (`.getMap()`, real NPSP shape:
+                // `describe.fields.getMap()`/`describe.fieldSets.getMap()`,
+                // `fflib_SObjectDescribe.cls:54,62`) never reaches that
+                // check at all, since a `MethodCallExpr`'s own target
+                // resolves here, not through `bind_field_expr`'s marker-
+                // consuming arm. Translating the marker to the real
+                // scraped class it stands for (`Schema.SObjectTypeFields`/
+                // `Schema.SObjectTypeFieldSets`, ticket 39's 2b) lets the
+                // ordinary stdlib-method lookup below find `getMap()` the
+                // same way it would for any other stdlib receiver --
+                // regardless of receiver mode (token vs. already-described),
+                // since unlike the field-name hop, `.fields`/`.fieldSets`'s
+                // own real class doesn't differ by mode.
+                let real_class_name = match base.as_str() {
+                    "$fields_token" | "$fields_describe" => "SObjectTypeFields",
+                    "$fieldsets_token" | "$fieldsets_describe" => "SObjectTypeFieldSets",
+                    _ => base.as_str(),
+                };
+                let class = self.stdlib.class(real_class_name);
                 // A real object (standard or custom) is never itself a
                 // stdlib class by that exact name (`self.stdlib.class`
                 // only ever indexes `apex_stdlib::standard_classes`), so

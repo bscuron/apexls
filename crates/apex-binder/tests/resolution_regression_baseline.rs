@@ -797,8 +797,59 @@ fn corpus_root() -> PathBuf {
 ///     it once the data existed. `BASELINE_RESOLVED` unaffected (`206_952`,
 ///     `StdlibMember` isn't tallied); `BASELINE_UNRESOLVED` dropped -376
 ///     (`4_661` -> `4_285`).
-const BASELINE_RESOLVED: usize = 206_952;
-const BASELINE_UNRESOLVED: usize = 4_285;
+/// 30. Ticket 40's §2: `EntityDefinition` had no top-level entry anywhere in
+///     `standard_objects.json` -- confirmed directly against the raw file --
+///     even though it's a real, permanent Salesforce standard pseudo-object
+///     used to describe objects dynamically. A `MetadataRelationship`-typed
+///     custom-metadata field pointing at one (real NPSP shape,
+///     `fflib_AppBinding__mdt.BindingObject__c`) resolved the relationship
+///     traversal itself fine, but had no schema to resolve a further field
+///     off it against, so `.BindingObject__r.QualifiedApiName` dead-ended.
+///     While re-running the corpus check to verify this fix, found the
+///     identical gap on `FieldDefinition` (not named in ticket 40's §2, a
+///     sibling discovered mid-implementation, same root cause): real NPSP
+///     shape `Rollup__mdt.Summary_Field__c`/`Detail_Field__c` (`CRLP_Rollup_SEL.cls`)
+///     relate to it the same way. Fixed by hand-adding both as new top-level
+///     SObject entries, each with its three real fields (`QualifiedApiName`,
+///     `Label`, `MasterLabel`) -- no `apex-binder` code change needed, pure
+///     data addition, since the existing `__r`-suffix relationship-field
+///     resolution machinery in `schema_index.rs` already handles it once the
+///     target object's schema exists. `BASELINE_RESOLVED` rose +3
+///     (`206_952` -> `206_955`, the same "argument/chain type newly known"
+///     ripple effect documented in entry 1); `BASELINE_UNRESOLVED` dropped
+///     -122 (`4_285` -> `4_163`).
+/// 31. Ticket 39's 2b: `Schema.SObjectTypeFields`/`Schema.SObjectTypeFieldSets`
+///     had no stdlib entry at all -- the same "referenced but never defined"
+///     scraper gap as `ApexPages.Severity` (entry 29) -- even though they're
+///     the real result types of the compiler-magic `object.fields`/
+///     `object.fieldSets` shorthand (entries 20/27). So even once the token
+///     shorthand (`.fields.<FieldName>`) resolved, a real method
+///     (`.getMap()`) chained directly off `.fields`/`.fieldSets` itself had
+///     nothing to resolve against. Fixed in two parts: (a) hand-added both
+///     classes to `apex_reference.json`, each with one real method,
+///     `getMap()`, returning `Map<String, Schema.SObjectField>`/
+///     `Map<String, Schema.FieldSet>` respectively; (b) `bind_method_call_expr`'s
+///     `Ty::System` arm translates the four internal synthetic marker
+///     strings entries 20/27's owner-recovery produce
+///     (`"$fields_token"`/`"$fields_describe"`/`"$fieldsets_token"`/
+///     `"$fieldsets_describe"`) to these two real class names before the
+///     stdlib lookup, instead of looking up the literal marker string.
+///     Separately widened that same owner-recovery to still emit its
+///     synthetic marker `Ty` even when the owning object's *name* can't be
+///     recovered from `args` (empty args, not `None`/early-continue) --
+///     matters for a common real NPSP pattern that assigns a
+///     `Schema.DescribeSObjectResult` to a local variable/property first
+///     (`fflib_SObjectDescribe.cls`'s own lazy-load `describe` property) and
+///     calls `.fields.getMap()` off that variable later: there's no way to
+///     trace the object identity through that assignment, but `.getMap()`
+///     doesn't need one. The `UnknownSchema`-diagnostic-producing branch
+///     (used only by the `.fields.<FieldName>` bare-token shorthand, which
+///     *does* need a real owner to validate a field name against) still only
+///     fires when an owner *is* known, so this widening doesn't regress that
+///     path. `BASELINE_RESOLVED` unaffected (`206_955`, `StdlibMember` isn't
+///     tallied); `BASELINE_UNRESOLVED` dropped -153 (`4_163` -> `4_010`).
+const BASELINE_RESOLVED: usize = 206_955;
+const BASELINE_UNRESOLVED: usize = 4_010;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

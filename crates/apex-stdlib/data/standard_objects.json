@@ -277485,5 +277485,87 @@
     "page_id": "data_model",
     "name": "Data Model",
     "fields": []
+  },
+  {
+    "page_id": "sforce_api_objects_entitydefinition",
+    "name": "EntityDefinition",
+    "fields": [
+      {
+        "name": "QualifiedApiName",
+        "field_type": "string",
+        "properties": [
+          "Filter",
+          "Group",
+          "Sort"
+        ],
+        "description": "The API name of the entity.",
+        "reference_to": []
+      },
+      {
+        "name": "Label",
+        "field_type": "string",
+        "properties": [
+          "Filter",
+          "Group",
+          "Nillable",
+          "Sort"
+        ],
+        "description": "The entity label.",
+        "reference_to": []
+      },
+      {
+        "name": "MasterLabel",
+        "field_type": "string",
+        "properties": [
+          "Filter",
+          "Group",
+          "Nillable",
+          "Sort"
+        ],
+        "description": "The master label of the entity.",
+        "reference_to": []
+      }
+    ]
+  },
+  {
+    "page_id": "sforce_api_objects_fielddefinition",
+    "name": "FieldDefinition",
+    "fields": [
+      {
+        "name": "QualifiedApiName",
+        "field_type": "string",
+        "properties": [
+          "Filter",
+          "Group",
+          "Sort"
+        ],
+        "description": "The API name of the field.",
+        "reference_to": []
+      },
+      {
+        "name": "Label",
+        "field_type": "string",
+        "properties": [
+          "Filter",
+          "Group",
+          "Nillable",
+          "Sort"
+        ],
+        "description": "The field label.",
+        "reference_to": []
+      },
+      {
+        "name": "MasterLabel",
+        "field_type": "string",
+        "properties": [
+          "Filter",
+          "Group",
+          "Nillable",
+          "Sort"
+        ],
+        "description": "The master label of the field.",
+        "reference_to": []
+      }
+    ]
   }
 ]
