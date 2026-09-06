@@ -2726,7 +2726,15 @@ impl<'a> BodyBinder<'a> {
         // case above relies on) into the next hop -- safe from ever
         // colliding with a real class name, since `$` isn't a legal
         // character in an Apex identifier.
-        if name.eq_ignore_ascii_case("fields") {
+        //
+        // `fieldSets` is the same compiler-magic shorthand shape off the
+        // same two receiver modes (`Object.fieldSets.<Name>`/
+        // `SObjectType.<Object>.fieldSets.<Name>`, both real NPSP idioms,
+        // e.g. `Schema.SObjectType.Account.fieldSets.BDE_Entry_FS.getFields()`)
+        // -- unlike `fields`, its own real result type (`Schema.FieldSet`)
+        // doesn't differ by receiver mode, so it shares this owner-recovery
+        // but gets its own marker pair below.
+        if name.eq_ignore_ascii_case("fields") || name.eq_ignore_ascii_case("fieldSets") {
             if let Some(Ty::System { name: object, args }) = &target_type {
                 // `object` (the receiver's own `Ty` name) is either
                 // "DescribeSObjectResult" (describe mode: the receiver
@@ -2756,13 +2764,15 @@ impl<'a> BodyBinder<'a> {
                         highlight,
                         Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
                             object: Some(owner.clone()),
-                            field: Some(SmolStr::new_static("fields")),
+                            field: Some(SmolStr::new(name)),
                         })),
                     );
-                    let marker = if bare_object_type {
-                        "$fields_token"
-                    } else {
-                        "$fields_describe"
+                    let is_field_sets = name.eq_ignore_ascii_case("fieldSets");
+                    let marker = match (is_field_sets, bare_object_type) {
+                        (true, true) => "$fieldsets_token",
+                        (true, false) => "$fieldsets_describe",
+                        (false, true) => "$fields_token",
+                        (false, false) => "$fields_describe",
                     };
                     return Some(Ty::system_with_args(
                         marker,
@@ -2781,12 +2791,16 @@ impl<'a> BodyBinder<'a> {
         // `Schema.DescribeFieldResult` for the already-described form --
         // see the check above for the org verification behind both.
         if let Some(Ty::System { name: marker, args }) = &target_type {
+            // Both marker families carry the owning object's name the same
+            // way (in `args[0]`, per the two checks above that produce
+            // them) -- recovered once here rather than duplicated per
+            // marker family below.
+            let owner = args.first().and_then(|a| match a {
+                Ty::System { name, .. } => Some(name.clone()),
+                Ty::Project(_) => None,
+            });
             if marker == "$fields_token" || marker == "$fields_describe" {
-                let owner = args.first().and_then(|a| match a {
-                    Ty::System { name, .. } => Some(name.clone()),
-                    Ty::Project(_) => None,
-                });
-                if let Some(owner) = owner {
+                if let Some(owner) = owner.clone() {
                     let field_schema = self.schema.field(&owner, name);
                     let resolution = match &field_schema {
                         Some(_) => Resolution::SchemaObject(Box::new(SchemaObjectRef {
@@ -2804,6 +2818,38 @@ impl<'a> BodyBinder<'a> {
                     } else {
                         Ty::system("DescribeFieldResult")
                     });
+                }
+            }
+
+            // The field-set-name hop after `.fieldSets`
+            // (`object.fieldSets.<FieldSetName>`), consuming the
+            // `$fieldsets_*` marker the check above produces. Unlike the
+            // `.fields.<FieldName>` hop, there's no local metadata for a
+            // field set's own membership to validate the name against
+            // (SFDX field-set metadata isn't parsed by `apex-metadata` at
+            // all), so this always resolves as `Resolution::UnknownSchema`
+            // -- harmless, since `unknown_schema_diagnostics` only ever
+            // fires on a `SoqlFieldName` node, never this plain `FieldExpr`
+            // hop (see its own doc comment). Real Apex types this the same,
+            // real `Schema.FieldSet`, regardless of which receiver mode
+            // produced the marker -- confirmed against real NPSP call
+            // sites (`Schema.SObjectType.Allocation__c.fieldSets.ManageAllocationsAdditionalFields.getFields()`),
+            // which chain a real `FieldSet` method directly off this hop
+            // with no intervening `.getDescribe()`.
+            if marker == "$fieldsets_token" || marker == "$fieldsets_describe" {
+                if let Some(owner) = owner {
+                    self.refs.set_with_highlight(
+                        ptr,
+                        highlight,
+                        Resolution::UnknownSchema(Box::new(UnknownSchemaRef {
+                            object: Some(owner),
+                            field: Some(SmolStr::new(name)),
+                        })),
+                    );
+                    return self
+                        .stdlib
+                        .class("FieldSet")
+                        .map(|c| Ty::system_owned(c.name.clone(), Vec::new()));
                 }
             }
         }
