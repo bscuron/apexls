@@ -777,8 +777,28 @@ fn corpus_root() -> PathBuf {
 ///     rose +1 (`206_951` -> `206_952`, the same "argument/chain type
 ///     newly known" ripple effect documented in entry 1);
 ///     `BASELINE_UNRESOLVED` dropped -90 (`4_751` -> `4_661`).
+/// 29. Ticket 39's 2d: `ApexPages.Severity` (and its `CONFIRM`/`ERROR`/
+///     `FATAL`/`INFO`/`WARNING` constants) had no top-level entry anywhere
+///     in the stdlib snapshot, even though `ApexPages`'s own scraped
+///     `hasMessages(ApexPages.Severity)` and `ApexPages.Message`'s own
+///     constructor/`getSeverity()` reference the type by name -- the
+///     scraper captured every method that *references* the nested enum
+///     without ever emitting the enum's own definition page, the same
+///     "referenced but never defined" gap as `SObjectTypeFields`/
+///     `SObjectTypeFieldSets` (entry 27's 2b). Real, common NPSP idiom
+///     across 47 files (e.g. `ADDR_CopyAddrHHObjBTN_CTRL.cls:152`'s
+///     `ApexPages.Severity.ERROR`), building an `ApexPages.Message`. Fixed
+///     by hand-adding the missing `Severity` enum entry (with its five
+///     constants) to `apex_reference.json`, `namespace: "ApexPages"` set
+///     correctly (unlike `Metadata`'s own `Enum`-kind pages, ticket 40's
+///     still-open §3, whose scraped `namespace` is `null`) -- no
+///     `apex-binder` code change needed, the existing `class_in_namespace`
+///     two-segment lookup and bare-class property lookup already handled
+///     it once the data existed. `BASELINE_RESOLVED` unaffected (`206_952`,
+///     `StdlibMember` isn't tallied); `BASELINE_UNRESOLVED` dropped -376
+///     (`4_661` -> `4_285`).
 const BASELINE_RESOLVED: usize = 206_952;
-const BASELINE_UNRESOLVED: usize = 4_661;
+const BASELINE_UNRESOLVED: usize = 4_285;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

@@ -328,6 +328,56 @@
     "properties": []
   },
   {
+    "page_id": "apex_enum_System_ApexPages_Severity",
+    "name": "Severity",
+    "kind": "Enum",
+    "namespace": "ApexPages",
+    "description": "Represents the severity of a message added to the page, such as an error or warning.",
+    "methods": [],
+    "properties": [
+      {
+        "anchor_id": "apex_enum_System_ApexPages_Severity_CONFIRM",
+        "name": "CONFIRM",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Severity",
+        "description": "A confirmation that the requested action was performed."
+      },
+      {
+        "anchor_id": "apex_enum_System_ApexPages_Severity_ERROR",
+        "name": "ERROR",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Severity",
+        "description": "A serious error has occurred, and processing hasn't successfully completed."
+      },
+      {
+        "anchor_id": "apex_enum_System_ApexPages_Severity_FATAL",
+        "name": "FATAL",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Severity",
+        "description": "A fatal error has occurred, and processing has been aborted."
+      },
+      {
+        "anchor_id": "apex_enum_System_ApexPages_Severity_INFO",
+        "name": "INFO",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Severity",
+        "description": "An informational message that isn't an error or warning."
+      },
+      {
+        "anchor_id": "apex_enum_System_ApexPages_Severity_WARNING",
+        "name": "WARNING",
+        "is_static": true,
+        "visibility": "public",
+        "type_name": "Severity",
+        "description": "A warning that processing may not complete successfully."
+      }
+    ]
+  },
+  {
     "page_id": "apex_pages_standardcontroller",
     "name": "StandardController",
     "kind": "Class",
