@@ -728,8 +728,24 @@ fn corpus_root() -> PathBuf {
 ///     across every real implementor -- more accurate, not less.
 ///     `BASELINE_UNRESOLVED` unaffected (confirmed: the shift lands in
 ///     `Candidates`, untallied by either counter, not `Unresolved`).
-const BASELINE_RESOLVED: usize = 206_903;
-const BASELINE_UNRESOLVED: usize = 5_538;
+/// 26. `resolve::ty_from_scraped_type` stripped a leading `"Namespace."`
+///     prefix off a scraped return/property type's own *base* (e.g.
+///     `"Schema.DescribeFieldResult"` -> `"DescribeFieldResult"`, entry 13's
+///     fix) but never did the same for its *generic arguments* -- a scraped
+///     `"Map<String, Schema.SObjectType>"` (real: `Schema.getGlobalDescribe()`'s
+///     own signature) kept its `Schema.SObjectType` argument as the literal
+///     20-character dotted string, which no later `stdlib.class(&name)`
+///     lookup could ever match, dead-ending any further chained call
+///     (`Schema.getGlobalDescribe().get('Account').newSObject()`, real
+///     `fflib_ApexMocksUtilsTest.cls` shape). Not narrow to `SObjectType`:
+///     fixed generally by having each generic argument recurse back through
+///     `ty_from_scraped_type` itself instead of a bare `Ty::system_owned`,
+///     so it benefits every namespace-qualified generic argument in the
+///     whole stdlib snapshot, not just this one call site.
+///     `BASELINE_RESOLVED` rose +48 (`206_903` -> `206_951`);
+///     `BASELINE_UNRESOLVED` dropped -753 (`5_538` -> `4_785`).
+const BASELINE_RESOLVED: usize = 206_951;
+const BASELINE_UNRESOLVED: usize = 4_785;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

@@ -278,10 +278,15 @@ fn narrow_stdlib_overload(
 /// literally `"Schema.DescribeFieldResult"`, which no later
 /// `stdlib.class(&name)` lookup could ever match -- silently dead-ending
 /// any further chained call right after it (`token.getDescribe().getName()`,
-/// a real bug this fixed). Left as the whole original string when it
-/// isn't a recognized two-segment namespace+class pair (a generic
-/// argument, a name that merely happens to contain a dot, ...) -- "can't
-/// prove it's namespace-qualified" keeps today's behavior, never a guess.
+/// a real bug this fixed). Applied recursively to each generic argument
+/// too (`"Map<String, Schema.SObjectType>"`'s `Schema.SObjectType` arg
+/// needs the same stripping the base type gets, or a later
+/// `stdlib.class(&name)` on that arg's name -- e.g. resolving
+/// `Schema.getGlobalDescribe().get('Account').newSObject()` -- dead-ends
+/// the same way). Left as the whole original string when it isn't a
+/// recognized two-segment namespace+class pair (a name that merely
+/// happens to contain a dot, ...) -- "can't prove it's namespace-qualified"
+/// keeps today's behavior, never a guess.
 fn ty_from_scraped_type(stdlib: &StdlibIndex, type_str: &str) -> Ty {
     let (base, args) = apex_stdlib::split_generic_type(type_str);
     let base = match base.rsplit_once('.') {
@@ -290,8 +295,8 @@ fn ty_from_scraped_type(stdlib: &StdlibIndex, type_str: &str) -> Ty {
     };
     Ty::system_owned(
         base,
-        args.into_iter()
-            .map(|a| Ty::system_owned(a, Vec::new()))
+        args.iter()
+            .map(|a| ty_from_scraped_type(stdlib, a))
             .collect(),
     )
 }
