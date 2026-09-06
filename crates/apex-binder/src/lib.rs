@@ -351,7 +351,13 @@ impl BoundProgram {
             /// (writing a salsa input cancels every other in-flight
             /// query on every other clone of the database) makes this a
             /// correctness requirement here, not just an optimization.
-            text: Option<String>,
+            /// `Arc<str>` (not `String`) built directly here, not
+            /// converted later at the `sync_file_text_into_db` call site
+            /// -- the override branch already only has a borrowed
+            /// `&String` on hand, so building the `Arc<str>` here is one
+            /// allocation (`Arc::from(&str)`), not two (a `String` clone
+            /// followed by a separate `Arc::from(String)` conversion).
+            text: Option<Arc<str>>,
         }
         let check_freshness = |path: PathBuf, file: FileId| -> Option<CandidateFile> {
             let trigger = path
@@ -384,7 +390,7 @@ impl BoundProgram {
                     trigger,
                     dirty: true,
                     freshness,
-                    text: Some(content.clone()),
+                    text: Some(Arc::from(content.as_str())),
                 });
             }
 
@@ -425,7 +431,7 @@ impl BoundProgram {
                 trigger,
                 dirty: true,
                 freshness,
-                text: Some(content),
+                text: Some(Arc::from(content)),
             })
         };
         let mut checked: Vec<CandidateFile> = hotpath::measure_block!("stage_1a_check_freshness", {

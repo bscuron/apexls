@@ -168,7 +168,11 @@ pub(crate) fn vf_referenced_classes(
 pub(crate) struct FileTextInput {
     file: FileId,
     trigger: bool,
-    text: String,
+    /// `Arc<str>` (not `String`, ticket 11 of `.scratch/apex-performance/`)
+    /// so [`parse_query`] can hand this exact allocation to
+    /// `apex_parser::Parse::text` via a cheap `Arc` clone instead of
+    /// `Arc::from`-copying the bytes a second time.
+    text: Arc<str>,
 }
 
 /// Pushes a freshly-read file's text into `db`, creating `existing`'s
@@ -188,7 +192,7 @@ pub(crate) fn sync_file_text_into_db(
     existing: Option<FileTextInput>,
     file: FileId,
     trigger: bool,
-    text: String,
+    text: Arc<str>,
 ) -> FileTextInput {
     match existing {
         Some(input) => {
@@ -210,9 +214,9 @@ pub(crate) fn parse_query(db: &dyn salsa::Database, input: FileTextInput) -> Par
     PARSE_NODE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if *input.trigger(db) {
-            apex_parser::parse_trigger_unit_with_cache(input.text(db), &mut cache)
+            apex_parser::parse_trigger_unit_with_cache_and_text(input.text(db).clone(), &mut cache)
         } else {
-            apex_parser::parse_compilation_unit_with_cache(input.text(db), &mut cache)
+            apex_parser::parse_compilation_unit_with_cache_and_text(input.text(db).clone(), &mut cache)
         }
     })
 }

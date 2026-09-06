@@ -43,6 +43,7 @@ mod tests {
     use apex_parser::NodeCache;
     use rowan::ast::AstNode;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
 
     fn corpus_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus/npsp")
@@ -92,7 +93,7 @@ mod tests {
             };
 
             // "new"
-            let input = db::sync_file_text_into_db(&mut db, None, file, trigger, text.clone());
+            let input = db::sync_file_text_into_db(&mut db, None, file, trigger, Arc::from(text.as_str()));
             let new_parse = db::parse_query(&db, input);
             let new_collection = db::collect_query(&db, input);
 

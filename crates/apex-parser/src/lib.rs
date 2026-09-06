@@ -125,14 +125,31 @@ pub fn parse_trigger_unit(src: &str) -> Parse {
 /// instead of growing across however many edits a session accumulates.
 #[hotpath::measure]
 pub fn parse_compilation_unit_with_cache(src: &str, cache: &mut NodeCache) -> Parse {
-    parse_root(src, cache, grammar::declarations::compilation_unit)
+    parse_root(src, Arc::from(src), cache, grammar::declarations::compilation_unit)
 }
 
 /// Like [`parse_trigger_unit`], but shares `cache` -- see
 /// [`parse_compilation_unit_with_cache`]'s doc comment.
 #[hotpath::measure]
 pub fn parse_trigger_unit_with_cache(src: &str, cache: &mut NodeCache) -> Parse {
-    parse_root(src, cache, grammar::declarations::trigger_unit)
+    parse_root(src, Arc::from(src), cache, grammar::declarations::trigger_unit)
+}
+
+/// Like [`parse_compilation_unit_with_cache`], but for a caller that
+/// already holds `text` as an `Arc<str>` (`apex-binder`'s `db::parse_query`,
+/// whose `FileTextInput::text` is itself an `Arc<str>`) -- shares that
+/// allocation for the returned `Parse::text` (one `Arc` clone) instead of
+/// `Arc::from(src)` copying the bytes a second time.
+#[hotpath::measure]
+pub fn parse_compilation_unit_with_cache_and_text(text: Arc<str>, cache: &mut NodeCache) -> Parse {
+    parse_root(&text, text.clone(), cache, grammar::declarations::compilation_unit)
+}
+
+/// Like [`parse_compilation_unit_with_cache_and_text`], but for a trigger
+/// unit -- see that function's doc comment.
+#[hotpath::measure]
+pub fn parse_trigger_unit_with_cache_and_text(text: Arc<str>, cache: &mut NodeCache) -> Parse {
+    parse_root(&text, text.clone(), cache, grammar::declarations::trigger_unit)
 }
 
 /// Like `parse_with`, but for entry points whose grammar function always
@@ -141,6 +158,7 @@ pub fn parse_trigger_unit_with_cache(src: &str, cache: &mut NodeCache) -> Parse 
 /// generic-root wrapping needed on top.
 fn parse_root(
     src: &str,
+    text: Arc<str>,
     cache: &mut NodeCache,
     f: impl FnOnce(&mut Parser<'_>) -> parser::CompletedMarker,
 ) -> Parse {
@@ -149,7 +167,7 @@ fn parse_root(
     f(&mut p);
     let (events, errors) = p.finish();
     let green = event::build(src, &input, events, cache);
-    Parse { green, errors, text: Arc::from(src) }
+    Parse { green, errors, text }
 }
 
 fn parse_with(

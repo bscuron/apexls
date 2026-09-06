@@ -132,6 +132,21 @@ floor, not a tradeable one.
   single-reference keys; capturing more would need the arena approach this
   decision deliberately rejected. First concrete, verified memory win on
   this map.
+- [Ship the FileTextInput.text `Arc<str>` fix](issues/11-source-text-arc-str-implement.md):
+  picked up as a prerequisite for ticket 07 (below), which needs a cheap way
+  for `BoundProgram` to re-derive an evicted file's text without retaining
+  its full green tree. Shipped as designed; a real double-allocation bug was
+  found and fixed during implementation (the first version still allocated
+  twice on the `overrides`-driven warm-edit path), and a real methodological
+  pitfall was found and worked around (system-level drift across a long
+  session of repeated rebuilds read as a false "regression" until baseline/
+  comparison pairs were run strictly back-to-back). Verified: tests pass,
+  `warm_rebind_after_one_file_edit` **improved** (-6-7%, reproducible),
+  `bind_npsp_full` unchanged. Real memory: retained footprint dropped
+  202.5MB -> 187.8MB (**-14.68MB, ~7.2%**), matching ticket 03's own
+  original duplicate-text-copy estimate almost exactly. Combined with ticket
+  12: **-16.6MB (~8.1%) verified so far**, Tier 1 (rowan trees,
+  `ReferenceTable`/`FileBodies`) still untouched.
 
 ## Not yet specified
 
