@@ -744,8 +744,41 @@ fn corpus_root() -> PathBuf {
 ///     whole stdlib snapshot, not just this one call site.
 ///     `BASELINE_RESOLVED` rose +48 (`206_903` -> `206_951`);
 ///     `BASELINE_UNRESOLVED` dropped -753 (`5_538` -> `4_785`).
-const BASELINE_RESOLVED: usize = 206_951;
-const BASELINE_UNRESOLVED: usize = 4_785;
+/// 27. `bind_field_expr` had no `.fieldSets` handling at all -- unlike
+///     `.fields` (entry 20), which already got the owner-recovery +
+///     synthetic-marker treatment, `.fieldSets` fell straight through to
+///     the generic property lookup and stayed `Unresolved`, dead-ending
+///     every `.fieldSets.<Name>.getFields()` chain (real NPSP shape,
+///     `ALLO_ManageAllocations_CTRL.cls:481`'s
+///     `Schema.SObjectType.Allocation__c.fieldSets.ManageAllocationsAdditionalFields.getFields()`).
+///     Fixed by widening entry 20's own owner-recovery to also match
+///     `fieldSets` (sharing the same bare-object-type/already-described
+///     receiver detection), with its own `$fieldsets_*` marker pair --
+///     unlike `.fields`, `.fieldSets.<Name>` always types as the same real
+///     `Schema.FieldSet` regardless of receiver mode, confirmed by every
+///     real NPSP call site chaining a `FieldSet` method directly off it
+///     with no intervening `.getDescribe()`. `BASELINE_RESOLVED` unaffected
+///     (`206_951`, `StdlibMember`/`UnknownSchema` aren't tallied);
+///     `BASELINE_UNRESOLVED` dropped -34 (`4_785` -> `4_751`).
+/// 28. Ticket 39's 2a: `<ObjectName>.SObjectType` (the *canonical*, far
+///     more common order, e.g. `Account.SObjectType`) returned a bare
+///     `Ty::System { name: "SObjectType", args: [] }` with no object name
+///     at all, unlike the *reversed* `SObjectType.<ObjectName>` order
+///     (entry 19b), which already carried the object name in `args`. Every
+///     `.fields`/`.fieldSets` hop chained off the canonical order (the
+///     idiomatic, everywhere-in-NPSP way to reach a field/field-set
+///     describe token, e.g. `fflib_SObjectDescribeTest.cls:62`'s
+///     `Account.SObjectType.fields.name`) dead-ended as a direct result,
+///     since entry 20/27's owner-recovery could never find an object name
+///     to key off. Fixed by carrying the object name in `args` the same
+///     way the reversed order already does, and widening the `.fields`/
+///     `.fieldSets` owner-recovery to also accept a `"SObjectType"`-named
+///     receiver alongside `"DescribeSObjectResult"`. `BASELINE_RESOLVED`
+///     rose +1 (`206_951` -> `206_952`, the same "argument/chain type
+///     newly known" ripple effect documented in entry 1);
+///     `BASELINE_UNRESOLVED` dropped -90 (`4_751` -> `4_661`).
+const BASELINE_RESOLVED: usize = 206_952;
+const BASELINE_UNRESOLVED: usize = 4_661;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {

@@ -90,6 +90,38 @@ fn a_sobjecttype_prefixed_fieldsets_dot_name_chains_into_a_fieldset_method() {
     }
 }
 
+/// The *canonical*-order receiver, `<ObjectName>.SObjectType` (ticket 39's
+/// 2a) -- e.g. `ALLO_ManageAllocations_CTRL.cls:481`'s
+/// `Schema.SObjectType.Allocation__c.fieldSets....` uses the reversed
+/// order, but the far more common canonical order
+/// (`Account.SObjectType.fieldSets.Name`) used to lose the object name
+/// entirely and dead-end right at `.fieldSets`. Chains into the same
+/// `Schema.FieldSet` method the reversed order does.
+#[test]
+fn a_canonical_object_dot_sobjecttype_fieldsets_dot_name_chains_into_a_fieldset_method() {
+    let dir = write_fixture_dir(
+        "fieldsets-dot-canonical-sobjecttype-mode",
+        &[(
+            "Foo.cls",
+            "public class Foo { public void run() { List<Schema.FieldSetMember> f = Account.SObjectType.fieldSets.MyFieldSet.getFields(); } }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        field_expr_resolution(&program, "MyFieldSet"),
+        Some(Resolution::UnknownSchema(Box::new(apex_binder::UnknownSchemaRef {
+            object: Some("Account".into()),
+            field: Some("MyFieldSet".into()),
+        }))),
+    );
+    match method_call_resolution(&program, "getFields") {
+        Some(Resolution::StdlibMember(m)) => assert_eq!(m.class_name, "FieldSet"),
+        other => panic!("expected .getFields() to resolve as a real FieldSet method, got {other:?}"),
+    }
+}
+
 /// The bare-object-receiver mode: `Account.fieldSets.Name` chains into the
 /// same `Schema.FieldSet` method (no separate "token" type the way
 /// `.fields` has).

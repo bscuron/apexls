@@ -123,6 +123,40 @@ fn a_sobjecttype_prefixed_fields_dot_field_chains_into_a_describe_result_method(
     }
 }
 
+/// The *canonical*-order receiver, `<ObjectName>.SObjectType` (as opposed
+/// to the reversed `SObjectType.<ObjectName>` case just above) --
+/// confirmed against a real org (ticket 39's 2a) to be a genuinely
+/// different, far more common real-world idiom
+/// (`Account.SObjectType.fields.Name`, e.g.
+/// `fflib_SObjectDescribeTest.cls:62`'s `Account.SObjectType.fields.name`)
+/// that used to lose the object name entirely and dead-end right at
+/// `.fields`. Chains into the same `Schema.DescribeFieldResult` method the
+/// reversed order does.
+#[test]
+fn a_canonical_object_dot_sobjecttype_fields_dot_field_chains_into_a_describe_result_method() {
+    let dir = write_fixture_dir(
+        "fields-dot-canonical-sobjecttype-mode",
+        &[(
+            "Foo.cls",
+            "public class Foo { public void run() { String l = Account.SObjectType.fields.Name.getLabel(); } }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        field_expr_resolution(&program, "Name"),
+        Some(Resolution::SchemaObject(Box::new(apex_binder::SchemaObjectRef {
+            object: "Account".into(),
+            field: Some("Name".into()),
+        }))),
+    );
+    match method_call_resolution(&program, "getLabel") {
+        Some(Resolution::StdlibMember(m)) => assert_eq!(m.class_name, "DescribeFieldResult"),
+        other => panic!("expected .getLabel() to resolve as a real DescribeFieldResult method, got {other:?}"),
+    }
+}
+
 /// The same shorthand off a project-local custom object/field, token mode.
 #[test]
 fn a_custom_object_fields_dot_field_chains_into_a_sobjectfield_method() {

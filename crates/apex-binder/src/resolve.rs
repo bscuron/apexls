@@ -301,6 +301,19 @@ fn ty_from_scraped_type(stdlib: &StdlibIndex, type_str: &str) -> Ty {
     )
 }
 
+/// Recovers an owning object's name from a synthetic `Ty::System`'s own
+/// `args[0]` -- the one place left to carry it for every
+/// `SObjectType.<ObjectName>`/`<ObjectName>.SObjectType`/`.fields`/
+/// `.fieldSets` marker `bind_field_expr` produces (see their own doc
+/// comments for why `args` gets reused this way). Shared by both of that
+/// function's owner-recovery sites so the match isn't duplicated.
+fn owner_from_args(args: &[Ty]) -> Option<SmolStr> {
+    args.first().and_then(|a| match a {
+        Ty::System { name, .. } => Some(name.clone()),
+        Ty::Project(_) => None,
+    })
+}
+
 /// The real Apex type a schema field's *value* has, from its own
 /// metadata `field_type` (Salesforce's `<type>` element text --
 /// `"Picklist"`, `"Currency"`, `"DateTime"`, ... -- see
@@ -2566,7 +2579,24 @@ impl<'a> BodyBinder<'a> {
                         )))
                     }),
                 );
-                return class.map(|c| Ty::system_owned(c.name.clone(), Vec::new()));
+                // The object name rides along in `args` (not a real
+                // generic type argument -- the same reuse the
+                // `SObjectType.<ObjectName>` reversed order below relies
+                // on), so the `.fields`/`.fieldSets` owner-recovery further
+                // down can recover which object a further
+                // `.fields.<field>`/`.fieldSets.<name>` hop chained off
+                // this belongs to. Without this, `Account.SObjectType.fields.Name`
+                // -- the idiomatic, everywhere-in-NPSP way to reach a field
+                // describe token, e.g. `fflib_SObjectDescribeTest.cls:62`'s
+                // `Account.SObjectType.fields.name` -- dead-ended at
+                // `.fields` because the receiver's own `Ty` carried no
+                // object identity at all.
+                return class.map(|c| {
+                    Ty::system_owned(
+                        c.name.clone(),
+                        vec![Ty::system_owned(object.clone(), Vec::new())],
+                    )
+                });
             }
         }
 
@@ -2744,17 +2774,17 @@ impl<'a> BodyBinder<'a> {
                 // object-type-name reference does -- is a conceptually
                 // different receiver, so that resolution shape alone
                 // can't tell the two modes apart; `object`'s own name
-                // can) or a real schema object name directly (token
-                // mode).
-                let bare_object_type = !object.eq_ignore_ascii_case("DescribeSObjectResult")
-                    && self.schema.object(object).is_some();
+                // can), "SObjectType" (the *canonical*-order
+                // `<ObjectName>.SObjectType` case just above, which
+                // carries the same owning-object name in `args`), or a
+                // real schema object name directly (token mode).
+                let described_object = object.eq_ignore_ascii_case("DescribeSObjectResult")
+                    || object.eq_ignore_ascii_case("SObjectType");
+                let bare_object_type = !described_object && self.schema.object(object).is_some();
                 let owner = if bare_object_type {
                     Some(object.clone())
-                } else if object.eq_ignore_ascii_case("DescribeSObjectResult") {
-                    args.first().and_then(|a| match a {
-                        Ty::System { name, .. } => Some(name.clone()),
-                        Ty::Project(_) => None,
-                    })
+                } else if described_object {
+                    owner_from_args(args)
                 } else {
                     None
                 };
@@ -2791,16 +2821,8 @@ impl<'a> BodyBinder<'a> {
         // `Schema.DescribeFieldResult` for the already-described form --
         // see the check above for the org verification behind both.
         if let Some(Ty::System { name: marker, args }) = &target_type {
-            // Both marker families carry the owning object's name the same
-            // way (in `args[0]`, per the two checks above that produce
-            // them) -- recovered once here rather than duplicated per
-            // marker family below.
-            let owner = args.first().and_then(|a| match a {
-                Ty::System { name, .. } => Some(name.clone()),
-                Ty::Project(_) => None,
-            });
             if marker == "$fields_token" || marker == "$fields_describe" {
-                if let Some(owner) = owner.clone() {
+                if let Some(owner) = owner_from_args(args) {
                     let field_schema = self.schema.field(&owner, name);
                     let resolution = match &field_schema {
                         Some(_) => Resolution::SchemaObject(Box::new(SchemaObjectRef {
@@ -2837,7 +2859,7 @@ impl<'a> BodyBinder<'a> {
             // which chain a real `FieldSet` method directly off this hop
             // with no intervening `.getDescribe()`.
             if marker == "$fieldsets_token" || marker == "$fieldsets_describe" {
-                if let Some(owner) = owner {
+                if let Some(owner) = owner_from_args(args) {
                     self.refs.set_with_highlight(
                         ptr,
                         highlight,
