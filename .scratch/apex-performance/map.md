@@ -168,6 +168,21 @@ floor, not a tradeable one.
   hits the less-common declarations-changed edit class, and both required
   gate benchmarks are unaffected. `cargo test -p apex-binder`/`apexls-server`
   pass unchanged, including `rapid_edit_burst`'s own 600-edit stress test.
+- [Re-measure real RSS after Tier 1](issues/13-post-tier1-real-rss-remeasurement-research.md):
+  re-ran ticket 05's exact method (real `mimalloc`-backed binary, real NPSP
+  corpus, `WorkingSet64`/`PrivateMemorySize64`) against current `HEAD`, now
+  that all of Tier 1 (tickets 07/09/11/12) has shipped. **The map's
+  destination is not met**: real working set is ~359.4-359.7MB across two
+  independent runs, flat to slightly higher than ticket 05's own
+  pre-Tier-1 ~355.8MB figure, despite Tier 1's verified -48.4MB/~23.7%
+  `dhat`-measured logical reduction. Confirms the gap ticket 05 already
+  identified (dhat counts logical alloc/dealloc bytes; real RSS is
+  dominated by `mimalloc`'s own segment/arena reservation and size-class
+  rounding, which doesn't shrink just because logical bytes freed do) also
+  swallows Tier 1's real, verified structural wins whole. Flags -- without
+  deciding -- that `mimalloc` purge/decommit tuning (currently excluded
+  from this map's destination, see Out of scope) may be the only lever
+  that actually reaches the destination as stated; that's the user's call.
 
 ## Not yet specified
 
