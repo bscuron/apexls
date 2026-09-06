@@ -127,6 +127,17 @@ pub struct BoundProgram {
     /// `files` rather than searched linearly per request.
     file_ids: FxHashMap<PathBuf, FileId>,
     parses: FxHashMap<FileId, Parse>,
+    /// Every current file's source text, independent of whether its
+    /// `Parse` is still resident in `parses` (ticket 07,
+    /// `.scratch/apex-performance/`: `BindCache::file_parses` is now
+    /// eviction-capped, so a file untouched for a while may be missing from
+    /// `parses` even though it's still part of the project). `Self::syntax`
+    /// falls back to re-parsing from here on a `parses` miss -- an `Arc<str>`
+    /// clone per file (ticket 11 made this a pointer bump, not a byte copy),
+    /// so retaining this for every file costs only what ticket 03 already
+    /// measured raw source text costs (~7% of the total footprint), never
+    /// the far larger green tree an evicted file no longer pays for.
+    texts: FxHashMap<FileId, Arc<str>>,
     pub symbols: SymbolTable,
     /// `Arc`-wrapped for the same reason `symbols`/`bodies` are cheap to
     /// clone into each call's snapshot: `crate::db::schema_index` only
@@ -482,6 +493,7 @@ impl BoundProgram {
                 cache.path_ids.remove(&path);
             }
             cache.file_parses.remove(&file);
+            cache.parse_last_used.remove(&file);
             cache.file_text_inputs.remove(&file);
         }
         cache
@@ -624,20 +636,40 @@ impl BoundProgram {
         // changed anywhere (conservative fallback, identical cost to a
         // full rebuild), or just the dirty files otherwise -- see this
         // method's doc comment.
-        // Keyed by `&Parse` (`Sync`, safe to share across threads), not
-        // by an already-built `SyntaxNode` (rowan's tree is `Rc`-based,
-        // so `SyntaxNode` itself is neither `Send` nor `Sync`) -- each
-        // parallel closure below calls `.syntax()` itself to build its
-        // own thread-local node from the shared `Parse`.
-        let parse_by_file: FxHashMap<FileId, &Parse> = current_ids
-            .iter()
-            .filter_map(|&file| cache.file_parses.get(&file).map(|parse| (file, parse)))
-            .collect();
         let files_to_rebind: Vec<FileId> = if declarations_changed {
             current_ids.iter().copied().collect()
         } else {
             checked.iter().filter(|c| c.dirty).map(|c| c.file).collect()
         };
+        // Built for exactly `files_to_rebind` (not blanket `current_ids`) --
+        // a cache hit is a cheap `Parse::clone` (two `Arc` bumps), a miss
+        // (ticket 07, `.scratch/apex-performance/`: `cache.file_parses` is
+        // now eviction-capped, see its own doc comment) re-fetches via
+        // `db::parse_query`'s own salsa memoization and re-populates
+        // `file_parses` so a file touched again soon doesn't keep missing.
+        // Every touched file's `parse_last_used` is bumped either way, so
+        // `evict_stale_parses` (called once this whole call finishes) never
+        // evicts something this very call just needed. Owned `Parse`
+        // values, not `&Parse` -- `Parse` is cheap to clone and `Sync`
+        // (`Arc`-based `GreenNode`, see its own doc comment), so every
+        // parallel closure below can still safely share `&parse_by_file`
+        // across threads and call `.syntax()` itself to build its own
+        // thread-local node.
+        cache.parse_generation += 1;
+        let mut parse_by_file: FxHashMap<FileId, Parse> = FxHashMap::default();
+        for &file in &files_to_rebind {
+            let parse = match cache.file_parses.get(&file) {
+                Some(parse) => parse.clone(),
+                None => {
+                    let input = cache.file_text_inputs[&file];
+                    let parse = db::parse_query(&cache.db, input);
+                    cache.file_parses.insert(file, parse.clone());
+                    parse
+                }
+            };
+            cache.parse_last_used.insert(file, cache.parse_generation);
+            parse_by_file.insert(file, parse);
+        }
         // Borrows straight from `cache.table` instead of cloning each
         // `Symbol` -- `bind_symbol_body` only ever needs `&Symbol`, and
         // `cache.table` isn't mutated again until after `bound` (below) is
@@ -780,15 +812,40 @@ impl BoundProgram {
         let files = cache.paths.clone();
         let file_ids = cache.path_ids.clone();
         let parses = cache.file_parses.clone();
+        // Every current file's source text, independent of whether its
+        // `Parse` is still resident in `parses` above (ticket 07,
+        // `.scratch/apex-performance/`: `file_parses` is now eviction-capped)
+        // -- a cheap `Arc<str>` clone per file (ticket 11 made this a
+        // pointer bump, not a byte copy), so `BoundProgram::syntax` always
+        // has enough to re-derive a evicted file's tree on demand even when
+        // its `Parse` itself isn't in `parses`.
+        let texts: FxHashMap<FileId, Arc<str>> = current_ids
+            .iter()
+            .filter_map(|&file| {
+                cache
+                    .file_text_inputs
+                    .get(&file)
+                    .map(|&input| (file, input.text(&cache.db).clone()))
+            })
+            .collect();
         let bodies: FxHashMap<FileId, Arc<FileBodies>> = current_ids
             .iter()
             .filter_map(|&file| cache.bodies.get(&file).map(|fb| (file, Arc::clone(fb))))
             .collect();
 
+        // Ticket 07's own eviction, applied after this call's snapshot is
+        // fully assembled -- so it never evicts something *this* call
+        // itself just needed, only what's gone stale since. The *next*
+        // call's own `parses`/`texts` clone will reflect whatever this
+        // sweep removed; this call's snapshot keeps what was resident at
+        // assembly time regardless.
+        cache.evict_stale_parses();
+
         BoundProgram {
             files,
             file_ids,
             parses,
+            texts,
             symbols: cache.table.clone(),
             schema,
             stdlib,
@@ -827,17 +884,53 @@ impl BoundProgram {
         self.file_ids.get(path).copied()
     }
 
-    pub fn syntax(&self, file: FileId) -> SyntaxNode {
-        self.parses[&file].syntax()
+    /// Re-parses `file` on demand from its always-retained `texts` entry --
+    /// the fallback [`Self::syntax`]/[`Self::syntax_errors`] share for a
+    /// file whose `Parse` was evicted from `BindCache::file_parses` (ticket
+    /// 07, `.scratch/apex-performance/`) since this snapshot's own
+    /// assembly. Not cached anywhere: `BoundProgram` is an immutable,
+    /// `Arc`-shared snapshot read concurrently by many request handlers, so
+    /// caching a re-parse here would need its own interior-mutability
+    /// story. Accepted v1 simplification -- a repeated read of the same
+    /// rarely-edited-but-often-viewed file within one snapshot's lifetime
+    /// re-parses every time, rather than a correctness gap; upgrade path is
+    /// a `Mutex`-guarded per-snapshot cache if this ever measures as a real
+    /// cost.
+    fn reparse_evicted(&self, file: FileId) -> Parse {
+        let text = self
+            .texts
+            .get(&file)
+            .expect("every current file has retained text, even if its Parse was evicted")
+            .clone();
+        let trigger = self
+            .files
+            .get(&file)
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
+        let mut cache = apex_parser::NodeCache::default();
+        if trigger {
+            apex_parser::parse_trigger_unit_with_cache_and_text(text, &mut cache)
+        } else {
+            apex_parser::parse_compilation_unit_with_cache_and_text(text, &mut cache)
+        }
     }
 
-    /// `file`'s exact source text -- a reference fetch into the `Parse`
-    /// already retained for `file`, not a `SyntaxNode::text().to_string()`
-    /// tree walk. Callers building a `LineIndex` (hover, completion,
-    /// rename, semantic-tokens, ...) should use this instead of
-    /// `self.syntax(file).text().to_string()`.
+    pub fn syntax(&self, file: FileId) -> SyntaxNode {
+        match self.parses.get(&file) {
+            Some(parse) => parse.syntax(),
+            None => self.reparse_evicted(file).syntax(),
+        }
+    }
+
+    /// `file`'s exact source text -- a reference fetch into `texts`
+    /// (retained for every current file regardless of whether its `Parse`
+    /// is still in `BindCache::file_parses`, ticket 07), not a
+    /// `SyntaxNode::text().to_string()` tree walk. Callers building a
+    /// `LineIndex` (hover, completion, rename, semantic-tokens, ...) should
+    /// use this instead of `self.syntax(file).text().to_string()`.
     pub fn source_text(&self, file: FileId) -> &str {
-        self.parses[&file].text()
+        &self.texts[&file]
     }
 
     /// Every `apex_parser::ParseError` recorded while parsing `file` --
@@ -845,11 +938,20 @@ impl BoundProgram {
     /// an error plus a best-effort tree" guarantee
     /// (`apex_parser::errors`'s own module doc comment) means this is
     /// just surfacing data that already existed, not computing anything
-    /// new. Empty for a file that was never parsed (or parsed cleanly),
-    /// matching every other `self.parses`-backed lookup's "nothing
-    /// recorded" behavior.
-    pub fn syntax_errors(&self, file: FileId) -> &[ParseError] {
-        self.parses.get(&file).map_or(&[], |p| &p.errors)
+    /// new. Empty for a file that was never parsed (or parsed cleanly).
+    /// `Cow` (not a plain reference, unlike before) since a `Parse` evicted
+    /// from `BindCache::file_parses` (ticket 07) falls back to
+    /// [`Self::reparse_evicted`], a local temporary with nothing in `self`
+    /// left to borrow the errors from -- real syntax errors on an evicted
+    /// file must still be reported, never silently treated as "no errors."
+    /// `Cow::Borrowed` for the common (not-evicted) case avoids cloning the
+    /// error list on every call just to satisfy the rare fallback branch's
+    /// own need for an owned value.
+    pub fn syntax_errors(&self, file: FileId) -> std::borrow::Cow<'_, [ParseError]> {
+        match self.parses.get(&file) {
+            Some(parse) => std::borrow::Cow::Borrowed(&parse.errors),
+            None => std::borrow::Cow::Owned(self.reparse_evicted(file).errors),
+        }
     }
 
     /// Every provable type-checking defect found inline while binding

@@ -171,8 +171,12 @@ pub(crate) struct FileTextInput {
     /// `Arc<str>` (not `String`, ticket 11 of `.scratch/apex-performance/`)
     /// so [`parse_query`] can hand this exact allocation to
     /// `apex_parser::Parse::text` via a cheap `Arc` clone instead of
-    /// `Arc::from`-copying the bytes a second time.
-    text: Arc<str>,
+    /// `Arc::from`-copying the bytes a second time. `pub(crate)` (unlike
+    /// every other field/query in this module) so `crate::lib`'s snapshot
+    /// assembly (`BoundProgram::texts`, ticket 07) can read it directly
+    /// without a redundant `parse_query` round-trip just to get the text
+    /// back out.
+    pub(crate) text: Arc<str>,
 }
 
 /// Pushes a freshly-read file's text into `db`, creating `existing`'s
@@ -209,7 +213,20 @@ pub(crate) fn sync_file_text_into_db(
 /// (`Arc`-based `GreenNode` plus a `Vec<ParseError>`, see its own doc
 /// comment) and every call site wants an owned copy, not a `db`-lifetime-
 /// tied reference.
-#[salsa::tracked(no_eq, returns(clone))]
+///
+/// `lru = 256` (ticket 07, `.scratch/apex-performance/`): bounds how many
+/// distinct files' memoized `Parse`s this query retains internally. Needed
+/// alongside `crate::incremental::BindCache::evict_stale_parses` -- not
+/// instead of it -- since `Parse`'s own `GreenNode` is `Arc`-based: evicting
+/// only one of the two caches still leaves the other holding a live
+/// reference, so neither eviction alone reclaims anything (the real tension
+/// ticket 06's research found). Sized generously, the same reasoning as
+/// `PARSE_EVICTION_WINDOW`: this cap only needs to be large enough that it
+/// essentially never fires before `BindCache`'s own, more precisely-tuned
+/// eviction already would have -- a correctness safety net bounding salsa's
+/// own worst-case retention over an arbitrarily long session, not this
+/// project's primary eviction mechanism.
+#[salsa::tracked(no_eq, returns(clone), lru = 256)]
 pub(crate) fn parse_query(db: &dyn salsa::Database, input: FileTextInput) -> Parse {
     PARSE_NODE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();

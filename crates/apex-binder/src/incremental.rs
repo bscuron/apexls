@@ -150,25 +150,38 @@ pub struct BindCache {
     pub(crate) paths: FxHashMap<FileId, PathBuf>,
     /// Reverse of `paths`, patched alongside it.
     pub(crate) path_ids: FxHashMap<PathBuf, FileId>,
-    /// Every currently-live file's last-bound `Parse`, keyed by `FileId`
+    /// Every recently-touched file's last-bound `Parse`, keyed by `FileId`
     /// -- the `BoundProgram`-facing counterpart to `freshness` above
     /// (which is keyed by `PathBuf`, purely for that field's own
-    /// staleness check). Patched only for dirty files each call, exactly
-    /// like `table`/`bodies` below -- an unaffected file's entry is
-    /// already correct and never re-queried. Ticket 29 deliberately
-    /// keeps this field despite its own text calling for its deletion:
-    /// `crate::BoundProgram::from_files_cached`'s Pass 2 needs *every*
-    /// current file's `Parse` on hand for the conservative "declarations
-    /// changed somewhere, rebind everything" case, and sweeping all
-    /// ~1,070 corpus files through a salsa query every single call (most
-    /// of them just a memoized-value fetch) measured slower than this
-    /// persisted map's near-free `.clone()` on the warm single-edit path
-    /// -- the exact case this migration's own done-bar protects. A dirty
-    /// file's entry is now populated from `crate::db::parse_query`'s
-    /// salsa-memoized output (see [`Self::file_text_inputs`]) rather than
-    /// `parse_one`'s direct computation, but the field's role is
-    /// otherwise unchanged.
+    /// staleness check). Patched for dirty files each call the same way
+    /// `table`/`bodies` below are -- an unaffected file's entry is already
+    /// correct and never re-queried -- but, unlike them, **not** kept
+    /// forever: ticket 07 of `.scratch/apex-performance/` (following
+    /// ticket 29's own precedent of routing every file through
+    /// `crate::db::parse_query` measuring slower for the warm single-edit
+    /// path) found this map's own permanent, never-evicted retention was
+    /// the real reason apexls-server's steady-state rowan-tree memory
+    /// never shrinks even for a file no LSP request or rebind has touched
+    /// in a long time. [`Self::evict_stale_parses`] now prunes any entry
+    /// [`PARSE_EVICTION_WINDOW`] rebinds stale, called once per
+    /// `crate::BoundProgram::from_files_cached` call. A miss here (either
+    /// because a file was never dirty yet, or because it was evicted)
+    /// falls back to `crate::db::parse_query`'s own salsa memoization
+    /// (bounded by its own `lru` cap, see that function's doc comment) --
+    /// re-populated into this map on that fetch, so a file touched again
+    /// soon after eviction doesn't pay a repeated cache-miss cost every
+    /// single call.
     pub(crate) file_parses: FxHashMap<FileId, Parse>,
+    /// Bumped once per `crate::BoundProgram::from_files_cached` call --
+    /// [`Self::parse_last_used`]'s clock. See [`Self::evict_stale_parses`].
+    pub(crate) parse_generation: u64,
+    /// Each file's most recent [`Self::parse_generation`] at which
+    /// [`Self::file_parses`] needed its entry (a hit or a miss-then-refetch
+    /// both count) -- what [`Self::evict_stale_parses`] compares against
+    /// `parse_generation` to decide what's gone stale. A file with no
+    /// entry here has never been part of a `files_to_rebind` set at all
+    /// (nothing to evict).
+    pub(crate) parse_last_used: FxHashMap<FileId, u64>,
     /// Each currently-known file's own [`FileTextInput`] identity --
     /// created once (`crate::db::sync_file_text_into_db`) and reused
     /// (its `text` field overwritten, never recreated) so `db`'s
@@ -218,6 +231,19 @@ pub struct BindCache {
     pub(crate) bodies: FxHashMap<FileId, Arc<FileBodies>>,
 }
 
+/// How many `crate::BoundProgram::from_files_cached` calls a file's `Parse`
+/// survives in [`BindCache::file_parses`] without being touched (a rebind or
+/// a capability-handler read) before [`BindCache::evict_stale_parses`] drops
+/// it. Chosen generously, not measured against a specific corpus size --
+/// large enough that ordinary back-and-forth editing between a couple of
+/// files never evicts either one (each edit only bumps the *edited* file's
+/// own recency, so a same-file streak keeps every other recently-touched
+/// file within the window too), small enough that a long-idle file's tree
+/// doesn't sit resident indefinitely. See ticket 07 of
+/// `.scratch/apex-performance/` for the full reasoning and the real
+/// `BindCache::file_parses`-vs-`parse_query` tension this resolves.
+pub(crate) const PARSE_EVICTION_WINDOW: u64 = 8;
+
 impl BindCache {
     /// Forces the next [`crate::BoundProgram::from_files_cached`] call to
     /// redo the directory walk (and SFDX metadata parse) instead of
@@ -228,5 +254,25 @@ impl BindCache {
     /// for the honest limit this closes).
     pub fn invalidate_discovery(&mut self) {
         self.discovery = None;
+    }
+
+    /// Drops every [`Self::file_parses`] entry not touched in the last
+    /// [`PARSE_EVICTION_WINDOW`] generations -- see that constant's and
+    /// `file_parses`'s own doc comments. Called once per
+    /// `crate::BoundProgram::from_files_cached` call, after that call's own
+    /// touched files have already updated [`Self::parse_last_used`], so
+    /// nothing this call itself needed is ever evicted out from under it.
+    pub(crate) fn evict_stale_parses(&mut self) {
+        let floor = self.parse_generation.saturating_sub(PARSE_EVICTION_WINDOW);
+        let stale: Vec<FileId> = self
+            .parse_last_used
+            .iter()
+            .filter(|&(_, &last_used)| last_used < floor)
+            .map(|(&file, _)| file)
+            .collect();
+        for file in stale {
+            self.file_parses.remove(&file);
+            self.parse_last_used.remove(&file);
+        }
     }
 }

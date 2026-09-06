@@ -147,6 +147,27 @@ floor, not a tradeable one.
   original duplicate-text-copy estimate almost exactly. Combined with ticket
   12: **-16.6MB (~8.1%) verified so far**, Tier 1 (rowan trees,
   `ReferenceTable`/`FileBodies`) still untouched.
+- [Decide and ship rowan tree retention](issues/07-rowan-tree-retention-decision.md):
+  locked and shipped a coordinated two-layer eviction -- `db::parse_query`
+  gets `lru = 256` (a safety net; needed since salsa's own memo table would
+  otherwise keep every tree alive regardless of `BindCache`'s own eviction)
+  plus a new generation-counter-based eviction on `BindCache::file_parses`
+  itself (`PARSE_EVICTION_WINDOW = 8` rebinds), with `parse_by_file`'s
+  construction and a new `BoundProgram::texts` field (every file's source
+  text, always retained via ticket 11's cheap `Arc<str>` share) making both
+  Pass 2 and capability-handler reads miss-tolerant instead of panicking.
+  **Empirically verified the one untested scenario before shipping** (two
+  throwaway probes, deleted after use): a declarations-changed edit after
+  heavy eviction costs ~405ms vs. ~239ms with nothing evicted (+~70%,
+  confirming diagnostics-map ticket 29's precedent risk was real) --
+  balanced against **-31.8MB (~17%) further steady-state memory** in the
+  same scenario (**-48.4MB/~23.7% combined with tickets 09/11** off the
+  original 204.4MB baseline, the map's largest win). Put this exact
+  tradeoff to the user directly rather than deciding unilaterally --
+  **shipped as-is**: the rebuild is background/non-blocking, the cost only
+  hits the less-common declarations-changed edit class, and both required
+  gate benchmarks are unaffected. `cargo test -p apex-binder`/`apexls-server`
+  pass unchanged, including `rapid_edit_burst`'s own 600-edit stress test.
 
 ## Not yet specified
 
