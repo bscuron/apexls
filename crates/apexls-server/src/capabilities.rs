@@ -2381,6 +2381,18 @@ pub(crate) fn visibility_narrowing_diagnostics(
     file: FileId,
     encoding: PositionEncoding,
 ) -> Vec<Diagnostic> {
+    // This whole diagnostic's premise is "no reference to this member
+    // exists outside its family," provable only from every file's Pass 2
+    // data at once -- unlike dead-code detection, there's no file-scoped
+    // subset of candidates left once `Private`/`Global` are already
+    // excluded from candidacy (see `apex_binder::visibility_narrowing`'s
+    // own module doc comment). Under ticket 04's (`.scratch/apex-memory/`)
+    // working-set scoping this is almost always incomplete data, so rather
+    // than risk a wrong "safe to narrow" suggestion, the whole diagnostic
+    // goes quiet until every file happens to be bound.
+    if !program.is_fully_bound() {
+        return Vec::new();
+    }
     let text = program.source_text(file);
     let index = LineIndex::new(&text);
     apex_binder::narrowing_candidates_in_file(program, file)
@@ -2744,6 +2756,18 @@ pub(crate) fn parameter_reorder_actions(
     range: Range,
     encoding: PositionEncoding,
 ) -> Vec<CodeActionOrCommand> {
+    // `parameter_op_workspace_edit` rewrites every call site project-wide
+    // via `references_to` -- under ticket 04's (`.scratch/apex-memory/`)
+    // working-set scoping that can silently miss a call site in an unbound
+    // file, generating an edit that leaves that call broken. Unlike
+    // rename (a rare, explicit action worth a temporary full-project
+    // spike-bind), this fires on every `textDocument/codeAction` request
+    // near a parameter list -- spiking there would erode the map's whole
+    // memory win, so this action simply stops being offered until every
+    // file happens to be bound instead.
+    if !program.is_fully_bound() {
+        return Vec::new();
+    }
     let root = program.syntax(file);
     let text = program.source_text(file);
     let index = LineIndex::new(&text);

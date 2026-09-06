@@ -635,12 +635,62 @@ impl BoundProgram {
         // Pass 2 (parallel): rebind every current file if declarations
         // changed anywhere (conservative fallback, identical cost to a
         // full rebuild), or just the dirty files otherwise -- see this
-        // method's doc comment.
-        let files_to_rebind: Vec<FileId> = if declarations_changed {
-            current_ids.iter().copied().collect()
-        } else {
-            checked.iter().filter(|c| c.dirty).map(|c| c.file).collect()
+        // method's doc comment. Ticket 04 (`.scratch/apex-memory/`) narrows
+        // both branches to `working_set` (pinned open files plus LRU-capped
+        // on-demand-promoted ones -- `cache.open_paths`/`cache.promoted_files`)
+        // whenever `cache.scoping_enabled` is set: a dirty file outside it
+        // only gets Pass 1 (already unconditional, above) -- no Pass 2 rerun
+        // -- and a declaration change anywhere only forces a rebind of the
+        // working set, not the whole project, since cross-file resolution
+        // never depends on another file's own Pass 2 output (ticket 03).
+        // `None` (scoping off) preserves the exact prior behavior for every
+        // CLI/test/batch caller.
+        let working_set: Option<FxHashSet<FileId>> = cache.scoping_enabled.then(|| {
+            let mut set: FxHashSet<FileId> = checked
+                .iter()
+                .filter(|c| cache.open_paths.contains(&c.path))
+                .map(|c| c.file)
+                .collect();
+            set.extend(
+                cache
+                    .promoted_files
+                    .keys()
+                    .copied()
+                    .filter(|f| current_ids.contains(f)),
+            );
+            set
+        });
+        let files_to_rebind: Vec<FileId> = match &working_set {
+            Some(working_set) => {
+                if declarations_changed {
+                    working_set.iter().copied().collect()
+                } else {
+                    checked
+                        .iter()
+                        .filter(|c| c.dirty && working_set.contains(&c.file))
+                        .map(|c| c.file)
+                        .collect()
+                }
+            }
+            None => {
+                if declarations_changed {
+                    current_ids.iter().copied().collect()
+                } else {
+                    checked.iter().filter(|c| c.dirty).map(|c| c.file).collect()
+                }
+            }
         };
+        // Prune `cache.bodies`/`promoted_files` down to exactly the current
+        // working set -- a file that fell out of it since the last call
+        // (closed, or LRU-evicted) has its Pass 2 data actually dropped
+        // here, not just excluded from this call's own snapshot below, so
+        // steady-state memory really does shrink back toward the
+        // declaration-only floor rather than accumulating every file ever
+        // promoted.
+        if let Some(working_set) = &working_set {
+            cache.bodies.retain(|file, _| working_set.contains(file));
+            cache.promoted_files.retain(|file, _| working_set.contains(file));
+        }
         // Built for exactly `files_to_rebind` (not blanket `current_ids`) --
         // a cache hit is a cheap `Parse::clone` (two `Arc` bumps), a miss
         // (ticket 07, `.scratch/apex-performance/`: `cache.file_parses` is
@@ -762,39 +812,7 @@ impl BoundProgram {
                 by_file.entry(file).or_default().push((key, body));
             }
             for (file, bodies) in by_file {
-                let mut base = cache.table.declared_len(file) as u32;
-                // Pre-sized rather than growing via repeated `.extend()`/
-                // `.insert()` calls as each body is folded in below --
-                // `scopes`' bound (`bodies.len()`) is an upper bound, not
-                // exact (not every body has a `Some(key)`), but a small
-                // over-reservation beats the reallocations this file's
-                // bodies would otherwise cause one at a time. See the
-                // `hotpath`-measured finding in `BACKLOG.md` §2 this
-                // targets.
-                let mut extra_symbols = Vec::with_capacity(
-                    bodies
-                        .iter()
-                        .map(|(_, body)| body.pending_locals.len())
-                        .sum(),
-                );
-                let mut file_bodies = incremental::FileBodies {
-                    refs: ReferenceTable::default(),
-                    scopes: FxHashMap::with_capacity_and_hasher(bodies.len(), Default::default()),
-                    type_mismatches: Vec::new(),
-                };
-                for (key, body) in bodies {
-                    let remap = |id: SymbolId| resolve::remap_local_id(id, base);
-                    let mut scopes = body.scopes;
-                    scopes.remap_symbol_ids(&remap);
-                    body.refs.map_ids_into(&remap, &mut file_bodies.refs);
-                    if let Some(key) = key {
-                        file_bodies.scopes.insert(key, scopes);
-                    }
-                    file_bodies.type_mismatches.extend(body.type_mismatches);
-                    base += body.pending_locals.len() as u32;
-                    extra_symbols.extend(body.pending_locals);
-                }
-                cache.table.append_file_symbols(file, extra_symbols);
+                let file_bodies = merge_pass2_results(&mut cache.table, file, bodies);
                 cache.bodies.insert(file, Arc::new(file_bodies));
             }
         });
@@ -1322,6 +1340,209 @@ impl BoundProgram {
             })
             .map(|(local, _)| SymbolId::new(file, local as u32))
     }
+
+    /// Whether `file` currently has Pass 2 (body/reference) data bound in
+    /// this snapshot -- `false` for a declaration-only file outside the
+    /// Pass 2 working set (ticket 04, `.scratch/apex-memory/`), or for a
+    /// file this snapshot doesn't know about at all.
+    pub fn is_bound(&self, file: FileId) -> bool {
+        self.bodies.contains_key(&file)
+    }
+
+    /// Whether *every* currently-known file has Pass 2 data bound --
+    /// unconditionally `true` for a caller that never turned on working-set
+    /// scoping (`BindCache::scoping_enabled`, ticket 04), since Pass 2 then
+    /// always covers the whole project; under scoping, `true` only when the
+    /// working set happens to cover every file. Consulted by any analysis
+    /// that needs to *prove an absence* project-wide (dead code, visibility
+    /// narrowing) via `Self::references_to`, since a scoped snapshot's
+    /// `references_to` can only prove presence, never absence, for a symbol
+    /// whose visibility could reach outside its own file.
+    pub fn is_fully_bound(&self) -> bool {
+        self.bodies.len() >= self.file_count()
+    }
+
+    /// Ticket 04's on-demand promotion: if `file` isn't part of this
+    /// snapshot's Pass 2 working set yet (no `bodies` entry), synchronously
+    /// binds just that one file now, reusing `cache`'s already-resident
+    /// Pass 1 state (declarations, inheritance, supertype pointers) --
+    /// the ~80KB/file cost ticket 03 measured, not a project-wide rebuild.
+    /// Also records the promotion in `cache` (LRU-capped,
+    /// `BindCache::note_promoted`) so it survives into the *next*
+    /// background rebuild's snapshot instead of silently reverting on the
+    /// next edit -- and, when that promotion pushes the cache over its
+    /// cap, evicts the same displaced file from *this* snapshot's own
+    /// `bodies` too, so a single long-lived snapshot visited into more
+    /// than the cap's worth of distinct non-open files (many cross-file
+    /// jumps between rebuilds) can't grow unbounded just because the
+    /// cache-side cap alone only bounds the *next* rebuild's snapshot. A
+    /// no-op (`false`) if `file` is already bound, or isn't a file this
+    /// snapshot knows about at all.
+    pub fn ensure_bound(&mut self, file: FileId, cache: &mut BindCache) -> bool {
+        if self.bodies.contains_key(&file) || !self.files.contains_key(&file) {
+            return false;
+        }
+        let Some(bodies) =
+            cache.bind_pass2_for_file(file, &self.schema, &self.stdlib, &self.labels, &self.pages)
+        else {
+            return false;
+        };
+        if let Some(evicted) = cache.note_promoted(file) {
+            self.bodies.remove(&evicted);
+        }
+        self.bodies.insert(file, bodies);
+        true
+    }
+
+    /// Ticket 04's temporary full-project Pass 2 spike: `find-all-references`,
+    /// `rename`, and call-hierarchy's `incomingCalls` are the only
+    /// capabilities needing every file's `bodies` at once
+    /// (`Self::references_to` iterates `self.bodies.values()`
+    /// project-wide) -- binds whatever this snapshot's working set left
+    /// unbound, runs `f` against the now fully-bound snapshot, then evicts
+    /// exactly what this call itself added (from both this snapshot and
+    /// `cache`) so the steady-state working-set-only footprint returns
+    /// right after. A file already legitimately in the working set (open,
+    /// or LRU-promoted) is untouched by the eviction. A no-op spike when
+    /// scoping was never turned on (`cache.scoping_enabled` false, e.g. the
+    /// CLI/tests): every file is already bound, so nothing gets added or
+    /// evicted.
+    pub fn with_full_binding<R>(
+        &mut self,
+        cache: &mut BindCache,
+        f: impl FnOnce(&BoundProgram) -> R,
+    ) -> R {
+        let files: Vec<FileId> = self.files().collect();
+        let mut newly_bound = Vec::new();
+        for file in files {
+            if !self.bodies.contains_key(&file) {
+                if let Some(bodies) = cache.bind_pass2_for_file(
+                    file,
+                    &self.schema,
+                    &self.stdlib,
+                    &self.labels,
+                    &self.pages,
+                ) {
+                    self.bodies.insert(file, bodies);
+                    newly_bound.push(file);
+                }
+            }
+        }
+        let result = f(self);
+        for file in newly_bound {
+            self.bodies.remove(&file);
+            cache.bodies.remove(&file);
+        }
+        result
+    }
+}
+
+impl BindCache {
+    /// Synchronously Pass-2-binds `file` alone, reusing this cache's
+    /// already-resident Pass 1 state (`self.table`'s declarations/
+    /// inheritance, `self.supertype_ptrs`) instead of re-walking the
+    /// project -- ticket 04's (`.scratch/apex-memory/`) single-file
+    /// on-demand-promotion and full-project-spike primitive, shared by
+    /// `BoundProgram::ensure_bound`/`with_full_binding`. `None` if `file`
+    /// isn't a known file at all (nothing declared for it in `self.table`)
+    /// or its text input can't be recovered.
+    pub(crate) fn bind_pass2_for_file(
+        &mut self,
+        file: FileId,
+        schema: &SchemaIndex,
+        stdlib: &StdlibIndex,
+        labels: &LabelIndex,
+        pages: &PageIndex,
+    ) -> Option<Arc<FileBodies>> {
+        if !self.table.has_file(file) {
+            return None;
+        }
+        let parse = match self.file_parses.get(&file) {
+            Some(parse) => parse.clone(),
+            None => {
+                let input = *self.file_text_inputs.get(&file)?;
+                let parse = db::parse_query(&self.db, input);
+                self.file_parses.insert(file, parse.clone());
+                parse
+            }
+        };
+        self.parse_generation += 1;
+        self.parse_last_used.insert(file, self.parse_generation);
+        let root = parse.syntax();
+
+        let to_bind: Vec<(SymbolId, &Symbol)> = self
+            .table
+            .symbols_of_file(file)
+            .iter()
+            .enumerate()
+            .map(|(local, symbol)| (SymbolId::new(file, local as u32), symbol))
+            .collect();
+        let mut bound: Vec<(Option<SyntaxPtr>, resolve::BoundBody)> = to_bind
+            .iter()
+            .flat_map(|(id, symbol)| {
+                bind_symbol_body(&self.table, schema, stdlib, labels, pages, &root, *id, symbol)
+            })
+            .collect();
+        for (owner, ptr) in self.supertype_ptrs.get(&file).into_iter().flatten() {
+            if let Some(ty) = ptr.to_node(&root) {
+                bound.push((
+                    None,
+                    resolve::bind_type_ref(&self.table, schema, stdlib, file, Some(*owner), &ty),
+                ));
+            }
+        }
+
+        let file_bodies = Arc::new(merge_pass2_results(&mut self.table, file, bound));
+        self.bodies.insert(file, Arc::clone(&file_bodies));
+        Some(file_bodies)
+    }
+}
+
+/// Folds one file's freshly-bound Pass 2 output (`bodies`, one entry per
+/// declared symbol's body/initializer/supertype -- see `bind_symbol_body`/
+/// `resolve::bind_type_ref`) into `table` and a fresh [`FileBodies`],
+/// allocating each body's pending locals onto the end of `file`'s own
+/// declared symbols and remapping each body's sentinel ids to the
+/// resulting real ids as it goes (a running per-file base, so sibling
+/// bodies bound concurrently in the same file don't collide over the same
+/// local-id range). Shared by `BoundProgram::from_files_cached`'s main
+/// per-file merge loop and `BindCache::bind_pass2_for_file`'s single-file
+/// on-demand path (ticket 04, `.scratch/apex-memory/`) -- both need
+/// exactly this same remap-and-append dance, just for a different-sized
+/// `files_to_rebind`.
+fn merge_pass2_results(
+    table: &mut SymbolTable,
+    file: FileId,
+    bodies: Vec<(Option<SyntaxPtr>, resolve::BoundBody)>,
+) -> FileBodies {
+    let mut base = table.declared_len(file) as u32;
+    // Pre-sized rather than growing via repeated `.extend()`/`.insert()`
+    // calls as each body is folded in below -- `scopes`' bound
+    // (`bodies.len()`) is an upper bound, not exact (not every body has a
+    // `Some(key)`), but a small over-reservation beats the reallocations
+    // this file's bodies would otherwise cause one at a time. See the
+    // `hotpath`-measured finding in `BACKLOG.md` §2 this targets.
+    let mut extra_symbols =
+        Vec::with_capacity(bodies.iter().map(|(_, body)| body.pending_locals.len()).sum());
+    let mut file_bodies = FileBodies {
+        refs: ReferenceTable::default(),
+        scopes: FxHashMap::with_capacity_and_hasher(bodies.len(), Default::default()),
+        type_mismatches: Vec::new(),
+    };
+    for (key, body) in bodies {
+        let remap = |id: SymbolId| resolve::remap_local_id(id, base);
+        let mut scopes = body.scopes;
+        scopes.remap_symbol_ids(&remap);
+        body.refs.map_ids_into(&remap, &mut file_bodies.refs);
+        if let Some(key) = key {
+            file_bodies.scopes.insert(key, scopes);
+        }
+        file_bodies.type_mismatches.extend(body.type_mismatches);
+        base += body.pending_locals.len() as u32;
+        extra_symbols.extend(body.pending_locals);
+    }
+    table.append_file_symbols(file, extra_symbols);
+    file_bodies
 }
 
 /// Compares two versions of one file's Pass 1 output by declared
@@ -1546,5 +1767,158 @@ fn bind_symbol_body(
         | SymbolKind::CatchVar
         | SymbolKind::ForEachVar
         | SymbolKind::SwitchBindingVar => Vec::new(),
+    }
+}
+
+/// Ticket 04 (`.scratch/apex-memory/`): working-set scoping mechanics --
+/// `BindCache::scoping_enabled`/`open_paths`/`note_promoted` and
+/// `BoundProgram::is_bound`/`is_fully_bound`/`ensure_bound`/`with_full_binding`.
+#[cfg(test)]
+mod scoping_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn write_fixture(test_name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "apex-binder-scoping-{test_name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, content) in files {
+            std::fs::write(dir.join(name), content).unwrap();
+        }
+        dir
+    }
+
+    /// Nothing in this map's design touches a caller that never sets
+    /// `scoping_enabled` -- confirms `from_files_cached`'s default
+    /// (`BindCache::default()`) still fully binds every file, matching the
+    /// CLI/tests' existing expectations untouched by ticket 04.
+    #[test]
+    fn scoping_disabled_binds_every_file_regardless_of_open_paths() {
+        let dir = write_fixture(
+            "disabled",
+            &[
+                ("A.cls", "public class A { public void a() { } }"),
+                ("B.cls", "public class B { public void b() { } }"),
+            ],
+        );
+        let mut cache = BindCache::default();
+        let program = BoundProgram::from_files_cached(&dir, &HashMap::new(), &mut cache);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(program.is_fully_bound());
+    }
+
+    /// The map's decisive behavior: with scoping on and only `A.cls`
+    /// open, Pass 2 covers `A` alone -- `B` stays declaration-only -- while
+    /// Pass 1 (declarations) stays project-wide for both, unaffected.
+    #[test]
+    fn scoping_enabled_restricts_pass2_to_open_files_only() {
+        let dir = write_fixture(
+            "enabled",
+            &[
+                ("A.cls", "public class A { public void a() { } }"),
+                ("B.cls", "public class B { public void b() { } }"),
+            ],
+        );
+        let mut cache = BindCache::default();
+        cache.scoping_enabled = true;
+        cache.open_paths = std::iter::once(dir.join("A.cls")).collect();
+        let program = BoundProgram::from_files_cached(&dir, &HashMap::new(), &mut cache);
+        let a = program.file_id(&dir.join("A.cls")).unwrap();
+        let b = program.file_id(&dir.join("B.cls")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(program.is_bound(a), "the open file must be Pass 2-bound");
+        assert!(!program.is_bound(b), "the unopened file must stay declaration-only");
+        assert!(!program.is_fully_bound());
+        assert!(
+            program.symbols.iter().any(|(_, s)| s.name == "B"),
+            "Pass 1 declarations must stay project-wide even for an unopened file"
+        );
+    }
+
+    /// A cross-file jump into `B` (goto-definition landing there, say)
+    /// promotes it synchronously -- idempotent on a repeat call.
+    #[test]
+    fn ensure_bound_promotes_a_non_open_file_on_demand() {
+        let dir = write_fixture(
+            "promote",
+            &[
+                ("A.cls", "public class A { public void a() { } }"),
+                ("B.cls", "public class B { public void b() { } }"),
+            ],
+        );
+        let mut cache = BindCache::default();
+        cache.scoping_enabled = true;
+        cache.open_paths = std::iter::once(dir.join("A.cls")).collect();
+        let mut program = BoundProgram::from_files_cached(&dir, &HashMap::new(), &mut cache);
+        let b = program.file_id(&dir.join("B.cls")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(!program.is_bound(b));
+        assert!(program.ensure_bound(b, &mut cache), "promotion should bind B");
+        assert!(program.is_bound(b));
+        assert!(!program.ensure_bound(b, &mut cache), "already bound -- a no-op");
+    }
+
+    /// `note_promoted`'s LRU cap in isolation, via synthetic `FileId`s --
+    /// no real project needed to prove the eviction arithmetic itself.
+    #[test]
+    fn note_promoted_evicts_the_least_recently_promoted_file_past_the_cap() {
+        let mut cache = BindCache::default();
+        for i in 0..=(incremental::PROMOTED_FILE_CAP as u32) {
+            cache.note_promoted(FileId(i));
+        }
+        assert_eq!(cache.promoted_files.len(), incremental::PROMOTED_FILE_CAP);
+        assert!(
+            !cache.promoted_files.contains_key(&FileId(0)),
+            "the least-recently-promoted file should have been evicted"
+        );
+        assert!(cache
+            .promoted_files
+            .contains_key(&FileId(incremental::PROMOTED_FILE_CAP as u32)));
+    }
+
+    /// `find-all-references`'s own primitive (`references_to`) is exactly
+    /// what `with_full_binding` exists to make safe: a reference written in
+    /// an unopened file (`B` calling `A::helper`) is invisible until the
+    /// spike runs, present during it, and the spike leaves the
+    /// working-set-only footprint restored afterward.
+    #[test]
+    fn with_full_binding_sees_every_reference_then_evicts_back_to_the_working_set() {
+        let dir = write_fixture(
+            "spike",
+            &[
+                ("A.cls", "public class A { public void helper() { } }"),
+                ("B.cls", "public class B { public void go() { new A().helper(); } }"),
+            ],
+        );
+        let mut cache = BindCache::default();
+        cache.scoping_enabled = true;
+        cache.open_paths = std::iter::once(dir.join("A.cls")).collect();
+        let mut program = BoundProgram::from_files_cached(&dir, &HashMap::new(), &mut cache);
+        let a = program.file_id(&dir.join("A.cls")).unwrap();
+        let b = program.file_id(&dir.join("B.cls")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let helper = program
+            .symbols
+            .iter()
+            .find(|(_, s)| s.name == "helper")
+            .map(|(id, _)| id)
+            .unwrap();
+        assert_eq!(
+            program.references_to(helper).count(),
+            0,
+            "B isn't bound yet, so its call site is invisible before the spike"
+        );
+
+        let count_during_spike =
+            program.with_full_binding(&mut cache, |program| program.references_to(helper).count());
+        assert_eq!(count_during_spike, 1, "the spike must see B's own call site");
+
+        assert!(program.is_bound(a), "A was already in the working set, untouched by eviction");
+        assert!(!program.is_bound(b), "B must be evicted back out once the spike finishes");
     }
 }

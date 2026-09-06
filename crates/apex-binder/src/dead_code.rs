@@ -299,16 +299,25 @@ pub fn dead_symbols_in_file(program: &BoundProgram, file: FileId) -> Vec<DeadSym
         .filter(|(id, s)| {
             // Private/local candidates are genuinely file-scoped (see the
             // module doc comment) -- the cheaper file-scoped lookup is
-            // the *correct* one, not just faster. A `public` candidate
-            // can be referenced from any file in the project, so it must
-            // use the project-wide lookup instead; reusing the
+            // the *correct* one, not just faster, regardless of whether
+            // `program` is fully bound (ticket 04, `.scratch/apex-memory/`:
+            // a scoped snapshot's own file is always Pass-2-bound, since
+            // it's the one diagnostics are being computed for). A `public`
+            // candidate can be referenced from any file in the project, so
+            // it must use the project-wide lookup instead; reusing the
             // file-scoped one here would silently miss real references
             // and produce false positives. A `@TestVisible` private/
             // protected candidate needs that same project-wide lookup
             // for the same reason -- see `is_test_visible`'s own doc
             // comment -- despite still being a `Private` candidate here.
+            // That project-wide lookup is only trustworthy when every file
+            // is actually Pass-2-bound (`is_fully_bound`) -- under ticket
+            // 04's working-set scoping, a reference sitting in an unbound
+            // file is invisible to `references_to`, so a candidate here
+            // is left unflagged (never a false "dead") rather than trusted
+            // on incomplete data.
             if s.modifiers.visibility == Visibility::Public || is_test_visible(program, s) {
-                program.references_to(*id).next().is_none()
+                program.is_fully_bound() && program.references_to(*id).next().is_none()
             } else {
                 program.references_to_in_file(file, *id).next().is_none()
             }
@@ -615,6 +624,38 @@ mod tests {
         assert!(
             dead.is_empty(),
             "expected no dead symbols, got {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Ticket 04's (`.scratch/apex-memory/`) working-set scoping means a
+    /// non-open file's Pass 2 data (including any reference it records)
+    /// simply isn't resident -- so a `Public` method used only from such a
+    /// file must never be reported dead just because this binder can't see
+    /// that reference, unlike the always-fully-bound `from_files` case
+    /// `public_method_referenced_only_from_another_file_is_not_flagged`
+    /// above covers.
+    #[test]
+    fn public_method_referenced_only_from_an_unopened_file_is_not_falsely_flagged_dead_under_scoping()
+    {
+        let src = "public class Foo {\n    public void helper() { }\n}\n";
+        let caller = "public class Caller {\n    public void run() { new Foo().helper(); }\n}\n";
+        let dir = write_fixture("scoped-cross-file-ref", src, &[("Caller.cls", caller)]);
+        let mut cache = crate::BindCache::default();
+        cache.scoping_enabled = true;
+        cache.open_paths = std::iter::once(dir.join("Foo.cls")).collect();
+        let program =
+            BoundProgram::from_files_cached(&dir, &std::collections::HashMap::new(), &mut cache);
+        let file = program.file_id(&dir.join("Foo.cls")).unwrap();
+        assert!(
+            !program.is_fully_bound(),
+            "Caller.cls must stay outside the Pass 2 working set -- it was never opened"
+        );
+        let dead = dead_symbols_in_file(&program, file);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            dead.is_empty(),
+            "must never flag a Public method dead without full project data: {:?}",
             dead.iter().map(|d| &d.name).collect::<Vec<_>>()
         );
     }

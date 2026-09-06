@@ -303,9 +303,16 @@ struct BindState {
 
 impl Default for BindState {
     fn default() -> Self {
+        // Ticket 04 (`.scratch/apex-memory/`): the LSP server is the one
+        // caller that opts into Pass 2 working-set scoping -- the CLI
+        // (`apexls check`) and every test/batch caller of `BoundProgram`
+        // never touch a `BindState` at all, so this is the single place
+        // that turns it on, once, for the life of the connection.
+        let mut cache = BindCache::default();
+        cache.scoping_enabled = true;
         Self {
             program: RwLock::default(),
-            cache: Mutex::default(),
+            cache: Mutex::new(cache),
             documents: Mutex::default(),
             bound_version: tokio::sync::watch::channel(0).0,
             worker_active: AtomicBool::new(false),
@@ -612,6 +619,11 @@ fn spawn_rebuild_worker(
             let rebuild_bind = Arc::clone(&bind);
             let result = tokio::task::spawn_blocking(move || {
                 let mut cache = rebuild_bind.cache.lock();
+                // Ticket 04: every open buffer is unconditionally pinned in
+                // the Pass 2 working set -- `overrides` (built above from
+                // exactly the same `documents.texts` snapshot) already *is*
+                // that set, keyed the same way `open_paths` needs to be.
+                cache.open_paths = overrides.keys().cloned().collect();
                 let program = BoundProgram::from_files_cached(&root, &overrides, &mut cache);
                 drop(cache);
                 let file_count = program.file_count();
@@ -1251,7 +1263,16 @@ impl LanguageServer for Backend {
     /// `capabilities::references`: every location project-wide
     /// referencing the symbol at the cursor (a declaration or a
     /// reference), via `BoundProgram::references_to`'s reverse-index
-    /// lookup -- see `BACKLOG.md` §3.
+    /// lookup -- see `BACKLOG.md` §3. Genuinely needs every file's
+    /// `bodies` at once, so this is one of the few capabilities that
+    /// triggers ticket 04's (`.scratch/apex-memory/`) temporary
+    /// full-project spike-bind (`BoundProgram::with_full_binding`) rather
+    /// than reading the working-set-scoped snapshot as-is -- run on
+    /// `spawn_blocking` like `spawn_rebuild_worker`'s own rebuilds, since
+    /// binding every still-unbound file is real CPU work that must never
+    /// run inline on an async worker thread while holding `bind.program`'s
+    /// write lock (that would stall the whole runtime for every other
+    /// in-flight request, not just this one).
     fn references(
         &mut self,
         params: ReferenceParams,
@@ -1264,18 +1285,23 @@ impl LanguageServer for Backend {
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read();
-            let Some(program) = program_guard.as_ref() else {
-                return Ok(None);
-            };
-            let Some((file, offset)) =
-                capabilities::resolve_position(program, &uri, position, encoding)
-            else {
-                return Ok(None);
-            };
-
-            let locations =
-                capabilities::references(program, file, offset, include_declaration, encoding);
+            let locations = tokio::task::spawn_blocking(move || {
+                let mut program_guard = bind.program.write();
+                let Some(program) = program_guard.as_mut() else {
+                    return Vec::new();
+                };
+                let Some((file, offset)) =
+                    capabilities::resolve_position(program, &uri, position, encoding)
+                else {
+                    return Vec::new();
+                };
+                let mut cache = bind.cache.lock();
+                program.with_full_binding(&mut cache, |program| {
+                    capabilities::references(program, file, offset, include_declaration, encoding)
+                })
+            })
+            .await
+            .unwrap_or_default();
             Ok((!locations.is_empty()).then_some(locations))
         })
     }
@@ -1313,6 +1339,13 @@ impl LanguageServer for Backend {
     /// method, a trigger, ...) -- refuses with a `ResponseError` rather
     /// than silently returning `None`, so the client shows the user
     /// *why* rename isn't offered here instead of just not offering it.
+    /// `rename_target` itself needs every file's `bodies`
+    /// (`references_resolve_cleanly` -> `references_to`), so this also
+    /// goes through ticket 04's (`.scratch/apex-memory/`) full-project
+    /// spike-bind, same as `references`/`rename` -- a client is free to
+    /// call `prepareRename` without ever calling `rename` after, so the
+    /// eligibility check here can't defer that cost to the later request.
+    /// Run on `spawn_blocking`, same reasoning as `references`.
     fn prepare_rename(
         &mut self,
         params: TextDocumentPositionParams,
@@ -1324,31 +1357,42 @@ impl LanguageServer for Backend {
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read();
-            let Some(program) = program_guard.as_ref() else {
-                return Ok(None);
-            };
-            let Some((file, offset)) =
-                capabilities::resolve_position(program, &uri, position, encoding)
-            else {
-                return Ok(None);
-            };
+            tokio::task::spawn_blocking(move || {
+                let mut program_guard = bind.program.write();
+                let Some(program) = program_guard.as_mut() else {
+                    return Ok(None);
+                };
+                let Some((file, offset)) =
+                    capabilities::resolve_position(program, &uri, position, encoding)
+                else {
+                    return Ok(None);
+                };
 
-            if let Err(refusal) = capabilities::rename_target(program, file, offset) {
-                return Err(ResponseError::new(ErrorCode::REQUEST_FAILED, refusal.message()));
-            }
-            let range = capabilities::prepare_rename_range(program, file, offset, encoding);
-            Ok(range.map(PrepareRenameResponse::Range))
+                let mut cache = bind.cache.lock();
+                program.with_full_binding(&mut cache, |program| {
+                    if let Err(refusal) = capabilities::rename_target(program, file, offset) {
+                        return Err(ResponseError::new(ErrorCode::REQUEST_FAILED, refusal.message()));
+                    }
+                    let range = capabilities::prepare_rename_range(program, file, offset, encoding);
+                    Ok(range.map(PrepareRenameResponse::Range))
+                })
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(ResponseError::new(ErrorCode::REQUEST_FAILED, "internal error: bind task panicked"))
+            })
         })
     }
 
     /// `capabilities::rename_edits`: a project-wide `WorkspaceEdit`
     /// renaming the symbol at the cursor, built from exactly the same
-    /// `references_to`/`highlight_range` data `references` already uses.
-    /// Refuses (a `ResponseError`, never a silent empty edit) for
-    /// anything `capabilities::rename_target`'s eligibility check
-    /// wouldn't have offered via `prepareRename` either, since a client
-    /// is allowed to skip `prepareRename` and call this directly.
+    /// `references_to`/`highlight_range` data `references` already uses --
+    /// so this too goes through ticket 04's (`.scratch/apex-memory/`)
+    /// full-project spike-bind. Refuses (a `ResponseError`, never a silent
+    /// empty edit) for anything `capabilities::rename_target`'s
+    /// eligibility check wouldn't have offered via `prepareRename` either,
+    /// since a client is allowed to skip `prepareRename` and call this
+    /// directly. Run on `spawn_blocking`, same reasoning as `references`.
     fn rename(
         &mut self,
         params: RenameParams,
@@ -1361,20 +1405,31 @@ impl LanguageServer for Backend {
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read();
-            let Some(program) = program_guard.as_ref() else {
-                return Ok(None);
-            };
-            let Some((file, offset)) =
-                capabilities::resolve_position(program, &uri, position, encoding)
-            else {
-                return Ok(None);
-            };
+            tokio::task::spawn_blocking(move || {
+                let mut program_guard = bind.program.write();
+                let Some(program) = program_guard.as_mut() else {
+                    return Ok(None);
+                };
+                let Some((file, offset)) =
+                    capabilities::resolve_position(program, &uri, position, encoding)
+                else {
+                    return Ok(None);
+                };
 
-            match capabilities::rename_edits(program, file, offset, &new_name, encoding) {
-                Ok(edit) => Ok(Some(edit)),
-                Err(refusal) => Err(ResponseError::new(ErrorCode::REQUEST_FAILED, refusal.message())),
-            }
+                let mut cache = bind.cache.lock();
+                program.with_full_binding(&mut cache, |program| {
+                    match capabilities::rename_edits(program, file, offset, &new_name, encoding) {
+                        Ok(edit) => Ok(Some(edit)),
+                        Err(refusal) => {
+                            Err(ResponseError::new(ErrorCode::REQUEST_FAILED, refusal.message()))
+                        }
+                    }
+                })
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(ResponseError::new(ErrorCode::REQUEST_FAILED, "internal error: bind task panicked"))
+            })
         })
     }
 
@@ -1411,6 +1466,13 @@ impl LanguageServer for Backend {
     /// `capabilities::incoming_calls`: every caller of the callable
     /// `params.item` names, re-resolved from its own `uri`/
     /// `selection_range` against whatever bind is live right now.
+    /// Genuinely project-wide (`call_hierarchy::incoming_calls` ->
+    /// `BoundProgram::references_to`, unlike `outgoing_calls`/
+    /// `prepare_call_hierarchy`, which only ever need one file's own
+    /// `bodies`) -- ticket 04's (`.scratch/apex-memory/`) own research
+    /// missed this one, but it needs exactly the same full-project
+    /// spike-bind treatment as `references`/`rename`, including running on
+    /// `spawn_blocking`.
     fn incoming_calls(
         &mut self,
         params: CallHierarchyIncomingCallsParams,
@@ -1422,21 +1484,42 @@ impl LanguageServer for Backend {
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read();
-            let Some(program) = program_guard.as_ref() else {
-                return Ok(None);
-            };
-            let Some((file, offset)) =
-                capabilities::resolve_position(program, &uri, position, encoding)
-            else {
-                return Ok(None);
-            };
+            let calls = tokio::task::spawn_blocking(move || {
+                let mut program_guard = bind.program.write();
+                let Some(program) = program_guard.as_mut() else {
+                    return None;
+                };
+                let Some((file, offset)) =
+                    capabilities::resolve_position(program, &uri, position, encoding)
+                else {
+                    return None;
+                };
 
-            Ok(capabilities::incoming_calls(program, file, offset, encoding))
+                let mut cache = bind.cache.lock();
+                program.with_full_binding(&mut cache, |program| {
+                    capabilities::incoming_calls(program, file, offset, encoding)
+                })
+            })
+            .await
+            .unwrap_or_default();
+            Ok(calls)
         })
     }
 
     /// `capabilities::outgoing_calls`: the mirror image of `incoming_calls`.
+    /// Unlike every other position-based capability, `params.item.uri`
+    /// here names whatever file a call-hierarchy item was expanded from --
+    /// not necessarily an open document -- so `outgoing_calls` (needing
+    /// only that one file's own `bodies`, via `BoundProgram::call_sites_in_range`)
+    /// promotes it on demand (`BoundProgram::ensure_bound`, ticket 04)
+    /// rather than assuming it's already Pass-2-bound the way an open
+    /// document always is. Tries a read-only fast path first (the common
+    /// case: `file` is already bound), falling back to a *single* write-
+    /// lock scope that resolves the position, promotes, and answers all
+    /// together -- resolving under one lock and promoting under another,
+    /// separately acquired one, would leave a window for a concurrent
+    /// background rebuild to land in between and publish a fresh snapshot
+    /// that never got the promotion, silently losing it for this request.
     fn outgoing_calls(
         &mut self,
         params: CallHierarchyOutgoingCallsParams,
@@ -1448,8 +1531,21 @@ impl LanguageServer for Backend {
         let bind = Arc::clone(&self.bind);
         Box::pin(async move {
             wait_for_rebuild(&bind, target_version).await;
-            let program_guard = bind.program.read();
-            let Some(program) = program_guard.as_ref() else {
+            {
+                let program_guard = bind.program.read();
+                if let Some(program) = program_guard.as_ref() {
+                    if let Some((file, offset)) =
+                        capabilities::resolve_position(program, &uri, position, encoding)
+                    {
+                        if program.is_bound(file) {
+                            return Ok(capabilities::outgoing_calls(program, file, offset, encoding));
+                        }
+                    }
+                }
+            }
+
+            let mut program_guard = bind.program.write();
+            let Some(program) = program_guard.as_mut() else {
                 return Ok(None);
             };
             let Some((file, offset)) =
@@ -1457,7 +1553,7 @@ impl LanguageServer for Backend {
             else {
                 return Ok(None);
             };
-
+            program.ensure_bound(file, &mut bind.cache.lock());
             Ok(capabilities::outgoing_calls(program, file, offset, encoding))
         })
     }

@@ -19,7 +19,7 @@ use crate::symbol_table::SymbolTable;
 use apex_discover::Discovery;
 use apex_parser::Parse;
 use apex_syntax::ast::Type;
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smol_str::SmolStr;
 use std::hash::Hasher;
 use std::path::PathBuf;
@@ -229,7 +229,44 @@ pub struct BindCache {
     /// file gets rebound.
     pub(crate) supertype_ptrs: FxHashMap<FileId, Vec<(SymbolId, AstPtr<Type>)>>,
     pub(crate) bodies: FxHashMap<FileId, Arc<FileBodies>>,
+    /// Whether `crate::BoundProgram::from_files_cached` should scope Pass 2
+    /// (body/reference binding) to a working set instead of the whole
+    /// project (ticket 04, `.scratch/apex-memory/`). `false` for every
+    /// CLI/test/batch caller (`from_files`/`from_files_with_overrides`'s
+    /// implicit default, never toggled) -- a working set isn't a
+    /// meaningful concept for a one-shot full-project bind. `apexls-server`
+    /// is the only caller that ever sets this `true`, once, before its
+    /// first `from_files_cached` call.
+    pub scoping_enabled: bool,
+    /// Every currently-open file's path (`apexls-server`'s `Documents`,
+    /// re-synced before each `from_files_cached` call from the same
+    /// `overrides` map that call itself already receives) -- pinned,
+    /// unconditionally, in the Pass 2 working set whenever
+    /// [`Self::scoping_enabled`] is set. Ignored entirely otherwise.
+    pub open_paths: FxHashSet<PathBuf>,
+    /// Non-open files promoted into the Pass 2 working set on demand
+    /// (`crate::BoundProgram::ensure_bound`, via a cross-file jump landing
+    /// somewhere not open), each mapped to the [`Self::promoted_generation`]
+    /// it was last touched at -- the same recency-tracking shape as
+    /// `parse_last_used`/`PARSE_EVICTION_WINDOW`, capped at
+    /// [`PROMOTED_FILE_CAP`] rather than time-windowed (see
+    /// [`Self::note_promoted`]). Only ever populated when
+    /// [`Self::scoping_enabled`] is set.
+    pub(crate) promoted_files: FxHashMap<FileId, u64>,
+    /// Bumped once per [`Self::note_promoted`] call -- [`Self::promoted_files`]'s
+    /// clock, mirroring `parse_generation`.
+    pub(crate) promoted_generation: u64,
 }
+
+/// How many non-open files [`BindCache::note_promoted`] keeps Pass-2-bound
+/// on top of whatever's currently open, before evicting the least-
+/// recently-promoted one -- generous enough that ordinary cross-file
+/// navigation (a handful of goto-definition/hover jumps into unopened
+/// files) never thrashes, small enough that it stays well inside the
+/// map's ~140-150MB destination's margin (ticket 04, `.scratch/apex-memory/`:
+/// ~4-8MB at this cap's size, on top of the 15-open-file projection the
+/// map's own budget already assumed).
+pub(crate) const PROMOTED_FILE_CAP: usize = 100;
 
 /// How many `crate::BoundProgram::from_files_cached` calls a file's `Parse`
 /// survives in [`BindCache::file_parses`] without being touched (a rebind or
@@ -274,5 +311,34 @@ impl BindCache {
             self.file_parses.remove(&file);
             self.parse_last_used.remove(&file);
         }
+    }
+
+    /// Records `file` as freshly promoted into the Pass 2 working set
+    /// (`crate::BoundProgram::ensure_bound`), then evicts the least-
+    /// recently-promoted file's `bodies` entry -- returning it, so the
+    /// caller can also drop it from its own live `BoundProgram` snapshot's
+    /// `bodies` (see `ensure_bound`'s own doc comment: without that, a
+    /// single long-lived snapshot could accumulate unbounded promotions
+    /// between rebuilds, since this cache-side cap alone only bounds the
+    /// *next* rebuild's snapshot) -- if that pushes [`Self::promoted_files`]
+    /// over [`PROMOTED_FILE_CAP`]. An O(cap) scan per call, not a real LRU
+    /// structure, since the cap is small enough (~100) that this is
+    /// cheaper than the bookkeeping a dedicated LRU container would add.
+    /// A no-op scan-and-reinsert (`None`) for a file that's already
+    /// tracked -- this just refreshes its recency.
+    pub(crate) fn note_promoted(&mut self, file: FileId) -> Option<FileId> {
+        self.promoted_generation += 1;
+        self.promoted_files.insert(file, self.promoted_generation);
+        if self.promoted_files.len() <= PROMOTED_FILE_CAP {
+            return None;
+        }
+        let &lru_file = self
+            .promoted_files
+            .iter()
+            .min_by_key(|&(_, &generation)| generation)
+            .map(|(file, _)| file)?;
+        self.promoted_files.remove(&lru_file);
+        self.bodies.remove(&lru_file);
+        Some(lru_file)
     }
 }

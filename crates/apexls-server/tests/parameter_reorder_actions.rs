@@ -182,6 +182,32 @@ impl Session {
         session
     }
 
+    /// Opens an additional file -- needed because the server now scopes
+    /// Pass 2 binding to open documents only (ticket 04,
+    /// `.scratch/apex-memory/`), and `parameter_reorder_actions` refuses to
+    /// offer anything unless every file is bound (a project-wide,
+    /// `references_to`-driven rewrite can't be trusted against incomplete
+    /// data) -- so a call site living in a file `Session::start` never
+    /// opened would otherwise make the whole action disappear.
+    fn open_file(&mut self, uri: &Url, text: &str) {
+        send(
+            &mut self.stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "apex",
+                        "version": 1,
+                        "text": text,
+                    }
+                }
+            }),
+        );
+        self.wait_for_rebuild();
+    }
+
     fn wait_for_rebuild(&mut self) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut saw_rebuild = false;
@@ -272,6 +298,8 @@ fn rotate_left_right_and_remove_rewrite_the_declaration_and_every_call_site() {
     let caller_b_uri = Url::from_file_path(dir.join("CallerB.cls")).unwrap();
 
     let mut session = Session::start(&root_uri, &widget_uri, WIDGET_SRC);
+    session.open_file(&caller_a_uri, CALLER_A_SRC);
+    session.open_file(&caller_b_uri, CALLER_B_SRC);
 
     let response = code_action_request(&mut session, &widget_uri, WIDGET_SRC, "String b");
     assert!(response.get("error").is_none(), "codeAction returned an error: {response:?}");
@@ -345,6 +373,7 @@ fn a_constructors_parameters_rewrite_the_declaration_and_every_call_site() {
     let caller_a_uri = Url::from_file_path(dir.join("CallerA.cls")).unwrap();
 
     let mut session = Session::start(&root_uri, &widget_uri, WIDGET_SRC);
+    session.open_file(&caller_a_uri, CALLER_A_SRC);
     let response = code_action_request(&mut session, &widget_uri, WIDGET_SRC, "String b");
     let actions = response["result"].as_array().expect("expected a code action array");
     assert_eq!(actions.len(), 3, "expected all three actions for a 3-param constructor: {actions:?}");
