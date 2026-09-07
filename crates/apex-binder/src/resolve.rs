@@ -2054,18 +2054,20 @@ impl<'a> BodyBinder<'a> {
                         let ptr = SyntaxPtr::new(self.file, ty.syntax());
                         // `QualifiedName` (not `Type`) -- resolve by its
                         // whole-text base name against project types
-                        // only; unlike `resolve_type_ref`, exception
-                        // types are never SObject-shaped, so there's no
-                        // schema fallback to attempt here. (The catch
-                        // *variable*'s own type, set below via
+                        // first, falling back to a bare stdlib class
+                        // (`Exception` itself, the only exception type
+                        // this crate has real scraped data for -- see
+                        // `stdlib.class`'s own data). Exception types are
+                        // never SObject-shaped, so there's no schema
+                        // fallback to attempt here, unlike
+                        // `resolve_type_ref`. (The catch *variable*'s own
+                        // type, set below via
                         // `declare_local_with_type_name`, still gets the
                         // fuller `type_of_symbol` resolution -- including
-                        // its `stdlib.class` fallback -- when something
-                        // later in the block actually uses `e`; this
-                        // reference alone deliberately stays project-only,
-                        // the "structural" classification
-                        // `capabilities::classify_unresolved` documents
-                        // for exactly this shape.)
+                        // its own `stdlib.class` fallback -- when
+                        // something later in the block actually uses `e`;
+                        // this is just the same fallback applied to the
+                        // reference on the catch clause itself.)
                         //
                         // `ty.syntax().text_range()` can be wider than the
                         // name (trailing trivia; see `bind_name_expr`'s
@@ -2084,7 +2086,19 @@ impl<'a> BodyBinder<'a> {
                         let name = SmolStr::new(ty.syntax().text().to_string().trim());
                         match self.table.resolve_dotted_name(&name) {
                             Some(id) => self.refs.set(ptr, Resolution::Resolved(id)),
-                            None => self.refs.set(ptr, Resolution::Unresolved),
+                            None => match self.stdlib.class(&name) {
+                                Some(class) => self.refs.set(
+                                    ptr,
+                                    Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                                        class.namespace.clone(),
+                                        &class.name,
+                                        None,
+                                        None,
+                                        None,
+                                    ))),
+                                ),
+                                None => self.refs.set(ptr, Resolution::Unresolved),
+                            },
                         }
                         name
                     });

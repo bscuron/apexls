@@ -1525,9 +1525,15 @@ pub(crate) fn syntax_error_diagnostics(
 /// shapes where the binder produces `Resolution::Unresolved` not because
 /// the referenced name doesn't exist in real Apex, but because this
 /// binder's own resolution has no fallback for that shape at all --
-/// catch-clause/`whenValue`/`upsert`-external-id lookups
-/// (`SymbolTable::resolve_dotted_name`, project-local only, no stdlib or
-/// schema fallback), one segment of a namespace-qualified stdlib type
+/// a catch-clause exception-type lookup (`SymbolTable::resolve_dotted_name`
+/// plus a bare `StdlibIndex::class` fallback, but no schema fallback and no
+/// per-namespace lookup; *not* also `whenValue`/`upsert`-external-id, despite
+/// what an earlier version of this doc comment claimed -- a switch/`when`
+/// value's type-pattern form already gets the full `resolve_type_ref`
+/// fallback chain, and both a switch/`when` value's literal-list form and an
+/// `upsert` external-id field are never bound to any `Resolution` at all,
+/// so neither can ever reach this function in the first place), one segment
+/// of a namespace-qualified stdlib type
 /// (`resolve::record_qualified_segments`, the one case a bare *token*
 /// gets its own recorded `Resolution` -- see `SyntaxPtr::for_token`'s doc
 /// comment), a bare `super` reference or `super(...)`/`this(...)` call
@@ -1536,9 +1542,9 @@ pub(crate) fn syntax_error_diagnostics(
 /// single object to resolve against (most commonly a `TYPEOF ... ELSE`
 /// field, `soql::bind_typeof`'s own doc comment: "always `Unresolved`").
 /// `None` for everything else (`NameExpr`, `FieldExpr`, `MethodCallExpr`,
-/// `NewExpr`, `Type` not shaped like a built-in exception subtype's name,
-/// `ThisExpr`, an unqualified non-`this`/`super` call) -- the higher-
-/// confidence default, on the theory that a reference this
+/// `NewExpr`, `Type`/`QualifiedName` not shaped like a built-in exception
+/// subtype's name, `ThisExpr`, an unqualified non-`this`/`super` call) --
+/// the higher-confidence default, on the theory that a reference this
 /// investigation couldn't specifically explain away is more likely a real
 /// typo than not. This is a best-effort heuristic, not a proof: the
 /// `CallExpr` case in particular can't distinguish "the supertype itself
@@ -1553,27 +1559,28 @@ pub(crate) fn syntax_error_diagnostics(
 /// than a filter -- see that function's own doc comment.
 fn classify_unresolved(program: &BoundProgram, ptr: SyntaxPtr, name: &str) -> Option<&'static str> {
     match ptr.kind() {
-        SyntaxKind::QualifiedName => Some(
-            "catch-clause/switch-value/upsert-field type lookups resolve only against \
-             project-local types, with no standard-library or schema fallback",
-        ),
         // A built-in Apex exception *subtype* (`DmlException`,
         // `QueryException`, `NullPointerException`, ...) used as a type
-        // reference (`System.DmlException caughtEx;`) -- Salesforce's own
-        // docs only cover these in prose alongside `Exception` itself,
-        // never as their own scraped class/method reference page (same
-        // gap `Exception` itself had before this crate's own bundled
-        // entry was hand-corrected -- see `apex_stdlib::standard_classes`'s
-        // doc comment), so this crate has no way to confirm one by name
-        // and never will without scraper changes. Every real Apex
-        // exception class name ends in literally `Exception`, not just
-        // convention -- a hard compiler rule (confirmed against a real
-        // org: "Classes extending Exception must have a name ending in
-        // Exception"), so this is a safe, general signal to classify by,
-        // not a guess. Scoped to `Type` specifically (not `NameExpr`/
+        // reference -- either a declared-variable type
+        // (`System.DmlException caughtEx;`, `SyntaxKind::Type`) or a
+        // catch-clause exception type (`catch (DmlException e)`,
+        // `SyntaxKind::QualifiedName`; bare `Exception` itself resolves
+        // via `StdlibIndex::class`'s own hand-corrected entry and never
+        // reaches this function at all). Salesforce's own docs only cover
+        // subtypes in prose alongside `Exception` itself, never as their
+        // own scraped class/method reference page (same gap `Exception`
+        // itself had before this crate's own bundled entry was
+        // hand-corrected -- see `apex_stdlib::standard_classes`'s doc
+        // comment), so this crate has no way to confirm one by name and
+        // never will without scraper changes. Every real Apex exception
+        // class name ends in literally `Exception`, not just convention --
+        // a hard compiler rule (confirmed against a real org: "Classes
+        // extending Exception must have a name ending in Exception"), so
+        // this is a safe, general signal to classify by, not a guess.
+        // Scoped to `Type`/`QualifiedName` specifically (not `NameExpr`/
         // `FieldExpr`/...): an unrelated *variable* merely named
         // `somethingException` is not this shape at all.
-        SyntaxKind::Type if name.ends_with("Exception") => Some(
+        SyntaxKind::Type | SyntaxKind::QualifiedName if name.ends_with("Exception") => Some(
             "the referenced name looks like a built-in Apex exception subtype (ends in \
              \"Exception\"), which this binder can never individually confirm -- Salesforce's \
              own docs cover these only in prose, never as their own class reference page",
@@ -1637,8 +1644,16 @@ fn classify_unresolved(program: &BoundProgram, ptr: SyntaxPtr, name: &str) -> Op
                  needs to exist",
             )
         }
+        // A `QualifiedName` not caught by the exception-suffix arm above
+        // is a catch-clause type that's neither a project-local type nor
+        // the one stdlib class this binder can confirm by a bare name --
+        // most likely a genuine typo in the catch clause, not a binder
+        // gap, so this gets the higher-confidence `ERROR` default like
+        // everything else in this arm rather than the `WARNING` the
+        // exception-suffix case gets.
         SyntaxKind::FieldExpr
         | SyntaxKind::Type
+        | SyntaxKind::QualifiedName
         | SyntaxKind::MethodCallExpr
         | SyntaxKind::NewExpr
         | SyntaxKind::ThisExpr => None,

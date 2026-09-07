@@ -11,6 +11,7 @@
 
 use apex_binder::{BoundProgram, Resolution, SchemaObjectRef, StdlibMemberRef, SymbolKind};
 use apex_syntax::ast::expr::{FieldExpr, MethodCallExpr, NameExpr};
+use apex_syntax::ast::QualifiedName;
 use rowan::ast::AstNode;
 
 fn write_fixture_dir(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
@@ -797,5 +798,55 @@ fn a_catch_variables_declared_type_resolves_for_chained_calls() {
             narrowed_param_types: None,
         }))),
         "chaining .contains(...) off getMessage()'s own String result should keep resolving"
+    );
+}
+
+/// The catch clause's own exception-type reference (a `QualifiedName`,
+/// distinct from the catch *variable*'s declared type covered above) used
+/// to have no stdlib fallback at all -- `catch (Exception e)` stayed
+/// `Unresolved` even though bare `Exception` is a real, fully modeled
+/// `apex_stdlib` class, since the catch-clause binder only ever consulted
+/// project-local types (`SymbolTable::resolve_dotted_name`). Real-world
+/// case this covers: NPSP's `fflib_QueryFactoryTest.cls`.
+#[test]
+fn a_bare_stdlib_exception_type_in_a_catch_clause_resolves() {
+    let dir = write_fixture_dir(
+        "catch-clause-stdlib-exception-type",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             public void run() { \
+                 try { \
+                     doSomething(); \
+                 } catch (Exception e) { \
+                     System.debug(e); \
+                 } \
+             } \
+             private void doSomething() {} \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = program.files().next().expect("one file");
+    let root = program.syntax(file);
+    let exception_type_node = root
+        .descendants()
+        .find_map(QualifiedName::cast)
+        .expect("the catch clause's exception type should be a QualifiedName node");
+    let ptr = apex_binder::SyntaxPtr::new(file, exception_type_node.syntax());
+
+    assert_eq!(
+        program.resolution(ptr).cloned(),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "Exception".into(),
+            member: None,
+            arg_count: None,
+            narrowed_param_types: None,
+        }))),
+        "catch (Exception e)'s own exception-type reference should resolve to the bundled \
+         stdlib Exception class, not stay Unresolved"
     );
 }

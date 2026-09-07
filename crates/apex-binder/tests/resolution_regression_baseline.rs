@@ -848,8 +848,23 @@ fn corpus_root() -> PathBuf {
 ///     fires when an owner *is* known, so this widening doesn't regress that
 ///     path. `BASELINE_RESOLVED` unaffected (`206_955`, `StdlibMember` isn't
 ///     tallied); `BASELINE_UNRESOLVED` dropped -153 (`4_163` -> `4_010`).
+/// 32. A catch clause's own exception-type reference
+///     (`resolve::BodyBinder::bind_stmt`'s `Stmt::Try` arm, a `QualifiedName`
+///     node) only ever consulted project-local types
+///     (`SymbolTable::resolve_dotted_name`), with no stdlib fallback --
+///     unlike the catch *variable*'s own declared type, which already fell
+///     back to `stdlib.class` via `type_of_symbol`. `catch (Exception e)`,
+///     a real, fully modeled `apex_stdlib` class, stayed `Unresolved`
+///     regardless. Real case: NPSP's `fflib_QueryFactoryTest.cls`. Fixed by
+///     adding the identical bare-class `stdlib.class(&name)` fallback
+///     `resolve_type_ref_base` already uses, consulted only after
+///     `resolve_dotted_name` fails. Doesn't resolve any exception *subtype*
+///     (`DmlException`, ...) -- no scraped/hand-corrected data exists for
+///     those, only for bare `Exception` itself. `BASELINE_RESOLVED`
+///     unaffected (`206_955`, `StdlibMember` isn't tallied);
+///     `BASELINE_UNRESOLVED` dropped -559 (`4_010` -> `3_451`).
 const BASELINE_RESOLVED: usize = 206_955;
-const BASELINE_UNRESOLVED: usize = 4_010;
+const BASELINE_UNRESOLVED: usize = 3_451;
 
 #[test]
 fn resolved_and_unresolved_counts_never_regress_from_their_pinned_baseline() {
