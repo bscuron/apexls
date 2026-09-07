@@ -91,8 +91,23 @@ pub struct StdlibClass {
     /// `Option` too rather than defaulting to a sentinel string.
     pub namespace: Option<SmolStr>,
     pub name: SmolStr,
+    pub kind: StdlibKind,
     pub methods: Vec<StdlibMethod>,
     pub properties: Vec<StdlibProperty>,
+}
+
+/// Whether a [`StdlibClass`] is a real Apex class, interface, or enum --
+/// restored from `RawClass::kind` (dropped entirely until now), needed so
+/// a caller can ask "does this name a stdlib *interface*" rather than just
+/// "does this name a stdlib type." `standard_classes()`'s own filter
+/// already guarantees a `RawClass` only ever survives into a real
+/// `StdlibClass` when its raw `kind` is exactly one of the three strings
+/// this maps from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdlibKind {
+    Class,
+    Interface,
+    Enum,
 }
 
 /// One method or constructor. Constructors appear in the scraped data
@@ -237,6 +252,11 @@ fn to_stdlib_class(raw: RawClass) -> StdlibClass {
     StdlibClass {
         namespace: raw.namespace.map(|n| SmolStr::new(&n)),
         name: SmolStr::new(&raw.name),
+        kind: match raw.kind.as_str() {
+            "Interface" => StdlibKind::Interface,
+            "Enum" => StdlibKind::Enum,
+            _ => StdlibKind::Class,
+        },
         methods: raw.methods.into_iter().map(to_stdlib_method).collect(),
         properties: raw.properties.into_iter().map(to_stdlib_property).collect(),
     }
@@ -692,6 +712,25 @@ mod tests {
             .expect("INFO should be one of LoggingLevel's values");
         assert!(info.is_static);
         assert_eq!(info.type_name.as_deref(), Some("LoggingLevel"));
+    }
+
+    /// `Database.Batchable` is a real, commonly-implemented interface --
+    /// confirms `kind` survives `to_stdlib_class` as `Interface`, not the
+    /// default `Class`, and that an ordinary class (`Database` itself)
+    /// still comes through as `Class`.
+    #[test]
+    fn kind_distinguishes_a_stdlib_interface_from_a_stdlib_class() {
+        let classes = standard_classes();
+        let batchable = classes
+            .iter()
+            .find(|c| c.name == "Batchable" && c.namespace.as_deref() == Some("Database"))
+            .expect("Database.Batchable should be in the bundled snapshot");
+        assert_eq!(batchable.kind, StdlibKind::Interface);
+        let database = classes
+            .iter()
+            .find(|c| c.name == "Database" && c.namespace.as_deref() == Some("System"))
+            .expect("Database should be in the bundled snapshot");
+        assert_eq!(database.kind, StdlibKind::Class);
     }
 
     /// `Test` collides between the `Canvas` and `System` namespaces --

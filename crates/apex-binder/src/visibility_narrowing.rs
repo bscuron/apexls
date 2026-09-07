@@ -76,12 +76,15 @@ fn top_level_container(program: &BoundProgram, id: SymbolId) -> SymbolId {
     current
 }
 
-/// True for a `Method` that overrides a virtual/abstract member, or
-/// satisfies (same name, same arity) an interface/base-class method
-/// somewhere in its container's `inherited_chain` -- either way, Apex
-/// forbids the method from being declared *less* visible than what it
-/// overrides/implements, so narrowing it is never safe regardless of its
-/// own real reference footprint. Mirrors `apexls-server`'s
+/// True for a `Method` that overrides a virtual/abstract member, satisfies
+/// (same name, same arity) an interface/base-class method somewhere in
+/// its container's `inherited_chain`, or satisfies a real Salesforce
+/// standard-library interface's method the same way (`Database.Batchable`,
+/// `Schedulable`, ... -- see `SymbolTable::implements_stdlib_interface_method`;
+/// these never appear in `inherited_chain` itself, since they have no
+/// `SymbolId`) -- either way, Apex forbids the method from being declared
+/// *less* visible than what it overrides/implements, so narrowing it is
+/// never safe regardless of its own real reference footprint. Mirrors `apexls-server`'s
 /// `method_override_chain_reason`'s first two checks (its third,
 /// "overridden by a subclass," doesn't apply here: narrowing a virtual
 /// base method doesn't force narrowing whatever overrides it, and this
@@ -109,7 +112,9 @@ fn overrides_or_implements(program: &BoundProgram, id: SymbolId, symbol: &Symbol
             .lookup_member(ancestor, &symbol.name)
             .into_iter()
             .any(|candidate| candidate != id && program.symbols.params(candidate).len() == arity)
-    })
+    }) || program
+        .symbols
+        .implements_stdlib_interface_method(container, &symbol.name, arity)
 }
 
 /// The nearest enclosing `Class`/`Interface`/`Enum` symbol whose
@@ -634,6 +639,28 @@ mod tests {
         assert!(
             !found.iter().any(|c| c.name == "greet"),
             "a method satisfying an interface contract must never be flagged: {:?}",
+            names_and_required(&found)
+        );
+    }
+
+    /// `Database.Batchable`'s methods have no `SymbolId` (they're never
+    /// project-local), so before `implements_stdlib_interface_method` this
+    /// would incorrectly narrow `finish` to `Private` on the strength of
+    /// its one same-class call -- but Apex forbids a `Database.Batchable`
+    /// implementation from declaring `finish` anything but `public`.
+    #[test]
+    fn stdlib_interface_implementing_method_is_never_flagged_even_if_narrowly_used() {
+        let src = "public class Foo implements Database.Batchable<SObject> {\n    \
+             public Database.QueryLocator start(Database.BatchableContext bc) { return null; }\n    \
+             public void execute(Database.BatchableContext bc, List<SObject> records) { }\n    \
+             public void finish(Database.BatchableContext bc) { }\n    \
+             public void run() { finish(null); }\n\
+         }\n";
+        let found = candidates("stdlib-interface-not-flagged", src);
+        assert!(
+            !found.iter().any(|c| c.name == "finish"),
+            "a method satisfying Database.Batchable's contract must never be flagged, even though \
+             its only real reference is a narrow same-class call: {:?}",
             names_and_required(&found)
         );
     }

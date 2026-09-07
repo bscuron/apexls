@@ -18,8 +18,10 @@
 //! SymbolTable`, so those stay a fast sequential pass over the
 //! already-computed results.
 
+use crate::stdlib_index::StdlibIndex;
 use crate::symbol::SymbolId;
 use crate::symbol_table::SymbolTable;
+use apex_stdlib::{StdlibClass, StdlibKind};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
@@ -33,6 +35,7 @@ pub(crate) fn resolve_inheritance(
     table: &mut SymbolTable,
     raw_extends: &[(SymbolId, Vec<SmolStr>)],
     raw_super: &[(SymbolId, SmolStr)],
+    stdlib: &StdlibIndex,
 ) {
     let resolved_super: Vec<(SymbolId, Result<SymbolId, SmolStr>)> = raw_super
         .par_iter()
@@ -49,23 +52,80 @@ pub(crate) fn resolve_inheritance(
 
     // Resolve each type's *direct* supertype names to `SymbolId`s first,
     // building a plain adjacency map. A name that doesn't resolve at all
-    // (a system/library base class like `Exception`) is simply dropped:
-    // an unresolvable supertype contributes nothing to the chain, it
-    // doesn't abort collection.
-    let direct: FxHashMap<SymbolId, Vec<SymbolId>> = raw_extends
+    // as project-local is either a real stdlib interface (kept alongside,
+    // in `direct_stdlib`, see that binding's own comment below) or a
+    // genuine system/library name this binder has no data for at all
+    // (e.g. `extends Exception`) -- either way it's simply dropped from
+    // `direct` itself: an unresolvable supertype contributes nothing to
+    // `inherited_chain`, it doesn't abort collection.
+    let direct_and_stdlib: Vec<(SymbolId, Vec<SymbolId>, Vec<&'static StdlibClass>)> = raw_extends
         .par_iter()
         .map(|(type_id, names)| {
-            let resolved = names.iter().filter_map(|n| resolve_supertype_name(table, *type_id, n)).collect();
-            (*type_id, resolved)
+            let mut resolved = Vec::new();
+            let mut stdlib_direct = Vec::new();
+            for name in names {
+                match resolve_supertype_name(table, *type_id, name) {
+                    Some(id) => resolved.push(id),
+                    None => stdlib_direct.extend(resolve_stdlib_interface(stdlib, name)),
+                }
+            }
+            (*type_id, resolved, stdlib_direct)
         })
+        .collect();
+
+    let direct: FxHashMap<SymbolId, Vec<SymbolId>> = direct_and_stdlib
+        .iter()
+        .map(|(type_id, resolved, _)| (*type_id, resolved.clone()))
+        .collect();
+    // Every type's own *directly*-declared stdlib interfaces (before
+    // transitively unioning in ancestors' own, below) -- a type with none
+    // is simply absent, so `flatten`-style ancestor lookups below default
+    // to empty rather than needing an `Option` everywhere.
+    let direct_stdlib: FxHashMap<SymbolId, Vec<&'static StdlibClass>> = direct_and_stdlib
+        .into_iter()
+        .filter(|(_, _, stdlib_direct)| !stdlib_direct.is_empty())
+        .map(|(type_id, _, stdlib_direct)| (type_id, stdlib_direct))
         .collect();
 
     let chains: Vec<(SymbolId, Vec<SymbolId>)> = raw_extends
         .par_iter()
         .map(|(type_id, _)| (*type_id, flatten(&direct, *type_id)))
         .collect();
+
+    // `stdlib_implements`: `direct_stdlib`, unioned transitively across
+    // the exact same flattened ancestor set `chains` just computed for
+    // `inherited_chain` -- so a class implementing a project-local
+    // interface that itself extends a stdlib interface still gets that
+    // stdlib interface's exemption, the same transitivity
+    // `inherited_chain` itself already has.
+    let stdlib_implements: Vec<(SymbolId, Vec<&'static StdlibClass>)> = chains
+        .par_iter()
+        .map(|(type_id, chain)| {
+            let mut classes: Vec<&'static StdlibClass> =
+                direct_stdlib.get(type_id).cloned().unwrap_or_default();
+            for ancestor in chain {
+                if let Some(more) = direct_stdlib.get(ancestor) {
+                    classes.extend(more.iter().copied());
+                }
+            }
+            (*type_id, classes)
+        })
+        // Unconditional, even when `classes` is empty -- matching
+        // `inherited_chain`'s own unconditional `set_inherited_chain` call
+        // below. `SymbolTable::rebuild_indices` carries `stdlib_implements`
+        // forward unchanged across a rebuild that skips this pass
+        // entirely, so a type that *used to* implement a stdlib interface
+        // but no longer does (e.g. its `implements` clause was edited to
+        // drop it) must still get a fresh, empty entry written here to
+        // overwrite the stale one -- filtering it out would leave the old
+        // value in place forever.
+        .collect();
+
     for (type_id, chain) in chains {
         table.set_inherited_chain(type_id, chain);
+    }
+    for (type_id, classes) in stdlib_implements {
+        table.set_stdlib_implements(type_id, classes);
     }
 
     // `subtypes` is `direct`'s reverse graph: every type that has at
@@ -119,6 +179,28 @@ fn resolve_supertype_name(table: &SymbolTable, type_id: SymbolId, name: &str) ->
     }
     let from = table.get(type_id).container;
     table.resolve_dotted_name_from(name, from)
+}
+
+/// Checks a supertype name that failed to resolve as project-local
+/// against `apex-stdlib`'s bundled data, keeping the match only when it's
+/// specifically a stdlib *interface* (`Class`/`Enum` matches are a
+/// different, already-handled shape -- see `SymbolTable::unresolved_direct_super`'s
+/// own doc comment for the `extends`-a-stdlib-*class* fallback this isn't).
+/// A namespace-qualified name (`Database.Batchable`) splits on its first
+/// `.` into namespace + tail; a bare name (`Comparable`, `StubProvider`)
+/// goes straight to [`StdlibIndex::class`], which already picks the right
+/// entry for the handful of real namespace collisions. Only tried for
+/// exactly two segments -- a further-dotted tail (three or more segments)
+/// is out of scope, the same restriction `resolve.rs`'s own
+/// `class_in_namespace` call sites already apply (`resolve.rs:1627`,
+/// `:1653`), since every real stdlib interface name is `Namespace.Type`.
+fn resolve_stdlib_interface(stdlib: &StdlibIndex, name: &str) -> Option<&'static StdlibClass> {
+    let class = match name.split_once('.') {
+        Some((namespace, tail)) if !tail.contains('.') => stdlib.class_in_namespace(namespace, tail),
+        Some(_) => None,
+        None => stdlib.class(name),
+    }?;
+    (class.kind == StdlibKind::Interface).then_some(class)
 }
 
 /// Every `SymbolId` transitively reachable from `type_id` via `direct`,

@@ -626,6 +626,7 @@ impl BoundProgram {
                         &mut cache.table,
                         &inputs.raw_extends,
                         &inputs.raw_super,
+                        &stdlib,
                     );
                 }
                 cache.raw_inheritance_inputs = Some(inputs);

@@ -147,6 +147,16 @@ struct Indices {
     /// common case -- most declared types are never extended/implemented
     /// at all.
     subtypes: FxHashMap<SymbolId, Vec<SymbolId>>,
+    /// Populated by Pass 1.5: every real Salesforce standard-library
+    /// interface a type symbol's `extends`/`implements` clause names,
+    /// transitively -- the stdlib counterpart of `inherited_chain`, for a
+    /// supertype name that named something real but has no `SymbolId` to
+    /// live in `inherited_chain` itself (`Database.Batchable`,
+    /// `Schedulable`, ...; see `crate::inherit::resolve_inheritance`'s own
+    /// doc comment for why a synthetic `SymbolId` isn't minted for these
+    /// instead). Absent (empty slice) for a type that implements no
+    /// recognized stdlib interface, by far the common case.
+    stdlib_implements: FxHashMap<SymbolId, Vec<&'static apex_stdlib::StdlibClass>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -223,7 +233,7 @@ impl SymbolTable {
     /// whatever's currently in `by_file`, replacing [`Self`]'s whole
     /// [`Indices`] bundle with a fresh `Arc` in one atomic swap.
     /// `inherited_chain`/`direct_super`/`unresolved_direct_super`/
-    /// `subtypes` are **carried forward unchanged** from the previous
+    /// `subtypes`/`stdlib_implements` are **carried forward unchanged** from the previous
     /// bundle rather than reset -- those are Pass 1.5's job
     /// (`crate::inherit::resolve_inheritance`), which the caller may or
     /// may not run right after this (Wayfinder `apex-diagnostics` map,
@@ -236,7 +246,7 @@ impl SymbolTable {
     /// call instead of silently going empty. When the caller *does* run
     /// `resolve_inheritance` right after, it overwrites these same
     /// fields with fresh values via `set_inherited_chain`/`set_direct_super`/
-    /// `set_unresolved_direct_super`/`set_subtypes`, exactly as before --
+    /// `set_unresolved_direct_super`/`set_subtypes`/`set_stdlib_implements`, exactly as before --
     /// this carry-forward is invisible to that path.
     pub(crate) fn rebuild_indices(&mut self) {
         let mut fresh = Indices {
@@ -244,6 +254,7 @@ impl SymbolTable {
             direct_super: self.indices.direct_super.clone(),
             unresolved_direct_super: self.indices.unresolved_direct_super.clone(),
             subtypes: self.indices.subtypes.clone(),
+            stdlib_implements: self.indices.stdlib_implements.clone(),
             ..Indices::default()
         };
 
@@ -405,6 +416,42 @@ impl SymbolTable {
     /// own doc comment for why `crate::resolve` needs this.
     pub fn subtypes(&self, id: SymbolId) -> &[SymbolId] {
         self.indices.subtypes.get(&id).map_or(&[], |v| v.as_slice())
+    }
+
+    pub(crate) fn set_stdlib_implements(
+        &mut self,
+        id: SymbolId,
+        classes: Vec<&'static apex_stdlib::StdlibClass>,
+    ) {
+        Arc::make_mut(&mut self.indices).stdlib_implements.insert(id, classes);
+    }
+
+    /// Every real stdlib interface `id` (transitively) implements -- see
+    /// [`Indices::stdlib_implements`]'s own doc comment.
+    pub fn stdlib_implements(&self, id: SymbolId) -> &[&'static apex_stdlib::StdlibClass] {
+        self.indices.stdlib_implements.get(&id).map_or(&[], |v| v.as_slice())
+    }
+
+    /// True if some stdlib interface `container` implements (see
+    /// [`Self::stdlib_implements`]) declares a method matching `name`
+    /// (case-insensitively, matching [`crate::stdlib_index::StdlibIndex`]'s
+    /// own lookup convention) whose parameter count is exactly `arity` --
+    /// the stdlib counterpart of walking `inherited_chain` for a same-
+    /// name/arity match (see `crate::visibility_narrowing`'s
+    /// `overrides_or_implements`). Arity alone, no parameter-type
+    /// checking: this only ever needs to check membership against the
+    /// specific stdlib interfaces `container`'s own supertype list names,
+    /// never cross-interface attribution (unlike a hypothetical
+    /// missing-implementation diagnostic, which would need to tell
+    /// `Schedulable.execute`/`Queueable.execute`/`Finalizer.execute` apart
+    /// -- out of scope here, see the `stdlib-interfaces` Wayfinder map).
+    pub fn implements_stdlib_interface_method(&self, container: SymbolId, name: &str, arity: usize) -> bool {
+        self.stdlib_implements(container).iter().any(|class| {
+            class
+                .methods
+                .iter()
+                .any(|m| m.name.eq_ignore_ascii_case(name) && m.params.len() == arity)
+        })
     }
 
     /// Every `Parameter` symbol directly contained by `container` (a

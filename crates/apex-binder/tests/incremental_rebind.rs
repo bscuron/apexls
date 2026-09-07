@@ -169,6 +169,68 @@ fn declaration_changing_edit_via_incremental_cache_matches_a_cold_rebuild() {
     );
 }
 
+/// Regression test for a real gap found reviewing the `stdlib-interfaces`
+/// Wayfinder map's implementation: `SymbolTable::rebuild_indices` carries
+/// `stdlib_implements` forward unchanged whenever `resolve_inheritance`
+/// itself is skipped, so a type that *used to* implement a recognized
+/// stdlib interface but was edited to no longer must still get a fresh,
+/// empty entry written on the rebind that *does* rerun `resolve_inheritance`
+/// -- otherwise the stale, no-longer-true entry survives forever in that
+/// session, permanently (and wrongly) exempting `execute`/`start`/`finish`
+/// from dead-code/visibility-narrowing detection even after the class no
+/// longer implements `Database.Batchable` at all.
+#[test]
+fn stdlib_implements_does_not_survive_an_edit_that_removes_the_stdlib_interface_clause() {
+    let dir = write_fixture_dir(
+        "incremental-stdlib-implements-cleared",
+        &[(
+            "Foo.cls",
+            "public class Foo implements Database.Batchable<SObject> {\n    \
+                 public Database.QueryLocator start(Database.BatchableContext bc) { return null; }\n    \
+                 public void execute(Database.BatchableContext bc, List<SObject> records) { }\n    \
+                 public void finish(Database.BatchableContext bc) { }\n\
+             }\n",
+        )],
+    );
+
+    let mut cache = BindCache::default();
+    let first = BoundProgram::from_files_cached(&dir, &HashMap::new(), &mut cache);
+    let foo = first.symbols.top_level("Foo").expect("Foo should be declared");
+    assert!(
+        !first.symbols.stdlib_implements(foo).is_empty(),
+        "Foo implements Database.Batchable, expected a non-empty stdlib_implements entry"
+    );
+
+    // A declaration-changing edit (every parameter's own type changed,
+    // which flips `declarations_changed`) that swaps the `implements`
+    // clause from a stdlib interface to a project-local one (`Foo.Bar`,
+    // resolving fine) -- Foo still has a real `implements` clause (still
+    // present in `raw_extends`, unlike dropping the clause entirely,
+    // which is a separate, pre-existing gap: a type with *zero* remaining
+    // supertype clauses drops out of `raw_extends` altogether, so this
+    // pass's per-type loop never revisits it at all -- the same
+    // limitation `inherited_chain` itself already has, out of scope
+    // here), so `raw_inheritance_inputs` changes and `resolve_inheritance`
+    // actually reruns and revisits Foo.
+    let edited = "public class Foo implements Foo.Bar {\n    \
+             public Object start(Object bc) { return null; }\n    \
+             public void execute(Object bc, List<Object> records) { }\n    \
+             public void finish(Object bc) { }\n    \
+             public interface Bar { }\n\
+         }\n";
+    std::fs::write(dir.join("Foo.cls"), edited).unwrap();
+
+    let warm = BoundProgram::from_files_cached(&dir, &HashMap::new(), &mut cache);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let foo_warm = warm.symbols.top_level("Foo").expect("Foo should still be declared");
+    assert!(
+        warm.symbols.stdlib_implements(foo_warm).is_empty(),
+        "Foo no longer implements Database.Batchable after the edit -- its stale \
+         stdlib_implements entry must not survive the incremental rebind"
+    );
+}
+
 /// `BindCache`'s directory walk (`discovery`) is only ever redone when
 /// something suggests it's stale (see `BoundProgram::from_files_cached`'s
 /// doc comment) -- so a file deleted between two calls has to

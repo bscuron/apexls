@@ -1,10 +1,13 @@
 //! Provably-dead-declaration detection: the analysis backing both
 //! `apexls-server`'s `textDocument/publishDiagnostics`/`textDocument/codeAction`
 //! and the `apexls check` CLI subcommand. Deliberately conservative --
-//! Apex's platform (Flow, Aura/LWC, REST, Visualforce) can invoke code
-//! with zero textual Apex call sites, so this only ever flags a
-//! declaration when it can rule out every channel it knows about; see
-//! each filter's own doc comment for exactly which channel it closes.
+//! Apex's platform (Flow, Aura/LWC, REST, Visualforce, and async-job
+//! frameworks like `Database.executeBatch`/`System.schedule`/`System.enqueueJob`
+//! calling back through `Database.Batchable`/`Schedulable`/`Queueable` and
+//! other stdlib interfaces) can invoke code with zero textual Apex call
+//! sites, so this only ever flags a declaration when it can rule out
+//! every channel it knows about; see each filter's own doc comment for
+//! exactly which channel it closes.
 //!
 //! `private` methods/fields/properties and plain local variables were
 //! the first, narrowest-possible slice: `private` is genuinely
@@ -257,6 +260,28 @@ pub(crate) fn is_visualforce_referenced(program: &BoundProgram, symbol: &Symbol)
     program.vf_referenced_classes.contains(&name)
 }
 
+/// True for a `Method` whose container implements a real Salesforce
+/// standard-library interface (`Database.Batchable`, `Schedulable`,
+/// `Queueable`, ...) declaring a method of the same name and parameter
+/// count. Unlike `PLATFORM_INVOCATION_ANNOTATIONS`/`is_visualforce_referenced`,
+/// this needs no annotation to grant an invocation channel: satisfying a
+/// stdlib interface's own contract by name+arity is itself the whole
+/// signal, since the *platform* (never project Apex code) is what calls
+/// back into `execute()`/`start()`/`finish()` and friends -- a genuinely
+/// unprovable channel this binder can't see a textual call site for by
+/// construction, the same reason the annotation-driven channels above
+/// exempt outright rather than trying to trace a call.
+fn implements_stdlib_interface_method(program: &BoundProgram, id: SymbolId, symbol: &Symbol) -> bool {
+    if symbol.kind != SymbolKind::Method {
+        return false;
+    }
+    let Some(container) = symbol.container else {
+        return false;
+    };
+    let arity = program.symbols.params(id).len();
+    program.symbols.implements_stdlib_interface_method(container, &symbol.name, arity)
+}
+
 /// One provably-dead declaration in a file: everything both
 /// `apexls-server`'s LSP wrappers and `apexls check` need, computed once
 /// and shared between them. `visibility` exists specifically so
@@ -291,10 +316,11 @@ pub fn dead_symbols_in_file(program: &BoundProgram, file: FileId) -> Vec<DeadSym
         .map(|(local, s)| (SymbolId::new(file, local as u32), s))
         .filter(|(_, s)| is_dead_code_candidate_kind(s))
         .filter(|(_, s)| !is_platform_invoked_test_method(program, s))
-        .filter(|(_, s)| {
+        .filter(|(id, s)| {
             s.modifiers.visibility != Visibility::Public
                 || (!has_platform_invocation_annotation(program, s)
-                    && !is_visualforce_referenced(program, s))
+                    && !is_visualforce_referenced(program, s)
+                    && !implements_stdlib_interface_method(program, *id, s))
         })
         .filter(|(id, s)| {
             // Private/local candidates are genuinely file-scoped (see the
@@ -1003,6 +1029,50 @@ mod tests {
             "greet() implements Greeter.greet and is reached only via interface-typed dispatch \
              -- must not be flagged dead: {:?}",
             dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression test for this map's own motivating case: a real
+    /// Salesforce batch job's `execute`/`start`/`finish` methods are
+    /// invoked by the platform itself (`Database.executeBatch`), never by
+    /// any project Apex code -- so unlike the interface-typed-dispatch
+    /// case above, there is no in-project call site for
+    /// `expand_dynamic_dispatch` to widen through in the first place.
+    /// Without `implements_stdlib_interface_method`'s own exemption, all
+    /// three would be false-flagged dead despite genuinely satisfying
+    /// `Database.Batchable`'s contract.
+    #[test]
+    fn a_method_satisfying_a_stdlib_interface_contract_is_not_flagged_even_with_zero_callers() {
+        let src = "public class Foo implements Database.Batchable<SObject> {\n    \
+             public Database.QueryLocator start(Database.BatchableContext bc) { return null; }\n    \
+             public void execute(Database.BatchableContext bc, List<SObject> records) { }\n    \
+             public void finish(Database.BatchableContext bc) { }\n\
+         }\n";
+        let (_, _, dead) = dead_symbols("stdlib-interface-not-flagged", src);
+        assert!(
+            dead.iter().all(|d| !["start", "execute", "finish"].contains(&d.name.as_str())),
+            "start/execute/finish each satisfy Database.Batchable's contract by name+arity and are \
+             only ever invoked by the platform -- must not be flagged dead: {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// The stdlib-interface exemption must stay just as precise as the
+    /// project-local one above -- it should never blanket-exempt every
+    /// method on a class that happens to implement a stdlib interface,
+    /// only the ones that actually satisfy its contract by name+arity.
+    #[test]
+    fn an_unrelated_method_on_a_stdlib_interface_implementing_class_is_still_flagged() {
+        let src = "public class Foo implements Database.Batchable<SObject> {\n    \
+             public Database.QueryLocator start(Database.BatchableContext bc) { return null; }\n    \
+             public void execute(Database.BatchableContext bc, List<SObject> records) { }\n    \
+             public void finish(Database.BatchableContext bc) { }\n    \
+             private void unrelated() { }\n\
+         }\n";
+        let (_, _, dead) = dead_symbols("stdlib-interface-unrelated-method-still-flagged", src);
+        assert_eq!(
+            dead.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["unrelated"]
         );
     }
 
