@@ -117,6 +117,7 @@ use tower::ServiceBuilder;
 use tracing::{info, warn, Level};
 
 mod capabilities;
+mod fix;
 mod line_index;
 
 use line_index::{LineIndex, PositionEncoding};
@@ -2062,6 +2063,61 @@ pub fn diagnostics_for_file(program: &BoundProgram, file: apex_binder::FileId) -
             }
         })
         .collect()
+}
+
+/// One fix in `apexls fix`'s plain-text-report shape -- the same
+/// byte-offset-derived `line`/`col` convention [`CliDiagnostic`] uses.
+#[derive(Debug)]
+pub struct CliFix {
+    pub line: usize,
+    pub col: usize,
+    pub description: String,
+}
+
+/// The outcome of resolving one file's candidate fixes for `apexls fix`:
+/// `new_text` is the whole rewritten file, ready to write to disk, `Some`
+/// only when at least one fix actually applied. `conflicts` is every fix
+/// skipped because of a genuine crossing overlap (see
+/// `fix::resolve_fix_conflicts`'s own doc comment) -- worth reporting so a
+/// human can look. A subsumed fix (dropped because another fix's range
+/// fully contains it) appears in neither list: its target text is erased
+/// by the containing fix regardless, so there's nothing to report.
+pub struct CliFixResolution {
+    pub applied: Vec<CliFix>,
+    pub conflicts: Vec<CliFix>,
+    pub new_text: Option<String>,
+}
+
+/// `apexls fix`'s own CLI-facing entry point: the same protocol-agnostic
+/// candidate-fix production and conflict resolution
+/// `capabilities::dead_code_actions` is built on, applied to the whole
+/// file rather than filtered down to one LSP-requested range. The CLI
+/// analogue of [`diagnostics_for_file`].
+pub fn resolve_fixes_for_file(program: &BoundProgram, file: apex_binder::FileId) -> CliFixResolution {
+    let text = program.source_text(file);
+    let index = line_index::LineIndex::new(text);
+    let to_cli = |f: &fix::CandidateFix| {
+        let (line, col) = index.line_col(text, f.range.start().into());
+        CliFix {
+            line,
+            col,
+            description: f.description.clone(),
+        }
+    };
+
+    let resolution = fix::resolve_fix_conflicts(fix::candidate_fixes_for_file(program, file));
+    let applied: Vec<CliFix> = resolution.applied.iter().map(to_cli).collect();
+    let conflicts: Vec<CliFix> = resolution.conflicts.iter().map(to_cli).collect();
+    let new_text = if resolution.applied.is_empty() {
+        None
+    } else {
+        Some(fix::apply_fixes(text, resolution.applied))
+    };
+    CliFixResolution {
+        applied,
+        conflicts,
+        new_text,
+    }
 }
 
 /// Runs the LSP server to completion over stdio -- the whole behavior of

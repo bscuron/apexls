@@ -1,13 +1,15 @@
 //! `apexls`: the single binary bundling every non-editor-invoked apexls
 //! entry point -- `ast` (parse-and-dump a file), `check` (batch
-//! diagnostics report), and `server` (the LSP server, also reachable as
-//! its own `apexls-server` binary -- kept separate so existing editor
-//! configs that invoke `apexls-server` directly by name, over stdio,
-//! need zero changes; see `apexls_server::run_server`'s own doc
-//! comment).
+//! diagnostics report), `fix` (batch-apply fixable diagnostics), and
+//! `server` (the LSP server, also reachable as its own `apexls-server`
+//! binary -- kept separate so existing editor configs that invoke
+//! `apexls-server` directly by name, over stdio, need zero changes; see
+//! `apexls_server::run_server`'s own doc comment).
 
 mod ast;
 mod check;
+mod fix;
+mod project;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -35,6 +37,8 @@ enum Command {
     Ast { file: PathBuf },
     /// Report every diagnostic across the project, cargo-check-style.
     Check { paths: Vec<PathBuf> },
+    /// Batch-apply every fixable diagnostic across the project, cargo-fix-style.
+    Fix { paths: Vec<PathBuf> },
 }
 
 fn main() -> ExitCode {
@@ -49,5 +53,6 @@ fn main() -> ExitCode {
         }
         Command::Ast { file } => ast::run(&file),
         Command::Check { paths } => check::run(&paths),
+        Command::Fix { paths } => fix::run(&paths),
     }
 }

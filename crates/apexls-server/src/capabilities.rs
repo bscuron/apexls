@@ -2490,11 +2490,13 @@ fn ranges_overlap(a: Range, b: Range) -> bool {
 }
 
 /// `textDocument/codeAction`: a "Remove unused ..." quick-fix for every
-/// dead symbol (`dead_symbols_in_file`) whose own name overlaps the
-/// requested `range`. Deliberately re-derives dead symbols from
-/// `program` rather than trusting `params.context.diagnostics` echoed
-/// back by the client -- self-contained, and works even if the client
-/// never displayed/requested `dead_code_diagnostics` first. Computes the
+/// candidate fix (`crate::fix::candidate_fixes_for_file`) whose own range
+/// overlaps the requested `range` -- the same protocol-agnostic candidate
+/// list `apexls fix` batch-applies, filtered down to one interactively-
+/// requested spot. Deliberately re-derives candidates from `program`
+/// rather than trusting `params.context.diagnostics` echoed back by the
+/// client -- self-contained, and works even if the client never
+/// displayed/requested `dead_code_diagnostics` first. Computes the
 /// `WorkspaceEdit` eagerly rather than deferring to `codeAction/resolve`
 /// (unimplemented): cheap, one symbol, `program` already loaded in
 /// memory -- the same eager-computation choice `rename_edits` already
@@ -2510,33 +2512,29 @@ pub(crate) fn dead_code_actions(
     };
     let text = program.source_text(file);
     let index = LineIndex::new(&text);
-    apex_binder::dead_symbols_in_file(program, file)
+    crate::fix::candidate_fixes_for_file(program, file)
         .into_iter()
-        .filter(|dead| {
-            let name_range = Range {
-                start: index.to_position(&text, dead.name_range.start().into(), encoding),
-                end: index.to_position(&text, dead.name_range.end().into(), encoding),
+        .filter_map(|candidate| {
+            let trigger_range = Range {
+                start: index.to_position(&text, candidate.trigger_range.start().into(), encoding),
+                end: index.to_position(&text, candidate.trigger_range.end().into(), encoding),
             };
-            ranges_overlap(name_range, range)
+            let edit_range = Range {
+                start: index.to_position(&text, candidate.range.start().into(), encoding),
+                end: index.to_position(&text, candidate.range.end().into(), encoding),
+            };
+            ranges_overlap(trigger_range, range).then_some((candidate, edit_range))
         })
-        .map(|dead| {
-            let deletion_range = Range {
-                start: index.to_position(&text, dead.deletion_range.start().into(), encoding),
-                end: index.to_position(&text, dead.deletion_range.end().into(), encoding),
-            };
+        .map(|(candidate, edit_range)| {
             CodeActionOrCommand::CodeAction(CodeAction {
-                title: format!(
-                    "Remove unused {} '{}'",
-                    apex_binder::kind_label(dead.kind, dead.visibility),
-                    dead.name
-                ),
+                title: candidate.description,
                 kind: Some(CodeActionKind::QUICKFIX),
                 edit: Some(WorkspaceEdit {
                     changes: Some(HashMap::from([(
                         uri.clone(),
                         vec![TextEdit {
-                            range: deletion_range,
-                            new_text: String::new(),
+                            range: edit_range,
+                            new_text: candidate.new_text,
                         }],
                     )])),
                     ..Default::default()
