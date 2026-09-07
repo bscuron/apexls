@@ -2086,19 +2086,37 @@ impl<'a> BodyBinder<'a> {
                         let name = SmolStr::new(ty.syntax().text().to_string().trim());
                         match self.table.resolve_dotted_name(&name) {
                             Some(id) => self.refs.set(ptr, Resolution::Resolved(id)),
-                            None => match self.stdlib.class(&name) {
-                                Some(class) => self.refs.set(
-                                    ptr,
-                                    Resolution::StdlibMember(Box::new(stdlib_member_ref(
-                                        class.namespace.clone(),
-                                        &class.name,
-                                        None,
-                                        None,
-                                        None,
-                                    ))),
-                                ),
-                                None => self.refs.set(ptr, Resolution::Unresolved),
-                            },
+                            None => {
+                                // Mirrors `resolve_type_ref_base`'s own
+                                // two-step stdlib fallback
+                                // (resolve.rs:1159-1173/1195): a namespace-
+                                // qualified name (`System.Exception`, legal
+                                // Apex, same shape as `System.String s;`)
+                                // must go through `class_in_namespace`, not
+                                // `class` -- `StdlibIndex::classes` is
+                                // keyed by bare class name only, so
+                                // `class(&name)` alone never matches a
+                                // two-segment dotted string.
+                                let stdlib_class = match name.split_once('.') {
+                                    Some((namespace, class_name)) if !class_name.contains('.') => {
+                                        self.stdlib.class_in_namespace(namespace, class_name)
+                                    }
+                                    _ => self.stdlib.class(&name),
+                                };
+                                match stdlib_class {
+                                    Some(class) => self.refs.set(
+                                        ptr,
+                                        Resolution::StdlibMember(Box::new(stdlib_member_ref(
+                                            class.namespace.clone(),
+                                            &class.name,
+                                            None,
+                                            None,
+                                            None,
+                                        ))),
+                                    ),
+                                    None => self.refs.set(ptr, Resolution::Unresolved),
+                                }
+                            }
                         }
                         name
                     });

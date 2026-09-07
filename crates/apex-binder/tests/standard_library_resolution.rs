@@ -850,3 +850,52 @@ fn a_bare_stdlib_exception_type_in_a_catch_clause_resolves() {
          stdlib Exception class, not stay Unresolved"
     );
 }
+
+/// The same fallback, but namespace-qualified (`catch (System.Exception e)`,
+/// as legal as `System.String s;`). A bare `stdlib.class(&name)` lookup
+/// alone can't handle this: `name` here is the whole two-segment string
+/// `"System.Exception"`, which is never a key in `StdlibIndex`'s by-bare-
+/// name map -- the fallback needs the same `class_in_namespace` step
+/// `resolve_type_ref_base` already tries first for this identical shape.
+#[test]
+fn a_namespace_qualified_stdlib_exception_type_in_a_catch_clause_resolves() {
+    let dir = write_fixture_dir(
+        "catch-clause-namespaced-stdlib-exception-type",
+        &[(
+            "Foo.cls",
+            "public class Foo { \
+             public void run() { \
+                 try { \
+                     doSomething(); \
+                 } catch (System.Exception e) { \
+                     System.debug(e); \
+                 } \
+             } \
+             private void doSomething() {} \
+         }",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let file = program.files().next().expect("one file");
+    let root = program.syntax(file);
+    let exception_type_node = root
+        .descendants()
+        .find_map(QualifiedName::cast)
+        .expect("the catch clause's exception type should be a QualifiedName node");
+    let ptr = apex_binder::SyntaxPtr::new(file, exception_type_node.syntax());
+
+    assert_eq!(
+        program.resolution(ptr).cloned(),
+        Some(Resolution::StdlibMember(Box::new(StdlibMemberRef {
+            namespace: Some("System".into()),
+            class_name: "Exception".into(),
+            member: None,
+            arg_count: None,
+            narrowed_param_types: None,
+        }))),
+        "catch (System.Exception e)'s own exception-type reference should resolve via the \
+         class_in_namespace fallback, not stay Unresolved"
+    );
+}
