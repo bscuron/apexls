@@ -148,12 +148,10 @@ is the nearest unclosed bracket". The old rule read the trailing hole in
 `{ ... [SELECT ...] ... }` as expression position, because the character before it is `]`.
 Guarded by `finds_a_bare_expression_anywhere_inside_a_loop` and
 `an_unterminated_segment_is_repaired_but_nonsense_is_still_rejected`.
-- **`... P ... Q ... ` is refused deeply.** Descent only runs when everything after the fixed
-  element is an ellipsis, because a descendant match leaves nowhere well-defined to look for Q.
-  The shape returns nothing rather than something wrong. This is a larger limit than first
-  recorded (which named only *adjacent* fixed statements) and it blocks corpus item 8
-  (`Test.startTest()` with no matching `Test.stopTest()`). Guarded by
-  `two_fixed_elements_around_an_ellipsis_do_not_match_deeply`.
+- **Two fixed elements with no ellipsis between them** ask to be *consecutive*, which is
+  meaningless once they may sit at different depths, so that shape stays shallow. Likewise a
+  pattern missing its leading or trailing `...` has anchored that end to the block's first or
+  last statement, which a match buried at depth is not. Both stay shallow rather than guessing.
 - **An assignment pattern does not match a declaration.** `$X = [SELECT ...]` misses
   `List<Contact> cs = [SELECT ...]`. This is the isomorphism gap the map already tracks.
 - **`for (...)` matches for-each loops only**, since the C-style header is a different tree
@@ -169,7 +167,23 @@ whole `try` is what lets a match report its own position and isolate one clause 
 multi-`catch`. The consequence is stated in the entry point's own doc comment: a pattern can now
 be written that the Apex compiler would refuse.
 
-**11. Matching is case-insensitive, because Apex is.** Found by the user against the real
+**11. `... P ... Q ...` matches in document order.** Deep matching now flattens the block's
+whole subtree into one document-ordered list and walks the pattern's fixed elements across it
+with a forward-only cursor, so the shape means "P somewhere, then Q somewhere after it" however
+deeply either is nested. Matching each fixed element independently was what made this
+unanswerable before: a descendant match left no defined place to resume the search for Q.
+
+On NPSP, `{ ... Test.startTest(); ... Test.stopTest(); ... }` finds 1,613 blocks and the same
+two reversed finds **0** -- order is genuinely enforced, and `stopTest` never precedes
+`startTest`, which is the best available check that the cursor is real. Guarded by
+`two_fixed_elements_around_an_ellipsis_match_in_document_order`.
+
+Note this does **not** deliver corpus item 8 (`Test.startTest()` with *no* matching
+`Test.stopTest()`): that is a negative query and there is no negation in the language. What it
+delivers is the positive ordering shape item 8 is built from, which is also acquire/release and
+open/close.
+
+**12. Matching is case-insensitive, because Apex is.** Found by the user against the real
 corpus: `Database.query(...)` returned 260 hits and `database.query(...)` returned 64, two
 halves of one set. Both now return 327. String literal contents stay case-sensitive, since case
 there is a difference in value rather than in spelling; capture unification is case-insensitive,

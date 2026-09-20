@@ -167,9 +167,11 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
   positions from the new shared `apex_syntax::significant_range`, with `soql` switched onto it.
   **Search is built and shipped** as `apexls query` -- the whole NPSP corpus in ~0.6s, binding
   nothing. A compiled `Pattern` holds a `GreenNode`, not a red `SyntaxNode`, which is a
-  thread-local cursor and cannot cross rayon workers. Deep descent runs only when the fixed
-  element is followed by an ellipsis, so `{ ... P }` keeps its promise that P is last and
-  `{ ... P ... Q ... }` is refused rather than answered wrongly. A block segment may be written
+  thread-local cursor and cannot cross rayon workers. Deep matching runs over the block's
+  subtree flattened into document order with a forward-only cursor, so `{ ... P ... Q ... }`
+  means "P somewhere, then Q somewhere after it" and the reverse order is a different query; it
+  is offered only for a pattern unanchored at both ends, so `{ ... P }` keeps its promise that
+  P is last. A block segment may be written
   as a bare expression (`{ ... [SELECT ...] ... }`): the omitted `;` is supplied and the
   statement wrapper unwrapped when searching, so the flagship query works. Matching is
   case-insensitive, as Apex is, with string literal contents excepted. **The whole binding
@@ -179,12 +181,11 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
 
 ## Not yet specified
 
-- **Matching `... P ... Q ...` deeply.** Descent runs only when everything after the fixed
-  element is an ellipsis, because a descendant match leaves nowhere well-defined to look for Q;
-  the shape currently returns nothing rather than something wrong. This blocks corpus item 8
-  (`Test.startTest()` with no matching `Test.stopTest()`) and is the largest remaining gap in
-  the language. Lifting it means tracking a document-order cursor through the descendant search
-  rather than treating each fixed element independently.
+- **Negation.** Corpus item 8 (`Test.startTest()` with *no* matching `Test.stopTest()`) is a
+  negative query, and there is no way to say "not" in the language. The positive ordering shape
+  it is built from now works, but item 8 itself needs a `not`-style operator -- every tool in
+  the survey has one (`pattern-not`, `not:`, `!`), and it is the last piece of the binding
+  corpus that nothing else can reach.
 
 - **The escape hatch for what pattern literals cannot express.** Every tool in the survey ships
   one (ast-grep's `kind:`, Semgrep's `pattern-regex` generic mode, JetBrains SSR's Groovy

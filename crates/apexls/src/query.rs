@@ -34,15 +34,20 @@
 //! found wherever it actually sits -- inside a declaration, an argument, a
 //! `return`, not only as a statement of its own.
 //!
-//! **Two limits on deep matching**, both deliberate. Descent happens only
-//! when the fixed element is followed by an ellipsis, because a descendant
-//! match says nothing about what comes after it at the outer level: so
-//! `{ ... P ... }` finds P at any depth, while `{ ... P }` keeps its
-//! promise that P is the block's *last* statement and stays shallow. And
-//! for the same reason `{ ... P ... Q ... }` is refused deeply rather than
-//! answered wrongly -- matching P against a descendant leaves nowhere
-//! well-defined to look for Q. Both shapes return nothing instead of
-//! something false.
+//! Deep matching runs over the block's whole subtree flattened into
+//! document order, so `{ ... P ... Q ... }` means "P somewhere, then Q
+//! somewhere after it" however deeply either is nested -- the shape behind
+//! every ordering query. Order is enforced by a forward-only cursor, so the
+//! same two elements reversed is a different query.
+//!
+//! It is offered only for a pattern unanchored at both ends that separates
+//! every fixed element with an ellipsis (`[..., P, ..., Q, ...]`).
+//! Everything else is asking for something a descendant search cannot
+//! honestly answer, so it stays shallow rather than guessing: a missing
+//! leading or trailing `...` anchors that end to the block's first or last
+//! *statement*, which a match buried at depth is not, and two fixed
+//! elements with no `...` between them ask to be *consecutive*, which is
+//! meaningless once they may sit at different depths.
 //!
 //! Like `soql`, this binds nothing -- it discovers, parses and walks,
 //! skipping the whole `BoundProgram` cost. Matching is purely structural:
@@ -398,7 +403,12 @@ fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
     } else {
         (significant_children(pat), significant_children(src))
     };
-    match_seq(&pat_items, &src_items, deep, binds)
+    // Shallow first: it is cheaper, and it is the only reading that can
+    // honour a pattern anchored to the block's first or last statement.
+    if match_seq(&pat_items, &src_items, binds) {
+        return true;
+    }
+    deep && match_block_deep(&pat_items, &src_items, binds)
 }
 
 fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) -> bool {
@@ -460,21 +470,16 @@ fn token_text_eq(kind: SyntaxKind, pat: &str, src: &str) -> bool {
     }
 }
 
-/// Match a pattern element sequence against a source one.
+/// Match a pattern element sequence against a source one, at one level.
 ///
 /// Without any ellipsis this is an exact, element-for-element comparison,
-/// which is what makes `{ P }` mean "a block whose only statement is P".
+/// which is what makes `{ P }` mean "a block whose only statement is P". An
+/// ellipsis consumes zero or more elements, with backtracking over where it
+/// stops.
 ///
-/// An ellipsis consumes zero or more elements, with backtracking over where
-/// it stops. When `deep`, the element following an ellipsis may also match
-/// a *descendant* of the remaining elements rather than one of them
-/// directly -- this is what makes `{ ... P ... }` mean "contains P at any
-/// depth". A fixed element matched against a descendant does not constrain
-/// what follows it to that descendant's siblings, so a run of several fixed
-/// statements between two ellipses is matched shallowly; v1 accepts that,
-/// since every pattern the corpus needs has a single fixed element between
-/// its ellipses.
-fn match_seq(pat: &[SyntaxElement], src: &[SyntaxElement], deep: bool, binds: &mut Binds) -> bool {
+/// Strictly shallow: everything here compares siblings. Crossing block
+/// boundaries is [`match_block_deep`]'s job, tried afterwards.
+fn match_seq(pat: &[SyntaxElement], src: &[SyntaxElement], binds: &mut Binds) -> bool {
     let Some(head) = pat.first() else {
         return src.is_empty();
     };
@@ -486,51 +491,9 @@ fn match_seq(pat: &[SyntaxElement], src: &[SyntaxElement], deep: bool, binds: &m
         }
         for split in 0..=src.len() {
             let mut attempt = binds.clone();
-            if match_seq(rest, &src[split..], deep, &mut attempt) {
+            if match_seq(rest, &src[split..], &mut attempt) {
                 *binds = attempt;
                 return true;
-            }
-        }
-        // Descend only when everything after the fixed element is itself an
-        // ellipsis, i.e. the pattern is `... P ...`. A descendant match says
-        // nothing about what follows it at the outer level, so allowing it
-        // under any other tail would quietly drop that tail: before this
-        // guard, `{ ... P }` matched a block with P buried in the middle and
-        // two statements after it, destroying the "trailing `...` is
-        // load-bearing" rule the map relies on. `... P ... Q ...` is refused
-        // rather than answered wrongly -- see this module's doc comment.
-        // An *empty* tail is not good enough: `{ ... P }` anchors P as the
-        // block's last statement, and a descendant match cannot honour that.
-        // The tail must actually contain an ellipsis.
-        let tail = &rest[1..];
-        let tail_is_all_ellipses =
-            !tail.is_empty() && tail.iter().all(|e| hole_of(e) == Some(Hole::Ellipsis));
-        if deep && tail_is_all_ellipses {
-            for element in src {
-                let NodeOrToken::Node(node) = element else {
-                    continue;
-                };
-                // Try the segment as written, and -- if the user wrote a
-                // bare *expression* where the block grammar demanded a
-                // statement -- as that expression too. `{ ... [SELECT ...] ... }`
-                // means "a block containing this query somewhere", and the
-                // query turns up inside a declaration or an argument, not as
-                // a statement of its own. The `ExprStmt` wrapper is an
-                // artifact of statement position, so unwrapping it matches
-                // what was meant. Harmless for a segment that really is a
-                // statement: `System.debug(...);` then also matches via its
-                // own call expression, at the same site.
-                let unwrapped = expression_inside(&rest[0]);
-                for descendant in node.descendants().skip(1) {
-                    let candidate = NodeOrToken::Node(descendant.clone());
-                    for probe in [Some(&rest[0]), unwrapped.as_ref()].into_iter().flatten() {
-                        let mut attempt = binds.clone();
-                        if match_element(probe, &candidate, &mut attempt) {
-                            *binds = attempt;
-                            return true;
-                        }
-                    }
-                }
             }
         }
         return false;
@@ -539,7 +502,96 @@ fn match_seq(pat: &[SyntaxElement], src: &[SyntaxElement], deep: bool, binds: &m
     let Some(first) = src.first() else {
         return false;
     };
-    match_element(head, first, binds) && match_seq(&pat[1..], &src[1..], deep, binds)
+    match_element(head, first, binds) && match_seq(&pat[1..], &src[1..], binds)
+}
+
+/// The fixed elements of a block pattern shaped `... P ... Q ... `, in
+/// order -- or `None` if the pattern is not that shape.
+///
+/// Deep matching is only offered for a pattern that is unanchored at both
+/// ends and separates every fixed element with an ellipsis, i.e. the
+/// element list alternates `[..., P, ..., Q, ...]`. Everything else is
+/// asking for something a descendant search cannot honestly answer:
+///
+/// - No leading or trailing ellipsis means the user anchored that end to
+///   the block's first or last *statement*, and a match buried at depth is
+///   not that. `{ ... P }` must stay shallow or it stops meaning "P is
+///   last".
+/// - Two fixed elements with no ellipsis between them ask to be
+///   *consecutive*, and consecutiveness is meaningless once the two may sit
+///   at different depths.
+fn deep_plan(pat: &[SyntaxElement]) -> Option<Vec<SyntaxElement>> {
+    // An alternating `[..., P, ..., Q, ...]` list is always odd-length and
+    // at least three long.
+    if pat.len() < 3 || pat.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut fixed = Vec::with_capacity(pat.len() / 2);
+    for (i, element) in pat.iter().enumerate() {
+        let is_ellipsis = hole_of(element) == Some(Hole::Ellipsis);
+        if i % 2 == 0 {
+            if !is_ellipsis {
+                return None;
+            }
+        } else {
+            if is_ellipsis {
+                return None;
+            }
+            fixed.push(element.clone());
+        }
+    }
+    Some(fixed)
+}
+
+/// Match a block pattern against the block's whole subtree rather than its
+/// immediate children -- what makes `...` inside a block *deep*.
+///
+/// The block's descendants are flattened into one document-ordered list and
+/// the pattern's fixed elements are matched across it with a forward-only
+/// cursor, so `{ ... P ... Q ... }` means "P somewhere, then Q somewhere
+/// after it" however deeply either is nested. Matching each fixed element
+/// independently would not do: that is what made this shape unanswerable
+/// before, because a descendant match left no defined place to resume the
+/// search for Q.
+fn match_block_deep(pat: &[SyntaxElement], src: &[SyntaxElement], binds: &mut Binds) -> bool {
+    let Some(fixed) = deep_plan(pat) else {
+        return false;
+    };
+    let candidates: Vec<SyntaxElement> = src
+        .iter()
+        .filter_map(|e| e.as_node())
+        .flat_map(|n| n.descendants())
+        .map(NodeOrToken::Node)
+        .collect();
+    match_in_document_order(&fixed, &candidates, binds)
+}
+
+fn match_in_document_order(
+    fixed: &[SyntaxElement],
+    candidates: &[SyntaxElement],
+    binds: &mut Binds,
+) -> bool {
+    let Some(head) = fixed.first() else {
+        return true;
+    };
+    // Try the element as written, and -- if the user wrote a bare
+    // *expression* where the block grammar demanded a statement -- as that
+    // expression too. `{ ... [SELECT ...] ... }` means "a block containing
+    // this query somewhere", and the query turns up inside a declaration or
+    // an argument, not as a statement of its own.
+    let unwrapped = expression_inside(head);
+    for (i, candidate) in candidates.iter().enumerate() {
+        for probe in [Some(head), unwrapped.as_ref()].into_iter().flatten() {
+            let mut attempt = binds.clone();
+            if match_element(probe, candidate, &mut attempt)
+                && match_in_document_order(&fixed[1..], &candidates[i + 1..], &mut attempt)
+            {
+                *binds = attempt;
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The single expression an `ExprStmt` pattern element wraps, if that is
@@ -802,22 +854,47 @@ mod tests {
         );
     }
 
-    /// The known ceiling, recorded so it is a decision rather than a
-    /// surprise: two fixed elements separated by an ellipsis cannot be
-    /// matched deeply, because a descendant match says nothing about what
-    /// follows it at the outer level. Refused rather than answered wrongly.
+    /// `... P ... Q ...` -- "P somewhere, then Q somewhere after it" --
+    /// matched across the block's whole subtree in document order, however
+    /// deeply either sits. This is the shape behind every ordering query:
+    /// acquire/release, open/close, startTest/stopTest.
     #[test]
-    fn two_fixed_elements_around_an_ellipsis_do_not_match_deeply() {
-        let src = wrap(
+    fn two_fixed_elements_around_an_ellipsis_match_in_document_order() {
+        let nested = wrap(
             "        for (Account a : accounts) {\n            if (x) {\n                System.debug(a);\n                insert a;\n            }\n        }",
         );
-        assert!(
+        assert_eq!(
             hits(
                 "for (...) { ... System.debug(...); ... insert $X; ... }",
-                &src
+                &nested
+            )
+            .len(),
+            1,
+            "both nested two blocks deep, in order",
+        );
+
+        // Order is real, not incidental: the same two elements the other
+        // way round must not match.
+        assert!(
+            hits(
+                "for (...) { ... insert $X; ... System.debug(...); ... }",
+                &nested
             )
             .is_empty(),
-            "unsupported shape must find nothing rather than something wrong",
+            "Q before P is a different query and must not match",
+        );
+
+        // And they may sit at different depths from one another.
+        let straddling = wrap(
+            "        for (Account a : accounts) {\n            System.debug(a);\n            if (x) {\n                insert a;\n            }\n        }",
+        );
+        assert_eq!(
+            hits(
+                "for (...) { ... System.debug(...); ... insert $X; ... }",
+                &straddling
+            )
+            .len(),
+            1,
         );
     }
 
