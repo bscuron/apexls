@@ -218,6 +218,7 @@ dependencies = [
  "clap",
  "mimalloc",
  "rayon",
+ "regex",
  "tokio",
 ]
 

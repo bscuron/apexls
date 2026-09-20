@@ -74,6 +74,23 @@
 //! is still out of reach: a class holds members, not statements, so that
 //! needs a member-run hole.
 //!
+//! **Two escape hatches**, for the questions a pattern literal cannot ask.
+//! `kind:Name` matches any node of a syntax kind, and `regex:RE` any node
+//! whose significant text matches, anchored. Both cost the user something
+//! the literal form does not -- grammar node names, or a second language --
+//! which is why they are a fallback rather than the main road. They earn
+//! their place on questions with no literal form at all: a SOQL `WHERE`
+//! hole cannot be written, since a SOQL value must be a literal or a bind
+//! rather than an identifier, and a hardcoded Salesforce Id is a string of
+//! a particular length and alphabet that no tree shape distinguishes.
+//!
+//! **`--not` and `--containing`** filter a match by what it holds, which is
+//! how a question about *absence* gets asked at all. "Contains" includes
+//! the match itself, not only its descendants, so a negation can narrow a
+//! pattern rather than only exclude what is nested inside it:
+//! `kind:SoqlExpr --not kind:SoqlWhereClause --not kind:SoqlLimit` is
+//! "a query with neither clause", and all three name the same node.
+//!
 //! Like `soql`, this binds nothing -- it discovers, parses and walks,
 //! skipping the whole `BoundProgram` cost. Matching is purely structural:
 //! `System.debug(...)` matches that shape whether or not `System` resolves
@@ -125,18 +142,39 @@ enum Hole {
 /// it is one refcount bump. Each worker rebuilds its own cursors via
 /// [`Pattern::nodes`].
 #[derive(Debug, Clone)]
-struct Pattern {
-    /// Several trees, because one written pattern can denote more than one
-    /// shape. `for (...)` is the case that forces it: Apex's two loop forms
-    /// are different productions -- `ForEachStmt` for `for (T v : coll)`
-    /// and `ForStmt` for `for (init; cond; update)` -- so a pattern that
-    /// compiled to only one of them silently skipped every loop of the
-    /// other kind, which for a search tool is worse than failing outright.
-    /// A candidate matches if *any* of these does.
-    greens: Vec<apex_syntax::GreenNode>,
+enum Pattern {
+    /// The ordinary case: code with holes, compiled to the tree or trees it
+    /// denotes. Several, because one written pattern can mean more than one
+    /// shape -- `for (...)` covers both of Apex's loop productions, and a
+    /// pattern compiled to only one of them silently skipped every loop of
+    /// the other kind. A candidate matches if *any* tree does.
+    Trees(Vec<apex_syntax::GreenNode>),
+    /// `kind:Name` -- any node of that syntax kind.
+    ///
+    /// The escape hatch for shapes a pattern literal cannot spell, and the
+    /// price is exactly what the survey predicted: it costs the user
+    /// grammar node names, which is the thing pattern literals exist to
+    /// avoid. It earns its place because some questions have no literal
+    /// form at all -- "a query with no WHERE clause" needs to name the
+    /// clause, and a `WHERE` hole cannot be written, since a SOQL value
+    /// must be a literal or a bind rather than an identifier.
+    Kind(SyntaxKind),
+    /// `regex:RE` -- any node whose significant text matches, anchored at
+    /// both ends so a pattern cannot accidentally match a whole file.
+    ///
+    /// The other half of the escape hatch, for questions about *text* that
+    /// structure cannot answer: a hardcoded Salesforce Id is a string
+    /// literal of a particular length and alphabet, and no amount of tree
+    /// shape distinguishes it from any other string.
+    Regex(regex::Regex),
 }
 
-pub fn run(pattern_src: &str, paths: &[PathBuf]) -> ExitCode {
+pub fn run(
+    pattern_src: &str,
+    not_srcs: &[String],
+    containing_srcs: &[String],
+    paths: &[PathBuf],
+) -> ExitCode {
     let pattern = match Pattern::compile(pattern_src) {
         Ok(p) => p,
         Err(ArgError(message, code)) => {
@@ -144,10 +182,30 @@ pub fn run(pattern_src: &str, paths: &[PathBuf]) -> ExitCode {
             return ExitCode::from(code);
         }
     };
+    let mut excluded = Vec::with_capacity(not_srcs.len());
+    for src in not_srcs {
+        match Pattern::compile(src) {
+            Ok(p) => excluded.push(p),
+            Err(ArgError(message, code)) => {
+                eprintln!("{message}");
+                return ExitCode::from(code);
+            }
+        }
+    }
+    let mut required = Vec::with_capacity(containing_srcs.len());
+    for src in containing_srcs {
+        match Pattern::compile(src) {
+            Ok(p) => required.push(p),
+            Err(ArgError(message, code)) => {
+                eprintln!("{message}");
+                return ExitCode::from(code);
+            }
+        }
+    }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let matches = match walk_project(paths, &cwd, |path, src| {
-        matches_in_file(&pattern, path, src)
+        matches_in_file_filtered(&pattern, &excluded, &required, path, src)
     }) {
         Ok(matches) => matches,
         Err(ArgError(message, code)) => {
@@ -165,6 +223,29 @@ pub fn run(pattern_src: &str, paths: &[PathBuf]) -> ExitCode {
 
 impl Pattern {
     fn compile(pattern_src: &str) -> Result<Self, ArgError> {
+        if let Some(name) = pattern_src.strip_prefix("kind:") {
+            let name = name.trim();
+            return match SyntaxKind::from_name(name) {
+                Some(kind) => Ok(Pattern::Kind(kind)),
+                None => Err(ArgError(
+                    format!(
+                        "error: unknown syntax kind: {name}
+                         note: kinds are named as the grammar names them, e.g.                          SoqlWhereClause, MethodDecl, ForEachStmt
+                         note: `apexls ast <file>` prints the kinds of a real file"
+                    ),
+                    2,
+                )),
+            };
+        }
+        if let Some(re) = pattern_src.strip_prefix("regex:") {
+            // Anchored: an unanchored pattern would match the whole file as
+            // readily as the token meant, since every ancestor's text
+            // contains its descendants'.
+            return regex::Regex::new(&format!("^(?:{re})$"))
+                .map(Pattern::Regex)
+                .map_err(|e| ArgError(format!("error: invalid regex: {e}"), 2));
+        }
+
         // Whether a `{`-enclosed `...` means "a run of statements" or "an
         // expression sitting inside one" cannot be decided from the text:
         // `{ ... [SELECT ...] ... }` wants the first reading and
@@ -209,7 +290,7 @@ impl Pattern {
                 }
             }
             if !greens.is_empty() {
-                return Ok(Pattern { greens });
+                return Ok(Pattern::Trees(greens));
             }
         }
 
@@ -279,29 +360,38 @@ impl Pattern {
         None
     }
 
-    /// Fresh red-tree cursors over this pattern's shapes, built per worker.
-    fn nodes(&self) -> Vec<SyntaxNode> {
-        self.greens
-            .iter()
-            .map(|g| SyntaxNode::new_root(g.clone()))
-            .collect()
-    }
-
     /// Every match of this pattern in `root`, innermost and outermost both
     /// -- a nested match is a real match and hiding it would be worse than
     /// printing two lines.
     fn matches_in(&self, root: &SyntaxNode) -> Vec<SyntaxNode> {
-        let patterns = self.nodes();
-        root.descendants()
-            .filter(|candidate| {
-                patterns.iter().any(|pattern| {
-                    candidate.kind() == pattern.kind() && {
-                        let mut binds = HashMap::new();
-                        match_node(pattern, candidate, &mut binds)
-                    }
-                })
-            })
-            .collect()
+        match self {
+            // Fresh red-tree cursors per call, since a red node is a
+            // thread-local cursor and cannot be shared across workers.
+            Pattern::Trees(greens) => {
+                let patterns: Vec<SyntaxNode> = greens
+                    .iter()
+                    .map(|g| SyntaxNode::new_root(g.clone()))
+                    .collect();
+                root.descendants()
+                    .filter(|candidate| {
+                        patterns.iter().any(|pattern| {
+                            candidate.kind() == pattern.kind() && {
+                                let mut binds = HashMap::new();
+                                match_node(pattern, candidate, &mut binds)
+                            }
+                        })
+                    })
+                    .collect()
+            }
+            Pattern::Kind(kind) => root
+                .descendants()
+                .filter(|candidate| candidate.kind() == *kind)
+                .collect(),
+            Pattern::Regex(re) => root
+                .descendants()
+                .filter(|candidate| re.is_match(&significant_text(candidate)))
+                .collect(),
+        }
     }
 }
 
@@ -966,15 +1056,44 @@ fn significant_text(node: &SyntaxNode) -> String {
     })
 }
 
-fn matches_in_file(pattern: &Pattern, display_path: &Path, src: &str) -> Vec<Site> {
+/// Like [`matches_in_file`], but dropping any match that itself contains a
+/// match of one of `excluded`, and keeping only those containing a match of
+/// every one of `required`.
+///
+/// "Contains" includes the match node itself, not only its descendants,
+/// which is what lets a negation narrow a pattern rather than only exclude
+/// what is nested inside it: `[SELECT ... FROM $O]` minus
+/// `[SELECT ... FROM $O WHERE ...]` is "a query with no WHERE clause", and
+/// the two patterns describe the very same node.
+fn matches_in_file_filtered(
+    pattern: &Pattern,
+    excluded: &[Pattern],
+    required: &[Pattern],
+    display_path: &Path,
+    src: &str,
+) -> Vec<Site> {
     let parse = parse_apex_file(display_path, src);
     let index = LineIndex::new(src);
+    let root = parse.syntax();
 
     pattern
-        .matches_in(&parse.syntax())
+        .matches_in(&root)
         .into_iter()
+        .filter(|node| {
+            !excluded
+                .iter()
+                .any(|unwanted| !unwanted.matches_in(node).is_empty())
+                && required
+                    .iter()
+                    .all(|wanted| !wanted.matches_in(node).is_empty())
+        })
         .filter_map(|node| site_for(display_path, src, &index, &node))
         .collect()
+}
+
+#[cfg(test)]
+fn matches_in_file(pattern: &Pattern, display_path: &Path, src: &str) -> Vec<Site> {
+    matches_in_file_filtered(pattern, &[], &[], display_path, src)
 }
 
 #[cfg(test)]
@@ -1520,6 +1639,74 @@ mod tests {
             let p = Pattern::compile("public void $m(...) { ... }").expect("compiles");
             assert_eq!(matches_in_file(&p, Path::new("T.cls"), src).len(), 1);
         }
+    }
+
+    /// `kind:` names a syntax kind directly -- the escape hatch for shapes
+    /// a pattern literal cannot spell. A SOQL `WHERE` hole cannot be
+    /// written, because a SOQL value must be a literal or a bind rather
+    /// than an identifier, so naming the clause is the only way to ask
+    /// about it.
+    #[test]
+    fn kind_names_a_syntax_kind_directly() {
+        let src = wrap("        List<Account> a = [SELECT Id FROM Account WHERE Name = 'x'];");
+        assert_eq!(hits("kind:SoqlWhereClause", &src).len(), 1);
+        assert_eq!(
+            hits("kind:soqlwhereclause", &src).len(),
+            1,
+            "case-insensitive"
+        );
+        let err = Pattern::compile("kind:NoSuchKind").expect_err("unknown kind");
+        assert!(err.0.contains("unknown syntax kind"), "{}", err.0);
+    }
+
+    /// `regex:` asks about *text*, which structure cannot answer: a
+    /// hardcoded Salesforce Id is a string literal of a particular length
+    /// and alphabet, indistinguishable by shape from any other string.
+    /// Anchored, so a pattern cannot accidentally match a whole file.
+    #[test]
+    fn regex_matches_node_text_anchored() {
+        let src = wrap(
+            "        f('001000000000000AAA');
+        f('short');",
+        );
+        assert_eq!(hits("regex:'[a-zA-Z0-9]{18}'", &src).len(), 1);
+        assert!(
+            hits("regex:001", &src).is_empty(),
+            "anchored: a fragment must not match the whole literal",
+        );
+        assert!(Pattern::compile("regex:[unclosed").is_err());
+    }
+
+    /// `--not` and `--containing` filter a match by what it holds.
+    /// "Contains" includes the match itself, which is what lets a negation
+    /// narrow a pattern rather than only exclude what is nested inside it.
+    #[test]
+    fn not_and_containing_filter_by_what_a_match_holds() {
+        let src = wrap(
+            "        List<Account> a = [SELECT Id FROM Account WHERE Name = 'x'];
+        List<Contact> c = [SELECT Id FROM Contact];",
+        );
+        let filtered = |not: &[&str], containing: &[&str]| {
+            let p = Pattern::compile("kind:SoqlExpr").expect("compiles");
+            let not: Vec<_> = not.iter().map(|s| Pattern::compile(s).unwrap()).collect();
+            let req: Vec<_> = containing
+                .iter()
+                .map(|s| Pattern::compile(s).unwrap())
+                .collect();
+            matches_in_file_filtered(&p, &not, &req, Path::new("T.cls"), &src).len()
+        };
+        assert_eq!(filtered(&[], &[]), 2);
+        assert_eq!(
+            filtered(&["kind:SoqlWhereClause"], &[]),
+            1,
+            "the one without"
+        );
+        assert_eq!(filtered(&[], &["kind:SoqlWhereClause"]), 1, "the one with");
+        assert_eq!(
+            filtered(&["kind:SoqlExpr"], &[]),
+            0,
+            "a match contains itself"
+        );
     }
 
     #[test]

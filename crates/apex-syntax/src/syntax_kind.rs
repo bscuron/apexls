@@ -34,6 +34,27 @@ macro_rules! syntax_kind {
                     $(apex_lexer::TokenKind::$token => SyntaxKind::$token,)*
                 }
             }
+
+            /// Look a kind up by its own name, case-insensitively --
+            /// generated from the same lists, so it can never drift out of
+            /// step with the enum. Exists for tooling that lets a user name
+            /// a node kind directly (`apexls query 'kind:SoqlWhereClause'`),
+            /// which is the escape hatch for the shapes a pattern literal
+            /// cannot spell.
+            pub fn from_name(name: &str) -> Option<SyntaxKind> {
+                $(if name.eq_ignore_ascii_case(stringify!($token)) {
+                    return Some(SyntaxKind::$token);
+                })*
+                $(if name.eq_ignore_ascii_case(stringify!($node)) {
+                    return Some(SyntaxKind::$node);
+                })*
+                None
+            }
+
+            /// Every kind name, for error messages that suggest what was meant.
+            pub fn all_names() -> &'static [&'static str] {
+                &[$(stringify!($token),)* $(stringify!($node),)*]
+            }
         }
     };
 }

@@ -49,6 +49,14 @@ enum Command {
     /// position, `$NAME` matches one construct and captures it.
     Query {
         pattern: String,
+        /// Exclude any match that itself contains a match of this pattern.
+        /// Repeatable; a match is dropped if any of them hits.
+        #[arg(long = "not", value_name = "PATTERN")]
+        not: Vec<String>,
+        /// Keep only matches that themselves contain a match of this
+        /// pattern. Repeatable; every one of them must hit.
+        #[arg(long = "containing", value_name = "PATTERN")]
+        containing: Vec<String>,
         paths: Vec<PathBuf>,
     },
 }
@@ -67,6 +75,11 @@ fn main() -> ExitCode {
         Command::Check { paths } => check::run(&paths),
         Command::Fix { paths } => fix::run(&paths),
         Command::Soql { paths } => soql::run(&paths),
-        Command::Query { pattern, paths } => query::run(&pattern, &paths),
+        Command::Query {
+            pattern,
+            not,
+            containing,
+            paths,
+        } => query::run(&pattern, &not, &containing, &paths),
     }
 }
