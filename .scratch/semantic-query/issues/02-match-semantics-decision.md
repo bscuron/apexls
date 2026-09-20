@@ -183,7 +183,23 @@ Note this does **not** deliver corpus item 8 (`Test.startTest()` with *no* match
 delivers is the positive ordering shape item 8 is built from, which is also acquire/release and
 open/close.
 
-**12. Matching is case-insensitive, because Apex is.** Found by the user against the real
+**12. A `{`-enclosed `...` has two readings, and the parser picks.** Whether such a hole means
+"a run of statements" or "an expression sitting inside one" cannot be decided from the text:
+`{ ... [SELECT ...] ... }` needs the first and `{ ... String $v = ...; ... }` needs the second.
+Two successive lookback rules each fixed one case and broke the other -- previous-significant-
+character got the initializer right and the flagship wrong; nearest-enclosing-bracket got the
+flagship right and the initializer wrong, regressing `{ ... String $v = ...; ... }` to a compile
+error.
+
+Resolved by not guessing. The bracket rule remains the first attempt; if nothing parses, holes
+are flipped to the expression reading and retried, fewest flips first, until the parser accepts
+one. It is the same "try readings until one parses" move the entry-point loop already makes, and
+a pattern that compiles on the first attempt pays nothing. `{ ... String $v = ...; ... }` now
+finds 2,203 blocks on NPSP, and `...;` and `...` are interchangeable spellings. Guarded by
+`both_readings_of_a_brace_enclosed_hole_compile` and
+`a_hole_in_an_initializer_matches_any_initialiser`.
+
+**13. Matching is case-insensitive, because Apex is.** Found by the user against the real
 corpus: `Database.query(...)` returned 260 hits and `database.query(...)` returned 64, two
 halves of one set. Both now return 327. String literal contents stay case-sensitive, since case
 there is a difference in value rather than in spelling; capture unification is case-insensitive,

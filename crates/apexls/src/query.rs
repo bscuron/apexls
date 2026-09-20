@@ -127,7 +127,47 @@ pub fn run(pattern_src: &str, paths: &[PathBuf]) -> ExitCode {
 
 impl Pattern {
     fn compile(pattern_src: &str) -> Result<Self, ArgError> {
-        let substituted = substitute(pattern_src);
+        // Whether a `{`-enclosed `...` means "a run of statements" or "an
+        // expression sitting inside one" cannot be decided from the text:
+        // `{ ... [SELECT ...] ... }` wants the first reading and
+        // `{ ... String $v = ...; ... }` the second, and no lookback rule
+        // gets both. So [`substitute`]'s guess is only the *first* attempt.
+        // If nothing parses, flip holes to the expression reading and try
+        // again -- fewest flips first, so the guess is overridden as little
+        // as possible -- and let the parser be the judge. This is the same
+        // "try readings until one parses" move the entry-point loop below
+        // already makes, and a pattern that compiles on the first attempt
+        // pays nothing for it.
+        let ambiguous = ambiguous_hole_offsets(pattern_src);
+        // 2^n readings, so cap the search. Ten holes is far past any real
+        // pattern and still only 1024 attempts over a few hundred bytes.
+        let n = ambiguous.len().min(10);
+        let mut readings: Vec<u32> = (0..(1u32 << n)).collect();
+        readings.sort_by_key(|mask| mask.count_ones());
+
+        for mask in readings {
+            let flipped: Vec<usize> = (0..n)
+                .filter(|bit| mask & (1 << bit) != 0)
+                .map(|bit| ambiguous[bit])
+                .collect();
+            if let Some(pattern) = Self::compile_reading(pattern_src, &flipped) {
+                return Ok(pattern);
+            }
+        }
+
+        Err(ArgError(
+            format!(
+                "error: could not parse pattern as Apex: {pattern_src}\n\
+                 note: a pattern must be one complete expression, statement or block\n\
+                 note: `...` cannot stand for an operator or a whole declaration"
+            ),
+            2,
+        ))
+    }
+
+    /// One reading of the pattern, tried against every entry point.
+    fn compile_reading(pattern_src: &str, as_expression: &[usize]) -> Option<Self> {
+        let substituted = substitute(pattern_src, as_expression);
 
         // gogrep's multi-entry-point design: try each in turn and take the
         // first that consumes the whole pattern. No user annotation is
@@ -164,20 +204,13 @@ impl Pattern {
             let root = parse.syntax();
             let significant = significant_children(&root);
             if let [NodeOrToken::Node(node)] = significant.as_slice() {
-                return Ok(Pattern {
+                return Some(Pattern {
                     green: node.green().to_owned(),
                 });
             }
         }
 
-        Err(ArgError(
-            format!(
-                "error: could not parse pattern as Apex: {pattern_src}\n\
-                 note: a pattern must be one complete expression, statement or block\n\
-                 note: `...` cannot stand for an operator or a whole declaration"
-            ),
-            2,
-        ))
+        None
     }
 
     /// A fresh red-tree cursor over this pattern, built per worker.
@@ -207,24 +240,35 @@ impl Pattern {
 /// with the grammar. Two rules, both decided from the raw text alone, since
 /// there is no tree yet to ask:
 ///
-/// - A hole whose nearest preceding non-whitespace character is `{`, `;` or
-///   `}` sits where a *statement* is expected, and a bare identifier is not
-///   a statement, so it takes a trailing `;`.
+/// - A hole enclosed by `{` sits where a *statement* is expected, and a
+///   bare identifier is not a statement, so it takes a trailing `;`.
 /// - `for (...)` and `catch (...)` want a multi-token construct rather than
 ///   one name -- a loop header and a `Type name` pair respectively.
 ///
 /// Everywhere else -- argument lists, operands, SOQL clauses -- a bare
 /// identifier is both correct and sufficient.
-fn substitute(pattern: &str) -> String {
+///
+/// The first rule is a guess, and it is wrong about as often as it is
+/// right, because the two readings are genuinely ambiguous from text alone.
+/// `{ ... [SELECT ...] ... }` needs the trailing hole read as a statement
+/// even though the character before it is `]`; `{ ... String $v = ...; ... }`
+/// needs the initializer hole read as an expression even though a `{`
+/// encloses it. No lookback rule gets both. So `as_expression` lets
+/// [`Pattern::compile`] override the guess per hole and retry -- see
+/// [`ambiguous_hole_offsets`].
+fn substitute(pattern: &str, as_expression: &[usize]) -> String {
     let mut out = String::with_capacity(pattern.len());
     let bytes = pattern.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i..].starts_with(b"...") {
-            if in_statement_position(pattern, i) {
+            let statement = in_statement_position(pattern, i) && !as_expression.contains(&i);
+            if statement {
                 terminate_pending_statement(&mut out);
+                out.push_str(&ellipsis_expansion(pattern, i));
+            } else {
+                out.push_str(&expression_expansion(pattern, i));
             }
-            out.push_str(&ellipsis_expansion(pattern, i));
             i += 3;
         } else if bytes[i] == b'}' && in_statement_position(pattern, i) {
             terminate_pending_statement(&mut out);
@@ -263,6 +307,25 @@ fn terminate_pending_statement(out: &mut String) {
     let last = out.chars().rev().find(|c| !c.is_whitespace());
     if last.is_some_and(|c| !matches!(c, '{' | ';' | '}')) {
         out.push(';');
+    }
+}
+
+/// Every `...` whose reading [`substitute`] had to guess at, by byte
+/// offset -- the holes enclosed by `{`, which could be either a run of
+/// statements or an expression sitting inside one.
+fn ambiguous_hole_offsets(pattern: &str) -> Vec<usize> {
+    let bytes = pattern.as_bytes();
+    (0..bytes.len())
+        .filter(|&i| bytes[i..].starts_with(b"...") && in_statement_position(pattern, i))
+        .collect()
+}
+
+/// The expansion for a hole read as an expression rather than a statement.
+fn expression_expansion(pattern: &str, at: usize) -> String {
+    match enclosing_paren_head(pattern, at) {
+        Some("for") => format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_V : {ELLIPSIS_IDENT}_C"),
+        Some("catch") => format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_N"),
+        _ => ELLIPSIS_IDENT.to_string(),
     }
 }
 
@@ -736,6 +799,42 @@ mod tests {
     fn an_unterminated_segment_is_repaired_but_nonsense_is_still_rejected() {
         assert!(Pattern::compile("{ ... [SELECT ... FROM $O] }").is_ok());
         assert!(Pattern::compile("$LEFT $OP $RIGHT").is_err());
+    }
+
+    /// A `{`-enclosed `...` is ambiguous: a run of statements, or an
+    /// expression sitting inside one. No lookback rule decides it, because
+    /// `{ ... [SELECT ...] ... }` wants the first reading and
+    /// `{ ... String $v = ...; ... }` the second. Both must compile, which
+    /// is what the reading retry in `compile` buys.
+    #[test]
+    fn both_readings_of_a_brace_enclosed_hole_compile() {
+        for pattern in [
+            "{ ... [SELECT ... FROM $O] ... }",
+            "{ ... String $v = ...; ... }",
+            "{ ...; String $v = ...; ...; }",
+            "{ ... return ...; ... }",
+            "{ ... $x = f(...); ... }",
+        ] {
+            assert!(
+                Pattern::compile(pattern).is_ok(),
+                "should compile: {pattern}"
+            );
+        }
+    }
+
+    /// The hole in an initializer is an expression, so it matches whatever
+    /// initialises the variable -- and the statement it sits in is still
+    /// found at any depth.
+    #[test]
+    fn a_hole_in_an_initializer_matches_any_initialiser() {
+        let src = wrap(
+            "        for (Account a : accounts) {\n            if (x) {\n                String s = a.Name + '!';\n            }\n        }",
+        );
+        assert_eq!(hits("{ ... String $v = ...; ... }", &src).len(), 3);
+        assert!(
+            hits("{ ... Integer $v = ...; ... }", &src).is_empty(),
+            "the declared type is still part of the shape",
+        );
     }
 
     #[test]
