@@ -119,7 +119,7 @@ errors:
 
 | Item | Status |
 |---|---|
-| 1 SOQL in a loop | **not expressible** -- see ceilings below |
+| 1 SOQL in a loop | works -- 0 hits on NPSP, which is the *correct* answer: 2,450 for-each loops, none containing SOQL. Verified against a controlled fixture instead |
 | 2 DML in a loop | works (4 hits, one nested four blocks deep) |
 | 3 `System.debug` | works (46 hits) |
 | 4 swallowing `catch` | only as `try { ... } catch (...) { ... }` (774 hits); a bare `catch` pattern still needs the parser entry point ticket 01 specified, which is **not implemented** |
@@ -129,11 +129,25 @@ errors:
 
 ### Ceilings this surfaced, recorded rather than patched
 
-- **A `...`-separated segment inside a block must be a statement.** `for (...) { ... [SELECT ... FROM $O] ... }`
-  does not compile, because a bare SOQL expression is not an Apex statement -- so corpus item 1,
-  the flagship query, cannot be written directly. The fix is to let each segment choose its own
-  parse entry point; deliberately not bolted on here. Guarded by
-  `an_expression_cannot_yet_stand_where_a_block_expects_a_statement`.
+**9. A block segment may be a bare expression** (added after the ceiling below was first
+recorded, because it blocked the flagship query). A user writing
+`for (...) { ... [SELECT ... FROM $O] ... }` means "a loop containing this query" and writes the
+query as it appears in code, with no terminator -- which is not a statement, so the block would
+not parse. Two small changes make it work, and together they *are* the "let each segment choose
+its own entry point" fix the map asked for:
+
+- The omitted `;` is supplied before a statement-position ellipsis or a closing `}`. This parser
+  accepts `[SELECT Id FROM Account];` as an `ExprStmt`, which is what makes the repair possible.
+- The resulting `ExprStmt` wrapper is unwrapped when searching descendants, so the query is found
+  where it really sits -- inside a declaration, an argument, a `return` -- not only as a
+  statement of its own. Harmless for a segment that genuinely is a statement, which then matches
+  by either route at the same site.
+
+Deciding statement position also moved from "what is the previous non-space character" to "what
+is the nearest unclosed bracket". The old rule read the trailing hole in
+`{ ... [SELECT ...] ... }` as expression position, because the character before it is `]`.
+Guarded by `finds_a_bare_expression_anywhere_inside_a_loop` and
+`an_unterminated_segment_is_repaired_but_nonsense_is_still_rejected`.
 - **`... P ... Q ... ` is refused deeply.** Descent only runs when everything after the fixed
   element is an ellipsis, because a descendant match leaves nowhere well-defined to look for Q.
   The shape returns nothing rather than something wrong. This is a larger limit than first

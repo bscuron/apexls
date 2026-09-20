@@ -169,19 +169,20 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
   nothing. A compiled `Pattern` holds a `GreenNode`, not a red `SyntaxNode`, which is a
   thread-local cursor and cannot cross rayon workers. Deep descent runs only when the fixed
   element is followed by an ellipsis, so `{ ... P }` keeps its promise that P is last and
-  `{ ... P ... Q ... }` is refused rather than answered wrongly. Of the binding corpus subset,
-  items 2, 3, 6 and the two replace targets are expressible today; item 4 only in its
-  `try`-anchored form; item 1 not at all.
+  `{ ... P ... Q ... }` is refused rather than answered wrongly. A block segment may be written
+  as a bare expression (`{ ... [SELECT ...] ... }`): the omitted `;` is supplied and the
+  statement wrapper unwrapped when searching, so the flagship query works. **The whole binding
+  corpus subset is expressible** -- items 1, 2, 3, 6, R1, R2 outright, item 4 in its
+  `try`-anchored form pending the `parse_catch_clause` entry point.
 
 ## Not yet specified
 
-- **Letting each `...`-separated segment choose its own parse entry point.** Surfaced by running
-  the corpus against built search, which is exactly what the escape-hatch fog item predicted
-  would happen. Everything between two `...` inside a block must currently be a *statement*, so
-  `for (...) { ... [SELECT ... FROM $O] ... }` does not compile and **corpus item 1, the flagship
-  query, cannot be written directly** -- the user must fall back to `$X = [SELECT ...]`, which
-  then misses the declaration form. This is now the most valuable single improvement to the
-  language, and it is a pattern-compilation change rather than a matcher change.
+- **Matching `... P ... Q ...` deeply.** Descent runs only when everything after the fixed
+  element is an ellipsis, because a descendant match leaves nowhere well-defined to look for Q;
+  the shape currently returns nothing rather than something wrong. This blocks corpus item 8
+  (`Test.startTest()` with no matching `Test.stopTest()`) and is the largest remaining gap in
+  the language. Lifting it means tracking a document-order cursor through the descendant search
+  rather than treating each fixed element independently.
 
 - **The escape hatch for what pattern literals cannot express.** Every tool in the survey ships
   one (ast-grep's `kind:`, Semgrep's `pattern-regex` generic mode, JetBrains SSR's Groovy

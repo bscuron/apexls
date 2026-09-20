@@ -26,6 +26,14 @@
 //! written without any `...` is exact: `{ P }` matches only a block whose
 //! single statement is P.
 //!
+//! A block segment may be written as a bare *expression* even though a
+//! block grammatically holds statements: `for (...) { ... [SELECT ... FROM $O] ... }`
+//! is the flagship query and is exactly how a user thinks of it. The
+//! missing `;` is supplied so the pattern parses, and the resulting
+//! statement wrapper is unwrapped again when searching, so the query is
+//! found wherever it actually sits -- inside a declaration, an argument, a
+//! `return`, not only as a statement of its own.
+//!
 //! **Two limits on deep matching**, both deliberate. Descent happens only
 //! when the fixed element is followed by an ellipsis, because a descendant
 //! match says nothing about what comes after it at the outer level: so
@@ -203,8 +211,15 @@ fn substitute(pattern: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i..].starts_with(b"...") {
+            if in_statement_position(pattern, i) {
+                terminate_pending_statement(&mut out);
+            }
             out.push_str(&ellipsis_expansion(pattern, i));
             i += 3;
+        } else if bytes[i] == b'}' && in_statement_position(pattern, i) {
+            terminate_pending_statement(&mut out);
+            out.push('}');
+            i += 1;
         } else if bytes[i] == b'$' {
             let start = i + 1;
             let mut end = start;
@@ -222,6 +237,23 @@ fn substitute(pattern: &str) -> String {
         }
     }
     out
+}
+
+/// Close off a statement the user left unterminated.
+///
+/// A block pattern is a sequence of statements, and Apex statements end in
+/// `;` or `}`. But a user writing `{ ... [SELECT ... FROM $O] ... }` means
+/// "a block containing this query", and naturally writes the query without
+/// a terminator -- so the text handed to the parser is not a valid block
+/// and the whole pattern fails to compile. Appending the `;` they omitted
+/// costs nothing and is what they meant. (This parser accepts
+/// `[SELECT Id FROM Account];` as an `ExprStmt`, which is what makes the
+/// repair possible at all.)
+fn terminate_pending_statement(out: &mut String) {
+    let last = out.chars().rev().find(|c| !c.is_whitespace());
+    if last.is_some_and(|c| !matches!(c, '{' | ';' | '}')) {
+        out.push(';');
+    }
 }
 
 fn ellipsis_expansion(pattern: &str, at: usize) -> String {
@@ -265,12 +297,35 @@ fn enclosing_paren_head(pattern: &str, at: usize) -> Option<&str> {
     Some(&head[start..])
 }
 
+/// Is the hole at `at` sitting where a *statement* is expected?
+///
+/// Decided by the nearest enclosing unclosed bracket: inside `{` a block
+/// wants statements, inside `(` or `[` an argument list or SOQL clause
+/// wants an expression. This replaced an earlier "what is the previous
+/// non-space character" rule, which got `{ ... [SELECT ...] ... }` wrong --
+/// the trailing hole's previous character is `]`, so it was read as
+/// expression position and emitted without the `;` a statement needs.
+/// Asking what encloses the hole is both simpler and right, and it still
+/// needs nothing but the raw text.
 fn in_statement_position(pattern: &str, at: usize) -> bool {
-    pattern[..at]
-        .chars()
-        .rev()
-        .find(|c| !c.is_whitespace())
-        .is_some_and(|c| matches!(c, '{' | ';' | '}'))
+    enclosing_open_bracket(pattern, at) == Some('{')
+}
+
+/// The nearest bracket opened before `at` and not yet closed.
+fn enclosing_open_bracket(pattern: &str, at: usize) -> Option<char> {
+    let mut depth = 0i32;
+    pattern[..at].chars().rev().find(|&c| match c {
+        ')' | ']' | '}' => {
+            depth += 1;
+            false
+        }
+        '(' | '[' | '{' if depth == 0 => true,
+        '(' | '[' | '{' => {
+            depth -= 1;
+            false
+        }
+        _ => false,
+    })
 }
 
 /// The hole a pattern element denotes, if the element is nothing but a
@@ -423,12 +478,25 @@ fn match_seq(pat: &[SyntaxElement], src: &[SyntaxElement], deep: bool, binds: &m
                 let NodeOrToken::Node(node) = element else {
                     continue;
                 };
+                // Try the segment as written, and -- if the user wrote a
+                // bare *expression* where the block grammar demanded a
+                // statement -- as that expression too. `{ ... [SELECT ...] ... }`
+                // means "a block containing this query somewhere", and the
+                // query turns up inside a declaration or an argument, not as
+                // a statement of its own. The `ExprStmt` wrapper is an
+                // artifact of statement position, so unwrapping it matches
+                // what was meant. Harmless for a segment that really is a
+                // statement: `System.debug(...);` then also matches via its
+                // own call expression, at the same site.
+                let unwrapped = expression_inside(&rest[0]);
                 for descendant in node.descendants().skip(1) {
-                    let mut attempt = binds.clone();
                     let candidate = NodeOrToken::Node(descendant.clone());
-                    if match_element(&rest[0], &candidate, &mut attempt) {
-                        *binds = attempt;
-                        return true;
+                    for probe in [Some(&rest[0]), unwrapped.as_ref()].into_iter().flatten() {
+                        let mut attempt = binds.clone();
+                        if match_element(probe, &candidate, &mut attempt) {
+                            *binds = attempt;
+                            return true;
+                        }
                     }
                 }
             }
@@ -440,6 +508,27 @@ fn match_seq(pat: &[SyntaxElement], src: &[SyntaxElement], deep: bool, binds: &m
         return false;
     };
     match_element(head, first, binds) && match_seq(&pat[1..], &src[1..], deep, binds)
+}
+
+/// The single expression an `ExprStmt` pattern element wraps, if that is
+/// all it is. `None` for any other element, including an `ExprStmt` that
+/// holds more than one significant child.
+fn expression_inside(element: &SyntaxElement) -> Option<SyntaxElement> {
+    let NodeOrToken::Node(node) = element else {
+        return None;
+    };
+    if node.kind() != SyntaxKind::ExprStmt {
+        return None;
+    }
+    match significant_children(node).as_slice() {
+        [NodeOrToken::Node(inner)] => Some(NodeOrToken::Node(inner.clone())),
+        // The `;` is a child too, so an expression plus its terminator is
+        // still just an expression.
+        [NodeOrToken::Node(inner), NodeOrToken::Token(semi)] if semi.kind() == SyntaxKind::Semi => {
+            Some(NodeOrToken::Node(inner.clone()))
+        }
+        _ => None,
+    }
 }
 
 fn significant_children(node: &SyntaxNode) -> Vec<SyntaxElement> {
@@ -521,22 +610,48 @@ mod tests {
         assert!(err.0.contains("could not parse pattern"), "{}", err.0);
     }
 
-    /// The flagship query -- "SOQL anywhere inside a loop" -- cannot be
-    /// written directly, and that is a real gap rather than a quirk.
+    /// The flagship query: SOQL anywhere inside a loop, corpus item 1.
     ///
-    /// Everything between two `...` inside a block must be a *statement*,
-    /// because that is what a block contains. A bare `[SELECT ...]` is not a
-    /// valid Apex statement, so the pattern will not parse; the user has to
-    /// fall back to the assignment form, which then misses the variable
-    /// *declaration* form (see `an_assignment_pattern_does_not_match_a_declaration`).
-    /// Lifting this means letting each `...`-separated segment pick its own
-    /// entry point so an expression can stand where a statement is expected
-    /// -- recorded on the map, deliberately not bolted on here.
+    /// A user writing this means "a block containing this query", and writes
+    /// the query the way it appears in code -- as an expression, with no
+    /// terminator. Two things make that work: the missing `;` is supplied so
+    /// the block parses at all, and the resulting `ExprStmt` wrapper is
+    /// unwrapped when searching descendants, so the query is found wherever
+    /// it really sits. Here it sits in a *declaration*, which is the shape
+    /// the assignment form misses entirely.
     #[test]
-    fn an_expression_cannot_yet_stand_where_a_block_expects_a_statement() {
-        let err = Pattern::compile("for (...) { ... [SELECT ... FROM $O] ... }")
-            .expect_err("a bare SOQL expression is not an Apex statement");
-        assert!(err.0.contains("could not parse pattern"), "{}", err.0);
+    fn finds_a_bare_expression_anywhere_inside_a_loop() {
+        let declared = wrap(
+            "        for (Account a : accounts) {\n            List<Contact> cs = [SELECT Id FROM Contact];\n        }",
+        );
+        assert_eq!(
+            hits("for (...) { ... [SELECT ... FROM $O] ... }", &declared).len(),
+            1,
+            "the query is inside a declaration, not a statement of its own",
+        );
+
+        // Still deep, and still a loop: nested two blocks down, and absent
+        // from a method with no loop at all.
+        let nested = wrap(
+            "        for (Account a : accounts) {\n            if (a.Name != null) {\n                insert [SELECT Id FROM Contact];\n            }\n        }",
+        );
+        assert_eq!(
+            hits("for (...) { ... [SELECT ... FROM $O] ... }", &nested).len(),
+            1,
+        );
+        let unlooped = wrap("        List<Contact> cs = [SELECT Id FROM Contact];");
+        assert!(
+            hits("for (...) { ... [SELECT ... FROM $O] ... }", &unlooped).is_empty(),
+            "a query outside any loop is not a governor-limit bug",
+        );
+    }
+
+    /// The repair is only for a segment the user left unterminated -- it must
+    /// not paper over a genuinely unparseable pattern.
+    #[test]
+    fn an_unterminated_segment_is_repaired_but_nonsense_is_still_rejected() {
+        assert!(Pattern::compile("{ ... [SELECT ... FROM $O] }").is_ok());
+        assert!(Pattern::compile("$LEFT $OP $RIGHT").is_err());
     }
 
     #[test]
