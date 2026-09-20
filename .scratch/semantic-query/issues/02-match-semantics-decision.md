@@ -154,8 +154,7 @@ Guarded by `finds_a_bare_expression_anywhere_inside_a_loop` and
   last statement, which a match buried at depth is not. Both stay shallow rather than guessing.
 - **An assignment pattern does not match a declaration.** `$X = [SELECT ...]` misses
   `List<Contact> cs = [SELECT ...]`. This is the isomorphism gap the map already tracks.
-- **`for (...)` matches for-each loops only**, since the C-style header is a different tree
-  (ticket 01's one-to-many finding, still unimplemented).
+- ~~`for (...)` matches for-each loops only~~ **-- fixed.** See item 14.
 **10. `parse_catch_clause`/`CatchRoot` is implemented**, the one grammar change ticket 01
 specified. Checked against a real org first, at the user's insistence, and the answer was the
 uncomfortable one: **a bare `catch` is not valid Apex** -- `sf apex run` rejects
@@ -199,7 +198,21 @@ finds 2,203 blocks on NPSP, and `...;` and `...` are interchangeable spellings. 
 `both_readings_of_a_brace_enclosed_hole_compile` and
 `a_hole_in_an_initializer_matches_any_initialiser`.
 
-**13. Matching is case-insensitive, because Apex is.** Found by the user against the real
+**13. `for (...)` matches both loop forms**, which is ticket 01's one-to-many finding
+implemented. `Pattern` now holds several green trees and a candidate matches if any of them
+does; `for (...)` compiles to both `ForEachStmt` and `ForStmt` shapes, and a written-out
+`for (...; ...; ...)` pins the C-style form. Any header part may be omitted -- a hole standing
+alone in a sequence is an ellipsis, and an ellipsis may consume nothing, so `for (;;)` is
+covered for free.
+
+This was a *silent under-report*, the worst failure mode for a search tool: on NPSP
+`for (...) { ... }` went from 2,451 to 2,988, so **537 C-style loops were invisible to every
+loop query**, and `for (...) { ... insert $X; ... }` went from 4 to 5 -- the new hit is
+`RD_RecurringDonations.cls:424`, `for ( ;j<installments;j++ )` with a DML insert inside it, a
+real governor-limit bug the tool had been skipping. Guarded by `for_matches_both_loop_forms` and
+`an_explicit_c_style_header_matches_only_that_form`.
+
+**14. Matching is case-insensitive, because Apex is.** Found by the user against the real
 corpus: `Database.query(...)` returned 260 hits and `database.query(...)` returned 64, two
 halves of one set. Both now return 327. String literal contents stay case-sensitive, since case
 there is a difference in value rather than in spelling; capture unification is case-insensitive,

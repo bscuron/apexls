@@ -212,12 +212,11 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
   one-liner has real use.
 - **Whether the matcher gets an LSP surface.** `apexls-server` could expose query-driven
   navigation or a workspace-wide structural find. Not part of this destination.
-- **Whether one written pattern compiling to several trees becomes a general mechanism.** Ticket
-  01 found that `for (...)` must compile to both the for-each and C-style trees and match either,
-  so pattern compilation is already one-to-many. That is structurally the same machinery
-  Coccinelle's isomorphisms need. Whether the two should share one mechanism, or stay a
-  hardcoded special case plus a separate later feature, cannot be decided before match semantics
-  exist.
+- **Whether one-to-many compilation generalises into isomorphisms.** `for (...)` compiling to
+  both loop forms is now built, so `Pattern` already holds several trees and matches if any does
+  -- structurally the machinery Coccinelle's isomorphisms need. Whether the two become one
+  mechanism, or the loop case stays a hardcoded special case alongside a separate
+  equivalence-file feature, is still open.
 
 ## Out of scope
 

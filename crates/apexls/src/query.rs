@@ -49,6 +49,14 @@
 //! elements with no `...` between them ask to be *consecutive*, which is
 //! meaningless once they may sit at different depths.
 //!
+//! **One pattern can denote several shapes.** Apex has two loop forms and
+//! they are different productions -- `ForEachStmt` for `for (T v : coll)`
+//! and `ForStmt` for `for (init; cond; update)` -- so `for (...)` compiles
+//! to both and matches either. Writing the three-part header out
+//! (`for (...; ...; ...)`) pins the C-style form specifically. Any of the
+//! three parts may be omitted, including all of them, since a hole standing
+//! alone in a sequence is an ellipsis and an ellipsis may consume nothing.
+//!
 //! Like `soql`, this binds nothing -- it discovers, parses and walks,
 //! skipping the whole `BoundProgram` cost. Matching is purely structural:
 //! `System.debug(...)` matches that shape whether or not `System` resolves
@@ -85,17 +93,24 @@ enum Hole {
     Capture(String),
 }
 
-/// A pattern compiled to the single syntax node it denotes.
+/// A pattern compiled to the syntax node, or nodes, it denotes.
 ///
-/// Held as a *green* node, not the red `SyntaxNode` the parser handed back.
+/// Held as *green* nodes, not the red `SyntaxNode`s the parser handed back.
 /// A red node is a thread-local cursor into the tree and is deliberately
 /// neither `Send` nor `Sync`, so a pattern holding one could not cross onto
 /// rayon's workers; a `GreenNode` is the `Arc`-based shared half and cloning
-/// it is one refcount bump. Each worker rebuilds its own cursor via
-/// [`Pattern::node`].
+/// it is one refcount bump. Each worker rebuilds its own cursors via
+/// [`Pattern::nodes`].
 #[derive(Debug, Clone)]
 struct Pattern {
-    green: apex_syntax::GreenNode,
+    /// Several trees, because one written pattern can denote more than one
+    /// shape. `for (...)` is the case that forces it: Apex's two loop forms
+    /// are different productions -- `ForEachStmt` for `for (T v : coll)`
+    /// and `ForStmt` for `for (init; cond; update)` -- so a pattern that
+    /// compiled to only one of them silently skipped every loop of the
+    /// other kind, which for a search tool is worse than failing outright.
+    /// A candidate matches if *any* of these does.
+    greens: Vec<apex_syntax::GreenNode>,
 }
 
 pub fn run(pattern_src: &str, paths: &[PathBuf]) -> ExitCode {
@@ -145,13 +160,33 @@ impl Pattern {
         let mut readings: Vec<u32> = (0..(1u32 << n)).collect();
         readings.sort_by_key(|mask| mask.count_ones());
 
+        // Independently, every whole-header `for (...)` denotes both loop
+        // forms at once, so each is compiled both ways and *all* the
+        // results are kept -- unlike the reading search above, which picks
+        // one. Nested loops multiply, hence the cap.
+        let headers = for_header_hole_offsets(pattern_src);
+        let h = headers.len().min(4);
+
         for mask in readings {
             let flipped: Vec<usize> = (0..n)
                 .filter(|bit| mask & (1 << bit) != 0)
                 .map(|bit| ambiguous[bit])
                 .collect();
-            if let Some(pattern) = Self::compile_reading(pattern_src, &flipped) {
-                return Ok(pattern);
+
+            let mut greens: Vec<apex_syntax::GreenNode> = Vec::new();
+            for styles in 0..(1u32 << h) {
+                let classic: Vec<usize> = (0..h)
+                    .filter(|bit| styles & (1 << bit) != 0)
+                    .map(|bit| headers[bit])
+                    .collect();
+                if let Some(green) = Self::compile_reading(pattern_src, &flipped, &classic) {
+                    if !greens.contains(&green) {
+                        greens.push(green);
+                    }
+                }
+            }
+            if !greens.is_empty() {
+                return Ok(Pattern { greens });
             }
         }
 
@@ -166,8 +201,12 @@ impl Pattern {
     }
 
     /// One reading of the pattern, tried against every entry point.
-    fn compile_reading(pattern_src: &str, as_expression: &[usize]) -> Option<Self> {
-        let substituted = substitute(pattern_src, as_expression);
+    fn compile_reading(
+        pattern_src: &str,
+        as_expression: &[usize],
+        classic_headers: &[usize],
+    ) -> Option<apex_syntax::GreenNode> {
+        let substituted = substitute(pattern_src, as_expression, classic_headers);
 
         // gogrep's multi-entry-point design: try each in turn and take the
         // first that consumes the whole pattern. No user annotation is
@@ -204,31 +243,34 @@ impl Pattern {
             let root = parse.syntax();
             let significant = significant_children(&root);
             if let [NodeOrToken::Node(node)] = significant.as_slice() {
-                return Some(Pattern {
-                    green: node.green().to_owned(),
-                });
+                return Some(node.green().to_owned());
             }
         }
 
         None
     }
 
-    /// A fresh red-tree cursor over this pattern, built per worker.
-    fn node(&self) -> SyntaxNode {
-        SyntaxNode::new_root(self.green.clone())
+    /// Fresh red-tree cursors over this pattern's shapes, built per worker.
+    fn nodes(&self) -> Vec<SyntaxNode> {
+        self.greens
+            .iter()
+            .map(|g| SyntaxNode::new_root(g.clone()))
+            .collect()
     }
 
     /// Every match of this pattern in `root`, innermost and outermost both
     /// -- a nested match is a real match and hiding it would be worse than
     /// printing two lines.
     fn matches_in(&self, root: &SyntaxNode) -> Vec<SyntaxNode> {
-        let pattern = self.node();
+        let patterns = self.nodes();
         root.descendants()
             .filter(|candidate| {
-                candidate.kind() == pattern.kind() && {
-                    let mut binds = HashMap::new();
-                    match_node(&pattern, candidate, &mut binds)
-                }
+                patterns.iter().any(|pattern| {
+                    candidate.kind() == pattern.kind() && {
+                        let mut binds = HashMap::new();
+                        match_node(pattern, candidate, &mut binds)
+                    }
+                })
             })
             .collect()
     }
@@ -256,18 +298,19 @@ impl Pattern {
 /// encloses it. No lookback rule gets both. So `as_expression` lets
 /// [`Pattern::compile`] override the guess per hole and retry -- see
 /// [`ambiguous_hole_offsets`].
-fn substitute(pattern: &str, as_expression: &[usize]) -> String {
+fn substitute(pattern: &str, as_expression: &[usize], classic_headers: &[usize]) -> String {
     let mut out = String::with_capacity(pattern.len());
     let bytes = pattern.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i..].starts_with(b"...") {
             let statement = in_statement_position(pattern, i) && !as_expression.contains(&i);
+            let classic = classic_headers.contains(&i);
             if statement {
                 terminate_pending_statement(&mut out);
-                out.push_str(&ellipsis_expansion(pattern, i));
+                out.push_str(&ellipsis_expansion(pattern, i, classic));
             } else {
-                out.push_str(&expression_expansion(pattern, i));
+                out.push_str(&expression_expansion(pattern, i, classic));
             }
             i += 3;
         } else if bytes[i] == b'}' && in_statement_position(pattern, i) {
@@ -320,22 +363,71 @@ fn ambiguous_hole_offsets(pattern: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Every `...` that stands for a whole `for` header, by byte offset.
+///
+/// Only a hole that is the *entire* header counts. In an explicitly
+/// C-style `for (...; ...; ...)` each hole is one of the three parts, an
+/// ordinary expression, and the header's shape is already pinned by the
+/// semicolons the user wrote -- so those are left alone.
+fn for_header_hole_offsets(pattern: &str) -> Vec<usize> {
+    let bytes = pattern.as_bytes();
+    (0..bytes.len())
+        .filter(|&i| {
+            bytes[i..].starts_with(b"...")
+                && enclosing_paren_head(pattern, i) == Some("for")
+                && !encloses_a_semicolon(pattern, i)
+        })
+        .collect()
+}
+
+/// Does the parenthesised group the hole sits in contain a `;`? If so the
+/// user wrote the C-style header out themselves.
+fn encloses_a_semicolon(pattern: &str, at: usize) -> bool {
+    let Some(open) = enclosing_paren_offset(pattern, at) else {
+        return false;
+    };
+    // An explicit loop, not `any`: the scan has to *stop* at the closing
+    // paren rather than merely not match it, or a `;` anywhere later in the
+    // pattern (the body's statements, invariably) would be read as part of
+    // this header and make every `for (...)` look C-style.
+    let mut depth = 0i32;
+    for c in pattern[open + 1..].chars() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => return false,
+            ')' => depth -= 1,
+            ';' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The expansion for a hole read as an expression rather than a statement.
-fn expression_expansion(pattern: &str, at: usize) -> String {
+fn expression_expansion(pattern: &str, at: usize, classic: bool) -> String {
     match enclosing_paren_head(pattern, at) {
-        Some("for") => format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_V : {ELLIPSIS_IDENT}_C"),
+        Some("for") if encloses_a_semicolon(pattern, at) => ELLIPSIS_IDENT.to_string(),
+        Some("for") => for_header_expansion(classic),
         Some("catch") => format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_N"),
         _ => ELLIPSIS_IDENT.to_string(),
     }
 }
 
-fn ellipsis_expansion(pattern: &str, at: usize) -> String {
+/// A whole `for` header, in whichever of Apex's two loop forms is being
+/// compiled this time round -- `ForEachStmt`'s `T v : coll`, or
+/// `ForStmt`'s `init; cond; update`.
+fn for_header_expansion(classic: bool) -> String {
+    if classic {
+        format!("{ELLIPSIS_IDENT}_A; {ELLIPSIS_IDENT}_B; {ELLIPSIS_IDENT}_C")
+    } else {
+        format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_V : {ELLIPSIS_IDENT}_C")
+    }
+}
+
+fn ellipsis_expansion(pattern: &str, at: usize, classic: bool) -> String {
     match enclosing_paren_head(pattern, at) {
-        // A `for (...)` header expands to the for-each shape. The C-style
-        // `for (init; cond; update)` form is a different tree, so
-        // `for (...)` finds for-each loops only in v1 -- compiling one
-        // pattern to several trees is the open question this defers.
-        Some("for") => format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_V : {ELLIPSIS_IDENT}_C"),
+        Some("for") if encloses_a_semicolon(pattern, at) => ELLIPSIS_IDENT.to_string(),
+        Some("for") => for_header_expansion(classic),
         Some("catch") => format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_N"),
         _ if in_statement_position(pattern, at) => format!("{ELLIPSIS_IDENT};"),
         _ => ELLIPSIS_IDENT.to_string(),
@@ -349,21 +441,8 @@ fn ellipsis_expansion(pattern: &str, at: usize) -> String {
 /// about and let the rest fall through. `None` when the hole is not inside
 /// a paren group at all.
 fn enclosing_paren_head(pattern: &str, at: usize) -> Option<&str> {
-    let before = &pattern[..at];
-    let mut depth = 0i32;
-    let open = before.char_indices().rev().find_map(|(i, c)| match c {
-        ')' => {
-            depth += 1;
-            None
-        }
-        '(' if depth == 0 => Some(i),
-        '(' => {
-            depth -= 1;
-            None
-        }
-        _ => None,
-    })?;
-    let head = before[..open].trim_end();
+    let open = enclosing_paren_offset(pattern, at)?;
+    let head = pattern[..open].trim_end();
     let start = head
         .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .map_or(0, |i| i + 1);
@@ -380,6 +459,26 @@ fn enclosing_paren_head(pattern: &str, at: usize) -> Option<&str> {
 /// expression position and emitted without the `;` a statement needs.
 /// Asking what encloses the hole is both simpler and right, and it still
 /// needs nothing but the raw text.
+/// Byte offset of the `(` opening the group `at` sits directly inside.
+fn enclosing_paren_offset(pattern: &str, at: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    pattern[..at]
+        .char_indices()
+        .rev()
+        .find_map(|(i, c)| match c {
+            ')' => {
+                depth += 1;
+                None
+            }
+            '(' if depth == 0 => Some(i),
+            '(' => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        })
+}
+
 fn in_statement_position(pattern: &str, at: usize) -> bool {
     enclosing_open_bracket(pattern, at) == Some('{')
 }
@@ -1104,6 +1203,56 @@ mod tests {
         // The SOQL expression itself is still findable, which is the
         // workaround a user reaches for until isomorphisms exist.
         assert_eq!(hits("[SELECT ... FROM $OBJ]", &declared).len(), 1);
+    }
+
+    /// Apex has two loop forms and they are different productions, so one
+    /// written `for (...)` has to denote both. Matching only the for-each
+    /// form made every C-style loop invisible to every loop query -- a
+    /// silent under-report, which for a search tool is worse than an error.
+    #[test]
+    fn for_matches_both_loop_forms() {
+        let each = wrap("        for (Account a : accounts) {\n            insert a;\n        }");
+        let classic = wrap(
+            "        for (Integer i = 0; i < n; i++) {\n            insert rows[i];\n        }",
+        );
+        let bare = wrap("        for (Integer i = 0; i < n; i++) {\n            f();\n        }");
+
+        for src in [&each, &classic] {
+            assert_eq!(
+                hits("for (...) { ... insert $X; ... }", src).len(),
+                1,
+                "both loop forms are loops",
+            );
+        }
+        assert!(hits("for (...) { ... insert $X; ... }", &bare).is_empty());
+
+        // A C-style header may omit any of its three parts, and `for (...)`
+        // still covers it: a hole standing alone in a sequence is an
+        // ellipsis, and an ellipsis may consume nothing. NPSP's
+        // `for ( ;j<installments;j++ )` -- which contains a DML insert, and
+        // was invisible before -- is exactly this shape.
+        let no_init = wrap("        for ( ; i < n; i++) {\n            insert rows[i];\n        }");
+        let empty = wrap("        for (;;) {\n            insert row;\n        }");
+        for src in [&no_init, &empty] {
+            assert_eq!(hits("for (...) { ... insert $X; ... }", src).len(), 1);
+        }
+    }
+
+    /// The C-style header can also be written out, which pins the shape and
+    /// lets a pattern ask for that form specifically.
+    #[test]
+    fn an_explicit_c_style_header_matches_only_that_form() {
+        let each = wrap("        for (Account a : accounts) {\n            f();\n        }");
+        let classic =
+            wrap("        for (Integer i = 0; i < n; i++) {\n            f();\n        }");
+
+        assert_eq!(hits("for (...; ...; ...) { ... }", &classic).len(), 1);
+        assert!(
+            hits("for (...; ...; ...) { ... }", &each).is_empty(),
+            "an explicit three-part header is not a for-each loop",
+        );
+        // And the parts are still holes, so the header's contents vary.
+        assert_eq!(hits("for (...; $C; ...) { ... }", &classic).len(), 1);
     }
 
     #[test]
