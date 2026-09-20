@@ -130,10 +130,15 @@ impl Pattern {
         // required. Order matters only where a pattern is genuinely
         // ambiguous (`{ ... }` parses as both a statement and a block);
         // first-match-wins is well-defined and the root kind records which.
-        let entry_points: [fn(&str) -> apex_parser::Parse; 3] = [
+        // `parse_catch_clause` comes last because a bare `catch` is not
+        // valid Apex and nothing else can be mistaken for one -- it is a
+        // fallback for the single construct the other three cannot name,
+        // not a competitor to them.
+        let entry_points: [fn(&str) -> apex_parser::Parse; 4] = [
             apex_parser::parse_expression,
             apex_parser::parse_statement,
             apex_parser::parse_block,
+            apex_parser::parse_catch_clause,
         ];
 
         for parse_fn in entry_points {
@@ -407,9 +412,11 @@ fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) ->
             // Unification, scoped per match: the first occurrence binds,
             // later ones must agree. Compared on significant text so
             // `a.b` and `a . b` are the same capture, matching ast-grep's
-            // structural rather than byte-wise notion of "the same".
+            // structural rather than byte-wise notion of "the same", and
+            // case-insensitively because Apex identifiers are -- `acc` and
+            // `Acc` are one variable, so they are one capture.
             return match binds.get(&name) {
-                Some(existing) => *existing == text,
+                Some(existing) => existing.eq_ignore_ascii_case(&text),
                 None => {
                     binds.insert(name, text);
                     true
@@ -421,10 +428,35 @@ fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) ->
 
     match (pat, src) {
         (NodeOrToken::Token(p), NodeOrToken::Token(s)) => {
-            p.kind() == s.kind() && p.text() == s.text()
+            p.kind() == s.kind() && token_text_eq(p.kind(), p.text(), s.text())
         }
         (NodeOrToken::Node(p), NodeOrToken::Node(s)) => match_node(p, s, binds),
         _ => false,
+    }
+}
+
+/// Compare two token texts the way Apex itself compares them.
+///
+/// **Apex is a case-insensitive language**: `Database.query(q)` and
+/// `database.query(q)` are the same call, and a pattern that found only one
+/// spelling would silently under-report -- on the NPSP corpus
+/// `Database.query(...)` and `database.query(...)` return 260 and 64 hits
+/// respectively, and both are the same set of call sites written two ways.
+/// `soql.rs` already matches its `Database` receiver with
+/// `eq_ignore_ascii_case` for exactly this reason.
+///
+/// String literals are the exception: case-insensitivity is a property of
+/// Apex's *identifiers and keywords*, not of the characters inside a
+/// string, where `'USER_MODE'` and `'user_mode'` are genuinely different
+/// values.
+fn token_text_eq(kind: SyntaxKind, pat: &str, src: &str) -> bool {
+    if matches!(
+        kind,
+        SyntaxKind::StringLiteral | SyntaxKind::MultilineStringLiteral
+    ) {
+        pat == src
+    } else {
+        pat.eq_ignore_ascii_case(src)
     }
 }
 
@@ -787,6 +819,68 @@ mod tests {
             .is_empty(),
             "unsupported shape must find nothing rather than something wrong",
         );
+    }
+
+    /// Corpus item 4: a `catch` that swallows its exception.
+    ///
+    /// A bare `catch` is not valid Apex -- a real org rejects it with
+    /// "Unexpected token 'catch'" -- so this is a pattern the compiler
+    /// would refuse, parsed through a fragment entry point that exists
+    /// precisely to name sub-constructs. Anchoring on the `catch` rather
+    /// than the whole `try` is what lets it report the clause's own
+    /// position and isolate one clause of a multi-`catch`.
+    #[test]
+    fn finds_a_swallowing_catch_on_its_own() {
+        let src = wrap(
+            "        try {\n            insert a;\n        } catch (DmlException e) {\n        } catch (QueryException e) {\n            System.debug(e);\n        }",
+        );
+        assert_eq!(
+            hits("catch (...) { }", &src),
+            vec!["5:11:catch (DmlException e) { }".to_string()],
+            "the empty clause only, reported at its own position",
+        );
+        assert_eq!(
+            hits("catch (...) { System.debug(...); }", &src).len(),
+            1,
+            "the log-and-continue clause, isolated from its sibling",
+        );
+    }
+
+    /// Apex is a case-insensitive language, so a pattern must be too --
+    /// otherwise `Database.query(...)` and `database.query(...)` report
+    /// different halves of the same set of call sites.
+    #[test]
+    fn matching_is_case_insensitive_like_apex_itself() {
+        let src = wrap(
+            "        Database.query(q);\n        database.QUERY(q);\n        DATABASE.query(q);",
+        );
+        for pattern in ["Database.query(...);", "database.QUERY(...);"] {
+            assert_eq!(
+                hits(pattern, &src).len(),
+                3,
+                "every spelling is the same call: {pattern}",
+            );
+        }
+    }
+
+    /// ...but case-insensitivity belongs to identifiers and keywords, not
+    /// to the characters inside a string, where case is a real difference
+    /// in value.
+    #[test]
+    fn string_literal_contents_stay_case_sensitive() {
+        let src = wrap("        f('USER_MODE');\n        f('user_mode');");
+        assert_eq!(
+            hits("f('USER_MODE');", &src),
+            vec!["3:9:f('USER_MODE');".to_string()],
+        );
+    }
+
+    /// A capture is an identifier, so its two occurrences unify across a
+    /// difference in case.
+    #[test]
+    fn a_reused_capture_unifies_across_case() {
+        let src = wrap("        if (acc != null) { Acc.doIt(); }");
+        assert_eq!(hits("if ($X != null) { $X.doIt(); }", &src).len(), 1);
     }
 
     #[test]

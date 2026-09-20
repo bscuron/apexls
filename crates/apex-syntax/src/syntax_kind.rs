@@ -115,7 +115,7 @@ syntax_kind! {
     }
     nodes {
         // ---- Roots (fragment-parse entry points) / recovery ----
-        ExprRoot, StmtRoot, BlockRoot, ErrorNode,
+        ExprRoot, StmtRoot, BlockRoot, CatchRoot, ErrorNode,
 
         // ---- Types (expression/statement-scoped subset only) ----
         Type, TypeArgList, QualifiedName,

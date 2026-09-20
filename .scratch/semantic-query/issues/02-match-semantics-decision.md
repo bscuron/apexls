@@ -122,7 +122,7 @@ errors:
 | 1 SOQL in a loop | works -- 0 hits on NPSP, which is the *correct* answer: 2,450 for-each loops, none containing SOQL. Verified against a controlled fixture instead |
 | 2 DML in a loop | works (4 hits, one nested four blocks deep) |
 | 3 `System.debug` | works (46 hits) |
-| 4 swallowing `catch` | only as `try { ... } catch (...) { ... }` (774 hits); a bare `catch` pattern still needs the parser entry point ticket 01 specified, which is **not implemented** |
+| 4 swallowing `catch` | works -- `catch (...) { }` finds 48 empty catches, `catch (...) { ... System.debug(...); ... }` finds 6 log-and-continue ones |
 | 6 `Database.query` concat | works (45 hits) |
 | R1 `size() > 0` | findable (246 hits); the rewrite itself is not built, per the map |
 | R2 delete `System.debug` | findable; rewrite not built |
@@ -158,6 +158,20 @@ Guarded by `finds_a_bare_expression_anywhere_inside_a_loop` and
   `List<Contact> cs = [SELECT ...]`. This is the isomorphism gap the map already tracks.
 - **`for (...)` matches for-each loops only**, since the C-style header is a different tree
   (ticket 01's one-to-many finding, still unimplemented).
-- **`parse_catch_clause`/`CatchRoot` is still not implemented.** Ticket 01 specified it as the
-  one required grammar change; this ticket built the matcher without it, so corpus item 4 is
-  reachable only in its `try`-anchored form.
+**10. `parse_catch_clause`/`CatchRoot` is implemented**, the one grammar change ticket 01
+specified. Checked against a real org first, at the user's insistence, and the answer was the
+uncomfortable one: **a bare `catch` is not valid Apex** -- `sf apex run` rejects
+`catch (Exception e) { }` with "Unexpected token 'catch'" while accepting the same clause
+attached to a `try`. Added anyway, because no fragment entry point parses standalone-valid Apex
+(`a + b` is not a program, nor is a bare `{ stmt; }`); they exist so tooling can name a
+sub-construct, and `catchClause` is a real production. Anchoring on the clause rather than the
+whole `try` is what lets a match report its own position and isolate one clause of a
+multi-`catch`. The consequence is stated in the entry point's own doc comment: a pattern can now
+be written that the Apex compiler would refuse.
+
+**11. Matching is case-insensitive, because Apex is.** Found by the user against the real
+corpus: `Database.query(...)` returned 260 hits and `database.query(...)` returned 64, two
+halves of one set. Both now return 327. String literal contents stay case-sensitive, since case
+there is a difference in value rather than in spelling; capture unification is case-insensitive,
+so `acc` and `Acc` are one capture. Guarded by `matching_is_case_insensitive_like_apex_itself`,
+`string_literal_contents_stay_case_sensitive` and `a_reused_capture_unifies_across_case`.

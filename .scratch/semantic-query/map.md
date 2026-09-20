@@ -171,9 +171,11 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
   element is followed by an ellipsis, so `{ ... P }` keeps its promise that P is last and
   `{ ... P ... Q ... }` is refused rather than answered wrongly. A block segment may be written
   as a bare expression (`{ ... [SELECT ...] ... }`): the omitted `;` is supplied and the
-  statement wrapper unwrapped when searching, so the flagship query works. **The whole binding
-  corpus subset is expressible** -- items 1, 2, 3, 6, R1, R2 outright, item 4 in its
-  `try`-anchored form pending the `parse_catch_clause` entry point.
+  statement wrapper unwrapped when searching, so the flagship query works. Matching is
+  case-insensitive, as Apex is, with string literal contents excepted. **The whole binding
+  corpus subset is expressible**, item 4 included via the new `parse_catch_clause`/`CatchRoot`
+  entry point -- added knowingly, since a bare `catch` is not valid Apex (confirmed against a
+  real org) but no fragment entry point parses standalone-valid Apex anyway.
 
 ## Not yet specified
 

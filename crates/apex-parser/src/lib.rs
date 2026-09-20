@@ -86,6 +86,31 @@ pub fn parse_block(src: &str) -> Parse {
     })
 }
 
+/// Parse `src` as a lone `catch` clause
+/// (`CATCH LPAREN modifier* qualifiedName id RPAREN block`).
+///
+/// **A bare `catch` is not valid Apex** -- confirmed against a real org,
+/// which rejects `catch (Exception e) { }` with "Unexpected token 'catch'"
+/// while accepting the same clause attached to a `try`. This entry point
+/// exists anyway, for the same reason the three above it do: none of them
+/// parses standalone-valid Apex either (`a + b` is not a program, nor is a
+/// bare `{ stmt; }`). They exist so tooling can denote a *sub-construct* of
+/// the grammar, and a catch clause is a real production that tooling wants
+/// to name -- `apexls query` needs it to ask for a `catch` block that
+/// swallows its exception without having to anchor on the whole `try`,
+/// which would report the wrong position and could not isolate one clause
+/// of a multi-`catch`.
+///
+/// Consequence worth stating plainly: a caller can parse a fragment here
+/// that the Apex compiler would refuse. That is deliberate, and it is the
+/// same choice Semgrep documents for exactly this construct.
+pub fn parse_catch_clause(src: &str) -> Parse {
+    let mut cache = NodeCache::default();
+    parse_with(src, apex_syntax::SyntaxKind::CatchRoot, &mut cache, |p| {
+        grammar::statements::catch_clause(p);
+    })
+}
+
 /// Parse `src` as a whole `.cls` compilation unit: `modifier* (class |
 /// interface | enum)` declaration, EOF (Phase 3).
 #[hotpath::measure]
