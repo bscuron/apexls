@@ -111,6 +111,26 @@ pub fn parse_catch_clause(src: &str) -> Parse {
     })
 }
 
+/// Parse `src` as a single class-body member: a method, field, property,
+/// constructor, nested type, initializer block, or stray `;`.
+///
+/// Like [`parse_catch_clause`], this parses a *sub-construct* rather than
+/// standalone-valid Apex -- `public void f() {}` is not a program, it is
+/// something that appears inside one. It exists so tooling can name a
+/// member: `apexls query` needs it to ask about declarations at all, which
+/// is what the expression/statement/block entry points cannot reach.
+///
+/// `class_body_decl` is the right level rather than `member_decl`, because
+/// it also covers the initializer-block and bare-`;` forms a class body
+/// admits, and delegates nested `class`/`interface`/`enum` declarations to
+/// `type_decl` with the same tree shape they have at top level.
+pub fn parse_class_member(src: &str) -> Parse {
+    let mut cache = NodeCache::default();
+    parse_with(src, apex_syntax::SyntaxKind::MemberRoot, &mut cache, |p| {
+        grammar::declarations::class_body_decl(p);
+    })
+}
+
 /// Parse `src` as a whole `.cls` compilation unit: `modifier* (class |
 /// interface | enum)` declaration, EOF (Phase 3).
 #[hotpath::measure]

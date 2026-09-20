@@ -200,7 +200,7 @@ fn class_body(p: &mut Parser<'_>) {
 }
 
 /// `classBodyDeclaration: ';' | STATIC? block | modifier* memberDeclaration`.
-fn class_body_decl(p: &mut Parser<'_>) {
+pub(crate) fn class_body_decl(p: &mut Parser<'_>) {
     if p.at(SyntaxKind::Semi) {
         p.bump();
         return;

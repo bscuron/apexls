@@ -225,7 +225,31 @@ bare literal, out of 54 debug calls and 35 single-argument ones. Guarded by
 `a_whole_string_literal_hole_matches_any_string` and
 `holes_inside_a_string_literal_are_just_text`.
 
-**15. Matching is case-insensitive, because Apex is.** Found by the user against the real
+**15. Declarations are queryable**, via a fifth entry point `parse_class_member`/`MemberRoot`
+over the existing `class_body_decl` grammar -- which also covers fields, properties,
+constructors, initializer blocks and nested types. Before this, nothing about a *declaration*
+could be asked at all; only the code inside one. On NPSP: `private $T $f;` 657,
+`public void $m(...) { ... }` 650, `@AuraEnabled public static $T $m(...) { ... }` 118,
+`@future public static void $m(...) { ... }` 14 -- **corpus items 5 and 10 now reachable**.
+
+Two things fell out of it:
+
+- `f(...)` and `void m(...)` are written identically and mean different things, an argument list
+  versus a parameter list, and a formal parameter is a `Type name` pair so a bare identifier does
+  not parse there. Rather than another lookback rule, this became a second axis of the existing
+  reading retry: default to arguments, flip to parameters, let the parser decide.
+- `(...)` first meant *exactly one* parameter, because the two-token expansion was matched
+  structurally rather than as a hole. `hole_of` now treats an element whose *every* token is a
+  sentinel as one ellipsis, so it means any number including none. Requiring every token to be a
+  sentinel is what keeps this from re-opening the composite-pattern bug: `$A + $B` and `... + ...`
+  both contain a `+`.
+
+Still out of reach: a whole class body (`class $C { ... }`), since a class holds members rather
+than statements and a member-run hole does not exist. Guarded by
+`finds_declarations_not_just_code_inside_them` and
+`a_paren_hole_is_arguments_or_parameters_as_the_pattern_requires`.
+
+**16. Matching is case-insensitive, because Apex is.** Found by the user against the real
 corpus: `Database.query(...)` returned 260 hits and `database.query(...)` returned 64, two
 halves of one set. Both now return 327. String literal contents stay case-sensitive, since case
 there is a difference in value rather than in spelling; capture unification is case-insensitive,

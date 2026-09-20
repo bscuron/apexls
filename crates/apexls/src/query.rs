@@ -64,6 +64,16 @@
 //! way Semgrep spells it: `System.debug('...')` asks for a logged literal
 //! message and does not match `System.debug(x)`.
 //!
+//! **Declarations are reachable too**, not just the code inside them:
+//! `private $T $f;`, `public void $m(...) { ... }`,
+//! `@future public static void $m(...) { ... }`. A `(...)` is an argument
+//! list or a *parameter* list depending on what the rest of the pattern
+//! needs -- the two are written identically and a formal parameter is a
+//! `Type name` pair, so both readings are tried. Either way it means any
+//! number of them, including none. A whole class body (`class $C { ... }`)
+//! is still out of reach: a class holds members, not statements, so that
+//! needs a member-run hole.
+//!
 //! Like `soql`, this binds nothing -- it discovers, parses and walks,
 //! skipping the whole `BoundProgram` cost. Matching is purely structural:
 //! `System.debug(...)` matches that shape whether or not `System` resolves
@@ -227,15 +237,21 @@ impl Pattern {
         // required. Order matters only where a pattern is genuinely
         // ambiguous (`{ ... }` parses as both a statement and a block);
         // first-match-wins is well-defined and the root kind records which.
-        // `parse_catch_clause` comes last because a bare `catch` is not
-        // valid Apex and nothing else can be mistaken for one -- it is a
-        // fallback for the single construct the other three cannot name,
-        // not a competitor to them.
-        let entry_points: [fn(&str) -> apex_parser::Parse; 4] = [
+        // `parse_catch_clause` and `parse_class_member` come last, as
+        // fallbacks for constructs the first three cannot name rather than
+        // competitors to them. Order matters for the overlaps: a class body
+        // admits an initializer block, so `{ ... }` would parse as a member
+        // too, and a field declaration is spelled exactly like a local
+        // variable one, so `String $v = ...;` would parse as both. Putting
+        // members last keeps the statement and block readings, which are
+        // what those patterns almost always mean; a pattern that really
+        // wants the field says so with a modifier (`private String $v = ...;`).
+        let entry_points: [fn(&str) -> apex_parser::Parse; 5] = [
             apex_parser::parse_expression,
             apex_parser::parse_statement,
             apex_parser::parse_block,
             apex_parser::parse_catch_clause,
+            apex_parser::parse_class_member,
         ];
 
         for parse_fn in entry_points {
@@ -335,13 +351,14 @@ fn substitute(pattern: &str, as_expression: &[usize], classic_headers: &[usize])
             }
             i = end;
         } else if bytes[i..].starts_with(b"...") {
-            let statement = in_statement_position(pattern, i) && !as_expression.contains(&i);
+            let flipped = as_expression.contains(&i);
+            let statement = in_statement_position(pattern, i) && !flipped;
             let classic = classic_headers.contains(&i);
             if statement {
                 terminate_pending_statement(&mut out);
                 out.push_str(&ellipsis_expansion(pattern, i, classic));
             } else {
-                out.push_str(&expression_expansion(pattern, i, classic));
+                out.push_str(&expression_expansion(pattern, i, classic, flipped));
             }
             i += 3;
         } else if bytes[i] == b'}' && in_statement_position(pattern, i) {
@@ -385,17 +402,37 @@ fn terminate_pending_statement(out: &mut String) {
 }
 
 /// Every `...` whose reading [`substitute`] had to guess at, by byte
-/// offset -- the holes enclosed by `{`, which could be either a run of
-/// statements or an expression sitting inside one.
+/// offset. Two kinds, disjoint because a hole is either directly inside a
+/// brace or directly inside a paren, never both:
+///
+/// - A `{`-enclosed hole is a run of statements by default, an expression
+///   sitting inside one when flipped.
+/// - A `(`-enclosed hole is a call's argument list by default, a
+///   declaration's *parameter* list when flipped. `f(...)` and
+///   `void m(...)` are written identically and mean different things --
+///   a formal parameter is `Type name`, two tokens, so a bare identifier
+///   does not parse there.
 fn ambiguous_hole_offsets(pattern: &str) -> Vec<usize> {
     let bytes = pattern.as_bytes();
     (0..bytes.len())
         .filter(|&i| {
             bytes[i..].starts_with(b"...")
                 && !in_string_literal(pattern, i)
-                && in_statement_position(pattern, i)
+                && (in_statement_position(pattern, i) || in_plain_paren(pattern, i))
         })
         .collect()
+}
+
+/// Is the hole directly inside a parenthesised group that is not a `for`
+/// or `catch` header? Those two are decided by their keyword; everything
+/// else is an argument list or a parameter list, and the text cannot say
+/// which.
+fn in_plain_paren(pattern: &str, at: usize) -> bool {
+    enclosing_paren_offset(pattern, at).is_some()
+        && !matches!(
+            enclosing_paren_head(pattern, at),
+            Some("for") | Some("catch")
+        )
 }
 
 /// Where the string literal opening at `open` ends, one past its closing
@@ -482,13 +519,21 @@ fn encloses_a_semicolon(pattern: &str, at: usize) -> bool {
 }
 
 /// The expansion for a hole read as an expression rather than a statement.
-fn expression_expansion(pattern: &str, at: usize, classic: bool) -> String {
+fn expression_expansion(pattern: &str, at: usize, classic: bool, alternate: bool) -> String {
     match enclosing_paren_head(pattern, at) {
         Some("for") if encloses_a_semicolon(pattern, at) => ELLIPSIS_IDENT.to_string(),
         Some("for") => for_header_expansion(classic),
-        Some("catch") => format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_N"),
+        Some("catch") => type_and_name(),
+        // Flipped, a plain `(...)` is a declaration's parameter list.
+        _ if alternate && in_plain_paren(pattern, at) => type_and_name(),
         _ => ELLIPSIS_IDENT.to_string(),
     }
+}
+
+/// A `Type name` pair -- what a formal parameter and a catch parameter
+/// both are, and what a single identifier cannot stand in for.
+fn type_and_name() -> String {
+    format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_N")
 }
 
 /// A whole `for` header, in whichever of Apex's two loop forms is being
@@ -506,7 +551,7 @@ fn ellipsis_expansion(pattern: &str, at: usize, classic: bool) -> String {
     match enclosing_paren_head(pattern, at) {
         Some("for") if encloses_a_semicolon(pattern, at) => ELLIPSIS_IDENT.to_string(),
         Some("for") => for_header_expansion(classic),
-        Some("catch") => format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_N"),
+        Some("catch") => type_and_name(),
         _ if in_statement_position(pattern, at) => format!("{ELLIPSIS_IDENT};"),
         _ => ELLIPSIS_IDENT.to_string(),
     }
@@ -607,6 +652,20 @@ fn hole_of(element: &SyntaxElement) -> Option<Hole> {
     };
     if tokens.last().is_some_and(|t| t.kind() == SyntaxKind::Semi) {
         tokens.pop();
+    }
+    if tokens.is_empty() {
+        return None;
+    }
+    // An element whose every token is a sentinel is an ellipsis, however
+    // many tokens that took. The multi-token expansions need this: a
+    // formal parameter is `Type name`, so `void m(...)` expands to two
+    // sentinels, and unless the pair is recognised as one hole it matches
+    // structurally -- meaning *exactly one* parameter rather than any
+    // number. Requiring *every* token to be a sentinel is what keeps this
+    // from swallowing composites: `$A + $B` and `... + ...` both contain a
+    // `+`, so neither is a hole.
+    if tokens.iter().all(|t| t.text().starts_with(ELLIPSIS_IDENT)) {
+        return Some(Hole::Ellipsis);
     }
     let [only] = tokens.as_slice() else {
         return None;
@@ -1415,6 +1474,52 @@ mod tests {
             hits("System.debug(...);", &src),
             vec!["3:20:System.debug('a');".to_string()],
         );
+    }
+
+    /// Declarations are reachable at all only through the member entry
+    /// point -- an expression, statement or block pattern cannot name one.
+    /// This is what puts `@future` and `@AuraEnabled` methods, and fields,
+    /// within reach of a query.
+    #[test]
+    fn finds_declarations_not_just_code_inside_them() {
+        let src = "public class T {\n    private String secret;\n    @future public static void go(Id x) { f(); }\n    public void plain() { }\n}\n";
+        let find = |pattern: &str| {
+            let p = Pattern::compile(pattern).expect("pattern should compile");
+            matches_in_file(&p, Path::new("T.cls"), src).len()
+        };
+        assert_eq!(find("private $T $f;"), 1);
+        assert_eq!(find("@future public static void $m(...) { ... }"), 1);
+        assert_eq!(find("public void $m() { ... }"), 1, "no parameters");
+        assert_eq!(find("@isTest static void $m() { ... }"), 0);
+    }
+
+    /// `f(...)` and `void m(...)` are written identically and mean
+    /// different things: an argument list takes expressions, a parameter
+    /// list takes `Type name` pairs. Neither reading can be chosen from the
+    /// text, so both are tried -- and each pattern must land on its own.
+    #[test]
+    fn a_paren_hole_is_arguments_or_parameters_as_the_pattern_requires() {
+        let src = "public class T {\n    public void go(Id x, String y) { f(1, 2); }\n}\n";
+        let find = |pattern: &str| {
+            let p = Pattern::compile(pattern).expect("pattern should compile");
+            matches_in_file(&p, Path::new("T.cls"), src).len()
+        };
+        assert_eq!(find("public void $m(...) { ... }"), 1, "two parameters");
+        assert_eq!(find("f(...);"), 1, "argument list");
+
+        // `(...)` is any number of parameters, not exactly one.
+        let none = "public class T {
+    public void go() { }
+}
+";
+        let three = "public class T {
+    public void go(Id a, String b, Integer c) { }
+}
+";
+        for src in [none, three] {
+            let p = Pattern::compile("public void $m(...) { ... }").expect("compiles");
+            assert_eq!(matches_in_file(&p, Path::new("T.cls"), src).len(), 1);
+        }
     }
 
     #[test]
