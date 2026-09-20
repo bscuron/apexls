@@ -160,7 +160,28 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
   other grammar change, plus a compile-time error for holes in operator position, the one slot
   no substitution can reach.
 
+- [Decision: match semantics](issues/02-match-semantics-decision.md): recursive comparison of
+  significant children; exact sequences unless an ellipsis is present; `...` deep only inside a
+  `Block` (retry the next fixed element against descendants), with the block's own braces
+  excluded from the statement sequence; unification on significant text, scoped per match;
+  positions from the new shared `apex_syntax::significant_range`, with `soql` switched onto it.
+  **Search is built and shipped** as `apexls query` -- the whole NPSP corpus in ~0.6s, binding
+  nothing. A compiled `Pattern` holds a `GreenNode`, not a red `SyntaxNode`, which is a
+  thread-local cursor and cannot cross rayon workers. Deep descent runs only when the fixed
+  element is followed by an ellipsis, so `{ ... P }` keeps its promise that P is last and
+  `{ ... P ... Q ... }` is refused rather than answered wrongly. Of the binding corpus subset,
+  items 2, 3, 6 and the two replace targets are expressible today; item 4 only in its
+  `try`-anchored form; item 1 not at all.
+
 ## Not yet specified
+
+- **Letting each `...`-separated segment choose its own parse entry point.** Surfaced by running
+  the corpus against built search, which is exactly what the escape-hatch fog item predicted
+  would happen. Everything between two `...` inside a block must currently be a *statement*, so
+  `for (...) { ... [SELECT ... FROM $O] ... }` does not compile and **corpus item 1, the flagship
+  query, cannot be written directly** -- the user must fall back to `$X = [SELECT ...]`, which
+  then misses the declaration form. This is now the most valuable single improvement to the
+  language, and it is a pattern-compilation change rather than a matcher change.
 
 - **The escape hatch for what pattern literals cannot express.** Every tool in the survey ships
   one (ast-grep's `kind:`, Semgrep's `pattern-regex` generic mode, JetBrains SSR's Groovy

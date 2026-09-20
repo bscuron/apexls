@@ -42,11 +42,10 @@
 //! files/directories filtering *which* files are reported on, empty
 //! meaning the whole project.
 
-use crate::project::{canonicalize_filters, find_project_root, matches_any, ArgError};
+use crate::project::{parse_apex_file, site_for, walk_project, ArgError, Site};
 use apex_syntax::ast::expr::{Expr, MethodCallExpr};
 use apex_syntax::{AstNode, SyntaxKind};
 use apexls_server::LineIndex;
-use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -76,14 +75,6 @@ const DATABASE_QUERY_METHOD_NAMES: &[&str] = &[
     "getpaginationcursorwithbinds",
 ];
 
-#[derive(Debug)]
-struct Query {
-    path: PathBuf,
-    line: usize,
-    col: usize,
-    text: String,
-}
-
 pub fn run(paths: &[PathBuf]) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let queries = match find_queries(paths, &cwd) {
@@ -99,7 +90,7 @@ pub fn run(paths: &[PathBuf]) -> ExitCode {
     // whitespace-collapsed (see `collapse`), since real inline SOQL is
     // routinely written across half a dozen lines.
     for q in &queries {
-        println!("{}:{}:{}:{}", q.path.display(), q.line, q.col, q.text);
+        println!("{q}");
     }
 
     ExitCode::SUCCESS
@@ -108,73 +99,12 @@ pub fn run(paths: &[PathBuf]) -> ExitCode {
 /// The actual inventory logic, factored out of [`run`] the same way
 /// `check`'s `find_findings` is and for the same reason: testable
 /// without touching the real process-global CWD or capturing stdout.
-fn find_queries(paths: &[PathBuf], cwd: &Path) -> Result<Vec<Query>, ArgError> {
-    let filters = canonicalize_filters(paths)?;
-
-    // Parsing happens on rayon's workers below, and a pathologically
-    // long chain expression can overflow a default-sized stack purely on
-    // *dropping* its parsed tree (see `apex_parser`'s module doc
-    // comment). `apex_binder` does exactly this for its own parallel
-    // passes; this command never builds a `BoundProgram`, so nothing
-    // else would have set the pool up. Failure only means the global
-    // pool was already built (by an earlier call in this process, or by
-    // a test binary), whose stack size is then outside this command's
-    // control.
-    let _ = rayon::ThreadPoolBuilder::new()
-        .stack_size(apex_parser::RECOMMENDED_MIN_STACK_SIZE)
-        .build_global();
-
-    let root = find_project_root(cwd);
-    let files = apex_discover::find_apex_files(&root);
-
-    let mut queries: Vec<Query> = files
-        .par_iter()
-        .filter(|path| {
-            // Skip the syscall entirely when there's nothing to filter
-            // against -- `matches_any` treats an empty `filters` as
-            // "matches everything" regardless, so canonicalizing every
-            // discovered file up front would buy nothing in the
-            // (default, no-arguments) whole-project case.
-            filters.is_empty() || {
-                let canon = path.canonicalize().unwrap_or_else(|_| (*path).clone());
-                matches_any(&canon, &filters)
-            }
-        })
-        .filter_map(|path| {
-            // An unreadable file is skipped rather than failing the whole
-            // run, matching how `apex_discover`'s own walk treats an
-            // entry it can't read.
-            let src = std::fs::read_to_string(path).ok()?;
-            let path = path.as_path();
-            let display_path = path.strip_prefix(cwd).unwrap_or(path);
-            Some(queries_in_file(display_path, &src))
-        })
-        .flatten()
-        .collect();
-
-    // Globally sorted rather than printed as each file lands:
-    // `find_apex_files`' order is walk order, which varies run to run
-    // with a parallel walker.
-    queries.sort_by(|a, b| (&a.path, a.line, a.col).cmp(&(&b.path, b.line, b.col)));
-
-    Ok(queries)
+fn find_queries(paths: &[PathBuf], cwd: &Path) -> Result<Vec<Site>, ArgError> {
+    walk_project(paths, cwd, queries_in_file)
 }
 
-fn queries_in_file(display_path: &Path, src: &str) -> Vec<Query> {
-    // A `.trigger` file is not a compilation unit -- parsing one as a
-    // class yields an error tree with no `SoqlExpr` in it at all, which
-    // would silently drop every query written in a trigger. Dispatched
-    // on the extension exactly as `apex_binder` does (`db.rs`'s
-    // `trigger` input flag).
-    let is_trigger = display_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
-    let parse = if is_trigger {
-        apex_parser::parse_trigger_unit(src)
-    } else {
-        apex_parser::parse_compilation_unit(src)
-    };
+fn queries_in_file(display_path: &Path, src: &str) -> Vec<Site> {
+    let parse = parse_apex_file(display_path, src);
     let index = LineIndex::new(src);
 
     parse
@@ -200,41 +130,9 @@ fn queries_in_file(display_path: &Path, src: &str) -> Vec<Query> {
                 }
                 _ => return None,
             }
-            // Anchored on the node's own *significant* span, not its
-            // full `text_range`: a node's green-tree span can swallow
-            // trivia at either end (the sink starts a node before
-            // flushing its first token's leading trivia, and flushes
-            // trailing trivia before finishing it -- see
-            // `apex_parser`'s `event` module), so a query preceded by a
-            // comment would otherwise report the comment's position and
-            // print the comment as part of the query.
-            let mut significant = node
-                .descendants_with_tokens()
-                .filter_map(|e| e.into_token())
-                .filter(|t| !t.kind().is_trivia());
-            let first = significant.next()?;
-            let last = significant.last().unwrap_or_else(|| first.clone());
-            let start = usize::from(first.text_range().start());
-            let end = usize::from(last.text_range().end());
-            let (line, col) = index.line_col(src, start as u32);
-            Some(Query {
-                path: display_path.to_path_buf(),
-                line,
-                col,
-                text: collapse(&src[start..end]),
-            })
+            site_for(display_path, src, &index, &node)
         })
         .collect()
-}
-
-/// Squashes every run of whitespace (and every line break) down to a
-/// single space, so one query is one output line. Collapses runs inside
-/// a string literal too -- accepted deliberately: this is a grep-shaped
-/// locator format, and a query's exact internal spacing is something to
-/// go read at `path:line:col`, not something this output claims to
-/// preserve.
-fn collapse(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -248,11 +146,8 @@ mod tests {
         dir
     }
 
-    fn rendered(queries: &[Query]) -> Vec<String> {
-        queries
-            .iter()
-            .map(|q| format!("{}:{}:{}:{}", q.path.display(), q.line, q.col, q.text))
-            .collect()
+    fn rendered(queries: &[Site]) -> Vec<String> {
+        queries.iter().map(Site::to_string).collect()
     }
 
     #[test]
@@ -330,6 +225,27 @@ mod tests {
                 "AccountTrigger.trigger:2:24:[SELECT Id FROM Contact]".to_string(),
                 "AccountTrigger.trigger:3:5:Database.query('SELECT Id FROM Lead')".to_string(),
             ],
+        );
+    }
+
+    /// Guards `apex_syntax::significant_range`: a comment sitting directly
+    /// before a query is attached *inside* the node by the tree-builder, so
+    /// a raw `text_range()` would anchor the report at the comment's column
+    /// and print the comment as part of the query text.
+    #[test]
+    fn anchors_past_a_leading_comment_rather_than_at_it() {
+        let dir = temp_dir("leading-comment");
+        std::fs::write(
+            dir.join("Commented.cls"),
+            "public class Commented {\n    public void run() {\n        List<Account> a = /* why */ [SELECT Id FROM Account];\n    }\n}\n",
+        )
+        .unwrap();
+        let queries = find_queries(&[], &dir).expect("no path arguments to fail on");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            rendered(&queries),
+            vec!["Commented.cls:3:37:[SELECT Id FROM Account]".to_string()],
         );
     }
 

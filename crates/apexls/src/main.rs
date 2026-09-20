@@ -10,6 +10,7 @@ mod ast;
 mod check;
 mod fix;
 mod project;
+mod query;
 mod soql;
 
 use clap::{Parser, Subcommand};
@@ -42,6 +43,14 @@ enum Command {
     Fix { paths: Vec<PathBuf> },
     /// List every SOQL query site in the project, ripgrep --vimgrep-style.
     Soql { paths: Vec<PathBuf> },
+    /// Search the project for a structural pattern, ripgrep --vimgrep-style.
+    ///
+    /// PATTERN is Apex code with holes: `...` matches any code in that
+    /// position, `$NAME` matches one construct and captures it.
+    Query {
+        pattern: String,
+        paths: Vec<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -58,5 +67,6 @@ fn main() -> ExitCode {
         Command::Check { paths } => check::run(&paths),
         Command::Fix { paths } => fix::run(&paths),
         Command::Soql { paths } => soql::run(&paths),
+        Command::Query { pattern, paths } => query::run(&pattern, &paths),
     }
 }

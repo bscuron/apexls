@@ -1,5 +1,5 @@
 Type: grilling
-Status: open
+Status: resolved
 Blocked by: 01
 
 ## Question
@@ -46,3 +46,104 @@ Decide, concretely:
 
 Resolution records the match algorithm in enough detail that two people would implement the same
 thing, plus the shared significant-span helper's shape and where it lives.
+
+## Answer
+
+Settled by building it rather than by argument -- the semantics are pinned by the tests in
+`crates/apexls/src/query.rs`, each of which names the rule it guards. Search ships; replace does
+not, per the map.
+
+**1. The algorithm.** A match is a recursive comparison of *significant children* (trivia
+filtered out at every level), rooted at any descendant whose kind equals the pattern's root kind:
+
+- Two tokens match when kind and text are equal.
+- Two nodes match when kind is equal and their child sequences match.
+- A pattern element that is nothing but a hole short-circuits: `...` matches anything, `$NAME`
+  binds or unifies.
+- A sequence without any ellipsis is exact, element for element. This is what makes `{ P }` mean
+  "a block whose only statement is P" -- guarded by `a_block_pattern_without_an_ellipsis_is_exact`.
+- An ellipsis consumes zero or more elements, with backtracking over where it stops.
+
+**2. `...` is deep only inside a `Block`.** That is where "anywhere in this loop" has to mean
+what a user expects; an argument list's `...` stays an ordinary sibling wildcard, since
+`f(..., $X, ...)` reaching into a nested call's arguments would be nobody's intent. Implemented
+as: after an ellipsis fails to match shallowly, retry the next fixed element against every
+*descendant* of the remaining elements. Proven on real code -- on the NPSP corpus,
+`for (...) { ... insert $X; ... }` finds 4 sites including an `insert` nested four blocks deep
+inside an `if` inside the loop.
+
+A block's own braces must be excluded from the statement sequence, or a trailing `...` followed
+by `}` can never match once the `...` has consumed everything -- the pattern would fail on
+exactly the nesting it exists to find. Statements are all nodes, so keeping only child *nodes*
+drops both braces without special-casing either token.
+
+**3. Trivia.** Filtered at every comparison, so a tightly written pattern matches loosely
+written source, comments included -- `System.debug(...)` matches `System . debug( /* why */ 'a' )`,
+and on NPSP `$X.size() > 0` matches `records.size()>0`. Guarded by
+`matching_ignores_whitespace_and_comments`.
+
+**4. Unification** compares *significant text*, so `a.b` and `a . b` are the same capture --
+ast-grep's structural rather than byte-wise notion of "the same". Bindings are a plain map
+threaded through one match attempt and cloned before each backtracking branch, so they scope per
+match and never leak across sites. Guarded by `a_reused_capture_must_match_the_same_code`.
+
+**5. Position** is `apex_syntax::significant_range`, now a shared helper on the syntax layer with
+`soql` switched onto it (`crates/apexls/src/soql.rs` no longer carries its own copy). Guarded on
+both sides: `soql`'s `anchors_past_a_leading_comment_rather_than_at_it` and `query`'s
+`position_is_anchored_past_a_leading_comment`.
+
+**6. The walk binds nothing** -- discover, parse, match, exactly as `soql` does. Whole-corpus
+NPSP search runs in ~0.6s. One constraint found while building: a compiled pattern cannot hold a
+red `SyntaxNode`, which is a thread-local cursor and neither `Send` nor `Sync`. `Pattern` stores
+the `GreenNode` and each rayon worker rebuilds its own cursor.
+
+**7. Nested matches** are all reported, outermost and innermost -- guarded by
+`reports_every_nested_match_not_just_the_outermost`.
+
+**8. A hole is recognised as a *token*, not by text.** Two bugs found in review, both fixed and
+both now guarded, because they are the kind that returns confident wrong answers rather than
+errors:
+
+- Recognising a hole by text prefix/suffix made every *composite* pattern collapse into one
+  match-anything hole: `$A + $B` substitutes to text that still starts with the capture prefix
+  and ends with the capture suffix, so the whole binary expression read as one unbound capture.
+  `$X = $Y;` matched all 48,452 statements in NPSP; it now matches 14,786 real assignments, and
+  `Database.query($A + $B)` went from matching `Database.query(soql)` to finding 45 genuine
+  string-concatenated queries -- **corpus item 6 works**. Guarded by
+  `a_composite_pattern_is_not_mistaken_for_one_hole`.
+- Deep descent threw away the pattern's tail, so `{ ... P }` matched a block with P buried in the
+  middle and further statements after it, breaking the map's "the trailing `...` is load-bearing"
+  rule. Guarded by `deep_descent_requires_a_trailing_ellipsis`.
+
+### Corpus status, measured against NPSP
+
+| Item | Status |
+|---|---|
+| 1 SOQL in a loop | **not expressible** -- see ceilings below |
+| 2 DML in a loop | works (4 hits, one nested four blocks deep) |
+| 3 `System.debug` | works (46 hits) |
+| 4 swallowing `catch` | only as `try { ... } catch (...) { ... }` (774 hits); a bare `catch` pattern still needs the parser entry point ticket 01 specified, which is **not implemented** |
+| 6 `Database.query` concat | works (45 hits) |
+| R1 `size() > 0` | findable (246 hits); the rewrite itself is not built, per the map |
+| R2 delete `System.debug` | findable; rewrite not built |
+
+### Ceilings this surfaced, recorded rather than patched
+
+- **A `...`-separated segment inside a block must be a statement.** `for (...) { ... [SELECT ... FROM $O] ... }`
+  does not compile, because a bare SOQL expression is not an Apex statement -- so corpus item 1,
+  the flagship query, cannot be written directly. The fix is to let each segment choose its own
+  parse entry point; deliberately not bolted on here. Guarded by
+  `an_expression_cannot_yet_stand_where_a_block_expects_a_statement`.
+- **`... P ... Q ... ` is refused deeply.** Descent only runs when everything after the fixed
+  element is an ellipsis, because a descendant match leaves nowhere well-defined to look for Q.
+  The shape returns nothing rather than something wrong. This is a larger limit than first
+  recorded (which named only *adjacent* fixed statements) and it blocks corpus item 8
+  (`Test.startTest()` with no matching `Test.stopTest()`). Guarded by
+  `two_fixed_elements_around_an_ellipsis_do_not_match_deeply`.
+- **An assignment pattern does not match a declaration.** `$X = [SELECT ...]` misses
+  `List<Contact> cs = [SELECT ...]`. This is the isomorphism gap the map already tracks.
+- **`for (...)` matches for-each loops only**, since the C-style header is a different tree
+  (ticket 01's one-to-many finding, still unimplemented).
+- **`parse_catch_clause`/`CatchRoot` is still not implemented.** Ticket 01 specified it as the
+  one required grammar change; this ticket built the matcher without it, so corpus item 4 is
+  reachable only in its `try`-anchored form.

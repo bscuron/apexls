@@ -133,6 +133,9 @@ impl Name {
     /// exactly one whitespace character, easy to miss until something
     /// (like a rename's `TextEdit`) is actually sensitive to the exact
     /// end boundary instead of just "close enough to place a cursor."
+    /// (This is the single-identifier case of the same hazard
+    /// [`crate::significant_range`] handles for a node of any shape -- reach
+    /// for that one when the node is not a `Name`.)
     pub fn ident_range(&self) -> rowan::TextRange {
         self.token()
             .map(|t| t.text_range())

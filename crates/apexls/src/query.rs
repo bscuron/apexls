@@ -1,0 +1,746 @@
+//! `apexls query PATTERN [paths...]`: structural search over Apex source,
+//! printed ripgrep `--vimgrep`-style as `path:line:col:text`.
+//!
+//! A pattern is Apex code with holes in it. `...` matches any code in the
+//! position it sits; `$NAME` matches any single construct and captures it,
+//! and reusing the same `$NAME` requires both occurrences to match the same
+//! code. So `for (...) { ... System.debug(...); ... }` finds a debug call
+//! anywhere inside a for-each loop, and `$X.size() > 0` finds that shape
+//! whatever `$X` is.
+//!
+//! **How a pattern becomes a tree.** Neither `...` nor `$` is an Apex
+//! token, so a pattern string lexes cleanly and then parses into garbage.
+//! Each hole is therefore rewritten into an ordinary identifier before the
+//! unmodified parser ever sees it, and the identifiers are recognised again
+//! on the way out. Two positions need more than a bare identifier, both
+//! detectable from the keyword heading the parenthesised group the hole
+//! sits in: `for (...)` wants a whole loop header and `catch (...)` wants a
+//! `Type name` pair. See [`substitute`].
+//!
+//! **What `...` means.** Inside a block it is *deep*: it crosses block
+//! boundaries, so `{ ... P ... }` means "this block contains P at any
+//! depth", not "P is a direct child statement". That is the whole point for
+//! the motivating query -- a SOQL call nested in an `if` inside a `for` is
+//! still the governor-limit bug. Everywhere else (argument lists, SOQL
+//! clauses) `...` is an ordinary sibling-sequence wildcard. A block pattern
+//! written without any `...` is exact: `{ P }` matches only a block whose
+//! single statement is P.
+//!
+//! **Two limits on deep matching**, both deliberate. Descent happens only
+//! when the fixed element is followed by an ellipsis, because a descendant
+//! match says nothing about what comes after it at the outer level: so
+//! `{ ... P ... }` finds P at any depth, while `{ ... P }` keeps its
+//! promise that P is the block's *last* statement and stays shallow. And
+//! for the same reason `{ ... P ... Q ... }` is refused deeply rather than
+//! answered wrongly -- matching P against a descendant leaves nowhere
+//! well-defined to look for Q. Both shapes return nothing instead of
+//! something false.
+//!
+//! Like `soql`, this binds nothing -- it discovers, parses and walks,
+//! skipping the whole `BoundProgram` cost. Matching is purely structural:
+//! `System.debug(...)` matches that shape whether or not `System` resolves
+//! to the stdlib class, which is a deliberate v1 limit, not an oversight.
+
+use crate::project::{parse_apex_file, site_for, walk_project, ArgError, Site};
+use apex_syntax::{NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode};
+use apexls_server::LineIndex;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+/// What a `...` becomes before the real parser sees it. Any identifier
+/// starting with this is an ellipsis hole, which is what lets the
+/// multi-token expansions (`__AP_DOTS___T`, `__AP_DOTS___V`, ...) be
+/// recognised by the same rule as the bare form.
+///
+/// A source file containing this identifier verbatim cannot be confused
+/// for a hole: [`hole_of`] is only ever asked about *pattern* elements, and
+/// a hole in the pattern matches whatever sits opposite it regardless. So
+/// the sentinel needs to be unlikely, not reserved.
+const ELLIPSIS_IDENT: &str = "__AP_DOTS__";
+/// A named hole `$FOO` becomes `__AP_CAP_FOO__`; the capture's own name is
+/// spliced between the two halves.
+const CAPTURE_PREFIX: &str = "__AP_CAP_";
+const CAPTURE_SUFFIX: &str = "__";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Hole {
+    /// `...` -- matches any code in this position.
+    Ellipsis,
+    /// `$NAME` -- matches one construct, and unifies with other
+    /// occurrences of the same name within the same match.
+    Capture(String),
+}
+
+/// A pattern compiled to the single syntax node it denotes.
+///
+/// Held as a *green* node, not the red `SyntaxNode` the parser handed back.
+/// A red node is a thread-local cursor into the tree and is deliberately
+/// neither `Send` nor `Sync`, so a pattern holding one could not cross onto
+/// rayon's workers; a `GreenNode` is the `Arc`-based shared half and cloning
+/// it is one refcount bump. Each worker rebuilds its own cursor via
+/// [`Pattern::node`].
+#[derive(Debug, Clone)]
+struct Pattern {
+    green: apex_syntax::GreenNode,
+}
+
+pub fn run(pattern_src: &str, paths: &[PathBuf]) -> ExitCode {
+    let pattern = match Pattern::compile(pattern_src) {
+        Ok(p) => p,
+        Err(ArgError(message, code)) => {
+            eprintln!("{message}");
+            return ExitCode::from(code);
+        }
+    };
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let matches = match walk_project(paths, &cwd, |path, src| {
+        matches_in_file(&pattern, path, src)
+    }) {
+        Ok(matches) => matches,
+        Err(ArgError(message, code)) => {
+            eprintln!("{message}");
+            return ExitCode::from(code);
+        }
+    };
+
+    for m in &matches {
+        println!("{m}");
+    }
+
+    ExitCode::SUCCESS
+}
+
+impl Pattern {
+    fn compile(pattern_src: &str) -> Result<Self, ArgError> {
+        let substituted = substitute(pattern_src);
+
+        // gogrep's multi-entry-point design: try each in turn and take the
+        // first that consumes the whole pattern. No user annotation is
+        // needed, so Coccinelle's declare-the-kind alternative is not
+        // required. Order matters only where a pattern is genuinely
+        // ambiguous (`{ ... }` parses as both a statement and a block);
+        // first-match-wins is well-defined and the root kind records which.
+        let entry_points: [fn(&str) -> apex_parser::Parse; 3] = [
+            apex_parser::parse_expression,
+            apex_parser::parse_statement,
+            apex_parser::parse_block,
+        ];
+
+        for parse_fn in entry_points {
+            let parse = parse_fn(&substituted);
+            if !parse.errors.is_empty() {
+                continue;
+            }
+            // Not a `text_range()` coverage check, which looks equivalent
+            // and is dead code: `parse_with` completes the root marker over
+            // the entire input and the tree is lossless, so the root range
+            // always equals the input length whether the grammar consumed
+            // the tokens or not. Unconsumed input shows up as *extra
+            // children beside* the real node -- which is how
+            // `System.debug(...);` is caught being mis-accepted as an
+            // expression (`[MethodCallExpr, Semi]`), and how a hole in
+            // operator position (`$L $OP $R`, a lone `NameExpr` with two
+            // orphaned identifiers after it) is caught at all.
+            let root = parse.syntax();
+            let significant = significant_children(&root);
+            if let [NodeOrToken::Node(node)] = significant.as_slice() {
+                return Ok(Pattern {
+                    green: node.green().to_owned(),
+                });
+            }
+        }
+
+        Err(ArgError(
+            format!(
+                "error: could not parse pattern as Apex: {pattern_src}\n\
+                 note: a pattern must be one complete expression, statement or block\n\
+                 note: `...` cannot stand for an operator or a whole declaration"
+            ),
+            2,
+        ))
+    }
+
+    /// A fresh red-tree cursor over this pattern, built per worker.
+    fn node(&self) -> SyntaxNode {
+        SyntaxNode::new_root(self.green.clone())
+    }
+
+    /// Every match of this pattern in `root`, innermost and outermost both
+    /// -- a nested match is a real match and hiding it would be worse than
+    /// printing two lines.
+    fn matches_in(&self, root: &SyntaxNode) -> Vec<SyntaxNode> {
+        let pattern = self.node();
+        root.descendants()
+            .filter(|candidate| {
+                candidate.kind() == pattern.kind() && {
+                    let mut binds = HashMap::new();
+                    match_node(&pattern, candidate, &mut binds)
+                }
+            })
+            .collect()
+    }
+}
+
+/// Rewrite `...` and `$NAME` into ordinary Apex identifiers.
+///
+/// Position-aware, because a uniform substitution does not survive contact
+/// with the grammar. Two rules, both decided from the raw text alone, since
+/// there is no tree yet to ask:
+///
+/// - A hole whose nearest preceding non-whitespace character is `{`, `;` or
+///   `}` sits where a *statement* is expected, and a bare identifier is not
+///   a statement, so it takes a trailing `;`.
+/// - `for (...)` and `catch (...)` want a multi-token construct rather than
+///   one name -- a loop header and a `Type name` pair respectively.
+///
+/// Everywhere else -- argument lists, operands, SOQL clauses -- a bare
+/// identifier is both correct and sufficient.
+fn substitute(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"...") {
+            out.push_str(&ellipsis_expansion(pattern, i));
+            i += 3;
+        } else if bytes[i] == b'$' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            out.push_str(CAPTURE_PREFIX);
+            out.push_str(&pattern[start..end]);
+            out.push_str(CAPTURE_SUFFIX);
+            i = end;
+        } else {
+            let ch = pattern[i..].chars().next().expect("char boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+fn ellipsis_expansion(pattern: &str, at: usize) -> String {
+    match enclosing_paren_head(pattern, at) {
+        // A `for (...)` header expands to the for-each shape. The C-style
+        // `for (init; cond; update)` form is a different tree, so
+        // `for (...)` finds for-each loops only in v1 -- compiling one
+        // pattern to several trees is the open question this defers.
+        Some("for") => format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_V : {ELLIPSIS_IDENT}_C"),
+        Some("catch") => format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_N"),
+        _ if in_statement_position(pattern, at) => format!("{ELLIPSIS_IDENT};"),
+        _ => ELLIPSIS_IDENT.to_string(),
+    }
+}
+
+/// The identifier or keyword immediately before the open paren of the group
+/// the hole sits directly inside -- `for` for `for (...)`, and equally
+/// `debug` for `System.debug(...)`, since nothing here distinguishes a
+/// keyword from a method name. Callers match only the keywords they care
+/// about and let the rest fall through. `None` when the hole is not inside
+/// a paren group at all.
+fn enclosing_paren_head(pattern: &str, at: usize) -> Option<&str> {
+    let before = &pattern[..at];
+    let mut depth = 0i32;
+    let open = before.char_indices().rev().find_map(|(i, c)| match c {
+        ')' => {
+            depth += 1;
+            None
+        }
+        '(' if depth == 0 => Some(i),
+        '(' => {
+            depth -= 1;
+            None
+        }
+        _ => None,
+    })?;
+    let head = before[..open].trim_end();
+    let start = head
+        .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .map_or(0, |i| i + 1);
+    Some(&head[start..])
+}
+
+fn in_statement_position(pattern: &str, at: usize) -> bool {
+    pattern[..at]
+        .chars()
+        .rev()
+        .find(|c| !c.is_whitespace())
+        .is_some_and(|c| matches!(c, '{' | ';' | '}'))
+}
+
+/// The hole a pattern element denotes, if the element is nothing but a
+/// hole. Recognised from the element's significant text rather than its
+/// shape, because the parser wraps a bare identifier differently depending
+/// on where it sits -- `NameExpr` in expression position, `ExprStmt >
+/// NameExpr` in statement position -- and the hole is the same hole either
+/// way.
+fn hole_of(element: &SyntaxElement) -> Option<Hole> {
+    // The element has to be *nothing but* the hole, which means exactly one
+    // significant token (plus an optional `;`, since a statement-position
+    // hole is substituted as `__AP_DOTS__;`).
+    //
+    // Matching on the element's concatenated text instead would be subtly
+    // and badly wrong: `$A + $B` substitutes to `__AP_CAP_A__ + __AP_CAP_B__`,
+    // whose text still begins with the capture prefix and ends with the
+    // capture suffix, so a prefix/suffix test reads the whole binary
+    // expression as one capture named `A__ + __AP_CAP_B` -- which, being
+    // unbound, then matches *anything*. `$X = $Y;` degraded the same way and
+    // matched all 48,452 statements in the NPSP corpus. A hole is a token,
+    // so it is recognised as a token.
+    let mut tokens = match element {
+        NodeOrToken::Token(t) => vec![t.clone()],
+        NodeOrToken::Node(n) => n
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !t.kind().is_trivia())
+            .collect(),
+    };
+    if tokens.last().is_some_and(|t| t.kind() == SyntaxKind::Semi) {
+        tokens.pop();
+    }
+    let [only] = tokens.as_slice() else {
+        return None;
+    };
+    let text = only.text();
+    if text.starts_with(ELLIPSIS_IDENT) {
+        return Some(Hole::Ellipsis);
+    }
+    text.strip_prefix(CAPTURE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(CAPTURE_SUFFIX))
+        .map(|name| Hole::Capture(name.to_string()))
+}
+
+type Binds = HashMap<String, String>;
+
+fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
+    if pat.kind() != src.kind() {
+        return false;
+    }
+    // Deep only inside a block: that is where "anywhere in this loop" has
+    // to mean what a user expects. An argument list's `...` stays an
+    // ordinary sibling wildcard, since `f(..., $X, ...)` reaching into a
+    // nested call's arguments would be nobody's intent.
+    let deep = pat.kind() == SyntaxKind::Block;
+
+    // A block's children include its own braces, and they must not take
+    // part in the statement sequence: a trailing `...` followed by `}`
+    // could never match once the `...` had already consumed everything, so
+    // `{ ... P ... }` would fail on exactly the nesting it exists to find.
+    // Statements are all nodes, so keeping only the nodes drops both braces
+    // without special-casing either token.
+    let (pat_items, src_items) = if deep {
+        (child_nodes(pat), child_nodes(src))
+    } else {
+        (significant_children(pat), significant_children(src))
+    };
+    match_seq(&pat_items, &src_items, deep, binds)
+}
+
+fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) -> bool {
+    match hole_of(pat) {
+        Some(Hole::Ellipsis) => return true,
+        Some(Hole::Capture(name)) => {
+            let text = match src {
+                NodeOrToken::Token(t) => t.text().to_string(),
+                NodeOrToken::Node(n) => significant_text(n),
+            };
+            // Unification, scoped per match: the first occurrence binds,
+            // later ones must agree. Compared on significant text so
+            // `a.b` and `a . b` are the same capture, matching ast-grep's
+            // structural rather than byte-wise notion of "the same".
+            return match binds.get(&name) {
+                Some(existing) => *existing == text,
+                None => {
+                    binds.insert(name, text);
+                    true
+                }
+            };
+        }
+        None => {}
+    }
+
+    match (pat, src) {
+        (NodeOrToken::Token(p), NodeOrToken::Token(s)) => {
+            p.kind() == s.kind() && p.text() == s.text()
+        }
+        (NodeOrToken::Node(p), NodeOrToken::Node(s)) => match_node(p, s, binds),
+        _ => false,
+    }
+}
+
+/// Match a pattern element sequence against a source one.
+///
+/// Without any ellipsis this is an exact, element-for-element comparison,
+/// which is what makes `{ P }` mean "a block whose only statement is P".
+///
+/// An ellipsis consumes zero or more elements, with backtracking over where
+/// it stops. When `deep`, the element following an ellipsis may also match
+/// a *descendant* of the remaining elements rather than one of them
+/// directly -- this is what makes `{ ... P ... }` mean "contains P at any
+/// depth". A fixed element matched against a descendant does not constrain
+/// what follows it to that descendant's siblings, so a run of several fixed
+/// statements between two ellipses is matched shallowly; v1 accepts that,
+/// since every pattern the corpus needs has a single fixed element between
+/// its ellipses.
+fn match_seq(pat: &[SyntaxElement], src: &[SyntaxElement], deep: bool, binds: &mut Binds) -> bool {
+    let Some(head) = pat.first() else {
+        return src.is_empty();
+    };
+
+    if hole_of(head) == Some(Hole::Ellipsis) {
+        let rest = &pat[1..];
+        if rest.is_empty() {
+            return true;
+        }
+        for split in 0..=src.len() {
+            let mut attempt = binds.clone();
+            if match_seq(rest, &src[split..], deep, &mut attempt) {
+                *binds = attempt;
+                return true;
+            }
+        }
+        // Descend only when everything after the fixed element is itself an
+        // ellipsis, i.e. the pattern is `... P ...`. A descendant match says
+        // nothing about what follows it at the outer level, so allowing it
+        // under any other tail would quietly drop that tail: before this
+        // guard, `{ ... P }` matched a block with P buried in the middle and
+        // two statements after it, destroying the "trailing `...` is
+        // load-bearing" rule the map relies on. `... P ... Q ...` is refused
+        // rather than answered wrongly -- see this module's doc comment.
+        // An *empty* tail is not good enough: `{ ... P }` anchors P as the
+        // block's last statement, and a descendant match cannot honour that.
+        // The tail must actually contain an ellipsis.
+        let tail = &rest[1..];
+        let tail_is_all_ellipses =
+            !tail.is_empty() && tail.iter().all(|e| hole_of(e) == Some(Hole::Ellipsis));
+        if deep && tail_is_all_ellipses {
+            for element in src {
+                let NodeOrToken::Node(node) = element else {
+                    continue;
+                };
+                for descendant in node.descendants().skip(1) {
+                    let mut attempt = binds.clone();
+                    let candidate = NodeOrToken::Node(descendant.clone());
+                    if match_element(&rest[0], &candidate, &mut attempt) {
+                        *binds = attempt;
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    let Some(first) = src.first() else {
+        return false;
+    };
+    match_element(head, first, binds) && match_seq(&pat[1..], &src[1..], deep, binds)
+}
+
+fn significant_children(node: &SyntaxNode) -> Vec<SyntaxElement> {
+    node.children_with_tokens()
+        .filter(|c| !c.kind().is_trivia())
+        .collect()
+}
+
+/// Just the child *nodes*, dropping every token. Used for a block, whose
+/// tokens are its braces.
+fn child_nodes(node: &SyntaxNode) -> Vec<SyntaxElement> {
+    node.children().map(NodeOrToken::Node).collect()
+}
+
+fn significant_text(node: &SyntaxNode) -> String {
+    apex_syntax::significant_range(node).map_or_else(String::new, |range| {
+        let full = node.text_range();
+        let text = node.text().to_string();
+        let start = usize::from(range.start() - full.start());
+        let end = usize::from(range.end() - full.start());
+        text[start..end].to_string()
+    })
+}
+
+fn matches_in_file(pattern: &Pattern, display_path: &Path, src: &str) -> Vec<Site> {
+    let parse = parse_apex_file(display_path, src);
+    let index = LineIndex::new(src);
+
+    pattern
+        .matches_in(&parse.syntax())
+        .into_iter()
+        .filter_map(|node| site_for(display_path, src, &index, &node))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile `pattern`, search `src` as a class, and render each hit the
+    /// way the CLI would minus the path.
+    fn hits(pattern: &str, src: &str) -> Vec<String> {
+        let pattern = Pattern::compile(pattern).expect("pattern should compile");
+        matches_in_file(&pattern, Path::new("T.cls"), src)
+            .into_iter()
+            .map(|m| format!("{}:{}:{}", m.line, m.col, m.text))
+            .collect()
+    }
+
+    fn wrap(body: &str) -> String {
+        format!("public class T {{\n    public void run() {{\n{body}\n    }}\n}}\n")
+    }
+
+    #[test]
+    fn compiles_each_grammatical_position_a_hole_can_sit_in() {
+        for pattern in [
+            "System.debug(...)",
+            "System.debug(...);",
+            "$X.size() > 0",
+            "[SELECT ... FROM $OBJ]",
+            "for (...) { ... }",
+            "{ ... System.debug(...); ... }",
+            "try { ... } catch (...) { }",
+            "insert $X;",
+        ] {
+            assert!(
+                Pattern::compile(pattern).is_ok(),
+                "should compile: {pattern}"
+            );
+        }
+    }
+
+    /// The one position no substitution can reach: an operator is not an
+    /// identifier. It must fail loudly at compile time rather than silently
+    /// matching a bare name.
+    #[test]
+    fn rejects_a_hole_in_operator_position() {
+        let err = Pattern::compile("$LEFT $OP $RIGHT").expect_err("operator holes are unreachable");
+        assert!(err.0.contains("could not parse pattern"), "{}", err.0);
+    }
+
+    /// The flagship query -- "SOQL anywhere inside a loop" -- cannot be
+    /// written directly, and that is a real gap rather than a quirk.
+    ///
+    /// Everything between two `...` inside a block must be a *statement*,
+    /// because that is what a block contains. A bare `[SELECT ...]` is not a
+    /// valid Apex statement, so the pattern will not parse; the user has to
+    /// fall back to the assignment form, which then misses the variable
+    /// *declaration* form (see `an_assignment_pattern_does_not_match_a_declaration`).
+    /// Lifting this means letting each `...`-separated segment pick its own
+    /// entry point so an expression can stand where a statement is expected
+    /// -- recorded on the map, deliberately not bolted on here.
+    #[test]
+    fn an_expression_cannot_yet_stand_where_a_block_expects_a_statement() {
+        let err = Pattern::compile("for (...) { ... [SELECT ... FROM $O] ... }")
+            .expect_err("a bare SOQL expression is not an Apex statement");
+        assert!(err.0.contains("could not parse pattern"), "{}", err.0);
+    }
+
+    #[test]
+    fn finds_a_call_shape_regardless_of_its_arguments() {
+        let src = wrap(
+            "        System.debug('a');\n        System.debug(x, y);\n        Other.debug('a');",
+        );
+        assert_eq!(
+            hits("System.debug(...);", &src),
+            vec![
+                "3:9:System.debug('a');".to_string(),
+                "4:9:System.debug(x, y);".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn captures_match_any_single_construct() {
+        let src = wrap("        if (accounts.size() > 0) { return; }");
+        assert_eq!(
+            hits("$X.size() > 0", &src),
+            vec!["3:13:accounts.size() > 0".to_string()],
+        );
+    }
+
+    /// Reusing a capture requires both occurrences to be the same code --
+    /// the property that makes a capture more than a wildcard.
+    #[test]
+    fn a_reused_capture_must_match_the_same_code() {
+        let same = wrap("        if (a != null) { a.doIt(); }");
+        let different = wrap("        if (a != null) { b.doIt(); }");
+        let pattern = "if ($X != null) { $X.doIt(); }";
+        assert_eq!(hits(pattern, &same).len(), 1, "same receiver should match");
+        assert!(
+            hits(pattern, &different).is_empty(),
+            "a different receiver must not match"
+        );
+    }
+
+    /// The motivating query, and the reason `...` is deep: the SOQL call is
+    /// nested inside an `if` inside the loop, and that is still the
+    /// governor-limit bug.
+    #[test]
+    fn ellipsis_in_a_block_crosses_block_boundaries() {
+        let src = wrap(
+            "        for (Account a : accounts) {\n            if (a.Name != null) {\n                System.debug(a);\n            }\n        }",
+        );
+        assert_eq!(
+            hits("for (...) { ... System.debug(...); ... }", &src).len(),
+            1,
+            "a debug nested two blocks deep is still inside the loop",
+        );
+    }
+
+    /// The converse: no ellipsis means an exact block, so a loop with other
+    /// statements in it does not match a single-statement pattern.
+    #[test]
+    fn a_block_pattern_without_an_ellipsis_is_exact() {
+        let only =
+            wrap("        for (Account a : accounts) {\n            System.debug(a);\n        }");
+        let plus = wrap(
+            "        for (Account a : accounts) {\n            System.debug(a);\n            count++;\n        }",
+        );
+        let pattern = "for (...) { System.debug(...); }";
+        assert_eq!(hits(pattern, &only).len(), 1, "exact single statement");
+        assert!(
+            hits(pattern, &plus).is_empty(),
+            "an extra statement must break an exact block match"
+        );
+    }
+
+    /// Trivia is not structure: a pattern written tightly must match source
+    /// written loosely, comments included.
+    #[test]
+    fn matching_ignores_whitespace_and_comments() {
+        let src = wrap("        System . debug( /* why */ 'a' );");
+        assert_eq!(hits("System.debug(...);", &src).len(), 1);
+    }
+
+    /// A hole is one token, so a *composite* pattern must never collapse
+    /// into a single match-anything hole. `$A + $B` substitutes to text that
+    /// still begins with the capture prefix and ends with the capture
+    /// suffix, so recognising holes by text prefix/suffix read the whole
+    /// binary expression as one unbound capture -- and `$X = $Y;` then
+    /// matched all 48,452 statements in the NPSP corpus.
+    #[test]
+    fn a_composite_pattern_is_not_mistaken_for_one_hole() {
+        let src =
+            wrap("        Database.query(soql);\n        Database.query(a + b);\n        x = y;");
+        assert_eq!(
+            hits("Database.query($A + $B)", &src),
+            vec!["4:9:Database.query(a + b)".to_string()],
+            "a plain variable argument is not a concatenation",
+        );
+        // An assignment pattern matches assignments, not every statement.
+        assert_eq!(hits("$X = $Y;", &src).len(), 1);
+    }
+
+    /// A trailing `...` is load-bearing, so deep descent is only sound when
+    /// the fixed element is followed by one. Without this, `{ ... P }`
+    /// matched a block with P buried in the middle and further statements
+    /// after it.
+    #[test]
+    fn deep_descent_requires_a_trailing_ellipsis() {
+        let buried = wrap(
+            "        for (Account a : accounts) {\n            if (x) {\n                System.debug(a);\n            }\n            count++;\n        }",
+        );
+        assert!(
+            hits("for (...) { ... System.debug(...); }", &buried).is_empty(),
+            "no trailing `...` means the debug must be the block's last statement",
+        );
+        assert_eq!(
+            hits("for (...) { ... System.debug(...); ... }", &buried).len(),
+            1,
+            "with a trailing `...` the same nesting matches",
+        );
+    }
+
+    /// The known ceiling, recorded so it is a decision rather than a
+    /// surprise: two fixed elements separated by an ellipsis cannot be
+    /// matched deeply, because a descendant match says nothing about what
+    /// follows it at the outer level. Refused rather than answered wrongly.
+    #[test]
+    fn two_fixed_elements_around_an_ellipsis_do_not_match_deeply() {
+        let src = wrap(
+            "        for (Account a : accounts) {\n            if (x) {\n                System.debug(a);\n                insert a;\n            }\n        }",
+        );
+        assert!(
+            hits(
+                "for (...) { ... System.debug(...); ... insert $X; ... }",
+                &src
+            )
+            .is_empty(),
+            "unsupported shape must find nothing rather than something wrong",
+        );
+    }
+
+    #[test]
+    fn reports_every_nested_match_not_just_the_outermost() {
+        let src = wrap(
+            "        for (Account a : outer) {\n            for (Account b : inner) {\n                System.debug(b);\n            }\n        }",
+        );
+        assert_eq!(
+            hits("for (...) { ... System.debug(...); ... }", &src).len(),
+            2,
+            "both the outer and inner loop contain the debug call",
+        );
+    }
+
+    #[test]
+    fn finds_soql_inside_a_loop() {
+        let src = wrap(
+            "        for (Account a : accounts) {\n            cs = [SELECT Id FROM Contact];\n        }",
+        );
+        assert_eq!(
+            hits("for (...) { ... $X = [SELECT ... FROM $OBJ]; ... }", &src).len(),
+            1,
+        );
+    }
+
+    /// The pattern language is structural, so an assignment and a variable
+    /// *declaration* are different shapes and one pattern does not catch
+    /// both -- `cs = [...]` matches, `List<Contact> cs = [...]` does not.
+    /// This is the known ceiling that Coccinelle-style isomorphisms exist to
+    /// lift (see the map's "Not yet specified"), recorded here as behaviour
+    /// rather than left for a user to discover.
+    #[test]
+    fn an_assignment_pattern_does_not_match_a_declaration() {
+        let declared = wrap(
+            "        for (Account a : accounts) {\n            List<Contact> cs = [SELECT Id FROM Contact];\n        }",
+        );
+        assert!(
+            hits(
+                "for (...) { ... $X = [SELECT ... FROM $OBJ]; ... }",
+                &declared
+            )
+            .is_empty(),
+            "a declaration is a different tree from an assignment",
+        );
+        // The SOQL expression itself is still findable, which is the
+        // workaround a user reaches for until isomorphisms exist.
+        assert_eq!(hits("[SELECT ... FROM $OBJ]", &declared).len(), 1);
+    }
+
+    #[test]
+    fn finds_dml_inside_a_loop() {
+        let src = wrap("        for (Account a : accounts) {\n            insert a;\n        }");
+        assert_eq!(hits("for (...) { ... insert $X; ... }", &src).len(), 1);
+    }
+
+    #[test]
+    fn position_is_anchored_past_a_leading_comment() {
+        let src = wrap("        /* note */ System.debug('a');");
+        assert_eq!(
+            hits("System.debug(...);", &src),
+            vec!["3:20:System.debug('a');".to_string()],
+        );
+    }
+
+    #[test]
+    fn searches_trigger_files_too() {
+        let src = "trigger T on Account (before insert) {\n    System.debug('a');\n}\n";
+        let pattern = Pattern::compile("System.debug(...);").expect("compiles");
+        let found = matches_in_file(&pattern, Path::new("T.trigger"), src);
+        assert_eq!(found.len(), 1, "a trigger is not a compilation unit");
+    }
+}
