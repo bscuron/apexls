@@ -1,7 +1,7 @@
 //! `apexls`: the single binary bundling every non-editor-invoked apexls
 //! entry point -- `ast` (parse-and-dump a file), `check` (batch
-//! diagnostics report), `fix` (batch-apply fixable diagnostics), and
-//! `server` (the LSP server, also reachable as its own `apexls-server`
+//! diagnostics report), `fix` (batch-apply fixable diagnostics), `soql`
+//! (project-wide SOQL query inventory), and `server` (the LSP server, also reachable as its own `apexls-server`
 //! binary -- kept separate so existing editor configs that invoke
 //! `apexls-server` directly by name, over stdio, need zero changes; see
 //! `apexls_server::run_server`'s own doc comment).
@@ -10,6 +10,7 @@ mod ast;
 mod check;
 mod fix;
 mod project;
+mod soql;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -39,6 +40,8 @@ enum Command {
     Check { paths: Vec<PathBuf> },
     /// Batch-apply every fixable diagnostic across the project, cargo-fix-style.
     Fix { paths: Vec<PathBuf> },
+    /// List every SOQL query site in the project, ripgrep --vimgrep-style.
+    Soql { paths: Vec<PathBuf> },
 }
 
 fn main() -> ExitCode {
@@ -54,5 +57,6 @@ fn main() -> ExitCode {
         Command::Ast { file } => ast::run(&file),
         Command::Check { paths } => check::run(&paths),
         Command::Fix { paths } => fix::run(&paths),
+        Command::Soql { paths } => soql::run(&paths),
     }
 }

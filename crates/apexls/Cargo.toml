@@ -13,6 +13,7 @@ apex-binder.workspace = true
 apex-discover.workspace = true
 apex-parser.workspace = true
 apex-printer.workspace = true
+apex-syntax.workspace = true
 apexls-server.workspace = true
 clap = { version = "4.6.6", features = ["derive"] }
 rayon = "1.12.0"

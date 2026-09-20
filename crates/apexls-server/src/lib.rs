@@ -119,8 +119,12 @@ use tracing::{info, warn, Level};
 mod capabilities;
 mod fix;
 mod line_index;
+// Re-exported for `apexls soql`, which needs the same byte-offset ->
+// 1-based (line, column) convention `CliDiagnostic`/`CliFix` already
+// report in, but builds no `BoundProgram` to get diagnostics from.
+pub use line_index::LineIndex;
 
-use line_index::{LineIndex, PositionEncoding};
+use line_index::PositionEncoding;
 
 /// The server's whole mutable state: the single resolved project root
 /// (see the module doc comment's "single-root only" section) plus

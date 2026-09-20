@@ -213,6 +213,7 @@ dependencies = [
  "apex-discover",
  "apex-parser",
  "apex-printer",
+ "apex-syntax",
  "apexls-server",
  "clap",
  "mimalloc",
