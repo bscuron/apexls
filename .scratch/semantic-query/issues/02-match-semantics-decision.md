@@ -212,7 +212,20 @@ loop query**, and `for (...) { ... insert $X; ... }` went from 4 to 5 -- the new
 real governor-limit bug the tool had been skipping. Guarded by `for_matches_both_loop_forms` and
 `an_explicit_c_style_header_matches_only_that_form`.
 
-**14. Matching is case-insensitive, because Apex is.** Found by the user against the real
+**14. A string literal is opaque, and `'...'` means any string.** Substituting inside quotes was
+a third silent wrong answer: `System.debug('...')` became a search for the literal text
+`'__AP_DOTS__'`, so it returned 0 while reading as "any string argument". Strings are now left
+alone by the substituter, so `'a...b'` is a three-dot string and `'$x'` is a dollar sign.
+
+A literal that is entirely `'...'` is the exception and means *any string literal*, as Semgrep
+spells it. It is its own hole kind rather than an ordinary ellipsis, because an ellipsis matches
+anything: `System.debug('...')` would then also match `System.debug(x)`, losing exactly the
+distinction the quotes were drawn to make. On NPSP it finds the 2 debug calls whose argument is a
+bare literal, out of 54 debug calls and 35 single-argument ones. Guarded by
+`a_whole_string_literal_hole_matches_any_string` and
+`holes_inside_a_string_literal_are_just_text`.
+
+**15. Matching is case-insensitive, because Apex is.** Found by the user against the real
 corpus: `Database.query(...)` returned 260 hits and `database.query(...)` returned 64, two
 halves of one set. Both now return 327. String literal contents stay case-sensitive, since case
 there is a difference in value rather than in spelling; capture unification is case-insensitive,

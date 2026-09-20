@@ -57,6 +57,13 @@
 //! three parts may be omitted, including all of them, since a hole standing
 //! alone in a sequence is an ellipsis and an ellipsis may consume nothing.
 //!
+//! **A string literal is opaque.** Holes written inside quotes are text --
+//! `'a...b'` is a three-dot string, `'$x'` is a dollar sign -- because a
+//! string is data, not structure. The one exception is a literal that is
+//! entirely `'...'`, which means *any string literal* and nothing else, the
+//! way Semgrep spells it: `System.debug('...')` asks for a logged literal
+//! message and does not match `System.debug(x)`.
+//!
 //! Like `soql`, this binds nothing -- it discovers, parses and walks,
 //! skipping the whole `BoundProgram` cost. Matching is purely structural:
 //! `System.debug(...)` matches that shape whether or not `System` resolves
@@ -88,6 +95,12 @@ const CAPTURE_SUFFIX: &str = "__";
 enum Hole {
     /// `...` -- matches any code in this position.
     Ellipsis,
+    /// `'...'` -- matches any string *literal*, and nothing else. Distinct
+    /// from `Ellipsis` because a hole written inside quotes asks for a
+    /// string specifically: `System.debug('...')` means "logging a literal
+    /// message", and matching `System.debug(x)` too would lose the
+    /// distinction the quotes were there to draw.
+    AnyString,
     /// `$NAME` -- matches one construct, and unifies with other
     /// occurrences of the same name within the same match.
     Capture(String),
@@ -303,7 +316,25 @@ fn substitute(pattern: &str, as_expression: &[usize], classic_headers: &[usize])
     let bytes = pattern.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i..].starts_with(b"...") {
+        if bytes[i] == b'\'' {
+            // A string literal is opaque. Substituting inside it was a
+            // silent wrong answer: `System.debug('...')` became a search
+            // for the literal text `'__AP_DOTS__'` and found nothing,
+            // while reading as "any string argument".
+            let end = string_literal_end(pattern, i);
+            let literal = &pattern[i..end];
+            if literal_content(literal) == Some("...") {
+                // The whole literal is a hole -- "any string" -- kept as a
+                // *string* token so it still matches a string literal and
+                // not an identifier. `hole_of` unwraps the quotes.
+                out.push('\'');
+                out.push_str(ELLIPSIS_IDENT);
+                out.push('\'');
+            } else {
+                out.push_str(literal);
+            }
+            i = end;
+        } else if bytes[i..].starts_with(b"...") {
             let statement = in_statement_position(pattern, i) && !as_expression.contains(&i);
             let classic = classic_headers.contains(&i);
             if statement {
@@ -359,8 +390,54 @@ fn terminate_pending_statement(out: &mut String) {
 fn ambiguous_hole_offsets(pattern: &str) -> Vec<usize> {
     let bytes = pattern.as_bytes();
     (0..bytes.len())
-        .filter(|&i| bytes[i..].starts_with(b"...") && in_statement_position(pattern, i))
+        .filter(|&i| {
+            bytes[i..].starts_with(b"...")
+                && !in_string_literal(pattern, i)
+                && in_statement_position(pattern, i)
+        })
         .collect()
+}
+
+/// Where the string literal opening at `open` ends, one past its closing
+/// quote -- or the end of the pattern if it is unterminated. A backslash
+/// escapes the next character, so `'it\'s'` is one literal.
+fn string_literal_end(pattern: &str, open: usize) -> usize {
+    let bytes = pattern.as_bytes();
+    let mut i = open + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'\'' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The text between a literal's quotes, if it is properly closed.
+fn literal_content(literal: &str) -> Option<&str> {
+    literal
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+}
+
+/// Is `at` inside a string literal? Scanned from the start, since quoting
+/// is only decidable in order.
+fn in_string_literal(pattern: &str, at: usize) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && i <= at {
+        if bytes[i] == b'\'' {
+            let end = string_literal_end(pattern, i);
+            if at > i && at < end - 1 {
+                return true;
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Every `...` that stands for a whole `for` header, by byte offset.
@@ -374,6 +451,7 @@ fn for_header_hole_offsets(pattern: &str) -> Vec<usize> {
     (0..bytes.len())
         .filter(|&i| {
             bytes[i..].starts_with(b"...")
+                && !in_string_literal(pattern, i)
                 && enclosing_paren_head(pattern, i) == Some("for")
                 && !encloses_a_semicolon(pattern, i)
         })
@@ -533,6 +611,12 @@ fn hole_of(element: &SyntaxElement) -> Option<Hole> {
     let [only] = tokens.as_slice() else {
         return None;
     };
+    // A string hole is a *string* token, so its quotes come off before the
+    // sentinel can be seen.
+    if is_string_literal_kind(only.kind()) {
+        let content = literal_content(only.text()).unwrap_or(only.text());
+        return (content == ELLIPSIS_IDENT).then_some(Hole::AnyString);
+    }
     let text = only.text();
     if text.starts_with(ELLIPSIS_IDENT) {
         return Some(Hole::Ellipsis);
@@ -540,6 +624,29 @@ fn hole_of(element: &SyntaxElement) -> Option<Hole> {
     text.strip_prefix(CAPTURE_PREFIX)
         .and_then(|rest| rest.strip_suffix(CAPTURE_SUFFIX))
         .map(|name| Hole::Capture(name.to_string()))
+}
+
+fn is_string_literal_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::StringLiteral | SyntaxKind::MultilineStringLiteral
+    )
+}
+
+/// Is this element a string literal -- the token itself, or the single
+/// expression node wrapping one?
+fn is_string_literal(element: &SyntaxElement) -> bool {
+    match element {
+        NodeOrToken::Token(t) => is_string_literal_kind(t.kind()),
+        NodeOrToken::Node(n) => {
+            let tokens: Vec<_> = n
+                .descendants_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| !t.kind().is_trivia())
+                .collect();
+            matches!(tokens.as_slice(), [only] if is_string_literal_kind(only.kind()))
+        }
+    }
 }
 
 type Binds = HashMap<String, String>;
@@ -576,6 +683,7 @@ fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
 fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) -> bool {
     match hole_of(pat) {
         Some(Hole::Ellipsis) => return true,
+        Some(Hole::AnyString) => return is_string_literal(src),
         Some(Hole::Capture(name)) => {
             let text = match src {
                 NodeOrToken::Token(t) => t.text().to_string(),
@@ -1141,6 +1249,45 @@ mod tests {
     /// ...but case-insensitivity belongs to identifiers and keywords, not
     /// to the characters inside a string, where case is a real difference
     /// in value.
+    /// A string literal is opaque, so a hole written inside one is text,
+    /// not a hole -- with a single exception: a literal that is *entirely*
+    /// `'...'` means "any string", the way Semgrep spells it.
+    ///
+    /// Before this, `System.debug('...')` substituted inside the quotes and
+    /// became a search for the literal text `'__AP_DOTS__'`, so it found
+    /// nothing at all while reading as "any string argument" -- a confident
+    /// wrong answer rather than an error.
+    #[test]
+    fn a_whole_string_literal_hole_matches_any_string() {
+        let src = wrap(
+            "        System.debug('hello');\n        System.debug('world');\n        System.debug(x);",
+        );
+        assert_eq!(
+            hits("System.debug('...');", &src).len(),
+            2,
+            "any string literal, but not a non-literal argument",
+        );
+        assert_eq!(
+            hits("System.debug('hello');", &src),
+            vec!["3:9:System.debug('hello');".to_string()],
+            "an ordinary literal still matches only itself",
+        );
+    }
+
+    /// Holes inside a string are literal text -- the string is data, not
+    /// structure, so `'a...b'` is a three-dot string and `'$x'` is a dollar
+    /// sign.
+    #[test]
+    fn holes_inside_a_string_literal_are_just_text() {
+        let src = wrap("        f('a...b');\n        f('$x');\n        f('zzz');");
+        assert_eq!(hits("f('a...b');", &src).len(), 1);
+        assert_eq!(hits("f('$x');", &src).len(), 1);
+        // And a string is opaque to the substituter, so quotes in the
+        // pattern do not derail the holes outside them.
+        assert_eq!(hits("f('a...b');", &src).len(), 1);
+        assert_eq!(hits("f(...);", &src).len(), 3);
+    }
+
     #[test]
     fn string_literal_contents_stay_case_sensitive() {
         let src = wrap("        f('USER_MODE');\n        f('user_mode');");
