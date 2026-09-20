@@ -161,7 +161,20 @@ fn find_queries(paths: &[PathBuf], cwd: &Path) -> Result<Vec<Query>, ArgError> {
 }
 
 fn queries_in_file(display_path: &Path, src: &str) -> Vec<Query> {
-    let parse = apex_parser::parse_compilation_unit(src);
+    // A `.trigger` file is not a compilation unit -- parsing one as a
+    // class yields an error tree with no `SoqlExpr` in it at all, which
+    // would silently drop every query written in a trigger. Dispatched
+    // on the extension exactly as `apex_binder` does (`db.rs`'s
+    // `trigger` input flag).
+    let is_trigger = display_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("trigger"));
+    let parse = if is_trigger {
+        apex_parser::parse_trigger_unit(src)
+    } else {
+        apex_parser::parse_compilation_unit(src)
+    };
     let index = LineIndex::new(src);
 
     parse
@@ -297,6 +310,26 @@ mod tests {
         assert_eq!(
             rendered(&queries),
             vec!["Baz.cls:3:27:[SELECT Id, (SELECT Id FROM Contacts) FROM Account]".to_string()],
+        );
+    }
+
+    #[test]
+    fn finds_queries_in_a_trigger_file() {
+        let dir = temp_dir("trigger");
+        std::fs::write(
+            dir.join("AccountTrigger.trigger"),
+            "trigger AccountTrigger on Account (before insert) {\n    List<Contact> cs = [SELECT Id FROM Contact];\n    Database.query('SELECT Id FROM Lead');\n}\n",
+        )
+        .unwrap();
+        let queries = find_queries(&[], &dir).expect("no path arguments to fail on");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            rendered(&queries),
+            vec![
+                "AccountTrigger.trigger:2:24:[SELECT Id FROM Contact]".to_string(),
+                "AccountTrigger.trigger:3:5:Database.query('SELECT Id FROM Lead')".to_string(),
+            ],
         );
     }
 
