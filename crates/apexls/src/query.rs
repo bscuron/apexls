@@ -101,12 +101,15 @@
 //! wildcard, which is what keeps a lone `*` the multiplication operator;
 //! `a*b` in a pattern is therefore a glob and `a * b` is arithmetic.
 //!
-//! **A declaration'''s modifiers match as a subset.** Every modifier the
-//! pattern names must be present, and ones it is silent about are ignored,
-//! so writing one narrows the search rather than pinning the whole list:
+//! **Modifiers match as a subset**, everywhere Apex lets one be written:
+//! a type or member declaration, a local variable, a method or catch
+//! parameter, a property accessor. Every modifier the pattern names must be
+//! present, and ones it is silent about are ignored, so writing one narrows
+//! the search rather than pinning the whole list --
 //! `static void addChild*() { ... }` finds
-//! `@isTest static void addChildQueries_success()`, while
-//! `@future static void addChild*() { ... }` finds none of them.
+//! `@isTest static void addChildQueries_success()`, and
+//! `@future static void addChild*() { ... }` finds none of them. Order does
+//! not matter either, so `public static` and `static public` are one list.
 //!
 //! **Replace** is `--replace TEMPLATE`, a string template taking only the
 //! pattern's *named* captures -- a bare `...` has nothing to refer to on
@@ -605,9 +608,9 @@ fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
     // `@isTest static void addChildQueries_success()` -- which matching the
     // list exactly did not, since the pattern had no way to say "and
     // whatever else this is annotated with".
-    if is_declaration(pat.kind()) {
-        let (pat_mods, pat_rest) = split_modifiers(&significant_children(pat));
-        let (src_mods, src_rest) = split_modifiers(&significant_children(src));
+    if carries_modifiers(pat.kind()) {
+        let (pat_mods, pat_rest) = partition_modifiers(&significant_children(pat));
+        let (src_mods, src_rest) = partition_modifiers(&significant_children(src));
         let every_named_modifier_present = pat_mods.iter().all(|wanted| {
             src_mods.iter().any(|have| {
                 let mut attempt = binds.clone();
@@ -969,26 +972,46 @@ fn glob_matches(glob: &str, text: &str) -> bool {
 }
 
 /// Does this kind carry a modifier list the pattern may narrow?
-fn is_declaration(kind: SyntaxKind) -> bool {
+///
+/// Every place Apex lets one be written: type and member declarations, a
+/// method or catch parameter, a property accessor, and a local variable.
+fn carries_modifiers(kind: SyntaxKind) -> bool {
     matches!(
         kind,
-        SyntaxKind::MethodDecl
+        SyntaxKind::ClassDecl
+            | SyntaxKind::InterfaceDecl
+            | SyntaxKind::EnumDecl
+            | SyntaxKind::MethodDecl
             | SyntaxKind::ConstructorDecl
             | SyntaxKind::FieldDecl
             | SyntaxKind::PropertyDecl
-            | SyntaxKind::ClassDecl
-            | SyntaxKind::InterfaceDecl
-            | SyntaxKind::EnumDecl
+            | SyntaxKind::PropertyAccessor
+            | SyntaxKind::FormalParam
+            | SyntaxKind::CatchClause
+            | SyntaxKind::LocalVarDeclStmt
     )
 }
 
-/// Split a declaration's children into its leading modifiers and the rest.
-fn split_modifiers(children: &[SyntaxElement]) -> (Vec<SyntaxElement>, Vec<SyntaxElement>) {
-    let end = children
-        .iter()
-        .position(|c| !matches!(c.kind(), SyntaxKind::Modifier | SyntaxKind::Annotation))
-        .unwrap_or(children.len());
-    (children[..end].to_vec(), children[end..].to_vec())
+/// Is this child one of the node's modifiers?
+///
+/// Usually a `Modifier` or `Annotation` node, but a local declaration
+/// bumps `final`/`transient` as bare tokens rather than wrapping them, so
+/// those count too -- otherwise `Integer $x = ...;` would fail to match
+/// `final Integer x = 1;` for a reason the user cannot see.
+fn is_modifier(element: &SyntaxElement) -> bool {
+    matches!(
+        element.kind(),
+        SyntaxKind::Modifier | SyntaxKind::Annotation | SyntaxKind::Final | SyntaxKind::Transient
+    )
+}
+
+/// Separate a node's modifiers from the rest of its children.
+///
+/// A partition rather than a leading run, because they are not always
+/// leading: a catch clause's modifiers sit after `catch (`, so taking a
+/// prefix would find none and silently fall back to exact matching.
+fn partition_modifiers(children: &[SyntaxElement]) -> (Vec<SyntaxElement>, Vec<SyntaxElement>) {
+    children.iter().cloned().partition(is_modifier)
 }
 
 fn significant_children(node: &SyntaxNode) -> Vec<SyntaxElement> {
@@ -2055,6 +2078,43 @@ mod tests {
         let names = Pattern::compile("f(a*b);").unwrap().capture_names();
         let err = Replacement::compile("g(a*b);", &names).expect_err("a glob captures nothing");
         assert!(err.0.contains("glob cannot appear"), "{}", err.0);
+    }
+
+    /// Subset matching applies everywhere Apex lets a modifier be written,
+    /// not only on members: a type declaration, a local variable, a catch
+    /// parameter, a method parameter, a property accessor.
+    #[test]
+    fn modifiers_narrow_everywhere_they_can_be_written() {
+        let src = "@isTest\npublic with sharing class T {\n    public void go(final Integer a, String b) {\n        final Integer n = 1;\n        Integer m = 2;\n        try { f(); } catch (final DmlException e) { }\n        try { g(); } catch (QueryException e) { }\n    }\n}\n";
+        let find = |pattern: &str| {
+            let p = Pattern::compile(pattern).expect("pattern should compile");
+            matches_in_file(&p, Path::new("T.cls"), src).len()
+        };
+
+        // A type declaration's annotations and sharing modifier.
+        assert_eq!(find("class $C { ... }"), 1, "none named");
+        assert_eq!(find("@isTest class $C { ... }"), 1, "named and present");
+        assert_eq!(find("with sharing class $C { ... }"), 1);
+        assert_eq!(find("@future class $C { ... }"), 0, "named and absent");
+
+        // A local declaration's `final`, which the grammar bumps as a bare
+        // token rather than wrapping in a `Modifier` node.
+        assert_eq!(find("Integer $v = ...;"), 2, "final and plain alike");
+        assert_eq!(
+            find("final Integer $v = ...;"),
+            1,
+            "narrows to the final one"
+        );
+
+        // A catch parameter's modifiers, which sit after `catch (` rather
+        // than leading the node -- the reason this is a partition and not
+        // a leading run.
+        assert_eq!(find("catch (...) { }"), 2);
+        assert_eq!(find("catch (final $T $e) { }"), 1);
+
+        // A method parameter's `final`.
+        assert_eq!(find("public void go(Integer $a, $T $b) { ... }"), 1);
+        assert_eq!(find("public void go(final Integer $a, $T $b) { ... }"), 1);
     }
 
     #[test]

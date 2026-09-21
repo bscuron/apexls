@@ -335,7 +335,17 @@ the pattern had no way to say "and whatever else this is annotated with". Writin
 narrows the search: `void addChild*()` finds all 9, `static void addChild*()` still finds 9, and
 `@future static void addChild*()` finds 0.
 
-**19. Matching is case-insensitive, because Apex is.** Found by the user against the real
+**19. Subset matching covers every modifier site**, not just members: a type declaration
+(`@isTest class $C`, `with sharing class $C`), a local variable's `final`, a catch parameter, a
+method parameter, a property accessor. Two details made the general form necessary -- a catch
+clause's modifiers sit after `catch (` rather than leading the node, so the split is a partition
+and not a prefix; and a local declaration bumps `final`/`transient` as bare tokens instead of
+wrapping them in `Modifier` nodes, so those count as modifiers too. On NPSP:
+`@isTest class $C { ... }` 283, `with sharing class $C { ... }` 363, `final $T $v = ...;` 386,
+and `catch (final $T $e) { ... }` 0 -- the last independently corroborated by `apex-parser`'s
+own note that the form "never appears anywhere in the NPSP corpus".
+
+**20. Matching is case-insensitive, because Apex is.** Found by the user against the real
 corpus: `Database.query(...)` returned 260 hits and `database.query(...)` returned 64, two
 halves of one set. Both now return 327. String literal contents stay case-sensitive, since case
 there is a difference in value rather than in spelling; capture unification is case-insensitive,
