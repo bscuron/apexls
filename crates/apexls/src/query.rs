@@ -95,6 +95,19 @@
 //! rewrite: `Database.query($...ARGS)` -> `Database.queryWithBinds($...ARGS, ...)`
 //! keeps a call'''s arguments whatever their number.
 //!
+//! **Globs match identifiers shell-style.** `addChild*`, `*_success`,
+//! `get?` -- `*` is any run of characters and `?` exactly one,
+//! case-insensitively. A glob must contain a name part as well as a
+//! wildcard, which is what keeps a lone `*` the multiplication operator;
+//! `a*b` in a pattern is therefore a glob and `a * b` is arithmetic.
+//!
+//! **A declaration'''s modifiers match as a subset.** Every modifier the
+//! pattern names must be present, and ones it is silent about are ignored,
+//! so writing one narrows the search rather than pinning the whole list:
+//! `static void addChild*() { ... }` finds
+//! `@isTest static void addChildQueries_success()`, while
+//! `@future static void addChild*() { ... }` finds none of them.
+//!
 //! **Replace** is `--replace TEMPLATE`, a string template taking only the
 //! pattern's *named* captures -- a bare `...` has nothing to refer to on
 //! the output side and is rejected before any file is touched. The match's
@@ -144,6 +157,12 @@ enum Hole {
     /// `g($...ARGS)` keeps a call's arguments whatever their number, which
     /// a one-construct capture cannot do.
     SeqCapture(String),
+    /// `addChild*` -- matches one construct whose text fits the glob.
+    ///
+    /// Shell-shaped: `*` stands for any run of characters and `?` for
+    /// exactly one. Case-insensitive, like every other comparison here,
+    /// because Apex is.
+    Glob(String),
     /// `$_` -- matches one construct and binds nothing.
     ///
     /// Distinct from `Capture("_")` because a name that unifies makes
@@ -191,11 +210,19 @@ impl Replacement {
                 apex_parser::TokenKind::PatternSeqCapture => 4,
                 _ => 0,
             };
+            if kind == apex_parser::TokenKind::PatternGlob {
+                return Err(ArgError(
+                    "error: a glob cannot appear in a replacement\n\
+                     note: a glob matches text but captures nothing; use $NAME in the pattern to carry it across"
+                        .to_string(),
+                    2,
+                ));
+            }
             if name_at == 0 {
                 return Err(ArgError(
-                    format!(
-                        "error: `...` cannot appear in a replacement\nnote: an unnamed hole has nothing to refer to; name it in the pattern and use the name here"
-                    ),
+                    "error: `...` cannot appear in a replacement\n\
+                     note: an unnamed hole has nothing to refer to; name it in the pattern and use the name here"
+                        .to_string(),
                     2,
                 ));
             }
@@ -500,6 +527,7 @@ fn hole_of(element: &SyntaxElement) -> Option<Hole> {
     };
     match only.kind() {
         SyntaxKind::PatternHole => return Some(Hole::Ellipsis),
+        SyntaxKind::PatternGlob => return Some(Hole::Glob(only.text().to_string())),
         SyntaxKind::PatternSeqCapture => {
             // `$...NAME` -- strip the sigil and the three dots.
             let name = only.text().get(4..).unwrap_or_default().to_string();
@@ -570,6 +598,28 @@ fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
     // nested call's arguments would be nobody's intent.
     let deep = pat.kind() == SyntaxKind::Block;
 
+    // A declaration's modifiers match as a *subset*: every modifier the
+    // pattern names must be there, and any the pattern is silent about are
+    // ignored. Writing one narrows the search rather than pinning the whole
+    // list, so `static void addChild*() { ... }` finds
+    // `@isTest static void addChildQueries_success()` -- which matching the
+    // list exactly did not, since the pattern had no way to say "and
+    // whatever else this is annotated with".
+    if is_declaration(pat.kind()) {
+        let (pat_mods, pat_rest) = split_modifiers(&significant_children(pat));
+        let (src_mods, src_rest) = split_modifiers(&significant_children(src));
+        let every_named_modifier_present = pat_mods.iter().all(|wanted| {
+            src_mods.iter().any(|have| {
+                let mut attempt = binds.clone();
+                match_element(wanted, have, &mut attempt)
+            })
+        });
+        if !every_named_modifier_present {
+            return false;
+        }
+        return match_seq(&pat_rest, &src_rest, binds);
+    }
+
     // A block's children include its own braces, and they must not take
     // part in the statement sequence: a trailing `...` followed by `}`
     // could never match once the `...` had already consumed everything, so
@@ -612,6 +662,13 @@ fn kinds_compatible(pat: &SyntaxNode, src: &SyntaxNode) -> bool {
 fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) -> bool {
     match hole_of(pat) {
         Some(Hole::Ellipsis) | Some(Hole::Anonymous) => return true,
+        Some(Hole::Glob(glob)) => {
+            let text = match src {
+                NodeOrToken::Token(t) => t.text().to_string(),
+                NodeOrToken::Node(n) => significant_text(n),
+            };
+            return glob_matches(&glob, &text);
+        }
         // A sequence capture reached here is standing where a single
         // element is expected rather than in a run, so it binds that one
         // element. Consistent either way: it binds whatever it consumed.
@@ -866,6 +923,72 @@ fn run_text(run: &[SyntaxElement]) -> String {
         usize::from(last.end()) - base,
     );
     text.get(from..to).unwrap_or_default().to_string()
+}
+
+/// Shell-style glob match: `*` is any run of characters, `?` exactly one.
+///
+/// Case-insensitive, like every other comparison here. Written out rather
+/// than compiled to a regex because `hole_of` is called for every element
+/// of every candidate, and building a regex there would dominate the walk.
+fn glob_matches(glob: &str, text: &str) -> bool {
+    let (g, t): (Vec<char>, Vec<char>) = (
+        glob.chars().flat_map(char::to_lowercase).collect(),
+        text.chars().flat_map(char::to_lowercase).collect(),
+    );
+    // Classic two-cursor wildcard match: on a mismatch, fall back to the
+    // last `*` and let it swallow one more character. Linear in practice
+    // and needs no allocation beyond the two buffers above.
+    let (mut gi, mut ti) = (0usize, 0usize);
+    let (mut star, mut retry) = (None, 0usize);
+    while ti < t.len() {
+        match g.get(gi) {
+            Some('*') => {
+                star = Some(gi);
+                retry = ti;
+                gi += 1;
+            }
+            Some('?') => {
+                gi += 1;
+                ti += 1;
+            }
+            Some(c) if *c == t[ti] => {
+                gi += 1;
+                ti += 1;
+            }
+            _ => match star {
+                Some(s) => {
+                    gi = s + 1;
+                    retry += 1;
+                    ti = retry;
+                }
+                None => return false,
+            },
+        }
+    }
+    g[gi..].iter().all(|c| *c == '*')
+}
+
+/// Does this kind carry a modifier list the pattern may narrow?
+fn is_declaration(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::MethodDecl
+            | SyntaxKind::ConstructorDecl
+            | SyntaxKind::FieldDecl
+            | SyntaxKind::PropertyDecl
+            | SyntaxKind::ClassDecl
+            | SyntaxKind::InterfaceDecl
+            | SyntaxKind::EnumDecl
+    )
+}
+
+/// Split a declaration's children into its leading modifiers and the rest.
+fn split_modifiers(children: &[SyntaxElement]) -> (Vec<SyntaxElement>, Vec<SyntaxElement>) {
+    let end = children
+        .iter()
+        .position(|c| !matches!(c.kind(), SyntaxKind::Modifier | SyntaxKind::Annotation))
+        .unwrap_or(children.len());
+    (children[..end].to_vec(), children[end..].to_vec())
 }
 
 fn significant_children(node: &SyntaxNode) -> Vec<SyntaxElement> {
@@ -1874,6 +1997,64 @@ mod tests {
         // The statement-terminator leniency this scoped back is still
         // there, which is what lets a block segment be written bare.
         assert!(Pattern::compile("{ ... [SELECT ... FROM $O] ... }").is_ok());
+    }
+
+    /// A glob matches an identifier shell-style: `*` any run of
+    /// characters, `?` exactly one, case-insensitively like everything
+    /// else here.
+    #[test]
+    fn a_glob_matches_an_identifier_shell_style() {
+        assert!(glob_matches("addChild*", "addChildQueries_success"));
+        assert!(glob_matches("*_success", "addChildQueries_success"));
+        assert!(glob_matches("addChild*_fail", "addChildQueriesNow_fail"));
+        assert!(glob_matches("get?", "getX"));
+        assert!(!glob_matches("get?", "getXY"));
+        assert!(
+            glob_matches("ADDCHILD*", "addChildQueries"),
+            "case-insensitive"
+        );
+        assert!(!glob_matches("addChild*", "removeChildQueries"));
+        assert!(glob_matches("*", "anything"));
+    }
+
+    /// A glob needs a *name* part as well as a wildcard. Without that rule
+    /// a lone `*` folds into a glob by itself and every multiplication in a
+    /// pattern stops parsing.
+    #[test]
+    fn a_lone_star_is_multiplication_not_a_glob() {
+        let src = wrap("        Integer n = a * b;\n        Integer m = x.size() * 2;");
+        assert_eq!(hits("$A * $B", &src).len(), 2);
+        assert_eq!(hits("x.size() * 2", &src).len(), 1);
+    }
+
+    /// Modifiers match as a *subset*: every one the pattern names must be
+    /// present, and ones it is silent about are ignored. Writing a modifier
+    /// narrows the search rather than pinning the whole list.
+    #[test]
+    fn modifiers_narrow_rather_than_pin_the_whole_list() {
+        let src = "public class T {\n    @isTest static void goNow() { f(); }\n    public void plain() { }\n}\n";
+        let find = |pattern: &str| {
+            let p = Pattern::compile(pattern).expect("pattern should compile");
+            matches_in_file(&p, Path::new("T.cls"), src).len()
+        };
+        assert_eq!(find("void go*() { ... }"), 1, "no modifiers named at all");
+        assert_eq!(
+            find("static void go*() { ... }"),
+            1,
+            "a subset still matches"
+        );
+        assert_eq!(find("@isTest static void go*() { ... }"), 1, "all of them");
+        assert_eq!(find("@future static void go*() { ... }"), 0, "narrows");
+        assert_eq!(find("public void go*() { ... }"), 0, "wrong modifier");
+    }
+
+    /// A glob matches text but captures nothing, so it cannot be spliced
+    /// back by a rewrite.
+    #[test]
+    fn a_glob_cannot_appear_in_a_replacement() {
+        let names = Pattern::compile("f(a*b);").unwrap().capture_names();
+        let err = Replacement::compile("g(a*b);", &names).expect_err("a glob captures nothing");
+        assert!(err.0.contains("glob cannot appear"), "{}", err.0);
     }
 
     #[test]

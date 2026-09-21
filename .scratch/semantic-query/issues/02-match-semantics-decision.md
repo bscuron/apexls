@@ -318,7 +318,24 @@ and the rule finally uniform -- `...` means "anything here", omitting it means e
 `[SELECT ... FROM $o]` returns 520; `[SELECT Id FROM $o WHERE Id = $v]`, impossible before,
 finds 14. Every previously-measured corpus number is unchanged.
 
-**18. Matching is case-insensitive, because Apex is.** Found by the user against the real
+**18. Identifier globs, and modifiers as a subset.** Two additions driven by a real query,
+`static void addChild*() { ... }`, which returned nothing for two independent reasons.
+
+A glob (`addChild*`, `*_success`, `get?`) matches one identifier shell-style, case-insensitively.
+It is folded from an adjacent run of name and wildcard tokens, and it must contain a *name* part:
+without that rule a lone `*` folds into a glob by itself and every multiplication in a pattern
+stops parsing -- `a * b` and `x.size() * 2` were both rejected until it was added. The cost is
+that `a*b` in a pattern is a glob while `a * b` is arithmetic, which is worth stating out loud.
+A glob captures nothing, so a replacement refuses it and says to use `$NAME` instead.
+
+Modifiers on a declaration now match as a **subset**: every modifier the pattern names must be
+present, and ones it is silent about are ignored. Matching the list exactly meant
+`static void addChild*()` could not find `@isTest static void addChildQueries_success()`, since
+the pattern had no way to say "and whatever else this is annotated with". Writing a modifier now
+narrows the search: `void addChild*()` finds all 9, `static void addChild*()` still finds 9, and
+`@future static void addChild*()` finds 0.
+
+**19. Matching is case-insensitive, because Apex is.** Found by the user against the real
 corpus: `Database.query(...)` returned 260 hits and `database.query(...)` returned 64, two
 halves of one set. Both now return 327. String literal contents stay case-sensitive, since case
 there is a difference in value rather than in spelling; capture unification is case-insensitive,

@@ -77,6 +77,7 @@ impl<'t> Parser<'t> {
                 SyntaxKind::PatternHole
                     | SyntaxKind::PatternCapture
                     | SyntaxKind::PatternSeqCapture
+                    | SyntaxKind::PatternGlob
             )
     }
 

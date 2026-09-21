@@ -50,6 +50,47 @@ impl Input {
                 i += 3;
                 continue;
             }
+            // An identifier glob: an adjacent run of names and wildcards
+            // with at least one wildcard in it. Adjacency is the whole
+            // test, and it is why `a*b` in a pattern is a glob while
+            // `a * b` is multiplication -- worth knowing, and the reason
+            // the spaces matter.
+            let mut run = 0;
+            let mut wildcards = 0;
+            let mut names = 0;
+            while i + run < raw.len() {
+                let t2 = raw[i + run];
+                let joins = run == 0 || t2.start == raw[i + run - 1].start + raw[i + run - 1].len;
+                let glob_part = match t2.kind {
+                    TokenKind::Identifier => {
+                        names += 1;
+                        true
+                    }
+                    TokenKind::Mul | TokenKind::Question => {
+                        wildcards += 1;
+                        true
+                    }
+                    _ => false,
+                };
+                if !joins || !glob_part {
+                    break;
+                }
+                run += 1;
+            }
+            // A glob must have a *name* part as well as a wildcard.
+            // Without that a lone `*` folds into a glob all by itself, and
+            // every multiplication in a pattern stops parsing -- `a * b`
+            // and `x.size() * 2` were both rejected.
+            if wildcards > 0 && names > 0 {
+                let last = raw[i + run - 1];
+                folded.push(Token {
+                    kind: TokenKind::PatternGlob,
+                    start: t.start,
+                    len: last.start + last.len - t.start,
+                });
+                i += run;
+                continue;
+            }
             // `$...NAME` first: `$` alone lexes as an identifier (a dot is
             // not an identifier-continue character), so the plainer
             // `$NAME` rule below would otherwise claim the `$` and leave
@@ -106,6 +147,7 @@ impl Input {
                     TokenKind::PatternHole
                         | TokenKind::PatternCapture
                         | TokenKind::PatternSeqCapture
+                        | TokenKind::PatternGlob
                 )
             })
             .map(|t| (t.start, t.len, t.kind))
