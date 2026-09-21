@@ -263,6 +263,13 @@ fn primary(p: &mut Parser<'_>) -> Option<CompletedMarker> {
     if p.at_hole() {
         let m = p.start();
         p.bump_hole();
+        // A call is built here rather than in the postfix chain, so a hole
+        // that names the callee needs the same treatment: `add*(y)` is a
+        // call to whichever method the glob matches.
+        if p.at(SyntaxKind::LParen) {
+            arg_list(p);
+            return Some(m.complete(p, SyntaxKind::CallExpr));
+        }
         return Some(m.complete(p, SyntaxKind::NameExpr));
     }
     match p.current() {
@@ -459,7 +466,9 @@ fn paren_or_cast_expr(p: &mut Parser<'_>) -> CompletedMarker {
 fn try_cast(p: &mut Parser<'_>) -> Option<CompletedMarker> {
     let m = p.start();
     p.bump(); // (
-    if !super::types::at_type_start(p) {
+    // A hole can stand where the cast's type begins, so `($T) $x` and
+    // `(List<$T>) $x` are writable.
+    if !super::types::at_type_start(p) && !p.at_hole() {
         return None;
     }
     super::types::type_ref(p);
@@ -503,7 +512,15 @@ fn paren_expr_body(p: &mut Parser<'_>) -> CompletedMarker {
 /// exclusions above, caught by the same metamorphic proptest.
 fn at_cast_operand_start(p: &Parser<'_>, n: usize) -> bool {
     let k = p.nth(n);
-    is_literal_kind(k)
+    // A hole can be the thing being cast: `(Account) $x`. Safe
+    // unconditionally, since these kinds only ever arise in a pattern.
+    matches!(
+        k,
+        SyntaxKind::PatternHole
+            | SyntaxKind::PatternCapture
+            | SyntaxKind::PatternSeqCapture
+            | SyntaxKind::PatternGlob
+    ) || is_literal_kind(k)
         || (super::ids::is_id_kind(k) && k != SyntaxKind::Instanceof)
         || matches!(
             k,

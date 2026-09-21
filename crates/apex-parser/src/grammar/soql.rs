@@ -49,7 +49,13 @@ pub(crate) fn sosl_expr(p: &mut Parser<'_>) -> CompletedMarker {
         _ => {
             p.bump(); // [
             p.expect(SyntaxKind::Find);
-            bound_expr(p);
+            // A hole stands for the search term, which is otherwise a
+            // literal or a bind and so unreachable: `[FIND ... RETURNING ...]`.
+            if p.at_hole() {
+                p.bump_hole();
+            } else {
+                bound_expr(p);
+            }
         }
     }
     sosl_clauses(p);
@@ -105,39 +111,75 @@ fn at_soql_clause_keyword(p: &Parser<'_>) -> bool {
 
 // ==== SOQL ====
 
+/// Consume a `...` standing for every clause that follows, if one is here.
+///
+/// Wrapped in a `SoqlWhereClause` for no deeper reason than that it has to
+/// be some node: the matcher only ever sees it as a hole, since its single
+/// token is one.
+fn trailing_clause_hole(p: &mut Parser<'_>) -> bool {
+    if !p.at_ellipsis() {
+        return false;
+    }
+    let m = p.start();
+    p.bump_hole();
+    m.complete(p, SyntaxKind::SoqlWhereClause);
+    true
+}
+
 fn query(p: &mut Parser<'_>) {
     p.expect(SyntaxKind::Select);
     select_list(p);
     p.expect(SyntaxKind::From);
     from_list(p);
-    // A hole here stands for any remaining clauses, which is what makes
-    // `[SELECT Id FROM $o ...]` mean "and whatever else this query does".
-    if p.at_hole() {
-        let m = p.start();
-        p.bump_hole();
-        m.complete(p, SyntaxKind::SoqlWhereClause);
+    // A hole at any clause boundary stands for every clause that follows,
+    // so `[SELECT Id FROM $o ...]` means "and whatever else this query
+    // does" and `[SELECT ... FROM $o WHERE $f = $v ...]` says the same
+    // after naming one clause. Checked at each boundary rather than only
+    // after the FROM list, which is where it used to stop.
+    if trailing_clause_hole(p) {
         return;
     }
     if p.at(SyntaxKind::Using) {
         using_scope(p);
     }
+    if trailing_clause_hole(p) {
+        return;
+    }
     if p.at(SyntaxKind::Where) {
         where_clause(p);
+    }
+    if trailing_clause_hole(p) {
+        return;
     }
     while p.at(SyntaxKind::With) {
         with_clause(p);
     }
+    if trailing_clause_hole(p) {
+        return;
+    }
     if p.at(SyntaxKind::Group) {
         group_by(p);
+    }
+    if trailing_clause_hole(p) {
+        return;
     }
     if p.at(SyntaxKind::Order) {
         order_by(p);
     }
+    if trailing_clause_hole(p) {
+        return;
+    }
     if p.at(SyntaxKind::Limit) {
         limit_clause(p);
     }
+    if trailing_clause_hole(p) {
+        return;
+    }
     if p.at(SyntaxKind::Offset) {
         offset_clause(p);
+    }
+    if trailing_clause_hole(p) {
+        return;
     }
     if p.at(SyntaxKind::All) && p.nth(1) == SyntaxKind::Rows {
         p.bump();
@@ -246,7 +288,7 @@ fn using_scope(p: &mut Parser<'_>) -> CompletedMarker {
 fn where_clause(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // WHERE
-    if p.at_hole() {
+    if p.at_ellipsis() {
         p.bump_hole();
         return m.complete(p, SyntaxKind::SoqlWhereClause);
     }
@@ -569,7 +611,7 @@ fn field_order(p: &mut Parser<'_>) -> CompletedMarker {
 fn limit_clause(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // LIMIT
-    if p.at_hole() {
+    if p.at_ellipsis() {
         p.bump_hole();
         return m.complete(p, SyntaxKind::SoqlLimit);
     }
@@ -848,6 +890,12 @@ fn field_name_list(p: &mut Parser<'_>) -> CompletedMarker {
 /// soslWithClause* limitClause? (UPDATE updateList)?`.
 fn sosl_clauses(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
+    // As in a SOQL query, a bare `...` here stands for every clause that
+    // follows.
+    if p.at_ellipsis() {
+        p.bump_hole();
+        return m.complete(p, SyntaxKind::SoslClauses);
+    }
     if p.at(SyntaxKind::In) {
         p.bump();
         search_group(p);

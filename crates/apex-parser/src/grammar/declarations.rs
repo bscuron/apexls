@@ -201,9 +201,12 @@ fn class_body(p: &mut Parser<'_>) {
 
 /// `classBodyDeclaration: ';' | STATIC? block | modifier* memberDeclaration`.
 pub(crate) fn class_body_decl(p: &mut Parser<'_>) {
-    // A hole stands in for whole members, which is what lets a class body
-    // be written `class $C { ... }`.
-    if p.at_hole() {
+    // A bare `...` stands in for whole members, which is what lets a class
+    // body be written `class $C { ... }`. Only the *ellipsis*: a capture
+    // here is naming a return type, so reading any hole as a member
+    // placeholder made `$_ add*(...) { ... }` swallow the `$_` and then
+    // choke on the method that followed it.
+    if p.at_ellipsis() {
         let m = p.start();
         p.bump_hole();
         m.complete(p, SyntaxKind::FieldDecl);
@@ -316,7 +319,7 @@ fn method_body_or_semi(p: &mut Parser<'_>) {
 fn formal_parameters(p: &mut Parser<'_>) {
     let m = p.start();
     p.expect(SyntaxKind::LParen);
-    if p.at_hole() {
+    if p.at_ellipsis() {
         // Any parameters, of any arity, including none.
         p.bump_hole();
     } else if !p.at(SyntaxKind::RParen) {
@@ -388,6 +391,13 @@ fn interface_body(p: &mut Parser<'_>) {
 /// formalParameters ';'` -- interface methods never have a body.
 fn interface_method_decl(p: &mut Parser<'_>) {
     let m = p.start();
+    // As in `class_body_decl`, a bare `...` stands in for whole members --
+    // only the ellipsis, since a capture here is naming a return type.
+    if p.at_ellipsis() {
+        p.bump_hole();
+        m.complete(p, SyntaxKind::MethodDecl);
+        return;
+    }
     modifiers(p);
     if p.at(SyntaxKind::Void) {
         p.bump();
@@ -429,10 +439,16 @@ pub(crate) fn trigger_unit(p: &mut Parser<'_>) -> CompletedMarker {
     p.expect(SyntaxKind::On);
     super::ids::expect_id(p); // SObject reference, not a declared name
     p.expect(SyntaxKind::LParen);
-    trigger_case(p);
-    while p.at(SyntaxKind::Comma) {
-        p.bump();
+    // A bare `...` stands for the whole event list, so a pattern need not
+    // spell out `before insert, after update, ...` to ask about a trigger.
+    if p.at_ellipsis() {
+        p.bump_hole();
+    } else {
         trigger_case(p);
+        while p.at(SyntaxKind::Comma) {
+            p.bump();
+            trigger_case(p);
+        }
     }
     p.expect(SyntaxKind::RParen);
     trigger_block(p);

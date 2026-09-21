@@ -81,6 +81,18 @@ impl<'t> Parser<'t> {
             )
     }
 
+    /// Is the parser on a bare `...`, as opposed to any hole?
+    ///
+    /// The distinction runs through the whole grammar: a check standing in
+    /// for a *whole construct or run* takes only an ellipsis, because a
+    /// capture there is naming one part of that construct. `catch (...)`
+    /// is any parameter while `catch ($T $e)` names its type and variable;
+    /// `WHERE ...` is any condition while `WHERE $f = 1` names its field.
+    /// Reading any hole as the whole thing swallows the parts that follow.
+    pub(crate) fn at_ellipsis(&self) -> bool {
+        self.pattern_mode && self.at(SyntaxKind::PatternHole)
+    }
+
     /// Was the token just consumed a bare `...`?
     ///
     /// Used at the one place the grammar is genuinely ambiguous about what

@@ -154,6 +154,11 @@ fn when_value(p: &mut Parser<'_>) -> CompletedMarker {
 
 fn when_literal(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
+    // A hole stands in for whatever the arm matches on.
+    if p.at_hole() {
+        p.bump_hole();
+        return m.complete(p, SyntaxKind::WhenLiteral);
+    }
     match p.current() {
         SyntaxKind::LParen => {
             p.bump();
@@ -191,7 +196,7 @@ fn for_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     // A hole stands in for the entire loop header, whichever of Apex's two
     // forms the source uses -- so one written `for (...)` covers both
     // rather than having to be compiled twice.
-    if p.at_hole() && p.nth(1) == SyntaxKind::RParen {
+    if p.at_ellipsis() && p.nth(1) == SyntaxKind::RParen {
         p.bump_hole();
         p.expect(SyntaxKind::RParen);
         if p.at(SyntaxKind::Semi) {
@@ -342,7 +347,7 @@ pub(crate) fn catch_clause(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // catch
     p.expect(SyntaxKind::LParen);
-    if p.at_hole() {
+    if p.at_ellipsis() {
         // The whole `Type name` pair, in one hole.
         p.bump_hole();
     } else {

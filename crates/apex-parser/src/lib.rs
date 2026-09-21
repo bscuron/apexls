@@ -153,6 +153,7 @@ pub enum Fragment {
     Block,
     CatchClause,
     ClassMember,
+    TriggerUnit,
 }
 
 /// Parse `src` as a structural-search *pattern*: Apex with holes in it.
@@ -195,6 +196,10 @@ pub fn parse_pattern(src: &str, fragment: Fragment) -> Parse {
         Fragment::ClassMember => {
             grammar::declarations::class_body_decl(&mut p);
             apex_syntax::SyntaxKind::MemberRoot
+        }
+        Fragment::TriggerUnit => {
+            grammar::declarations::trigger_unit(&mut p);
+            apex_syntax::SyntaxKind::TriggerRoot
         }
     };
     m.complete(&mut p, root);

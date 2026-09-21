@@ -140,7 +140,7 @@ syntax_kind! {
     }
     nodes {
         // ---- Roots (fragment-parse entry points) / recovery ----
-        ExprRoot, StmtRoot, BlockRoot, CatchRoot, MemberRoot, ErrorNode,
+        ExprRoot, StmtRoot, BlockRoot, CatchRoot, MemberRoot, TriggerRoot, ErrorNode,
 
         // ---- Types (expression/statement-scoped subset only) ----
         Type, TypeArgList, QualifiedName,

@@ -418,6 +418,7 @@ impl Pattern {
             Fragment::Block,
             Fragment::CatchClause,
             Fragment::ClassMember,
+            Fragment::TriggerUnit,
         ] {
             let parse = apex_parser::parse_pattern(pattern_src, fragment);
             if !parse.errors.is_empty() {
