@@ -12,6 +12,12 @@ pub(crate) struct Parser<'t> {
     pos: usize,
     events: Vec<Event>,
     errors: Vec<ParseError>,
+    /// Parsing a structural-search *pattern* rather than real Apex.
+    ///
+    /// A pattern's holes arrive as `PatternHole` tokens (see
+    /// `Input::new_pattern`), and in this mode the parser accepts one
+    /// wherever it *requires* a construct -- see [`Parser::at_hole`].
+    pattern_mode: bool,
 }
 
 impl<'t> Parser<'t> {
@@ -21,6 +27,16 @@ impl<'t> Parser<'t> {
             pos: 0,
             events: Vec::new(),
             errors: Vec::new(),
+            pattern_mode: false,
+        }
+    }
+
+    /// A parser over a structural-search pattern -- see
+    /// [`Parser::at_hole`].
+    pub(crate) fn new_pattern(input: &'t Input) -> Self {
+        Parser {
+            pattern_mode: true,
+            ..Parser::new(input)
         }
     }
 
@@ -40,6 +56,45 @@ impl<'t> Parser<'t> {
 
     pub(crate) fn at(&self, kind: SyntaxKind) -> bool {
         self.current() == kind
+    }
+
+    /// Is the parser sitting on a pattern hole?
+    ///
+    /// Only ever true while parsing a pattern, since no real Apex source
+    /// can produce the token. Grammar code consults this at the points
+    /// where it *requires* a construct -- a name, a type, a value, an
+    /// element of a list -- and lets the hole stand in for it.
+    ///
+    /// Deliberately *not* consulted where the grammar is making a
+    /// *choice*: `statement()` picks its form by asking `at(If)`,
+    /// `at(For)` and so on, and a hole that answered yes to the first of
+    /// those would silently parse every hole as an `if`. A hole satisfies
+    /// a requirement; it does not decide an alternative.
+    pub(crate) fn at_hole(&self) -> bool {
+        self.pattern_mode
+            && matches!(
+                self.current(),
+                SyntaxKind::PatternHole | SyntaxKind::PatternCapture
+            )
+    }
+
+    /// Was the token just consumed a bare `...`?
+    ///
+    /// Used at the one place the grammar is genuinely ambiguous about what
+    /// follows a hole: `[` after an ellipsis starts a SOQL query in a new
+    /// statement (`{ ... [SELECT ...] }`), whereas `[` after a capture is
+    /// an ordinary index expression (`$X[0]`).
+    pub(crate) fn prev_was_ellipsis(&self) -> bool {
+        self.pattern_mode
+            && self.pos > 0
+            && SyntaxKind::from_token_kind(self.input.kind(self.pos - 1))
+                == SyntaxKind::PatternHole
+    }
+
+    /// Consume a hole standing in for whatever the caller required.
+    pub(crate) fn bump_hole(&mut self) {
+        debug_assert!(self.at_hole());
+        self.bump();
     }
 
     pub(crate) fn at_eof(&self) -> bool {
@@ -74,6 +129,13 @@ impl<'t> Parser<'t> {
     pub(crate) fn expect(&mut self, kind: SyntaxKind) -> bool {
         if self.at(kind) {
             self.bump();
+            true
+        } else if self.pattern_mode && kind == SyntaxKind::Semi {
+            // A pattern is a fragment a human typed, and a trailing `;` is
+            // the thing they most often leave off -- `{ ... [SELECT ...] ... }`
+            // means "a block containing this query" and is written exactly
+            // like that. Tolerated only while parsing a pattern; real Apex
+            // still requires its terminators.
             true
         } else {
             self.error_at_gap(format!("expected {kind:?}, found {:?}", self.current()));

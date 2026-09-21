@@ -170,6 +170,19 @@ fn for_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     p.bump(); // for
     p.expect(SyntaxKind::LParen);
 
+    // A hole stands in for the entire loop header, whichever of Apex's two
+    // forms the source uses -- so one written `for (...)` covers both
+    // rather than having to be compiled twice.
+    if p.at_hole() && p.nth(1) == SyntaxKind::RParen {
+        p.bump_hole();
+        p.expect(SyntaxKind::RParen);
+        if p.at(SyntaxKind::Semi) {
+            p.bump();
+        } else {
+            statement(p);
+        }
+        return m.complete(p, SyntaxKind::ForEachStmt);
+    }
     let checkpoint = p.checkpoint();
     let is_each = try_enhanced_for_control(p);
     if !is_each {
@@ -311,11 +324,16 @@ pub(crate) fn catch_clause(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // catch
     p.expect(SyntaxKind::LParen);
-    super::declarations::modifiers(p);
-    if !super::types::qualified_name(p) {
-        p.error("expected exception type");
+    if p.at_hole() {
+        // The whole `Type name` pair, in one hole.
+        p.bump_hole();
+    } else {
+        super::declarations::modifiers(p);
+        if !super::types::qualified_name(p) {
+            p.error("expected exception type");
+        }
+        super::ids::expect_name(p);
     }
-    super::ids::expect_name(p);
     p.expect(SyntaxKind::RParen);
     block(p);
     m.complete(p, SyntaxKind::CatchClause)

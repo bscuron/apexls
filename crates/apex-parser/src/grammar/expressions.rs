@@ -119,6 +119,12 @@ macro_rules! left_assoc_level {
     ($name:ident, $next:ident, $at_op:expr) => {
         fn $name(p: &mut Parser<'_>) -> Option<CompletedMarker> {
             let mut lhs = $next(p)?;
+            // Deliberately *not* `|| p.at_hole()`. An operator is reached
+            // only by choosing to continue a binary expression, and a hole
+            // that answered yes there read `{ ... $X = y; }` as "the
+            // ellipsis, operated on by $X" -- swallowing the statement that
+            // follows. Operator position stays out of reach; every other
+            // hole is a requirement, which is unambiguous.
             while $at_op(p.current()) {
                 let m = lhs.precede(p);
                 p.bump();
@@ -219,6 +225,12 @@ fn expr_primary_chain(p: &mut Parser<'_>) -> Option<CompletedMarker> {
                 p.bump();
                 m.complete(p, SyntaxKind::IndexExpr)
             }
+            // A `[` right after a bare `...` is not indexing into the
+            // ellipsis -- it opens the next thing the pattern names, which
+            // in Apex is overwhelmingly a SOQL query: `{ ... [SELECT ...] }`
+            // reads as "a block containing this query". A `[` after a
+            // *capture* is left alone, since `$X[0]` really is an index.
+            SyntaxKind::LBrack if p.prev_was_ellipsis() => break,
             SyntaxKind::LBrack => {
                 let m = e.precede(p);
                 p.bump();
@@ -246,6 +258,13 @@ fn is_literal_kind(k: SyntaxKind) -> bool {
 }
 
 fn primary(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+    // A hole stands in for a whole primary expression, which is what makes
+    // `$v` usable anywhere a value is required.
+    if p.at_hole() {
+        let m = p.start();
+        p.bump_hole();
+        return Some(m.complete(p, SyntaxKind::NameExpr));
+    }
     match p.current() {
         SyntaxKind::This if p.nth(1) == SyntaxKind::LParen => {
             let m = p.start();

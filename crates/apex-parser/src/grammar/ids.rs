@@ -17,10 +17,18 @@ use crate::parser::Parser;
 use apex_syntax::SyntaxKind;
 
 pub(crate) fn at_id(p: &Parser<'_>) -> bool {
+    // A hole stands where a name is required, so every gate that asks
+    // "is there a name here" must say yes to one.
+    if p.at_hole() {
+        return true;
+    }
     is_id_kind(p.current())
 }
 
 pub(crate) fn at_any_id(p: &Parser<'_>) -> bool {
+    if p.at_hole() {
+        return true;
+    }
     is_any_id_kind(p.current())
 }
 
@@ -56,6 +64,13 @@ pub(crate) fn expect_any_id(p: &mut Parser<'_>) -> bool {
 /// (`QualifiedName`, SOQL field names, the trigger's `ON <object>`) --
 /// those aren't declaring anything.
 pub(crate) fn expect_name(p: &mut Parser<'_>) -> bool {
+    // A hole stands in for the declared name.
+    if p.at_hole() {
+        let m = p.start();
+        p.bump_hole();
+        m.complete(p, SyntaxKind::DeclName);
+        return true;
+    }
     let m = p.start();
     let ok = expect_id(p);
     m.complete(p, SyntaxKind::DeclName);

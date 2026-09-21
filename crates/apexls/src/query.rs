@@ -8,71 +8,63 @@
 //! anywhere inside a for-each loop, and `$X.size() > 0` finds that shape
 //! whatever `$X` is.
 //!
-//! **How a pattern becomes a tree.** Neither `...` nor `$` is an Apex
-//! token, so a pattern string lexes cleanly and then parses into garbage.
-//! Each hole is therefore rewritten into an ordinary identifier before the
-//! unmodified parser ever sees it, and the identifiers are recognised again
-//! on the way out. Two positions need more than a bare identifier, both
-//! detectable from the keyword heading the parenthesised group the hole
-//! sits in: `for (...)` wants a whole loop header and `catch (...)` wants a
-//! `Type name` pair. See [`substitute`].
+//! **How a pattern becomes a tree.** Holes are real tokens. `...` and
+//! `$NAME` are folded into `PatternHole`/`PatternCapture` before parsing
+//! (`apex_parser::parse_pattern`), and the ordinary Apex grammar accepts
+//! one wherever it *requires* a construct -- a name, a type, a value, a
+//! parameter list, a loop header, a SOQL clause. Nothing about real Apex
+//! parsing changes, because those tokens cannot arise from real source.
 //!
-//! **What `...` means.** Inside a block it is *deep*: it crosses block
-//! boundaries, so `{ ... P ... }` means "this block contains P at any
-//! depth", not "P is a direct child statement". That is the whole point for
-//! the motivating query -- a SOQL call nested in an `if` inside a `for` is
-//! still the governor-limit bug. Everywhere else (argument lists, SOQL
-//! clauses) `...` is an ordinary sibling-sequence wildcard. A block pattern
-//! written without any `...` is exact: `{ P }` matches only a block whose
-//! single statement is P.
+//! This replaced substituting each hole with an ordinary identifier before
+//! parsing. That only works where an identifier is grammatical, so it
+//! needed a different filler per position -- `;` for a statement, `T V : C`
+//! for a `for` header, `T N` for a parameter -- and could not reach a SOQL
+//! value or an operator at all. The list had no end, because "is this text
+//! grammatical here" has one answer per grammar position.
 //!
-//! A block segment may be written as a bare *expression* even though a
-//! block grammatically holds statements: `for (...) { ... [SELECT ... FROM $O] ... }`
-//! is the flagship query and is exactly how a user thinks of it. The
-//! missing `;` is supplied so the pattern parses, and the resulting
-//! statement wrapper is unwrapped again when searching, so the query is
-//! found wherever it actually sits -- inside a declaration, an argument, a
-//! `return`, not only as a statement of its own.
+//! **The rule is uniform: `...` means "anything here", and omitting it
+//! means exact.** `[SELECT ... FROM $o ...]` is any query (2,132 on the
+//! NPSP corpus, identical to `kind:SoqlExpr`); `[SELECT ... FROM $o]` is a
+//! query with no trailing clauses at all (520). Likewise `{ P }` is a block
+//! whose only statement is P, while `{ ... P ... }` is a block containing
+//! P.
 //!
-//! Deep matching runs over the block's whole subtree flattened into
-//! document order, so `{ ... P ... Q ... }` means "P somewhere, then Q
-//! somewhere after it" however deeply either is nested -- the shape behind
-//! every ordering query. Order is enforced by a forward-only cursor, so the
-//! same two elements reversed is a different query.
+//! **What `...` means inside a block** is *deep*: it crosses block
+//! boundaries, so `{ ... P ... }` means "contains P at any depth". That is
+//! the point for the motivating query -- a SOQL call nested in an `if`
+//! inside a `for` is still the governor-limit bug. Deep matching runs over
+//! the block's subtree flattened into document order with a forward-only
+//! cursor, so `{ ... P ... Q ... }` means "P somewhere, then Q somewhere
+//! after it" and the reverse order is a different query. It is offered only
+//! for a pattern unanchored at both ends that separates every fixed element
+//! with an ellipsis; everything else stays shallow rather than guessing,
+//! since a missing leading or trailing `...` anchors that end to the
+//! block's first or last statement, and two fixed elements with no `...`
+//! between them ask to be *consecutive*, which is meaningless once they may
+//! sit at different depths.
 //!
-//! It is offered only for a pattern unanchored at both ends that separates
-//! every fixed element with an ellipsis (`[..., P, ..., Q, ...]`).
-//! Everything else is asking for something a descendant search cannot
-//! honestly answer, so it stays shallow rather than guessing: a missing
-//! leading or trailing `...` anchors that end to the block's first or last
-//! *statement*, which a match buried at depth is not, and two fixed
-//! elements with no `...` between them ask to be *consecutive*, which is
-//! meaningless once they may sit at different depths.
-//!
-//! **One pattern can denote several shapes.** Apex has two loop forms and
-//! they are different productions -- `ForEachStmt` for `for (T v : coll)`
-//! and `ForStmt` for `for (init; cond; update)` -- so `for (...)` compiles
-//! to both and matches either. Writing the three-part header out
-//! (`for (...; ...; ...)`) pins the C-style form specifically. Any of the
-//! three parts may be omitted, including all of them, since a hole standing
-//! alone in a sequence is an ellipsis and an ellipsis may consume nothing.
+//! **One `for (...)` covers both loop forms.** Apex's two loop productions
+//! are different trees, and a pattern that matched only the for-each form
+//! made every C-style loop invisible to every loop query. A hole header
+//! parses once and [`kinds_compatible`] treats the two as the same
+//! construct.
 //!
 //! **A string literal is opaque.** Holes written inside quotes are text --
-//! `'a...b'` is a three-dot string, `'$x'` is a dollar sign -- because a
-//! string is data, not structure. The one exception is a literal that is
+//! `'a...b'` is a three-dot string, `'$x'` a dollar sign -- because a
+//! string is data, not structure. The exception is a literal that is
 //! entirely `'...'`, which means *any string literal* and nothing else, the
-//! way Semgrep spells it: `System.debug('...')` asks for a logged literal
-//! message and does not match `System.debug(x)`.
+//! way Semgrep spells it.
 //!
-//! **Declarations are reachable too**, not just the code inside them:
+//! **Declarations are reachable**, not just the code inside them:
 //! `private $T $f;`, `public void $m(...) { ... }`,
-//! `@future public static void $m(...) { ... }`. A `(...)` is an argument
-//! list or a *parameter* list depending on what the rest of the pattern
-//! needs -- the two are written identically and a formal parameter is a
-//! `Type name` pair, so both readings are tried. Either way it means any
-//! number of them, including none. A whole class body (`class $C { ... }`)
-//! is still out of reach: a class holds members, not statements, so that
-//! needs a member-run hole.
+//! `@future public static void $m(...) { ... }`.
+//!
+//! **Operator position is the one place a hole cannot go.** `$L $OP $R`
+//! does not compile. Every other hole satisfies a *requirement*, which is
+//! unambiguous; an operator is reached only by *choosing* to continue a
+//! binary expression, and a hole admitted there read `{ ... $X = y; }` as
+//! "the ellipsis, operated on by `$X`" and swallowed the statement after
+//! it. Rejected outright rather than answered wrongly.
 //!
 //! **Two escape hatches**, for the questions a pattern literal cannot ask.
 //! `kind:Name` matches any node of a syntax kind, and `regex:RE` any node
@@ -97,26 +89,17 @@
 //! to the stdlib class, which is a deliberate v1 limit, not an oversight.
 
 use crate::project::{parse_apex_file, site_for, walk_project, ArgError, Site};
+use apex_parser::Fragment;
 use apex_syntax::{NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode};
 use apexls_server::LineIndex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// What a `...` becomes before the real parser sees it. Any identifier
-/// starting with this is an ellipsis hole, which is what lets the
-/// multi-token expansions (`__AP_DOTS___T`, `__AP_DOTS___V`, ...) be
-/// recognised by the same rule as the bare form.
-///
-/// A source file containing this identifier verbatim cannot be confused
-/// for a hole: [`hole_of`] is only ever asked about *pattern* elements, and
-/// a hole in the pattern matches whatever sits opposite it regardless. So
-/// the sentinel needs to be unlikely, not reserved.
-const ELLIPSIS_IDENT: &str = "__AP_DOTS__";
-/// A named hole `$FOO` becomes `__AP_CAP_FOO__`; the capture's own name is
-/// spliced between the two halves.
-const CAPTURE_PREFIX: &str = "__AP_CAP_";
-const CAPTURE_SUFFIX: &str = "__";
+/// Stripped from a capture token's text (`$NAME`) to get the name.
+const HOLE_CAPTURE_SIGIL: char = '$';
+/// Apex string literals are single-quoted.
+const STRING_QUOTE: char = '\'';
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Hole {
@@ -133,22 +116,17 @@ enum Hole {
     Capture(String),
 }
 
-/// A pattern compiled to the syntax node, or nodes, it denotes.
+/// A compiled pattern.
 ///
-/// Held as *green* nodes, not the red `SyntaxNode`s the parser handed back.
-/// A red node is a thread-local cursor into the tree and is deliberately
-/// neither `Send` nor `Sync`, so a pattern holding one could not cross onto
-/// rayon's workers; a `GreenNode` is the `Arc`-based shared half and cloning
-/// it is one refcount bump. Each worker rebuilds its own cursors via
-/// [`Pattern::nodes`].
+/// The tree form is held as a *green* node, not the red `SyntaxNode` the
+/// parser handed back. A red node is a thread-local cursor into the tree
+/// and is deliberately neither `Send` nor `Sync`, so a pattern holding one
+/// could not cross onto rayon's workers; a `GreenNode` is the `Arc`-based
+/// shared half and cloning it is one refcount bump.
 #[derive(Debug, Clone)]
 enum Pattern {
-    /// The ordinary case: code with holes, compiled to the tree or trees it
-    /// denotes. Several, because one written pattern can mean more than one
-    /// shape -- `for (...)` covers both of Apex's loop productions, and a
-    /// pattern compiled to only one of them silently skipped every loop of
-    /// the other kind. A candidate matches if *any* tree does.
-    Trees(Vec<apex_syntax::GreenNode>),
+    /// The ordinary case: code with holes, compiled to the tree it denotes.
+    Tree(apex_syntax::GreenNode),
     /// `kind:Name` -- any node of that syntax kind.
     ///
     /// The escape hatch for shapes a pattern literal cannot spell, and the
@@ -228,11 +206,7 @@ impl Pattern {
             return match SyntaxKind::from_name(name) {
                 Some(kind) => Ok(Pattern::Kind(kind)),
                 None => Err(ArgError(
-                    format!(
-                        "error: unknown syntax kind: {name}
-                         note: kinds are named as the grammar names them, e.g.                          SoqlWhereClause, MethodDecl, ForEachStmt
-                         note: `apexls ast <file>` prints the kinds of a real file"
-                    ),
+                    format!("error: unknown syntax kind: {name}\nnote: kinds are named as the grammar names them, e.g. SoqlWhereClause, MethodDecl, ForEachStmt\nnote: `apexls ast <file>` prints the kinds of a real file"),
                     2,
                 )),
             };
@@ -246,118 +220,37 @@ impl Pattern {
                 .map_err(|e| ArgError(format!("error: invalid regex: {e}"), 2));
         }
 
-        // Whether a `{`-enclosed `...` means "a run of statements" or "an
-        // expression sitting inside one" cannot be decided from the text:
-        // `{ ... [SELECT ...] ... }` wants the first reading and
-        // `{ ... String $v = ...; ... }` the second, and no lookback rule
-        // gets both. So [`substitute`]'s guess is only the *first* attempt.
-        // If nothing parses, flip holes to the expression reading and try
-        // again -- fewest flips first, so the guess is overridden as little
-        // as possible -- and let the parser be the judge. This is the same
-        // "try readings until one parses" move the entry-point loop below
-        // already makes, and a pattern that compiles on the first attempt
-        // pays nothing for it.
-        let ambiguous = ambiguous_hole_offsets(pattern_src);
-        // 2^n readings, so cap the search. Ten holes is far past any real
-        // pattern and still only 1024 attempts over a few hundred bytes.
-        let n = ambiguous.len().min(10);
-        let mut readings: Vec<u32> = (0..(1u32 << n)).collect();
-        readings.sort_by_key(|mask| mask.count_ones());
-
-        // Independently, every whole-header `for (...)` denotes both loop
-        // forms at once, so each is compiled both ways and *all* the
-        // results are kept -- unlike the reading search above, which picks
-        // one. Nested loops multiply, hence the cap.
-        let headers = for_header_hole_offsets(pattern_src);
-        let h = headers.len().min(4);
-
-        for mask in readings {
-            let flipped: Vec<usize> = (0..n)
-                .filter(|bit| mask & (1 << bit) != 0)
-                .map(|bit| ambiguous[bit])
-                .collect();
-
-            let mut greens: Vec<apex_syntax::GreenNode> = Vec::new();
-            for styles in 0..(1u32 << h) {
-                let classic: Vec<usize> = (0..h)
-                    .filter(|bit| styles & (1 << bit) != 0)
-                    .map(|bit| headers[bit])
-                    .collect();
-                if let Some(green) = Self::compile_reading(pattern_src, &flipped, &classic) {
-                    if !greens.contains(&green) {
-                        greens.push(green);
-                    }
-                }
-            }
-            if !greens.is_empty() {
-                return Ok(Pattern::Trees(greens));
-            }
-        }
-
-        Err(ArgError(
-            format!(
-                "error: could not parse pattern as Apex: {pattern_src}\n\
-                 note: a pattern must be one complete expression, statement or block\n\
-                 note: `...` cannot stand for an operator or a whole declaration"
-            ),
-            2,
-        ))
-    }
-
-    /// One reading of the pattern, tried against every entry point.
-    fn compile_reading(
-        pattern_src: &str,
-        as_expression: &[usize],
-        classic_headers: &[usize],
-    ) -> Option<apex_syntax::GreenNode> {
-        let substituted = substitute(pattern_src, as_expression, classic_headers);
-
-        // gogrep's multi-entry-point design: try each in turn and take the
-        // first that consumes the whole pattern. No user annotation is
-        // needed, so Coccinelle's declare-the-kind alternative is not
-        // required. Order matters only where a pattern is genuinely
-        // ambiguous (`{ ... }` parses as both a statement and a block);
-        // first-match-wins is well-defined and the root kind records which.
-        // `parse_catch_clause` and `parse_class_member` come last, as
-        // fallbacks for constructs the first three cannot name rather than
-        // competitors to them. Order matters for the overlaps: a class body
-        // admits an initializer block, so `{ ... }` would parse as a member
-        // too, and a field declaration is spelled exactly like a local
-        // variable one, so `String $v = ...;` would parse as both. Putting
-        // members last keeps the statement and block readings, which are
-        // what those patterns almost always mean; a pattern that really
-        // wants the field says so with a modifier (`private String $v = ...;`).
-        let entry_points: [fn(&str) -> apex_parser::Parse; 5] = [
-            apex_parser::parse_expression,
-            apex_parser::parse_statement,
-            apex_parser::parse_block,
-            apex_parser::parse_catch_clause,
-            apex_parser::parse_class_member,
-        ];
-
-        for parse_fn in entry_points {
-            let parse = parse_fn(&substituted);
+        // gogrep's multi-entry-point design: the text alone does not say
+        // which fragment of the grammar a pattern is, so try each and take
+        // the first that consumes the whole thing. Holes need no handling
+        // here at all -- `parse_pattern` hands them to the real grammar as
+        // `PatternHole` tokens, which it accepts wherever it requires a
+        // construct.
+        for fragment in [
+            Fragment::Expression,
+            Fragment::Statement,
+            Fragment::Block,
+            Fragment::CatchClause,
+            Fragment::ClassMember,
+        ] {
+            let parse = apex_parser::parse_pattern(pattern_src, fragment);
             if !parse.errors.is_empty() {
                 continue;
             }
             // Not a `text_range()` coverage check, which looks equivalent
-            // and is dead code: `parse_with` completes the root marker over
-            // the entire input and the tree is lossless, so the root range
-            // always equals the input length whether the grammar consumed
-            // the tokens or not. Unconsumed input shows up as *extra
-            // children beside* the real node -- which is how
-            // `System.debug(...);` is caught being mis-accepted as an
-            // expression (`[MethodCallExpr, Semi]`), and how a hole in
-            // operator position (`$L $OP $R`, a lone `NameExpr` with two
-            // orphaned identifiers after it) is caught at all.
+            // and is dead code: the root marker spans the whole input
+            // whether the grammar consumed it or not. Unconsumed input
+            // shows up as *extra children beside* the real node.
             let root = parse.syntax();
-            let significant = significant_children(&root);
-            if let [NodeOrToken::Node(node)] = significant.as_slice() {
-                return Some(node.green().to_owned());
+            if let [NodeOrToken::Node(node)] = significant_children(&root).as_slice() {
+                return Ok(Pattern::Tree(node.green().to_owned()));
             }
         }
 
-        None
+        Err(ArgError(
+            format!("error: could not parse pattern as Apex: {pattern_src}\nnote: a pattern must be one complete expression, statement, block, catch clause or class member"),
+            2,
+        ))
     }
 
     /// Every match of this pattern in `root`, innermost and outermost both
@@ -365,21 +258,14 @@ impl Pattern {
     /// printing two lines.
     fn matches_in(&self, root: &SyntaxNode) -> Vec<SyntaxNode> {
         match self {
-            // Fresh red-tree cursors per call, since a red node is a
+            // A fresh red-tree cursor per call, since a red node is a
             // thread-local cursor and cannot be shared across workers.
-            Pattern::Trees(greens) => {
-                let patterns: Vec<SyntaxNode> = greens
-                    .iter()
-                    .map(|g| SyntaxNode::new_root(g.clone()))
-                    .collect();
+            Pattern::Tree(green) => {
+                let pattern = SyntaxNode::new_root(green.clone());
                 root.descendants()
                     .filter(|candidate| {
-                        patterns.iter().any(|pattern| {
-                            candidate.kind() == pattern.kind() && {
-                                let mut binds = HashMap::new();
-                                match_node(pattern, candidate, &mut binds)
-                            }
-                        })
+                        let mut binds = HashMap::new();
+                        match_node(&pattern, candidate, &mut binds)
                     })
                     .collect()
             }
@@ -395,343 +281,12 @@ impl Pattern {
     }
 }
 
-/// Rewrite `...` and `$NAME` into ordinary Apex identifiers.
-///
-/// Position-aware, because a uniform substitution does not survive contact
-/// with the grammar. Two rules, both decided from the raw text alone, since
-/// there is no tree yet to ask:
-///
-/// - A hole enclosed by `{` sits where a *statement* is expected, and a
-///   bare identifier is not a statement, so it takes a trailing `;`.
-/// - `for (...)` and `catch (...)` want a multi-token construct rather than
-///   one name -- a loop header and a `Type name` pair respectively.
-///
-/// Everywhere else -- argument lists, operands, SOQL clauses -- a bare
-/// identifier is both correct and sufficient.
-///
-/// The first rule is a guess, and it is wrong about as often as it is
-/// right, because the two readings are genuinely ambiguous from text alone.
-/// `{ ... [SELECT ...] ... }` needs the trailing hole read as a statement
-/// even though the character before it is `]`; `{ ... String $v = ...; ... }`
-/// needs the initializer hole read as an expression even though a `{`
-/// encloses it. No lookback rule gets both. So `as_expression` lets
-/// [`Pattern::compile`] override the guess per hole and retry -- see
-/// [`ambiguous_hole_offsets`].
-fn substitute(pattern: &str, as_expression: &[usize], classic_headers: &[usize]) -> String {
-    let mut out = String::with_capacity(pattern.len());
-    let bytes = pattern.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            // A string literal is opaque. Substituting inside it was a
-            // silent wrong answer: `System.debug('...')` became a search
-            // for the literal text `'__AP_DOTS__'` and found nothing,
-            // while reading as "any string argument".
-            let end = string_literal_end(pattern, i);
-            let literal = &pattern[i..end];
-            if literal_content(literal) == Some("...") {
-                // The whole literal is a hole -- "any string" -- kept as a
-                // *string* token so it still matches a string literal and
-                // not an identifier. `hole_of` unwraps the quotes.
-                out.push('\'');
-                out.push_str(ELLIPSIS_IDENT);
-                out.push('\'');
-            } else {
-                out.push_str(literal);
-            }
-            i = end;
-        } else if bytes[i..].starts_with(b"...") {
-            let flipped = as_expression.contains(&i);
-            let statement = in_statement_position(pattern, i) && !flipped;
-            let classic = classic_headers.contains(&i);
-            if statement {
-                terminate_pending_statement(&mut out);
-                out.push_str(&ellipsis_expansion(pattern, i, classic));
-            } else {
-                out.push_str(&expression_expansion(pattern, i, classic, flipped));
-            }
-            i += 3;
-        } else if bytes[i] == b'}' && in_statement_position(pattern, i) {
-            terminate_pending_statement(&mut out);
-            out.push('}');
-            i += 1;
-        } else if bytes[i] == b'$' {
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
-                end += 1;
-            }
-            out.push_str(CAPTURE_PREFIX);
-            out.push_str(&pattern[start..end]);
-            out.push_str(CAPTURE_SUFFIX);
-            i = end;
-        } else {
-            let ch = pattern[i..].chars().next().expect("char boundary");
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    out
-}
-
-/// Close off a statement the user left unterminated.
-///
-/// A block pattern is a sequence of statements, and Apex statements end in
-/// `;` or `}`. But a user writing `{ ... [SELECT ... FROM $O] ... }` means
-/// "a block containing this query", and naturally writes the query without
-/// a terminator -- so the text handed to the parser is not a valid block
-/// and the whole pattern fails to compile. Appending the `;` they omitted
-/// costs nothing and is what they meant. (This parser accepts
-/// `[SELECT Id FROM Account];` as an `ExprStmt`, which is what makes the
-/// repair possible at all.)
-fn terminate_pending_statement(out: &mut String) {
-    let last = out.chars().rev().find(|c| !c.is_whitespace());
-    if last.is_some_and(|c| !matches!(c, '{' | ';' | '}')) {
-        out.push(';');
-    }
-}
-
-/// Every `...` whose reading [`substitute`] had to guess at, by byte
-/// offset. Two kinds, disjoint because a hole is either directly inside a
-/// brace or directly inside a paren, never both:
-///
-/// - A `{`-enclosed hole is a run of statements by default, an expression
-///   sitting inside one when flipped.
-/// - A `(`-enclosed hole is a call's argument list by default, a
-///   declaration's *parameter* list when flipped. `f(...)` and
-///   `void m(...)` are written identically and mean different things --
-///   a formal parameter is `Type name`, two tokens, so a bare identifier
-///   does not parse there.
-fn ambiguous_hole_offsets(pattern: &str) -> Vec<usize> {
-    let bytes = pattern.as_bytes();
-    (0..bytes.len())
-        .filter(|&i| {
-            bytes[i..].starts_with(b"...")
-                && !in_string_literal(pattern, i)
-                && (in_statement_position(pattern, i) || in_plain_paren(pattern, i))
-        })
-        .collect()
-}
-
-/// Is the hole directly inside a parenthesised group that is not a `for`
-/// or `catch` header? Those two are decided by their keyword; everything
-/// else is an argument list or a parameter list, and the text cannot say
-/// which.
-fn in_plain_paren(pattern: &str, at: usize) -> bool {
-    enclosing_paren_offset(pattern, at).is_some()
-        && !matches!(
-            enclosing_paren_head(pattern, at),
-            Some("for") | Some("catch")
-        )
-}
-
-/// Where the string literal opening at `open` ends, one past its closing
-/// quote -- or the end of the pattern if it is unterminated. A backslash
-/// escapes the next character, so `'it\'s'` is one literal.
-fn string_literal_end(pattern: &str, open: usize) -> usize {
-    let bytes = pattern.as_bytes();
-    let mut i = open + 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 2,
-            b'\'' => return i + 1,
-            _ => i += 1,
-        }
-    }
-    bytes.len()
-}
-
-/// The text between a literal's quotes, if it is properly closed.
-fn literal_content(literal: &str) -> Option<&str> {
-    literal
-        .strip_prefix('\'')
-        .and_then(|rest| rest.strip_suffix('\''))
-}
-
-/// Is `at` inside a string literal? Scanned from the start, since quoting
-/// is only decidable in order.
-fn in_string_literal(pattern: &str, at: usize) -> bool {
-    let bytes = pattern.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && i <= at {
-        if bytes[i] == b'\'' {
-            let end = string_literal_end(pattern, i);
-            if at > i && at < end - 1 {
-                return true;
-            }
-            i = end;
-        } else {
-            i += 1;
-        }
-    }
-    false
-}
-
-/// Every `...` that stands for a whole `for` header, by byte offset.
-///
-/// Only a hole that is the *entire* header counts. In an explicitly
-/// C-style `for (...; ...; ...)` each hole is one of the three parts, an
-/// ordinary expression, and the header's shape is already pinned by the
-/// semicolons the user wrote -- so those are left alone.
-fn for_header_hole_offsets(pattern: &str) -> Vec<usize> {
-    let bytes = pattern.as_bytes();
-    (0..bytes.len())
-        .filter(|&i| {
-            bytes[i..].starts_with(b"...")
-                && !in_string_literal(pattern, i)
-                && enclosing_paren_head(pattern, i) == Some("for")
-                && !encloses_a_semicolon(pattern, i)
-        })
-        .collect()
-}
-
-/// Does the parenthesised group the hole sits in contain a `;`? If so the
-/// user wrote the C-style header out themselves.
-fn encloses_a_semicolon(pattern: &str, at: usize) -> bool {
-    let Some(open) = enclosing_paren_offset(pattern, at) else {
-        return false;
-    };
-    // An explicit loop, not `any`: the scan has to *stop* at the closing
-    // paren rather than merely not match it, or a `;` anywhere later in the
-    // pattern (the body's statements, invariably) would be read as part of
-    // this header and make every `for (...)` look C-style.
-    let mut depth = 0i32;
-    for c in pattern[open + 1..].chars() {
-        match c {
-            '(' => depth += 1,
-            ')' if depth == 0 => return false,
-            ')' => depth -= 1,
-            ';' if depth == 0 => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
-/// The expansion for a hole read as an expression rather than a statement.
-fn expression_expansion(pattern: &str, at: usize, classic: bool, alternate: bool) -> String {
-    match enclosing_paren_head(pattern, at) {
-        Some("for") if encloses_a_semicolon(pattern, at) => ELLIPSIS_IDENT.to_string(),
-        Some("for") => for_header_expansion(classic),
-        Some("catch") => type_and_name(),
-        // Flipped, a plain `(...)` is a declaration's parameter list.
-        _ if alternate && in_plain_paren(pattern, at) => type_and_name(),
-        _ => ELLIPSIS_IDENT.to_string(),
-    }
-}
-
-/// A `Type name` pair -- what a formal parameter and a catch parameter
-/// both are, and what a single identifier cannot stand in for.
-fn type_and_name() -> String {
-    format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_N")
-}
-
-/// A whole `for` header, in whichever of Apex's two loop forms is being
-/// compiled this time round -- `ForEachStmt`'s `T v : coll`, or
-/// `ForStmt`'s `init; cond; update`.
-fn for_header_expansion(classic: bool) -> String {
-    if classic {
-        format!("{ELLIPSIS_IDENT}_A; {ELLIPSIS_IDENT}_B; {ELLIPSIS_IDENT}_C")
-    } else {
-        format!("{ELLIPSIS_IDENT}_T {ELLIPSIS_IDENT}_V : {ELLIPSIS_IDENT}_C")
-    }
-}
-
-fn ellipsis_expansion(pattern: &str, at: usize, classic: bool) -> String {
-    match enclosing_paren_head(pattern, at) {
-        Some("for") if encloses_a_semicolon(pattern, at) => ELLIPSIS_IDENT.to_string(),
-        Some("for") => for_header_expansion(classic),
-        Some("catch") => type_and_name(),
-        _ if in_statement_position(pattern, at) => format!("{ELLIPSIS_IDENT};"),
-        _ => ELLIPSIS_IDENT.to_string(),
-    }
-}
-
-/// The identifier or keyword immediately before the open paren of the group
-/// the hole sits directly inside -- `for` for `for (...)`, and equally
-/// `debug` for `System.debug(...)`, since nothing here distinguishes a
-/// keyword from a method name. Callers match only the keywords they care
-/// about and let the rest fall through. `None` when the hole is not inside
-/// a paren group at all.
-fn enclosing_paren_head(pattern: &str, at: usize) -> Option<&str> {
-    let open = enclosing_paren_offset(pattern, at)?;
-    let head = pattern[..open].trim_end();
-    let start = head
-        .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .map_or(0, |i| i + 1);
-    Some(&head[start..])
-}
-
-/// Is the hole at `at` sitting where a *statement* is expected?
-///
-/// Decided by the nearest enclosing unclosed bracket: inside `{` a block
-/// wants statements, inside `(` or `[` an argument list or SOQL clause
-/// wants an expression. This replaced an earlier "what is the previous
-/// non-space character" rule, which got `{ ... [SELECT ...] ... }` wrong --
-/// the trailing hole's previous character is `]`, so it was read as
-/// expression position and emitted without the `;` a statement needs.
-/// Asking what encloses the hole is both simpler and right, and it still
-/// needs nothing but the raw text.
-/// Byte offset of the `(` opening the group `at` sits directly inside.
-fn enclosing_paren_offset(pattern: &str, at: usize) -> Option<usize> {
-    let mut depth = 0i32;
-    pattern[..at]
-        .char_indices()
-        .rev()
-        .find_map(|(i, c)| match c {
-            ')' => {
-                depth += 1;
-                None
-            }
-            '(' if depth == 0 => Some(i),
-            '(' => {
-                depth -= 1;
-                None
-            }
-            _ => None,
-        })
-}
-
-fn in_statement_position(pattern: &str, at: usize) -> bool {
-    enclosing_open_bracket(pattern, at) == Some('{')
-}
-
-/// The nearest bracket opened before `at` and not yet closed.
-fn enclosing_open_bracket(pattern: &str, at: usize) -> Option<char> {
-    let mut depth = 0i32;
-    pattern[..at].chars().rev().find(|&c| match c {
-        ')' | ']' | '}' => {
-            depth += 1;
-            false
-        }
-        '(' | '[' | '{' if depth == 0 => true,
-        '(' | '[' | '{' => {
-            depth -= 1;
-            false
-        }
-        _ => false,
-    })
-}
-
-/// The hole a pattern element denotes, if the element is nothing but a
-/// hole. Recognised from the element's significant text rather than its
-/// shape, because the parser wraps a bare identifier differently depending
-/// on where it sits -- `NameExpr` in expression position, `ExprStmt >
-/// NameExpr` in statement position -- and the hole is the same hole either
-/// way.
 fn hole_of(element: &SyntaxElement) -> Option<Hole> {
-    // The element has to be *nothing but* the hole, which means exactly one
-    // significant token (plus an optional `;`, since a statement-position
-    // hole is substituted as `__AP_DOTS__;`).
-    //
-    // Matching on the element's concatenated text instead would be subtly
-    // and badly wrong: `$A + $B` substitutes to `__AP_CAP_A__ + __AP_CAP_B__`,
-    // whose text still begins with the capture prefix and ends with the
-    // capture suffix, so a prefix/suffix test reads the whole binary
-    // expression as one capture named `A__ + __AP_CAP_B` -- which, being
-    // unbound, then matches *anything*. `$X = $Y;` degraded the same way and
-    // matched all 48,452 statements in the NPSP corpus. A hole is a token,
-    // so it is recognised as a token.
+    // The element has to be *nothing but* the hole: one significant token,
+    // plus an optional `;` where the grammar wrapped a hole into a
+    // statement. Asking about tokens rather than text is what keeps a
+    // composite from being swallowed -- `$A + $B` and `... + ...` each hold
+    // three tokens, so neither reads as a single hole.
     let mut tokens = match element {
         NodeOrToken::Token(t) => vec![t.clone()],
         NodeOrToken::Node(n) => n
@@ -743,36 +298,35 @@ fn hole_of(element: &SyntaxElement) -> Option<Hole> {
     if tokens.last().is_some_and(|t| t.kind() == SyntaxKind::Semi) {
         tokens.pop();
     }
-    if tokens.is_empty() {
-        return None;
-    }
-    // An element whose every token is a sentinel is an ellipsis, however
-    // many tokens that took. The multi-token expansions need this: a
-    // formal parameter is `Type name`, so `void m(...)` expands to two
-    // sentinels, and unless the pair is recognised as one hole it matches
-    // structurally -- meaning *exactly one* parameter rather than any
-    // number. Requiring *every* token to be a sentinel is what keeps this
-    // from swallowing composites: `$A + $B` and `... + ...` both contain a
-    // `+`, so neither is a hole.
-    if tokens.iter().all(|t| t.text().starts_with(ELLIPSIS_IDENT)) {
-        return Some(Hole::Ellipsis);
-    }
     let [only] = tokens.as_slice() else {
         return None;
     };
-    // A string hole is a *string* token, so its quotes come off before the
-    // sentinel can be seen.
+    match only.kind() {
+        SyntaxKind::PatternHole => return Some(Hole::Ellipsis),
+        SyntaxKind::PatternCapture => {
+            let name = only
+                .text()
+                .strip_prefix(HOLE_CAPTURE_SIGIL)
+                .unwrap_or(only.text());
+            return Some(Hole::Capture(name.to_string()));
+        }
+        _ => {}
+    }
+    // `'...'` -- a string literal whose whole content is an ellipsis. Never
+    // folded into a hole token, because the lexer sees one string literal
+    // and its insides are data, not structure.
     if is_string_literal_kind(only.kind()) {
         let content = literal_content(only.text()).unwrap_or(only.text());
-        return (content == ELLIPSIS_IDENT).then_some(Hole::AnyString);
+        return (content == "...").then_some(Hole::AnyString);
     }
-    let text = only.text();
-    if text.starts_with(ELLIPSIS_IDENT) {
-        return Some(Hole::Ellipsis);
-    }
-    text.strip_prefix(CAPTURE_PREFIX)
-        .and_then(|rest| rest.strip_suffix(CAPTURE_SUFFIX))
-        .map(|name| Hole::Capture(name.to_string()))
+    None
+}
+
+/// The text between a string literal's quotes, if it is properly closed.
+fn literal_content(literal: &str) -> Option<&str> {
+    literal
+        .strip_prefix(STRING_QUOTE)
+        .and_then(|rest| rest.strip_suffix(STRING_QUOTE))
 }
 
 fn is_string_literal_kind(kind: SyntaxKind) -> bool {
@@ -801,7 +355,7 @@ fn is_string_literal(element: &SyntaxElement) -> bool {
 type Binds = HashMap<String, String>;
 
 fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
-    if pat.kind() != src.kind() {
+    if !kinds_compatible(pat, src) {
         return false;
     }
     // Deep only inside a block: that is where "anywhere in this loop" has
@@ -827,6 +381,26 @@ fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
         return true;
     }
     deep && match_block_deep(&pat_items, &src_items, binds)
+}
+
+/// Do these two nodes name the same construct?
+///
+/// Identical kinds, plus one equivalence: Apex's two loop productions,
+/// `ForEachStmt` and `ForStmt`, are the same construct to a pattern that
+/// left the header a hole. `for (...)` is written once and means "any
+/// loop", so a pattern compiled to one form must still match the other --
+/// otherwise every C-style loop is invisible to every loop query, which for
+/// a search tool is worse than failing outright.
+fn kinds_compatible(pat: &SyntaxNode, src: &SyntaxNode) -> bool {
+    if pat.kind() == src.kind() {
+        return true;
+    }
+    let both_loops = matches!(pat.kind(), SyntaxKind::ForEachStmt | SyntaxKind::ForStmt)
+        && matches!(src.kind(), SyntaxKind::ForEachStmt | SyntaxKind::ForStmt);
+    both_loops
+        && significant_children(pat)
+            .iter()
+            .any(|c| hole_of(c) == Some(Hole::Ellipsis))
 }
 
 fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) -> bool {

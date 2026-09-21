@@ -18,7 +18,59 @@ pub(crate) struct Input {
 
 impl Input {
     pub(crate) fn new(src: &str) -> Input {
+        Input::build(apex_lexer::tokenize(src))
+    }
+
+    /// Like [`Input::new`], but for a *pattern*: each hole in the source
+    /// is folded into a single [`TokenKind::PatternHole`] before the
+    /// parser ever sees it.
+    ///
+    /// `...` lexes as three separate `Dot`s, and `$NAME` as one ordinary
+    /// `Identifier` (since `$` is a legal Apex identifier start). Folding
+    /// them here rather than in the lexer means ordinary Apex lexing is
+    /// untouched -- a hole token simply cannot arise from real source.
+    /// Only *adjacent* dots fold, so `a . . . b` with spaces stays three
+    /// dots.
+    pub(crate) fn new_pattern(src: &str) -> Input {
         let raw = apex_lexer::tokenize(src);
+        let mut folded: Vec<Token> = Vec::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            let t = raw[i];
+            let dots = i + 2 < raw.len()
+                && [0, 1, 2].iter().all(|n| raw[i + n].kind == TokenKind::Dot)
+                && raw[i + 1].start == raw[i].start + 1
+                && raw[i + 2].start == raw[i + 1].start + 1;
+            if dots {
+                folded.push(Token {
+                    kind: TokenKind::PatternHole,
+                    start: t.start,
+                    len: 3,
+                });
+                i += 3;
+                continue;
+            }
+            // `$` is a legal Apex identifier start character, so `$NAME`
+            // lexes as one ordinary `Identifier` -- there is no `$` token to
+            // look for. A pattern therefore reserves leading-`$`
+            // identifiers for captures, which real Apex code effectively
+            // never uses.
+            if t.kind == TokenKind::Identifier && src[t.start as usize..].starts_with('$') {
+                folded.push(Token {
+                    kind: TokenKind::PatternCapture,
+                    start: t.start,
+                    len: t.len,
+                });
+                i += 1;
+                continue;
+            }
+            folded.push(t);
+            i += 1;
+        }
+        Input::build(folded)
+    }
+
+    fn build(raw: Vec<Token>) -> Input {
         let significant = raw
             .iter()
             .enumerate()

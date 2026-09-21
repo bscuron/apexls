@@ -131,6 +131,72 @@ pub fn parse_class_member(src: &str) -> Parse {
     })
 }
 
+/// Which fragment of the grammar a structural-search pattern is parsed as.
+///
+/// A pattern is tried against each in turn by its caller, since the text
+/// alone does not say which it is -- the same multi-entry-point design the
+/// non-pattern fragment parsers above are used with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fragment {
+    Expression,
+    Statement,
+    Block,
+    CatchClause,
+    ClassMember,
+}
+
+/// Parse `src` as a structural-search *pattern*: Apex with holes in it.
+///
+/// Holes (`...`, `$NAME`) are folded into single `PatternHole` tokens
+/// before parsing (see `Input::new_pattern`), and the grammar accepts one
+/// wherever it *requires* a construct -- a name, a type, a value, an
+/// element of a list. Nothing about ordinary Apex parsing changes: the
+/// hole token cannot arise from real source.
+///
+/// This replaced an earlier approach that substituted each hole with an
+/// ordinary identifier before parsing. That only works where an identifier
+/// is grammatical, so it needed a different filler text per position --
+/// `;` for statements, `T V : C` for a `for` header, `T N` for a parameter
+/// -- and still could not reach a SOQL value or an operator at all. The
+/// list had no end, because "is this text grammatical here" has one answer
+/// per grammar position.
+pub fn parse_pattern(src: &str, fragment: Fragment) -> Parse {
+    let input = Input::new_pattern(src);
+    let mut cache = NodeCache::default();
+    let mut p = Parser::new_pattern(&input);
+    let m = p.start();
+    let root = match fragment {
+        Fragment::Expression => {
+            grammar::expressions::expr(&mut p);
+            apex_syntax::SyntaxKind::ExprRoot
+        }
+        Fragment::Statement => {
+            grammar::statements::statement(&mut p);
+            apex_syntax::SyntaxKind::StmtRoot
+        }
+        Fragment::Block => {
+            grammar::statements::block(&mut p);
+            apex_syntax::SyntaxKind::BlockRoot
+        }
+        Fragment::CatchClause => {
+            grammar::statements::catch_clause(&mut p);
+            apex_syntax::SyntaxKind::CatchRoot
+        }
+        Fragment::ClassMember => {
+            grammar::declarations::class_body_decl(&mut p);
+            apex_syntax::SyntaxKind::MemberRoot
+        }
+    };
+    m.complete(&mut p, root);
+    let (events, errors) = p.finish();
+    let green = event::build(src, &input, events, &mut cache);
+    Parse {
+        green,
+        errors,
+        text: Arc::from(src),
+    }
+}
+
 /// Parse `src` as a whole `.cls` compilation unit: `modifier* (class |
 /// interface | enum)` declaration, EOF (Phase 3).
 #[hotpath::measure]

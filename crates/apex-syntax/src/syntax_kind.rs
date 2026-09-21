@@ -133,6 +133,10 @@ syntax_kind! {
 
         // ---- Meta ----
         Unknown, Eof,
+
+        // ---- Structural search ----
+        // Never produced by the lexer; see `apex_lexer::TokenKind::PatternHole`.
+        PatternHole, PatternCapture,
     }
     nodes {
         // ---- Roots (fragment-parse entry points) / recovery ----

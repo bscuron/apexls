@@ -181,6 +181,11 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
 
 ## Not yet specified
 
+- **Operator-position holes.** `$L $OP $R` cannot be written. Every other hole satisfies a
+  grammatical *requirement*, which is unambiguous, but an operator is reached only by choosing
+  to continue a binary expression, and a hole admitted there misreads ordinary patterns such as
+  `{ ... $X = y; }`. Lifting it needs a way to say "this hole is an operator" that does not also
+  fire elsewhere.
 - **Replace.** The destination's remaining half: search is built, replace is specced and not.
   This is now the largest gap against the original ask.
 

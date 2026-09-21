@@ -201,6 +201,14 @@ fn class_body(p: &mut Parser<'_>) {
 
 /// `classBodyDeclaration: ';' | STATIC? block | modifier* memberDeclaration`.
 pub(crate) fn class_body_decl(p: &mut Parser<'_>) {
+    // A hole stands in for whole members, which is what lets a class body
+    // be written `class $C { ... }`.
+    if p.at_hole() {
+        let m = p.start();
+        p.bump_hole();
+        m.complete(p, SyntaxKind::FieldDecl);
+        return;
+    }
     if p.at(SyntaxKind::Semi) {
         p.bump();
         return;
@@ -308,7 +316,10 @@ fn method_body_or_semi(p: &mut Parser<'_>) {
 fn formal_parameters(p: &mut Parser<'_>) {
     let m = p.start();
     p.expect(SyntaxKind::LParen);
-    if !p.at(SyntaxKind::RParen) {
+    if p.at_hole() {
+        // Any parameters, of any arity, including none.
+        p.bump_hole();
+    } else if !p.at(SyntaxKind::RParen) {
         formal_parameter(p);
         while p.at(SyntaxKind::Comma) {
             p.bump();

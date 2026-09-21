@@ -312,6 +312,23 @@ pub enum TokenKind {
     /// A byte sequence that matched no rule; the lexer never fails, it
     /// emits `Unknown` tokens (typically length 1) so callers can recover.
     Unknown,
+    /// A structural-search hole (`...` or `$NAME`).
+    ///
+    /// **`tokenize` never produces this.** It exists so a *pattern* -- the
+    /// query language's code-with-holes -- can be parsed by the ordinary
+    /// Apex grammar rather than by a second, parallel one. `apex_parser`
+    /// rewrites the token stream of a pattern to fold each hole into one
+    /// of these, and the parser accepts it wherever it requires a
+    /// construct. Real Apex never lexes to it, so nothing about ordinary
+    /// parsing changes.
+    PatternHole,
+    /// A structural-search capture (`$NAME`).
+    ///
+    /// Like `PatternHole`, never produced by `tokenize`. Kept distinct from
+    /// it because the two behave differently where the grammar is
+    /// ambiguous: `... [x]` must not read as indexing into an ellipsis,
+    /// while `$X[0]` legitimately is an index expression.
+    PatternCapture,
     Eof,
 }
 

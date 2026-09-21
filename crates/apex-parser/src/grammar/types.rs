@@ -34,6 +34,13 @@ fn at_type_name_start(p: &Parser<'_>, n: usize) -> bool {
 /// returns `false` otherwise (nothing consumed, so callers can fall back
 /// to a different interpretation without a rollback).
 pub(crate) fn type_ref(p: &mut Parser<'_>) -> bool {
+    // A hole stands in for the whole type reference.
+    if p.at_hole() {
+        let m = p.start();
+        p.bump_hole();
+        m.complete(p, SyntaxKind::Type);
+        return true;
+    }
     if !at_type_start(p) {
         return false;
     }

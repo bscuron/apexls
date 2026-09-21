@@ -287,7 +287,38 @@ Corpus results on NPSP, completing the eleven:
 Guarded by `kind_names_a_syntax_kind_directly`, `regex_matches_node_text_anchored` and
 `not_and_containing_filter_by_what_a_match_holds`.
 
-**17. Matching is case-insensitive, because Apex is.** Found by the user against the real
+**17. Holes became real tokens, and the special cases went away.** The user's verdict on the
+accumulated per-position fillers was "I feel like we are missing something. Things shouldn't be
+this complicated" -- and that was right. Substituting a hole with an identifier only works where
+an identifier is grammatical, so every position needed its own filler (`;` for a statement,
+`T V : C` for a `for` header, `T N` for a parameter, a bind for a SOQL value) plus a
+combinatorial retry to choose between them. "Is this text grammatical here" has one answer per
+grammar position, so the list could never be finished.
+
+Replaced by a `PatternHole`/`PatternCapture` token pair that only `Input::new_pattern` ever
+produces, and a `pattern_mode` parser that accepts one wherever the grammar *requires* a
+construct. Real Apex parsing is untouched -- those tokens cannot arise from real source, and
+apex-parser's own suite is unchanged.
+
+The discipline that made it work: **a hole satisfies a requirement, it never decides a choice.**
+Admitted at a choice point it misreads everything -- letting `expect()` take a hole let one
+stand in for a *semicolon*, so `{ ... $X = y; }` swallowed the statement after the ellipsis, and
+admitting one as a binary operator did the same a different way. Both were backed out. Operator
+position is therefore still unreachable, and that is now a deliberate, documented limit rather
+than an accident.
+
+Two narrower ambiguities were decided rather than guessed: `[` after a bare `...` opens the next
+construct instead of indexing into the ellipsis (`{ ... [SELECT ...] }`), while `[` after a
+capture is still an index (`$X[0]`) -- which is why the two hole kinds are distinct; and a hole
+after a SOQL object name is the trailing `...`, not a table alias.
+
+Net effect: **905 lines deleted against 449 added**, `query.rs` alone about 450 lines lighter,
+and the rule finally uniform -- `...` means "anything here", omitting it means exact. On NPSP
+`[SELECT ... FROM $o ...]` returns 2,132, identical to `kind:SoqlExpr`, while
+`[SELECT ... FROM $o]` returns 520; `[SELECT Id FROM $o WHERE Id = $v]`, impossible before,
+finds 14. Every previously-measured corpus number is unchanged.
+
+**18. Matching is case-insensitive, because Apex is.** Found by the user against the real
 corpus: `Database.query(...)` returned 260 hits and `database.query(...)` returned 64, two
 halves of one set. Both now return 327. String literal contents stay case-sensitive, since case
 there is a difference in value rather than in spelling; capture unification is case-insensitive,

@@ -68,6 +68,14 @@ pub(crate) fn sosl_expr(p: &mut Parser<'_>) -> CompletedMarker {
 /// real-world-frequency tradeoff already used for `instanceof` and the
 /// arithmetic cast-operand exclusions in `grammar::expressions`.
 fn maybe_alias(p: &mut Parser<'_>) {
+    // A hole after the object name is the pattern's trailing `...`, meaning
+    // "and whatever clauses follow" -- not a table alias. An alias is
+    // optional, so refusing the hole here costs nothing, whereas taking it
+    // would silently turn `[SELECT ... FROM $o ...]` into "a query with an
+    // alias and no clauses".
+    if p.at_hole() {
+        return;
+    }
     if super::ids::at_id(p) && !at_soql_clause_keyword(p) {
         p.bump();
     }
@@ -102,6 +110,14 @@ fn query(p: &mut Parser<'_>) {
     select_list(p);
     p.expect(SyntaxKind::From);
     from_list(p);
+    // A hole here stands for any remaining clauses, which is what makes
+    // `[SELECT Id FROM $o ...]` mean "and whatever else this query does".
+    if p.at_hole() {
+        let m = p.start();
+        p.bump_hole();
+        m.complete(p, SyntaxKind::SoqlWhereClause);
+        return;
+    }
     if p.at(SyntaxKind::Using) {
         using_scope(p);
     }
@@ -195,6 +211,10 @@ fn select_entry(p: &mut Parser<'_>) -> CompletedMarker {
 /// (`id (DOT soslId)*`), the same shape.
 fn field_name(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
+    if p.at_hole() {
+        p.bump_hole();
+        return m.complete(p, SyntaxKind::SoqlFieldName);
+    }
     super::ids::expect_id(p);
     while p.at(SyntaxKind::Dot) && super::ids::is_id_kind(p.nth(1)) {
         p.bump();
@@ -226,6 +246,10 @@ fn using_scope(p: &mut Parser<'_>) -> CompletedMarker {
 fn where_clause(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // WHERE
+    if p.at_hole() {
+        p.bump_hole();
+        return m.complete(p, SyntaxKind::SoqlWhereClause);
+    }
     logical_expr(p);
     m.complete(p, SyntaxKind::SoqlWhereClause)
 }
@@ -318,6 +342,12 @@ fn comparison_operator(p: &mut Parser<'_>) {
 /// subQuery RPAREN | valueList | boundExpression`.
 fn value(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
+    // A SOQL value must be a literal or a bind -- never a bare name -- so
+    // a hole is the only way to write `WHERE Id = $v` at all.
+    if p.at_hole() {
+        p.bump_hole();
+        return m.complete(p, SyntaxKind::SoqlValue);
+    }
     match p.current() {
         SyntaxKind::Null
         | SyntaxKind::BooleanLiteral
@@ -539,6 +569,10 @@ fn field_order(p: &mut Parser<'_>) -> CompletedMarker {
 fn limit_clause(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // LIMIT
+    if p.at_hole() {
+        p.bump_hole();
+        return m.complete(p, SyntaxKind::SoqlLimit);
+    }
     if p.at(SyntaxKind::Colon) {
         bound_expr(p);
     } else {
