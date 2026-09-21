@@ -50,6 +50,26 @@ impl Input {
                 i += 3;
                 continue;
             }
+            // `$...NAME` first: `$` alone lexes as an identifier (a dot is
+            // not an identifier-continue character), so the plainer
+            // `$NAME` rule below would otherwise claim the `$` and leave
+            // the dots behind.
+            let seq = t.kind == TokenKind::Identifier
+                && t.len == 1
+                && src[t.start as usize..].starts_with('$')
+                && i + 4 < raw.len()
+                && [1, 2, 3].iter().all(|n| raw[i + n].kind == TokenKind::Dot)
+                && raw[i + 4].kind == TokenKind::Identifier
+                && (1..=4).all(|n| raw[i + n].start == t.start + n as u32);
+            if seq {
+                folded.push(Token {
+                    kind: TokenKind::PatternSeqCapture,
+                    start: t.start,
+                    len: 4 + raw[i + 4].len,
+                });
+                i += 5;
+                continue;
+            }
             // `$` is a legal Apex identifier start character, so `$NAME`
             // lexes as one ordinary `Identifier` -- there is no `$` token to
             // look for. A pattern therefore reserves leading-`$`
@@ -76,15 +96,19 @@ impl Input {
     /// *replacement* template sees holes exactly where the pattern parser
     /// would -- string literals opaque, adjacent dots folded, `$NAME`
     /// recognised as one token.
-    pub(crate) fn hole_spans(src: &str) -> Vec<(u32, u32, bool)> {
+    pub(crate) fn hole_spans(src: &str) -> Vec<(u32, u32, TokenKind)> {
         Input::new_pattern(src)
             .raw
             .iter()
-            .filter_map(|t| match t.kind {
-                TokenKind::PatternHole => Some((t.start, t.len, false)),
-                TokenKind::PatternCapture => Some((t.start, t.len, true)),
-                _ => None,
+            .filter(|t| {
+                matches!(
+                    t.kind,
+                    TokenKind::PatternHole
+                        | TokenKind::PatternCapture
+                        | TokenKind::PatternSeqCapture
+                )
             })
+            .map(|t| (t.start, t.len, t.kind))
             .collect()
     }
 

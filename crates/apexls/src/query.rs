@@ -90,6 +90,11 @@
 //! `kind:SoqlExpr --not kind:SoqlWhereClause --not kind:SoqlLimit` is
 //! "a query with neither clause", and all three name the same node.
 //!
+//! **`$...NAME`** captures a *run* of elements rather than one, and binds
+//! its source text, which is what lets a variable-length run survive a
+//! rewrite: `Database.query($...ARGS)` -> `Database.queryWithBinds($...ARGS, ...)`
+//! keeps a call'''s arguments whatever their number.
+//!
 //! **Replace** is `--replace TEMPLATE`, a string template taking only the
 //! pattern's *named* captures -- a bare `...` has nothing to refer to on
 //! the output side and is rejected before any file is touched. The match's
@@ -131,6 +136,14 @@ enum Hole {
     /// `$NAME` -- matches one construct, and unifies with other
     /// occurrences of the same name within the same match.
     Capture(String),
+    /// `$...NAME` -- matches a *run* of elements, zero or more, and binds
+    /// the source text of the whole run.
+    ///
+    /// The sequence counterpart of [`Hole::Capture`], and the only way to
+    /// carry a variable-length run across a rewrite: `f($...ARGS)` ->
+    /// `g($...ARGS)` keeps a call's arguments whatever their number, which
+    /// a one-construct capture cannot do.
+    SeqCapture(String),
     /// `$_` -- matches one construct and binds nothing.
     ///
     /// Distinct from `Capture("_")` because a name that unifies makes
@@ -171,9 +184,14 @@ impl Replacement {
     fn compile(text: &str, bound: &std::collections::HashSet<String>) -> Result<Self, ArgError> {
         let mut parts = Vec::new();
         let mut cursor = 0usize;
-        for (start, len, is_capture) in apex_parser::hole_spans(text) {
+        for (start, len, kind) in apex_parser::hole_spans(text) {
             let (start, len) = (start as usize, len as usize);
-            if !is_capture {
+            let name_at = match kind {
+                apex_parser::TokenKind::PatternCapture => 1,
+                apex_parser::TokenKind::PatternSeqCapture => 4,
+                _ => 0,
+            };
+            if name_at == 0 {
                 return Err(ArgError(
                     format!(
                         "error: `...` cannot appear in a replacement\nnote: an unnamed hole has nothing to refer to; name it in the pattern and use the name here"
@@ -181,7 +199,7 @@ impl Replacement {
                     2,
                 ));
             }
-            let name = text[start + 1..start + len].to_string();
+            let name = text[start + name_at..start + len].to_string();
             if !bound.contains(&name) {
                 return Err(ArgError(
                     format!("error: replacement uses ${name}, which the pattern never binds"),
@@ -438,9 +456,18 @@ impl Pattern {
         SyntaxNode::new_root(green.clone())
             .descendants_with_tokens()
             .filter_map(|e| e.into_token())
-            .filter(|t| t.kind() == SyntaxKind::PatternCapture)
+            .filter(|t| {
+                matches!(
+                    t.kind(),
+                    SyntaxKind::PatternCapture | SyntaxKind::PatternSeqCapture
+                )
+            })
             .filter_map(|t| {
-                let name = t.text().strip_prefix(HOLE_CAPTURE_SIGIL)?.to_string();
+                let name = if t.kind() == SyntaxKind::PatternSeqCapture {
+                    t.text().get(4..)?.to_string()
+                } else {
+                    t.text().strip_prefix(HOLE_CAPTURE_SIGIL)?.to_string()
+                };
                 (name != "_").then_some(name)
             })
             .collect()
@@ -469,6 +496,11 @@ fn hole_of(element: &SyntaxElement) -> Option<Hole> {
     };
     match only.kind() {
         SyntaxKind::PatternHole => return Some(Hole::Ellipsis),
+        SyntaxKind::PatternSeqCapture => {
+            // `$...NAME` -- strip the sigil and the three dots.
+            let name = only.text().get(4..).unwrap_or_default().to_string();
+            return Some(Hole::SeqCapture(name));
+        }
         SyntaxKind::PatternCapture => {
             let name = only
                 .text()
@@ -576,6 +608,17 @@ fn kinds_compatible(pat: &SyntaxNode, src: &SyntaxNode) -> bool {
 fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) -> bool {
     match hole_of(pat) {
         Some(Hole::Ellipsis) | Some(Hole::Anonymous) => return true,
+        // A sequence capture reached here is standing where a single
+        // element is expected rather than in a run, so it binds that one
+        // element. Consistent either way: it binds whatever it consumed.
+        Some(Hole::SeqCapture(name)) => {
+            let text = match src {
+                NodeOrToken::Token(t) => t.text().to_string(),
+                NodeOrToken::Node(n) => significant_text(n),
+            };
+            binds.insert(name, text);
+            return true;
+        }
         Some(Hole::AnyString) => return is_string_literal(src),
         Some(Hole::Capture(name)) => {
             let text = match src {
@@ -647,13 +690,29 @@ fn match_seq(pat: &[SyntaxElement], src: &[SyntaxElement], binds: &mut Binds) ->
         return src.is_empty();
     };
 
-    if hole_of(head) == Some(Hole::Ellipsis) {
+    // An ellipsis consumes zero or more elements; a *named* sequence does
+    // the same and records what it swallowed, so a rewrite can put it back.
+    let sequence = match hole_of(head) {
+        Some(Hole::Ellipsis) => Some(None),
+        Some(Hole::SeqCapture(name)) => Some(Some(name)),
+        _ => None,
+    };
+    if let Some(name) = sequence {
         let rest = &pat[1..];
-        if rest.is_empty() {
-            return true;
-        }
         for split in 0..=src.len() {
             let mut attempt = binds.clone();
+            if let Some(name) = &name {
+                attempt.insert(name.clone(), run_text(&src[..split]));
+            }
+            if rest.is_empty() {
+                if split < src.len() {
+                    // A trailing sequence swallows everything that is left,
+                    // so only the full-length split is the real binding.
+                    continue;
+                }
+                *binds = attempt;
+                return true;
+            }
             if match_seq(rest, &src[split..], &mut attempt) {
                 *binds = attempt;
                 return true;
@@ -776,6 +835,33 @@ fn expression_inside(element: &SyntaxElement) -> Option<SyntaxElement> {
         }
         _ => None,
     }
+}
+
+/// The source text spanned by a consumed run of elements, first
+/// significant byte to last. Empty when the run is.
+fn run_text(run: &[SyntaxElement]) -> String {
+    let significant = |e: &SyntaxElement| match e {
+        NodeOrToken::Token(t) => Some(t.text_range()),
+        NodeOrToken::Node(n) => apex_syntax::significant_range(n),
+    };
+    let Some(first) = run.iter().find_map(significant) else {
+        return String::new();
+    };
+    let last = run.iter().rev().find_map(significant).unwrap_or(first);
+    let root = match &run[0] {
+        NodeOrToken::Token(t) => t.parent().map(|p| p.ancestors().last().unwrap_or(p)),
+        NodeOrToken::Node(n) => Some(n.ancestors().last().unwrap_or_else(|| n.clone())),
+    };
+    let Some(root) = root else {
+        return String::new();
+    };
+    let base = usize::from(root.text_range().start());
+    let text = root.text().to_string();
+    let (from, to) = (
+        usize::from(first.start()) - base,
+        usize::from(last.end()) - base,
+    );
+    text.get(from..to).unwrap_or_default().to_string()
 }
 
 fn significant_children(node: &SyntaxNode) -> Vec<SyntaxElement> {
@@ -1728,6 +1814,43 @@ mod tests {
             1,
             "a rewrite takes only the enclosing one",
         );
+    }
+
+    /// `$...NAME` matches a run of any length, including none, and binds
+    /// what it swallowed -- which is the only way a variable-length run
+    /// survives a rewrite.
+    #[test]
+    fn a_sequence_capture_matches_a_run_of_any_length() {
+        let src = wrap("        f();\n        f(a);\n        f(a, b, c);");
+        assert_eq!(hits("f($...ARGS);", &src).len(), 3, "zero, one and many");
+
+        let bound = |src: &str| {
+            let p = Pattern::compile("f($...ARGS);").expect("compiles");
+            let parse = parse_apex_file(Path::new("T.cls"), src);
+            p.matches_with_binds(&parse.syntax())
+                .into_iter()
+                .map(|(_, b)| b.get("ARGS").cloned().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bound(&src),
+            vec!["".to_string(), "a".to_string(), "a, b, c".to_string()],
+            "the run's own source text, verbatim",
+        );
+    }
+
+    /// The rewrite that a one-construct capture could not express: carry a
+    /// call's arguments across, whatever their number.
+    #[test]
+    fn a_sequence_capture_carries_a_run_across_a_replacement() {
+        let names = Pattern::compile("f($...ARGS);").unwrap().capture_names();
+        let r = Replacement::compile("g($...ARGS);", &names).expect("compiles");
+        let mut binds = Binds::new();
+        binds.insert("ARGS".to_string(), "a, b, c".to_string());
+        assert_eq!(r.render(&binds), "g(a, b, c);");
+
+        // Still rejected if the pattern never bound it.
+        assert!(Replacement::compile("g($...OTHER);", &names).is_err());
     }
 
     #[test]

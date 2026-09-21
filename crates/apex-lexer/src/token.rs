@@ -329,6 +329,14 @@ pub enum TokenKind {
     /// ambiguous: `... [x]` must not read as indexing into an ellipsis,
     /// while `$X[0]` legitimately is an index expression.
     PatternCapture,
+    /// A structural-search sequence capture (`$...NAME`).
+    ///
+    /// Like the other two, never produced by `tokenize`. Distinct because
+    /// it matches a *run* of elements rather than one, and binds that run
+    /// so a rewrite can splice it back -- which is what lets
+    /// `f($...ARGS)` carry a call's arguments across a replacement
+    /// whatever their number.
+    PatternSeqCapture,
     Eof,
 }
 

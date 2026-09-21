@@ -74,7 +74,9 @@ impl<'t> Parser<'t> {
         self.pattern_mode
             && matches!(
                 self.current(),
-                SyntaxKind::PatternHole | SyntaxKind::PatternCapture
+                SyntaxKind::PatternHole
+                    | SyntaxKind::PatternCapture
+                    | SyntaxKind::PatternSeqCapture
             )
     }
 

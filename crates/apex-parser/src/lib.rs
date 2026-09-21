@@ -35,6 +35,7 @@ mod grammar;
 mod input;
 mod parser;
 
+pub use apex_lexer::TokenKind;
 pub use apex_syntax::NodeCache;
 pub use errors::{Parse, ParseError};
 
@@ -131,13 +132,12 @@ pub fn parse_class_member(src: &str) -> Parse {
     })
 }
 
-/// Where every structural-search hole sits in `src`, as
-/// `(start, len, is_capture)`.
+/// Where every structural-search hole sits in `src`, with its kind.
 ///
 /// For callers that need to find holes in text they will never parse --
 /// a *replacement* template, whose holes are filled from a match's
 /// bindings rather than matched against anything.
-pub fn hole_spans(src: &str) -> Vec<(u32, u32, bool)> {
+pub fn hole_spans(src: &str) -> Vec<(u32, u32, apex_lexer::TokenKind)> {
     Input::hole_spans(src)
 }
 

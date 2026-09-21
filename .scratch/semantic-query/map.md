@@ -193,10 +193,9 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
   to continue a binary expression, and a hole admitted there misreads ordinary patterns such as
   `{ ... $X = y; }`. Lifting it needs a way to say "this hole is an operator" that does not also
   fire elsewhere.
-- **Named sequence captures** (`$...ARGS`). A capture matches exactly one construct, so a
-  variable-length run cannot be carried across a rewrite: `Database.query($Q)` ->
-  `Database.queryWithBinds($Q, ...)` has nowhere to put the original arguments. The obvious
-  first extension now that replace exists.
+- **Constraints in the reserved `--where` slot.** Still empty. The corpus has not yet produced a
+  query that needs one, but "these two captures must differ" is the obvious first candidate,
+  since distinct capture names bind independently rather than requiring difference.
 
 - ~~The escape hatch~~ **-- resolved, and the answer was "both".** Running the corpus against
   built search was the instrument the map said it would be: item 9 needed `kind:` (a SOQL `WHERE`
