@@ -44,6 +44,24 @@ pub(crate) fn statement(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         // match already resolved those via the earlier exact arms), so
         // this only ever catches identifiers plus the many SOQL/SOSL/DML
         // keywords that double as ordinary names (`System`, `Name`, ...).
+        // A hole can start a declaration (`$T $v = ...;`) as well as an
+        // expression statement (`$X.f();`). Only the shape that can *only*
+        // be a declaration takes that path: a hole, then a name, then `=`
+        // or `;`. Without that lookahead the type-position hole is greedy
+        // -- `{ ... System.debug(x); }` parses as "declare a variable of
+        // type `...` named `System`" and swallows the statement.
+        // Only a *capture* may name the type. A bare `...` always means
+        // "any statements here", so `{ ... $X = y; }` is an ellipsis
+        // followed by an assignment -- not a declaration of a variable
+        // `$X` whose type is the ellipsis, which is what reading any hole
+        // here produced.
+        _ if p.at(SyntaxKind::PatternCapture)
+            && p.at_hole()
+            && (super::ids::is_id_kind(p.nth(1)) || p.nth(1) == SyntaxKind::PatternCapture)
+            && matches!(p.nth(2), SyntaxKind::Assign | SyntaxKind::Semi) =>
+        {
+            local_var_decl_or_expr_stmt(p)
+        }
         k if super::ids::is_id_kind(k) => local_var_decl_or_expr_stmt(p),
         _ => expr_stmt(p),
     };

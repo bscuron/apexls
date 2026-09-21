@@ -70,6 +70,24 @@ impl Input {
         Input::build(folded)
     }
 
+    /// Where every hole sits in `src`, as `(start, len, is_capture)`.
+    ///
+    /// Shares [`Input::new_pattern`]'s folding, so a caller scanning a
+    /// *replacement* template sees holes exactly where the pattern parser
+    /// would -- string literals opaque, adjacent dots folded, `$NAME`
+    /// recognised as one token.
+    pub(crate) fn hole_spans(src: &str) -> Vec<(u32, u32, bool)> {
+        Input::new_pattern(src)
+            .raw
+            .iter()
+            .filter_map(|t| match t.kind {
+                TokenKind::PatternHole => Some((t.start, t.len, false)),
+                TokenKind::PatternCapture => Some((t.start, t.len, true)),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn build(raw: Vec<Token>) -> Input {
         let significant = raw
             .iter()

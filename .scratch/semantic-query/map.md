@@ -146,6 +146,13 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
 
 ## Decisions so far
 
+- [Decision: replace semantics](issues/03-replace-semantics-decision.md): `--replace TEMPLATE`,
+  a string template taking only named captures; the significant range is spliced so untouched
+  formatting survives; an empty template deletes and takes its line; nested matches collapse to
+  the outermost (revising this map) while crossing overlaps are refused; edits apply
+  highest-offset-first. **Every rewritten file is re-parsed and not written if it gained parse
+  errors** -- a safety net no surveyed tool has, since none has a parser to hand.
+
 <!-- one line per closed ticket, then zoom the link for the detail -->
 
 - [Prototype: pattern string to syntax tree](issues/01-pattern-to-tree-prototype.md): holes
@@ -186,8 +193,10 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
   to continue a binary expression, and a hole admitted there misreads ordinary patterns such as
   `{ ... $X = y; }`. Lifting it needs a way to say "this hole is an operator" that does not also
   fire elsewhere.
-- **Replace.** The destination's remaining half: search is built, replace is specced and not.
-  This is now the largest gap against the original ask.
+- **Named sequence captures** (`$...ARGS`). A capture matches exactly one construct, so a
+  variable-length run cannot be carried across a rewrite: `Database.query($Q)` ->
+  `Database.queryWithBinds($Q, ...)` has nowhere to put the original arguments. The obvious
+  first extension now that replace exists.
 
 - ~~The escape hatch~~ **-- resolved, and the answer was "both".** Running the corpus against
   built search was the instrument the map said it would be: item 9 needed `kind:` (a SOQL `WHERE`

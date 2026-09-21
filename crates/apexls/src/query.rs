@@ -90,6 +90,16 @@
 //! `kind:SoqlExpr --not kind:SoqlWhereClause --not kind:SoqlLimit` is
 //! "a query with neither clause", and all three name the same node.
 //!
+//! **Replace** is `--replace TEMPLATE`, a string template taking only the
+//! pattern's *named* captures -- a bare `...` has nothing to refer to on
+//! the output side and is rejected before any file is touched. The match's
+//! significant range is spliced, so untouched formatting survives by
+//! construction; an empty template deletes, and takes its whole line when
+//! nothing else is on it. Nested matches collapse to the outermost, since
+//! the inner text is part of what the outer rewrite replaces; genuinely
+//! crossing overlaps are refused and both named. Every rewritten file is
+//! re-parsed and **not written if it gained parse errors**.
+//!
 //! Like `soql`, this binds nothing -- it discovers, parses and walks,
 //! skipping the whole `BoundProgram` cost. Matching is purely structural:
 //! `System.debug(...)` matches that shape whether or not `System` resolves
@@ -131,6 +141,88 @@ enum Hole {
     Anonymous,
 }
 
+/// A replacement template: literal text with capture holes to fill in.
+///
+/// A *string* template, not a tree transform -- the near-universal choice
+/// (ast-grep, Semgrep, Comby), and the right one here because the source is
+/// never re-printed. A rewrite is a byte-range splice into text that keeps
+/// its own formatting, which is the problem Comby disclaims outright and
+/// Semgrep has open indentation bugs for.
+#[derive(Debug, Clone)]
+struct Replacement {
+    parts: Vec<ReplacementPart>,
+}
+
+#[derive(Debug, Clone)]
+enum ReplacementPart {
+    Text(String),
+    Capture(String),
+}
+
+impl Replacement {
+    /// Only *named* captures may appear, and only ones the pattern binds.
+    ///
+    /// A bare `...` is rejected rather than given a meaning: on the match
+    /// side it stands for code nobody named, so on the output side it has
+    /// nothing to refer to. Positional correspondence between the nth `...`
+    /// of each side is how Coccinelle does it and is easy to get wrong;
+    /// requiring a name makes the template total -- every hole in it has
+    /// exactly one binding.
+    fn compile(text: &str, bound: &std::collections::HashSet<String>) -> Result<Self, ArgError> {
+        let mut parts = Vec::new();
+        let mut cursor = 0usize;
+        for (start, len, is_capture) in apex_parser::hole_spans(text) {
+            let (start, len) = (start as usize, len as usize);
+            if !is_capture {
+                return Err(ArgError(
+                    format!(
+                        "error: `...` cannot appear in a replacement\nnote: an unnamed hole has nothing to refer to; name it in the pattern and use the name here"
+                    ),
+                    2,
+                ));
+            }
+            let name = text[start + 1..start + len].to_string();
+            if !bound.contains(&name) {
+                return Err(ArgError(
+                    format!("error: replacement uses ${name}, which the pattern never binds"),
+                    2,
+                ));
+            }
+            if start > cursor {
+                parts.push(ReplacementPart::Text(text[cursor..start].to_string()));
+            }
+            parts.push(ReplacementPart::Capture(name));
+            cursor = start + len;
+        }
+        if cursor < text.len() {
+            parts.push(ReplacementPart::Text(text[cursor..].to_string()));
+        }
+        Ok(Replacement { parts })
+    }
+
+    fn render(&self, binds: &Binds) -> String {
+        self.parts
+            .iter()
+            .map(|part| match part {
+                ReplacementPart::Text(t) => t.as_str(),
+                ReplacementPart::Capture(name) => binds.get(name).map_or("", String::as_str),
+            })
+            .collect()
+    }
+
+    fn is_deletion(&self) -> bool {
+        self.parts.is_empty()
+    }
+}
+
+/// One rewrite: what to replace, and with what.
+#[derive(Debug)]
+struct Edit {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
 /// A compiled pattern.
 ///
 /// The tree form is held as a *green* node, not the red `SyntaxNode` the
@@ -164,6 +256,7 @@ enum Pattern {
 
 pub fn run(
     pattern_src: &str,
+    replacement_src: Option<&str>,
     not_srcs: &[String],
     containing_srcs: &[String],
     paths: &[PathBuf],
@@ -196,10 +289,34 @@ pub fn run(
         }
     }
 
+    let replacement = match replacement_src {
+        Some(text) => match Replacement::compile(text, &pattern.capture_names()) {
+            Ok(r) => Some(r),
+            Err(ArgError(message, code)) => {
+                eprintln!("{message}");
+                return ExitCode::from(code);
+            }
+        },
+        None => None,
+    };
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let matches = match walk_project(paths, &cwd, |path, src| {
-        matches_in_file_filtered(&pattern, &excluded, &required, path, src)
-    }) {
+    let refused = std::sync::atomic::AtomicBool::new(false);
+    let found = match &replacement {
+        Some(replacement) => run_replace(
+            &pattern,
+            replacement,
+            &excluded,
+            &required,
+            paths,
+            &cwd,
+            &refused,
+        ),
+        None => walk_project(paths, &cwd, |path, src| {
+            matches_in_file_filtered(&pattern, &excluded, &required, path, src)
+        }),
+    };
+    let matches = match found {
         Ok(matches) => matches,
         Err(ArgError(message, code)) => {
             eprintln!("{message}");
@@ -211,6 +328,12 @@ pub fn run(
         println!("{m}");
     }
 
+    // A refused file is an error even though the others were rewritten:
+    // a script that checks the exit code must not read "some files were
+    // skipped" as success.
+    if refused.load(std::sync::atomic::Ordering::Relaxed) {
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }
 
@@ -272,27 +395,55 @@ impl Pattern {
     /// -- a nested match is a real match and hiding it would be worse than
     /// printing two lines.
     fn matches_in(&self, root: &SyntaxNode) -> Vec<SyntaxNode> {
+        self.matches_with_binds(root)
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect()
+    }
+
+    /// As [`Pattern::matches_in`], but keeping each match's bindings, which
+    /// is what a replacement template is filled from.
+    fn matches_with_binds(&self, root: &SyntaxNode) -> Vec<(SyntaxNode, Binds)> {
         match self {
             // A fresh red-tree cursor per call, since a red node is a
             // thread-local cursor and cannot be shared across workers.
             Pattern::Tree(green) => {
                 let pattern = SyntaxNode::new_root(green.clone());
                 root.descendants()
-                    .filter(|candidate| {
+                    .filter_map(|candidate| {
                         let mut binds = HashMap::new();
-                        match_node(&pattern, candidate, &mut binds)
+                        match_node(&pattern, &candidate, &mut binds).then_some((candidate, binds))
                     })
                     .collect()
             }
             Pattern::Kind(kind) => root
                 .descendants()
                 .filter(|candidate| candidate.kind() == *kind)
+                .map(|c| (c, Binds::new()))
                 .collect(),
             Pattern::Regex(re) => root
                 .descendants()
                 .filter(|candidate| re.is_match(&significant_text(candidate)))
+                .map(|c| (c, Binds::new()))
                 .collect(),
         }
+    }
+
+    /// Every capture name this pattern binds -- what a replacement is
+    /// allowed to refer to.
+    fn capture_names(&self) -> std::collections::HashSet<String> {
+        let Pattern::Tree(green) = self else {
+            return std::collections::HashSet::new();
+        };
+        SyntaxNode::new_root(green.clone())
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == SyntaxKind::PatternCapture)
+            .filter_map(|t| {
+                let name = t.text().strip_prefix(HOLE_CAPTURE_SIGIL)?.to_string();
+                (name != "_").then_some(name)
+            })
+            .collect()
     }
 }
 
@@ -682,6 +833,186 @@ fn matches_in_file_filtered(
         })
         .filter_map(|node| site_for(display_path, src, &index, &node))
         .collect()
+}
+
+/// Rewrite every match in the project, in place.
+///
+/// In place with no dry-run by design: a repository is under version
+/// control, so `git diff` is the preview and `git checkout` the undo, and
+/// making the common case take two invocations would only duplicate what
+/// the VCS already does.
+fn run_replace(
+    pattern: &Pattern,
+    replacement: &Replacement,
+    excluded: &[Pattern],
+    required: &[Pattern],
+    paths: &[PathBuf],
+    cwd: &Path,
+    refused: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<Site>, ArgError> {
+    walk_project(paths, cwd, |display_path, src| {
+        rewrite_file(
+            pattern,
+            replacement,
+            excluded,
+            required,
+            display_path,
+            src,
+            refused,
+        )
+    })
+}
+
+/// Rewrite one file, returning the sites changed.
+///
+/// Reads the file again rather than trusting the copy the walk handed over,
+/// because `walk_project` is parse-only and hands out a borrowed `&str`;
+/// the write has to go through the real path either way.
+fn rewrite_file(
+    pattern: &Pattern,
+    replacement: &Replacement,
+    excluded: &[Pattern],
+    required: &[Pattern],
+    display_path: &Path,
+    src: &str,
+    refused: &std::sync::atomic::AtomicBool,
+) -> Vec<Site> {
+    let parse = parse_apex_file(display_path, src);
+    let index = LineIndex::new(src);
+    let root = parse.syntax();
+
+    let matches: Vec<_> = pattern
+        .matches_with_binds(&root)
+        .into_iter()
+        .filter(|(node, _)| {
+            !excluded
+                .iter()
+                .any(|unwanted| !unwanted.matches_in(node).is_empty())
+                && required
+                    .iter()
+                    .all(|wanted| !wanted.matches_in(node).is_empty())
+        })
+        .collect();
+
+    let mut edits = Vec::new();
+    let mut sites = Vec::new();
+    for (node, binds) in outermost_only(matches) {
+        let Some(range) = apex_syntax::significant_range(&node) else {
+            continue;
+        };
+        let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+        let (start, end) = if replacement.is_deletion() {
+            widen_deletion_to_line(src, start, end)
+        } else {
+            (start, end)
+        };
+        let Some(mut site) = site_for(display_path, src, &index, &node) else {
+            continue;
+        };
+        let new_text = replacement.render(&binds);
+        // Report what each site *became*, not what it was: a bulk rewrite
+        // is read to confirm it did the right thing, and the old text is
+        // still one `git diff` away.
+        site.text = if replacement.is_deletion() {
+            format!("{} -> (deleted)", site.text)
+        } else {
+            format!("{} -> {}", site.text, crate::project::collapse(&new_text))
+        };
+        edits.push(Edit {
+            start,
+            end,
+            text: new_text,
+        });
+        sites.push(site);
+    }
+    if edits.is_empty() {
+        return Vec::new();
+    }
+
+    // Crossing overlaps are genuinely ambiguous -- either rewrite changes
+    // text the other was computed against -- so both are skipped and named
+    // rather than one being picked silently. Nested matches never reach
+    // here; `outermost_only` has already resolved those.
+    edits.sort_by_key(|e| e.start);
+    if let Some(pair) = edits.windows(2).find(|w| w[1].start < w[0].end) {
+        eprintln!("error: overlapping rewrites in {}", display_path.display());
+        for e in pair {
+            eprintln!("  note: {}..{} {}", e.start, e.end, &src[e.start..e.end]);
+        }
+        eprintln!("  note: both change the same text; file skipped");
+        refused.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Vec::new();
+    }
+
+    // Highest offset first, so earlier edits' offsets stay valid without
+    // remapping -- the idiom `apexls-server`'s own fix pipeline uses.
+    let mut rewritten = src.to_string();
+    for edit in edits.iter().rev() {
+        rewritten.replace_range(edit.start..edit.end, &edit.text);
+    }
+
+    // The safety net the parser buys us, and which no surveyed tool has: if
+    // the rewrite would not parse, it is not written. One parse per changed
+    // file turns a bad replacement from silent corruption into a refusal.
+    let after = parse_apex_file(display_path, &rewritten);
+    if after.errors.len() > parse.errors.len() {
+        eprintln!(
+            "error: rewrite of {} would not parse",
+            display_path.display()
+        );
+        if let Some(e) = after.errors.first() {
+            eprintln!("  note: {} @ {}", e.message, e.offset);
+        }
+        eprintln!("  note: file not written");
+        refused.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Vec::new();
+    }
+
+    if std::fs::write(display_path, &rewritten).is_err() {
+        eprintln!("error: could not write {}", display_path.display());
+        refused.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Vec::new();
+    }
+    sites
+}
+
+/// Drop every match contained in another.
+///
+/// Search reports nested matches deliberately -- a call inside two nested
+/// loops really is two hits. For a rewrite they are guaranteed to overlap,
+/// so refusing the pair would make every nesting pattern unrewritable.
+/// Rewriting the outermost is the reading that loses nothing: the inner
+/// text is part of what the outer rewrite replaces.
+fn outermost_only(matches: Vec<(SyntaxNode, Binds)>) -> Vec<(SyntaxNode, Binds)> {
+    let ranges: Vec<_> = matches.iter().map(|(n, _)| n.text_range()).collect();
+    matches
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            !ranges.iter().enumerate().any(|(j, other)| {
+                j != *i && other.contains_range(ranges[*i]) && *other != ranges[*i]
+            })
+        })
+        .map(|(_, m)| m.clone())
+        .collect()
+}
+
+/// Grow a deletion to swallow its whole line when nothing else is on it.
+///
+/// Splicing only the significant range would leave a blank, indented line
+/// behind, which makes "delete every `System.debug(...);`" useless in
+/// practice. Deliberately narrow: the line must be whitespace either side
+/// of the match, so a deletion never takes code with it.
+fn widen_deletion_to_line(src: &str, start: usize, end: usize) -> (usize, usize) {
+    let line_start = src[..start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = src[end..].find('\n').map_or(src.len(), |i| end + i + 1);
+    let before_blank = src[line_start..start].trim().is_empty();
+    let after_blank = src[end..line_end].trim().is_empty();
+    if before_blank && after_blank {
+        (line_start, line_end)
+    } else {
+        (start, end)
+    }
 }
 
 #[cfg(test)]
@@ -1334,6 +1665,68 @@ mod tests {
             filtered(&["kind:SoqlExpr"], &[]),
             0,
             "a match contains itself"
+        );
+    }
+
+    /// A replacement is filled from the match's own bindings, and the
+    /// captured text is spliced back verbatim.
+    #[test]
+    fn a_replacement_is_filled_from_the_match() {
+        let names = |p: &str| Pattern::compile(p).unwrap().capture_names();
+        let r = Replacement::compile("!$X.isEmpty()", &names("$X.size() > 0")).unwrap();
+        let mut binds = Binds::new();
+        binds.insert("X".to_string(), "accounts".to_string());
+        assert_eq!(r.render(&binds), "!accounts.isEmpty()");
+    }
+
+    /// Only *named* captures may appear, and only ones the pattern binds.
+    /// A bare `...` has nothing to refer to on the output side, so it is
+    /// rejected rather than given a meaning.
+    #[test]
+    fn a_replacement_rejects_unnamed_and_unbound_holes() {
+        let names = |p: &str| Pattern::compile(p).unwrap().capture_names();
+        let err = Replacement::compile("log(...);", &names("System.debug(...);"))
+            .expect_err("`...` has nothing to refer to");
+        assert!(
+            err.0.contains("cannot appear in a replacement"),
+            "{}",
+            err.0
+        );
+
+        let err = Replacement::compile("g($B)", &names("f($A)")).expect_err("$B is never bound");
+        assert!(err.0.contains("never binds"), "{}", err.0);
+
+        // `$_` binds nothing, so it cannot be referred to either.
+        assert!(Replacement::compile("g($_)", &names("f($_)")).is_err());
+    }
+
+    /// An empty replacement deletes, and takes the whole line when nothing
+    /// else is on it -- otherwise "delete every `System.debug(...);`" would
+    /// leave a blank indented line behind at every site.
+    #[test]
+    fn deleting_takes_the_line_only_when_it_is_otherwise_empty() {
+        let src = "a;\n    f();\n  g(); h();\n";
+        // `f();` is alone on its line, so the line goes.
+        assert_eq!(widen_deletion_to_line(src, 7, 11), (3, 12));
+        // `g();` shares its line with `h();`, so only the call goes.
+        let g = src.find("g();").unwrap();
+        assert_eq!(widen_deletion_to_line(src, g, g + 4), (g, g + 4));
+    }
+
+    /// Search reports nested matches on purpose, but for a rewrite they are
+    /// guaranteed to overlap. Rewriting the outermost loses nothing, since
+    /// the inner text is part of what the outer rewrite replaces.
+    #[test]
+    fn nested_matches_collapse_to_the_outermost() {
+        let src = wrap("        f(f(a));");
+        let pattern = Pattern::compile("f(...)").expect("compiles");
+        let parse = parse_apex_file(Path::new("T.cls"), &src);
+        let all = pattern.matches_with_binds(&parse.syntax());
+        assert_eq!(all.len(), 2, "search sees both calls");
+        assert_eq!(
+            outermost_only(all).len(),
+            1,
+            "a rewrite takes only the enclosing one",
         );
     }
 

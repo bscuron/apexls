@@ -51,6 +51,13 @@ enum Command {
         pattern: String,
         /// Exclude any match that itself contains a match of this pattern.
         /// Repeatable; a match is dropped if any of them hits.
+        /// Rewrite every match with this template, in place.
+        ///
+        /// Only named captures from PATTERN may appear in it; an empty
+        /// template deletes the match. Repositories are under version
+        /// control, so there is no dry run -- omit this to search.
+        #[arg(long = "replace", short = 'r', value_name = "TEMPLATE")]
+        replace: Option<String>,
         #[arg(long = "not", value_name = "PATTERN")]
         not: Vec<String>,
         /// Keep only matches that themselves contain a match of this
@@ -77,9 +84,10 @@ fn main() -> ExitCode {
         Command::Soql { paths } => soql::run(&paths),
         Command::Query {
             pattern,
+            replace,
             not,
             containing,
             paths,
-        } => query::run(&pattern, &not, &containing, &paths),
+        } => query::run(&pattern, replace.as_deref(), &not, &containing, &paths),
     }
 }
