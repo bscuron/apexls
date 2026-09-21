@@ -657,6 +657,29 @@ fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
         return match_seq(&pat_rest, &src_rest, binds);
     }
 
+    // An array type is flat -- `Map<Id, X>[]` is `Map`, a `TypeArgList`,
+    // `[`, `]` as siblings, with no node for the element type -- so a hole
+    // standing for the type's name must take the whole run before the
+    // brackets, not one sibling, or `$T[]` finds `String[]` but never
+    // `Map<Id, X>[]` or `Schema.X[]`. Only the brackets are compared.
+    // ponytail: matcher-side because nesting the element type in the real
+    // tree would move every array type's hover/go-to target in the binder.
+    if pat.kind() == SyntaxKind::Type {
+        let (pat_items, src_items) = (significant_children(pat), significant_children(src));
+        let is_bracket =
+            |e: &SyntaxElement| matches!(e.kind(), SyntaxKind::LBrack | SyntaxKind::RBrack);
+        let pat_name = pat_items.iter().take_while(|e| !is_bracket(e)).count();
+        if let ([name], brackets) = pat_items.split_at(pat_name) {
+            if matches!(hole_of(name), Some(Hole::Capture(_) | Hole::Anonymous)) {
+                let src_name = src_items.iter().take_while(|e| !is_bracket(e)).count();
+                let (run, src_brackets) = src_items.split_at(src_name);
+                return !run.is_empty()
+                    && brackets.len() == src_brackets.len()
+                    && bind_capture(name, &run_text(run), binds);
+            }
+        }
+    }
+
     // A block's children include its own braces, and they must not take
     // part in the statement sequence: a trailing `...` followed by `}`
     // could never match once the `...` had already consumed everything, so
@@ -737,24 +760,12 @@ fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) ->
             return true;
         }
         Some(Hole::AnyString) => return is_string_literal(src),
-        Some(Hole::Capture(name)) => {
+        Some(Hole::Capture(_)) => {
             let text = match src {
                 NodeOrToken::Token(t) => t.text().to_string(),
                 NodeOrToken::Node(n) => significant_text(n),
             };
-            // Unification, scoped per match: the first occurrence binds,
-            // later ones must agree. Compared on significant text so
-            // `a.b` and `a . b` are the same capture, matching ast-grep's
-            // structural rather than byte-wise notion of "the same", and
-            // case-insensitively because Apex identifiers are -- `acc` and
-            // `Acc` are one variable, so they are one capture.
-            return match binds.get(&name) {
-                Some(existing) => existing.eq_ignore_ascii_case(&text),
-                None => {
-                    binds.insert(name, text);
-                    true
-                }
-            };
+            return bind_capture(pat, &text, binds);
         }
         None => {}
     }
@@ -765,6 +776,27 @@ fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) ->
         }
         (NodeOrToken::Node(p), NodeOrToken::Node(s)) => match_node(p, s, binds),
         _ => false,
+    }
+}
+
+/// Bind a capture hole to `text`, or check it against an earlier binding.
+///
+/// Unification, scoped per match: the first occurrence binds, later ones
+/// must agree. Compared on significant text so `a.b` and `a . b` are the
+/// same capture, matching ast-grep's structural rather than byte-wise
+/// notion of "the same", and case-insensitively because Apex identifiers
+/// are -- `acc` and `Acc` are one variable, so they are one capture. `$_`
+/// binds nothing and so always agrees.
+fn bind_capture(hole: &SyntaxElement, text: &str, binds: &mut Binds) -> bool {
+    let Some(Hole::Capture(name)) = hole_of(hole) else {
+        return true;
+    };
+    match binds.get(&name) {
+        Some(existing) => existing.eq_ignore_ascii_case(text),
+        None => {
+            binds.insert(name, text.to_string());
+            true
+        }
     }
 }
 
@@ -2299,6 +2331,53 @@ mod tests {
     fn finds_static_initializers() {
         let src = "public class T {\n    static { init(); }\n    void run() { init(); }\n}\n";
         assert_eq!(hits("static { ... }", src), ["2:5:static { init(); }"]);
+    }
+
+    /// An array type is flat in the tree, so the name hole must take the
+    /// whole run before the brackets -- generics and dotted names included.
+    #[test]
+    fn a_type_hole_covers_generic_and_qualified_array_types() {
+        let src = wrap(
+            "        String[] a;
+        Map<Id, Account>[] b;
+        Schema.SObjectField[] c;
+        List<String> d;",
+        );
+        assert_eq!(hits("$T[] $v;", &src).len(), 3);
+        assert_eq!(
+            hits("$T $v;", &src).len(),
+            4,
+            "a bare type hole is still any type"
+        );
+        assert_eq!(
+            hits("$T[][] $v;", &src).len(),
+            0,
+            "the bracket count must agree"
+        );
+        let src = wrap(
+            "        Map<Id, X>[] a = new Map<Id, X>[]{};
+        String[] b = new Integer[]{};",
+        );
+        assert_eq!(
+            hits("$T[] $v = new $T[]{ ... };", &src).len(),
+            1,
+            "and it unifies"
+        );
+    }
+
+    /// SOSL clauses take a clause hole anywhere, as SOQL's do.
+    #[test]
+    fn a_sosl_clause_can_be_named_after_a_clause_hole() {
+        let src = wrap("        r = [FIND :q IN NAME FIELDS RETURNING Contact(Id) LIMIT 100];");
+        for pattern in [
+            "[FIND $q ...]",
+            "[FIND $q ... RETURNING ... ...]",
+            "[FIND $q IN $g FIELDS ...]",
+            "[FIND $q ... LIMIT $n]",
+        ] {
+            assert_eq!(hits(pattern, &src).len(), 1, "{pattern}");
+        }
+        assert_eq!(hits("[FIND $q IN ALL FIELDS ...]", &src).len(), 0);
     }
 
     #[test]

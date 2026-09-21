@@ -55,10 +55,15 @@ pub(crate) fn statement(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         // followed by an assignment -- not a declaration of a variable
         // `$X` whose type is the ellipsis, which is what reading any hole
         // here produced.
-        _ if p.at(SyntaxKind::PatternCapture)
-            && p.at_hole()
-            && (super::ids::is_id_kind(p.nth(1)) || p.nth(1) == SyntaxKind::PatternCapture)
-            && matches!(p.nth(2), SyntaxKind::Assign | SyntaxKind::Semi) =>
+        // The type may carry an array suffix: `$T[] $v = ...;`.
+        _ if p.at(SyntaxKind::PatternCapture) && p.at_hole() && {
+            let mut n = 1;
+            while p.nth(n) == SyntaxKind::LBrack && p.nth(n + 1) == SyntaxKind::RBrack {
+                n += 2;
+            }
+            (super::ids::is_id_kind(p.nth(n)) || p.nth(n) == SyntaxKind::PatternCapture)
+                && matches!(p.nth(n + 1), SyntaxKind::Assign | SyntaxKind::Semi)
+        } =>
         {
             local_var_decl_or_expr_stmt(p)
         }

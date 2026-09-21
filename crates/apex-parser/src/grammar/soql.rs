@@ -597,7 +597,8 @@ fn field_order(p: &mut Parser<'_>) -> CompletedMarker {
 fn limit_clause(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // LIMIT
-    if p.at_ellipsis() {
+              // The count is one item, so any hole stands for it: `LIMIT $n`.
+    if p.at_hole() {
         p.bump_hole();
         return m.complete(p, SyntaxKind::SoqlLimit);
     }
@@ -612,6 +613,10 @@ fn limit_clause(p: &mut Parser<'_>) -> CompletedMarker {
 fn offset_clause(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // OFFSET
+    if p.at_hole() {
+        p.bump_hole();
+        return m.complete(p, SyntaxKind::SoqlOffset);
+    }
     if p.at(SyntaxKind::Colon) {
         bound_expr(p);
     } else {
@@ -876,26 +881,28 @@ fn field_name_list(p: &mut Parser<'_>) -> CompletedMarker {
 /// soslWithClause* limitClause? (UPDATE updateList)?`.
 fn sosl_clauses(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
-    // A bare `...` here stands for every clause. Unlike SOQL, a clause
-    // cannot yet be named after it.
-    if p.at_ellipsis() {
-        p.bump_hole();
-        return m.complete(p, SyntaxKind::SoslClauses);
-    }
+    // As in SOQL, a bare `...` at any clause boundary stands for any
+    // clauses there without ending the list, so a later clause can still
+    // be named: `[FIND $q ... RETURNING ...]`.
+    sosl_clause_hole(p);
     if p.at(SyntaxKind::In) {
         p.bump();
         search_group(p);
     }
+    sosl_clause_hole(p);
     if p.at(SyntaxKind::Returning) {
         p.bump();
         field_spec_list(p);
     }
+    sosl_clause_hole(p);
     while p.at(SyntaxKind::With) {
         sosl_with_clause(p);
     }
+    sosl_clause_hole(p);
     if p.at(SyntaxKind::Limit) {
         limit_clause(p);
     }
+    sosl_clause_hole(p);
     if p.at(SyntaxKind::Update) {
         p.bump();
         update_list(p);
@@ -903,9 +910,20 @@ fn sosl_clauses(p: &mut Parser<'_>) -> CompletedMarker {
     m.complete(p, SyntaxKind::SoslClauses)
 }
 
+/// A bare token rather than a wrapped node, as SOSL's clauses are a mix of
+/// tokens and nodes already -- the matcher sees it as a hole either way.
+fn sosl_clause_hole(p: &mut Parser<'_>) {
+    if p.at_ellipsis() {
+        p.bump_hole();
+    }
+}
+
 fn search_group(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
-    if matches!(
+    // A hole is the group's name: `IN $g FIELDS`.
+    if p.at_hole() {
+        p.bump_hole();
+    } else if matches!(
         p.current(),
         SyntaxKind::All
             | SyntaxKind::Email
@@ -923,6 +941,11 @@ fn search_group(p: &mut Parser<'_>) -> CompletedMarker {
 
 fn field_spec_list(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
+    // A bare `...` is the whole list, however many objects it returns.
+    if p.at_ellipsis() {
+        p.bump_hole();
+        return m.complete(p, SyntaxKind::SoslFieldSpecList);
+    }
     field_spec(p);
     while p.at(SyntaxKind::Comma) {
         p.bump();
