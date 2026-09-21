@@ -188,11 +188,6 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
 
 ## Not yet specified
 
-- **Operator-position holes.** `$L $OP $R` cannot be written. Every other hole satisfies a
-  grammatical *requirement*, which is unambiguous, but an operator is reached only by choosing
-  to continue a binary expression, and a hole admitted there misreads ordinary patterns such as
-  `{ ... $X = y; }`. Lifting it needs a way to say "this hole is an operator" that does not also
-  fire elsewhere.
 - **Constraints in the reserved `--where` slot.** Still empty. The corpus has not yet produced a
   query that needs one, but "these two captures must differ" is the obvious first candidate,
   since distinct capture names bind independently rather than requiring difference.

@@ -66,12 +66,19 @@
 //! `private $T $f;`, `public void $m(...) { ... }`,
 //! `@future public static void $m(...) { ... }`.
 //!
-//! **Operator position is the one place a hole cannot go.** `$L $OP $R`
-//! does not compile. Every other hole satisfies a *requirement*, which is
-//! unambiguous; an operator is reached only by *choosing* to continue a
-//! binary expression, and a hole admitted there read `{ ... $X = y; }` as
-//! "the ellipsis, operated on by `$X`" and swallowed the statement after
-//! it. Rejected outright rather than answered wrongly.
+//! **A capture can stand for an operator** -- `$L $OP $R` -- which is the
+//! one hole admitted at a *choice* point rather than a requirement, and so
+//! is fenced on both sides. Only a capture qualifies, never a bare `...`,
+//! since an operator is exactly one token. And never straight after a bare
+//! `...`: the first attempt admitted any hole there, and `{ ... $X = y; }`
+//! read `$X` as an operator applied to the ellipsis, swallowing the
+//! assignment after it. An ellipsis on the left means a statement run.
+//!
+//! **`comment:RE` searches comment text**, the one thing no other form can
+//! reach: comments are trivia, filtered out of every structural comparison
+//! and out of `regex:`'s significant text, so `regex:.*TODO.*` finds
+//! nothing. It reports one hit per *comment*, not per line, so a block
+//! comment mentioning TODO twice is one hit. Unanchored, unlike `regex:`.
 //!
 //! **Two escape hatches**, for the questions a pattern literal cannot ask.
 //! `kind:Name` matches any node of a syntax kind, and `regex:RE` any node
@@ -300,6 +307,16 @@ enum Pattern {
     /// literal of a particular length and alphabet, and no amount of tree
     /// shape distinguishes it from any other string.
     Regex(regex::Regex),
+    /// `comment:RE` -- any comment whose text contains a match.
+    ///
+    /// Comments are trivia, filtered out of every structural comparison
+    /// and out of `regex:`'s significant text, so no other form can reach
+    /// them -- `regex:.*TODO.*` found nothing on NPSP because every TODO
+    /// there is in a comment. Unanchored, unlike `regex:`: that one anchors
+    /// so a fragment cannot match a whole file through an ancestor's text,
+    /// but a comment is a single leaf with no ancestors in play, and
+    /// `comment:TODO` is the spelling anyone would reach for.
+    Comment(regex::Regex),
 }
 
 pub fn run(
@@ -397,6 +414,11 @@ impl Pattern {
                 )),
             };
         }
+        if let Some(re) = pattern_src.strip_prefix("comment:") {
+            return regex::Regex::new(re)
+                .map(Pattern::Comment)
+                .map_err(|e| ArgError(format!("error: invalid regex: {e}"), 2));
+        }
         if let Some(re) = pattern_src.strip_prefix("regex:") {
             // Anchored: an unanchored pattern would match the whole file as
             // readily as the token meant, since every ancestor's text
@@ -478,6 +500,17 @@ impl Pattern {
                 .descendants()
                 .filter(|candidate| re.is_match(&significant_text(candidate)))
                 .map(|c| (c, Binds::new()))
+                .collect(),
+            // Comments are tokens rather than nodes, so they are collected
+            // directly by `matches_in_file_filtered`; as a *filter* inside
+            // `--not`/`--containing` a comment pattern asks "does this match
+            // contain such a comment", answered by the enclosing node.
+            Pattern::Comment(re) => root
+                .descendants_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| is_comment_kind(t.kind()) && re.is_match(t.text()))
+                .filter_map(|t| t.parent())
+                .map(|n| (n, Binds::new()))
                 .collect(),
         }
     }
@@ -972,6 +1005,13 @@ fn glob_matches(glob: &str, text: &str) -> bool {
     g[gi..].iter().all(|c| *c == '*')
 }
 
+fn is_comment_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::LineComment | SyntaxKind::BlockComment | SyntaxKind::DocComment
+    )
+}
+
 /// Does this kind carry a modifier list the pattern may narrow?
 ///
 /// Every place Apex lets one be written: type and member declarations, a
@@ -1056,6 +1096,27 @@ fn matches_in_file_filtered(
     let parse = parse_apex_file(display_path, src);
     let index = LineIndex::new(src);
     let root = parse.syntax();
+
+    // A comment is a token, so it is reported at its own position rather
+    // than its enclosing node's, which would point at code the comment only
+    // happens to sit inside.
+    if let Pattern::Comment(re) = pattern {
+        return root
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| is_comment_kind(t.kind()) && re.is_match(t.text()))
+            .map(|t| {
+                let start = usize::from(t.text_range().start());
+                let (line, col) = index.line_col(src, start as u32);
+                Site {
+                    path: display_path.to_path_buf(),
+                    line,
+                    col,
+                    text: crate::project::collapse(t.text()),
+                }
+            })
+            .collect();
+    }
 
     pattern
         .matches_in(&root)
@@ -1294,13 +1355,11 @@ mod tests {
         }
     }
 
-    /// The one position no substitution can reach: an operator is not an
-    /// identifier. It must fail loudly at compile time rather than silently
-    /// matching a bare name.
+    /// A bare `...` still cannot stand for an operator: an operator is one
+    /// token, and only a *capture* may take its place.
     #[test]
-    fn rejects_a_hole_in_operator_position() {
-        let err = Pattern::compile("$LEFT $OP $RIGHT").expect_err("operator holes are unreachable");
-        assert!(err.0.contains("could not parse pattern"), "{}", err.0);
+    fn an_ellipsis_cannot_stand_for_an_operator() {
+        assert!(Pattern::compile("$L ... $R").is_err());
     }
 
     /// The flagship query: SOQL anywhere inside a loop, corpus item 1.
@@ -1344,7 +1403,7 @@ mod tests {
     #[test]
     fn an_unterminated_segment_is_repaired_but_nonsense_is_still_rejected() {
         assert!(Pattern::compile("{ ... [SELECT ... FROM $O] }").is_ok());
-        assert!(Pattern::compile("$LEFT $OP $RIGHT").is_err());
+        assert!(Pattern::compile("= = =").is_err());
     }
 
     /// A `{`-enclosed `...` is ambiguous: a run of statements, or an
@@ -2116,6 +2175,49 @@ mod tests {
         // A method parameter's `final`.
         assert_eq!(find("public void go(Integer $a, $T $b) { ... }"), 1);
         assert_eq!(find("public void go(final Integer $a, $T $b) { ... }"), 1);
+    }
+
+    /// Comments are trivia, invisible to every structural comparison and to
+    /// `regex:`, so `comment:` is the only way to find one. It reports one
+    /// hit per *comment*, not per line -- a block comment mentioning TODO on
+    /// two lines is one hit, which is why it can undercount `git grep`.
+    #[test]
+    fn comment_searches_comment_text() {
+        let src = wrap(
+            "        // TODO: fix this\n        f(); /* TODO one\n         TODO two */\n        String s = 'TODO in a string';",
+        );
+        let p = Pattern::compile("comment:TODO").expect("compiles");
+        let found = matches_in_file(&p, Path::new("T.cls"), &src);
+        assert_eq!(found.len(), 2, "two comments, the block one counted once");
+        assert!(
+            found.iter().all(|m| !m.text.contains("in a string")),
+            "a string literal is not a comment",
+        );
+    }
+
+    /// A capture may stand in an operator's place -- the one hole admitted
+    /// at a choice point, fenced so it cannot misread a statement run.
+    #[test]
+    fn a_capture_can_stand_for_an_operator() {
+        let src = wrap(
+            "        Integer a = x + y;\n        Integer b = x * y;\n        Boolean c = x == y;",
+        );
+        assert_eq!(hits("$L $OP $R", &src).len(), 3, "any binary operator");
+        assert_eq!(hits("x $OP y", &src).len(), 3);
+    }
+
+    /// The guard that makes operator captures safe. The first attempt read
+    /// `{ ... $X = y; }` as "the ellipsis, operated on by $X" and swallowed
+    /// the assignment after it; an ellipsis on the left means a statement
+    /// run, never an operand.
+    #[test]
+    fn an_operator_capture_never_follows_an_ellipsis() {
+        let src = wrap("        a();\n        cs = f();");
+        assert_eq!(
+            hits("{ ... $X = f(); }", &src).len(),
+            1,
+            "an ellipsis then an assignment, not an operator expression",
+        );
     }
 
     #[test]

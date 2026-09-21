@@ -115,6 +115,20 @@ fn expr_shift(p: &mut Parser<'_>) -> Option<CompletedMarker> {
 
 // ---- the plain left-associative binary levels ----
 
+/// Is the parser on a capture standing where a binary *operator* goes, as
+/// in `$L $OP $R`?
+///
+/// The one place a hole is admitted at a choice point, so it is fenced on
+/// both sides. Only a *capture* qualifies: an operator position is one
+/// token, and a bare `...` there would be meaningless. And never straight
+/// after a bare `...`: the first attempt at this admitted any hole, and
+/// `{ ... $X = y; }` then read `$X` as an operator applied to the
+/// ellipsis, swallowing the statement that followed. An ellipsis on the
+/// left means the pattern is a statement run, never an operand.
+fn at_operator_capture(p: &Parser<'_>) -> bool {
+    p.at(SyntaxKind::PatternCapture) && p.at_hole() && !p.prev_was_ellipsis()
+}
+
 macro_rules! left_assoc_level {
     ($name:ident, $next:ident, $at_op:expr) => {
         fn $name(p: &mut Parser<'_>) -> Option<CompletedMarker> {
@@ -125,7 +139,7 @@ macro_rules! left_assoc_level {
             // ellipsis, operated on by $X" -- swallowing the statement that
             // follows. Operator position stays out of reach; every other
             // hole is a requirement, which is unambiguous.
-            while $at_op(p.current()) {
+            while $at_op(p.current()) || at_operator_capture(p) {
                 let m = lhs.precede(p);
                 p.bump();
                 $next(p);
