@@ -55,6 +55,13 @@
 //! entirely `'...'`, which means *any string literal* and nothing else, the
 //! way Semgrep spells it.
 //!
+//! **`$_` matches one construct and binds nothing**, so `f($_, $_)` reads
+//! as "two arbitrary arguments" rather than "two identical ones" -- the
+//! spelling Semgrep, ast-grep and GritQL all share. A named capture still
+//! unifies, including inside generic type arguments:
+//! `Map<$K, $V> $v = new Map<$K, $V>();` requires the declared and
+//! constructed element types to agree.
+//!
 //! **Declarations are reachable**, not just the code inside them:
 //! `private $T $f;`, `public void $m(...) { ... }`,
 //! `@future public static void $m(...) { ... }`.
@@ -114,6 +121,14 @@ enum Hole {
     /// `$NAME` -- matches one construct, and unifies with other
     /// occurrences of the same name within the same match.
     Capture(String),
+    /// `$_` -- matches one construct and binds nothing.
+    ///
+    /// Distinct from `Capture("_")` because a name that unifies makes
+    /// `f($_, $_)` mean "two *identical* arguments", when every tool in the
+    /// survey (Semgrep, ast-grep, GritQL) spells "two arbitrary arguments"
+    /// exactly that way. Distinct from [`Hole::Ellipsis`] because it
+    /// matches exactly one element rather than any number of them.
+    Anonymous,
 }
 
 /// A compiled pattern.
@@ -308,7 +323,11 @@ fn hole_of(element: &SyntaxElement) -> Option<Hole> {
                 .text()
                 .strip_prefix(HOLE_CAPTURE_SIGIL)
                 .unwrap_or(only.text());
-            return Some(Hole::Capture(name.to_string()));
+            return Some(if name == "_" {
+                Hole::Anonymous
+            } else {
+                Hole::Capture(name.to_string())
+            });
         }
         _ => {}
     }
@@ -405,7 +424,7 @@ fn kinds_compatible(pat: &SyntaxNode, src: &SyntaxNode) -> bool {
 
 fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) -> bool {
     match hole_of(pat) {
-        Some(Hole::Ellipsis) => return true,
+        Some(Hole::Ellipsis) | Some(Hole::Anonymous) => return true,
         Some(Hole::AnyString) => return is_string_literal(src),
         Some(Hole::Capture(name)) => {
             let text = match src {
@@ -1055,6 +1074,41 @@ mod tests {
     fn a_reused_capture_unifies_across_case() {
         let src = wrap("        if (acc != null) { Acc.doIt(); }");
         assert_eq!(hits("if ($X != null) { $X.doIt(); }", &src).len(), 1);
+    }
+
+    /// A capture inside a generic type argument unifies like any other, so
+    /// `List<$X> $v = new List<$X>();` asks for the declared and
+    /// constructed element types to agree.
+    #[test]
+    fn captures_unify_inside_generic_type_arguments() {
+        let src = wrap(
+            "        Map<String, Id> a = new Map<String, Id>();\n        Map<String, Id> b = new Map<Id, String>();",
+        );
+        assert_eq!(
+            hits("Map<$K, $V> $v = new Map<$K, $V>();", &src),
+            vec!["3:9:Map<String, Id> a = new Map<String, Id>();".to_string()],
+            "only the declaration whose element types agree",
+        );
+        assert_eq!(
+            hits("Map<$K, $V> $v = new Map<$V, $K>();", &src),
+            vec!["4:9:Map<String, Id> b = new Map<Id, String>();".to_string()],
+            "swapped arguments pick out only the swapped declaration",
+        );
+    }
+
+    /// `$_` matches one construct and binds nothing, so `f($_, $_)` reads
+    /// as "two arbitrary arguments" -- the spelling every tool in the
+    /// survey uses. A capture that unified would instead demand the two be
+    /// identical, which is the opposite of what the underscore suggests.
+    #[test]
+    fn an_underscore_capture_binds_nothing() {
+        let src = wrap("        f(a, b);\n        f(a, a);");
+        assert_eq!(hits("f($_, $_);", &src).len(), 2, "any two arguments");
+        assert_eq!(
+            hits("f($x, $x);", &src),
+            vec!["4:9:f(a, a);".to_string()],
+            "a named capture still requires them to agree",
+        );
     }
 
     #[test]
