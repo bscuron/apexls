@@ -111,19 +111,22 @@ fn at_soql_clause_keyword(p: &Parser<'_>) -> bool {
 
 // ==== SOQL ====
 
-/// Consume a `...` standing for every clause that follows, if one is here.
+/// Consume a `...` standing for any clauses at this point, if one is here.
 ///
-/// Wrapped in a `SoqlWhereClause` for no deeper reason than that it has to
-/// be some node: the matcher only ever sees it as a hole, since its single
-/// token is one.
-fn trailing_clause_hole(p: &mut Parser<'_>) -> bool {
-    if !p.at_ellipsis() {
-        return false;
+/// It does *not* end the clause list: parsing carries on, so a later
+/// clause can still be named -- `[SELECT ... FROM $o ... GROUP BY ...]` is
+/// "any clauses, then a GROUP BY". Ending the list here, as it first did,
+/// made that unwritable, and nearly every real GROUP BY has a WHERE in
+/// front of it. The matcher treats the hole as an ellipsis over the
+/// query's clause sequence, so skipping and trailing both fall out.
+///
+/// Wrapped in a `SoqlWhereClause` only because it has to be some node.
+fn trailing_clause_hole(p: &mut Parser<'_>) {
+    if p.at_ellipsis() {
+        let m = p.start();
+        p.bump_hole();
+        m.complete(p, SyntaxKind::SoqlWhereClause);
     }
-    let m = p.start();
-    p.bump_hole();
-    m.complete(p, SyntaxKind::SoqlWhereClause);
-    true
 }
 
 fn query(p: &mut Parser<'_>) {
@@ -131,56 +134,39 @@ fn query(p: &mut Parser<'_>) {
     select_list(p);
     p.expect(SyntaxKind::From);
     from_list(p);
-    // A hole at any clause boundary stands for every clause that follows,
-    // so `[SELECT Id FROM $o ...]` means "and whatever else this query
-    // does" and `[SELECT ... FROM $o WHERE $f = $v ...]` says the same
-    // after naming one clause. Checked at each boundary rather than only
-    // after the FROM list, which is where it used to stop.
-    if trailing_clause_hole(p) {
-        return;
-    }
+    // A hole at any clause boundary stands for any clauses there, so
+    // `[SELECT Id FROM $o ...]` means "and whatever else this query does"
+    // and `[SELECT ... FROM $o ... GROUP BY ...]` means "any clauses, then
+    // a GROUP BY".
+    trailing_clause_hole(p);
     if p.at(SyntaxKind::Using) {
         using_scope(p);
     }
-    if trailing_clause_hole(p) {
-        return;
-    }
+    trailing_clause_hole(p);
     if p.at(SyntaxKind::Where) {
         where_clause(p);
     }
-    if trailing_clause_hole(p) {
-        return;
-    }
+    trailing_clause_hole(p);
     while p.at(SyntaxKind::With) {
         with_clause(p);
     }
-    if trailing_clause_hole(p) {
-        return;
-    }
+    trailing_clause_hole(p);
     if p.at(SyntaxKind::Group) {
         group_by(p);
     }
-    if trailing_clause_hole(p) {
-        return;
-    }
+    trailing_clause_hole(p);
     if p.at(SyntaxKind::Order) {
         order_by(p);
     }
-    if trailing_clause_hole(p) {
-        return;
-    }
+    trailing_clause_hole(p);
     if p.at(SyntaxKind::Limit) {
         limit_clause(p);
     }
-    if trailing_clause_hole(p) {
-        return;
-    }
+    trailing_clause_hole(p);
     if p.at(SyntaxKind::Offset) {
         offset_clause(p);
     }
-    if trailing_clause_hole(p) {
-        return;
-    }
+    trailing_clause_hole(p);
     if p.at(SyntaxKind::All) && p.nth(1) == SyntaxKind::Rows {
         p.bump();
         p.bump();
@@ -890,8 +876,8 @@ fn field_name_list(p: &mut Parser<'_>) -> CompletedMarker {
 /// soslWithClause* limitClause? (UPDATE updateList)?`.
 fn sosl_clauses(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
-    // As in a SOQL query, a bare `...` here stands for every clause that
-    // follows.
+    // A bare `...` here stands for every clause. Unlike SOQL, a clause
+    // cannot yet be named after it.
     if p.at_ellipsis() {
         p.bump_hole();
         return m.complete(p, SyntaxKind::SoslClauses);

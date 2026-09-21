@@ -126,7 +126,21 @@ fn expr_shift(p: &mut Parser<'_>) -> Option<CompletedMarker> {
 /// ellipsis, swallowing the statement that followed. An ellipsis on the
 /// left means the pattern is a statement run, never an operand.
 fn at_operator_capture(p: &Parser<'_>) -> bool {
-    p.at(SyntaxKind::PatternCapture) && p.at_hole() && !p.prev_was_ellipsis()
+    p.at(SyntaxKind::PatternCapture)
+        && p.at_hole()
+        && !p.prev_was_ellipsis()
+        // An operator is always followed by an operand. Without this,
+        // `upsert $X $f;` read `$f` as an operator still waiting for its
+        // right-hand side, and the statement would not compile.
+        && !matches!(
+            p.nth(1),
+            SyntaxKind::Semi
+                | SyntaxKind::RParen
+                | SyntaxKind::RBrack
+                | SyntaxKind::RBrace
+                | SyntaxKind::Comma
+                | SyntaxKind::Eof
+        )
 }
 
 macro_rules! left_assoc_level {
@@ -480,8 +494,8 @@ fn paren_or_cast_expr(p: &mut Parser<'_>) -> CompletedMarker {
 fn try_cast(p: &mut Parser<'_>) -> Option<CompletedMarker> {
     let m = p.start();
     p.bump(); // (
-    // A hole can stand where the cast's type begins, so `($T) $x` and
-    // `(List<$T>) $x` are writable.
+              // A hole can stand where the cast's type begins, so `($T) $x` and
+              // `(List<$T>) $x` are writable.
     if !super::types::at_type_start(p) && !p.at_hole() {
         return None;
     }

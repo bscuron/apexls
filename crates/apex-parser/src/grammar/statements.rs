@@ -119,6 +119,12 @@ fn switch_stmt(p: &mut Parser<'_>) -> CompletedMarker {
 
 fn when_control(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
+    // A bare `...` stands for any number of `when` arms, so a pattern can
+    // ask about a `switch` without spelling out every case.
+    if p.at_ellipsis() {
+        p.bump_hole();
+        return m.complete(p, SyntaxKind::WhenClause);
+    }
     p.expect(SyntaxKind::When);
     when_value(p);
     block(p);

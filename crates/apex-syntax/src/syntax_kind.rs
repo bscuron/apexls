@@ -177,7 +177,7 @@ syntax_kind! {
         ClassDecl, InterfaceDecl, EnumDecl, EnumConstantList,
         ClassBody, InterfaceBody, TypeRefList,
         Modifier, Annotation, AnnotationArgList, AnnotationArg,
-        MethodDecl, ConstructorDecl, FieldDecl, PropertyDecl,
+        MethodDecl, ConstructorDecl, FieldDecl, PropertyDecl, StaticInitializer,
         PropertyAccessor, FormalParamList, FormalParam,
 
         // ---- SOQL (Phase 4) ----

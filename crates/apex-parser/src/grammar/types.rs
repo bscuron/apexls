@@ -34,22 +34,21 @@ fn at_type_name_start(p: &Parser<'_>, n: usize) -> bool {
 /// returns `false` otherwise (nothing consumed, so callers can fall back
 /// to a different interpretation without a rollback).
 pub(crate) fn type_ref(p: &mut Parser<'_>) -> bool {
-    // A hole stands in for the whole type reference.
-    if p.at_hole() {
-        let m = p.start();
-        p.bump_hole();
-        m.complete(p, SyntaxKind::Type);
-        return true;
-    }
-    if !at_type_start(p) {
+    // A hole stands in for the type's name -- still followed by any `[]`,
+    // so `new $T[]{ ... }` is an array creation like `new Object[]{ ... }`.
+    if !p.at_hole() && !at_type_start(p) {
         return false;
     }
 
     let m = p.start();
-    type_name(p);
-    while p.at(SyntaxKind::Dot) && at_type_name_start(p, 1) {
-        p.bump(); // .
+    if p.at_hole() {
+        p.bump_hole();
+    } else {
         type_name(p);
+        while p.at(SyntaxKind::Dot) && at_type_name_start(p, 1) {
+            p.bump(); // .
+            type_name(p);
+        }
     }
     while p.at(SyntaxKind::LBrack) && p.nth(1) == SyntaxKind::RBrack {
         p.bump(); // [

@@ -690,10 +690,29 @@ fn kinds_compatible(pat: &SyntaxNode, src: &SyntaxNode) -> bool {
     }
     let both_loops = matches!(pat.kind(), SyntaxKind::ForEachStmt | SyntaxKind::ForStmt)
         && matches!(src.kind(), SyntaxKind::ForEachStmt | SyntaxKind::ForStmt);
-    both_loops
-        && significant_children(pat)
+    if both_loops {
+        return significant_children(pat)
             .iter()
-            .any(|c| hole_of(c) == Some(Hole::Ellipsis))
+            .any(|c| hole_of(c) == Some(Hole::Ellipsis));
+    }
+
+    // A brace initializer written as nothing but `{ ... }` has no `=>` to
+    // make it a map, so it parses as a *set* initializer -- and then never
+    // matched a map, returning nothing for `new Map<$K, $V>{ ... }` while
+    // NPSP holds 354 map initializers. Only the bare form is widened: once
+    // an element is written out, its shape says which kind is meant.
+    let initializer = |k: SyntaxKind| {
+        matches!(
+            k,
+            SyntaxKind::SetInitializer | SyntaxKind::MapInitializer | SyntaxKind::ArrayInitializer
+        )
+    };
+    initializer(pat.kind())
+        && initializer(src.kind())
+        && matches!(
+            significant_children(pat).as_slice(),
+            [_, middle, _] if hole_of(middle) == Some(Hole::Ellipsis)
+        )
 }
 
 fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) -> bool {
@@ -2218,6 +2237,68 @@ mod tests {
             1,
             "an ellipsis then an assignment, not an operator expression",
         );
+    }
+
+    /// `{ ... }` has no `=>` to make it a map, so it parses as a set
+    /// initializer; bare, it must still match a map's.
+    #[test]
+    fn a_bare_brace_initializer_matches_a_map_too() {
+        let src = wrap(
+            "        m = new Map<String, Integer>{ 'a' => 1 };\n        s = new Set<String>{ 'a' };",
+        );
+        assert_eq!(hits("new Map<$K, $V>{ ... }", &src).len(), 1);
+        assert_eq!(hits("new Set<$K>{ ... }", &src).len(), 1);
+        assert_eq!(
+            hits("new $T{ $k => $v }", &src).len(),
+            1,
+            "an element pins the kind"
+        );
+    }
+
+    /// A type hole still takes `[]`, so an array creation can be named.
+    #[test]
+    fn a_type_hole_can_be_an_array() {
+        let src = wrap("        x = new String[]{ 'a' };\n        y = new List<String>{ 'a' };");
+        assert_eq!(hits("new $T[]{ ... }", &src), ["3:13:new String[]{ 'a' }"]);
+    }
+
+    /// A clause hole no longer ends the clause list, so a clause can be
+    /// named after it -- real GROUP BYs nearly always follow a WHERE.
+    #[test]
+    fn a_clause_can_be_named_after_a_clause_hole() {
+        let src = wrap(
+            "        a = [SELECT COUNT(Id) FROM Account WHERE x = 1 GROUP BY Name];\n        b = [SELECT Id FROM Account WHERE x = 1];",
+        );
+        assert_eq!(hits("[SELECT ... FROM $o ... GROUP BY ...]", &src).len(), 1);
+        assert_eq!(hits("[SELECT ... FROM $o ...]", &src).len(), 2);
+    }
+
+    /// `$f` after `$X` is an operand, not an operator: an operator is always
+    /// followed by something.
+    #[test]
+    fn an_operator_capture_needs_a_right_hand_side() {
+        let src = wrap("        upsert records Id;\n        upsert records;");
+        assert_eq!(hits("upsert $X $f;", &src), ["3:9:upsert records Id;"]);
+    }
+
+    /// A bare `...` stands for any number of `when` arms.
+    #[test]
+    fn an_ellipsis_stands_for_switch_arms() {
+        let src = wrap(
+            "        switch on x { when 1 { a(); } when else { b(); } }\n        switch on y { when 1 { a(); } }",
+        );
+        assert_eq!(hits("switch on $e { ... }", &src).len(), 2);
+        assert_eq!(
+            hits("switch on $e { ... when else { ... } }", &src).len(),
+            1
+        );
+    }
+
+    /// A static initializer is one node, so it can be named whole.
+    #[test]
+    fn finds_static_initializers() {
+        let src = "public class T {\n    static { init(); }\n    void run() { init(); }\n}\n";
+        assert_eq!(hits("static { ... }", src), ["2:5:static { init(); }"]);
     }
 
     #[test]

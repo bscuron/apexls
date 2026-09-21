@@ -221,8 +221,13 @@ pub(crate) fn class_body_decl(p: &mut Parser<'_>) {
         return;
     }
     if p.at(SyntaxKind::Static) && p.nth(1) == SyntaxKind::LBrace {
+        // Wrapped in its own node so something denotes a static initializer
+        // as a whole -- before, `static` and the block were loose siblings
+        // in the class body and `static { ... }` could not be named.
+        let m = p.start();
         p.bump(); // static
-        super::statements::block(p); // static initializer block
+        super::statements::block(p);
+        m.complete(p, SyntaxKind::StaticInitializer);
         return;
     }
     member_decl(p);
