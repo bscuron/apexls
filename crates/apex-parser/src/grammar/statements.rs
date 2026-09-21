@@ -246,11 +246,11 @@ fn classic_for_control(p: &mut Parser<'_>) {
     if !p.at(SyntaxKind::Semi) {
         for_init(p);
     }
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     if !p.at(SyntaxKind::Semi) {
         super::expressions::expr(p);
     }
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     if !p.at(SyntaxKind::RParen) {
         for_update(p);
     }
@@ -310,7 +310,7 @@ fn do_while_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     block(p);
     p.expect(SyntaxKind::While);
     par_expr(p);
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     m.complete(p, SyntaxKind::DoWhileStmt)
 }
 
@@ -372,7 +372,7 @@ fn return_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     if !p.at(SyntaxKind::Semi) {
         super::expressions::expr(p);
     }
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     m.complete(p, SyntaxKind::ReturnStmt)
 }
 
@@ -380,21 +380,21 @@ fn throw_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // throw
     super::expressions::expr(p);
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     m.complete(p, SyntaxKind::ThrowStmt)
 }
 
 fn break_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump();
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     m.complete(p, SyntaxKind::BreakStmt)
 }
 
 fn continue_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump();
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     m.complete(p, SyntaxKind::ContinueStmt)
 }
 
@@ -420,7 +420,7 @@ fn dml_stmt(p: &mut Parser<'_>, kind: SyntaxKind) -> CompletedMarker {
     p.bump(); // insert / update / delete / undelete
     access_level(p);
     super::expressions::expr(p);
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     m.complete(p, kind)
 }
 
@@ -430,7 +430,7 @@ fn upsert_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     access_level(p);
     super::expressions::expr(p);
     super::types::qualified_name(p); // optional external ID field
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     m.complete(p, SyntaxKind::UpsertStmt)
 }
 
@@ -440,7 +440,7 @@ fn merge_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     access_level(p);
     super::expressions::expr(p);
     super::expressions::expr(p);
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     m.complete(p, SyntaxKind::MergeStmt)
 }
 
@@ -463,7 +463,7 @@ fn local_var_decl_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     if !try_local_var_decl_core(p) {
         p.error("expected a local variable declaration");
     }
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     m.complete(p, SyntaxKind::LocalVarDeclStmt)
 }
 
@@ -481,7 +481,7 @@ fn try_local_var_decl_stmt(p: &mut Parser<'_>) -> Option<CompletedMarker> {
     if !try_local_var_decl_core(p) {
         return None;
     }
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     Some(m.complete(p, SyntaxKind::LocalVarDeclStmt))
 }
 
@@ -541,7 +541,7 @@ fn expr_stmt(p: &mut Parser<'_>) -> CompletedMarker {
         }
         return m.complete(p, SyntaxKind::ExprStmt);
     }
-    p.expect(SyntaxKind::Semi);
+    p.expect_stmt_semi();
     m.complete(p, SyntaxKind::ExprStmt)
 }
 

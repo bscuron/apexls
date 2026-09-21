@@ -404,7 +404,11 @@ impl Pattern {
         }
 
         Err(ArgError(
-            format!("error: could not parse pattern as Apex: {pattern_src}\nnote: a pattern must be one complete expression, statement, block, catch clause or class member"),
+            format!(
+                "error: could not parse pattern as Apex: {pattern_src}\n\
+                 note: a pattern must be one complete expression, statement, block, catch clause or class member\n\
+                 note: a method needs its body -- `void $m(...) {{ ... }}` -- or a `;` if it has none"
+            ),
             2,
         ))
     }
@@ -1851,6 +1855,25 @@ mod tests {
 
         // Still rejected if the pattern never bound it.
         assert!(Replacement::compile("g($...OTHER);", &names).is_err());
+    }
+
+    /// A method pattern must say what its body is. Forgiving the missing
+    ///  produced a tree with neither a body nor a , which no
+    /// real declaration has -- so  compiled
+    /// happily and then matched nothing at all, anywhere. A pattern that
+    /// can never match is worse than one that will not compile.
+    #[test]
+    fn a_method_pattern_must_say_what_its_body_is() {
+        let err = Pattern::compile("public static void $m(...)")
+            .expect_err("a method needs a body or a semicolon");
+        assert!(err.0.contains("needs its body"), "{}", err.0);
+
+        assert!(Pattern::compile("public static void $m(...) { ... }").is_ok());
+        assert!(Pattern::compile("public static void $m(...);").is_ok());
+
+        // The statement-terminator leniency this scoped back is still
+        // there, which is what lets a block segment be written bare.
+        assert!(Pattern::compile("{ ... [SELECT ... FROM $O] ... }").is_ok());
     }
 
     #[test]

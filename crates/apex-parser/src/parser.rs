@@ -93,6 +93,25 @@ impl<'t> Parser<'t> {
                 == SyntaxKind::PatternHole
     }
 
+    /// Expect the `;` that ends a *statement*, forgivingly in a pattern.
+    ///
+    /// A pattern is a fragment a human typed, and a trailing `;` is what
+    /// they most often leave off: `{ ... [SELECT ... FROM $O] ... }` means
+    /// "a block containing this query" and is written exactly like that.
+    ///
+    /// Deliberately *not* `expect`'s general behaviour. When a method
+    /// declaration's `{ body }`-or-`;` was also forgiven, a bodyless
+    /// pattern like `public static void $m(...)` parsed into a tree with
+    /// neither a body nor a semicolon -- which no real declaration has, so
+    /// it silently matched nothing at all. A pattern that can never match
+    /// is worse than one that will not compile.
+    pub(crate) fn expect_stmt_semi(&mut self) -> bool {
+        if self.pattern_mode && !self.at(SyntaxKind::Semi) {
+            return true;
+        }
+        self.expect(SyntaxKind::Semi)
+    }
+
     /// Consume a hole standing in for whatever the caller required.
     pub(crate) fn bump_hole(&mut self) {
         debug_assert!(self.at_hole());
@@ -131,13 +150,6 @@ impl<'t> Parser<'t> {
     pub(crate) fn expect(&mut self, kind: SyntaxKind) -> bool {
         if self.at(kind) {
             self.bump();
-            true
-        } else if self.pattern_mode && kind == SyntaxKind::Semi {
-            // A pattern is a fragment a human typed, and a trailing `;` is
-            // the thing they most often leave off -- `{ ... [SELECT ...] ... }`
-            // means "a block containing this query" and is written exactly
-            // like that. Tolerated only while parsing a pattern; real Apex
-            // still requires its terminators.
             true
         } else {
             self.error_at_gap(format!("expected {kind:?}, found {:?}", self.current()));
