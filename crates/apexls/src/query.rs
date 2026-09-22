@@ -842,14 +842,68 @@ fn focus_inner(focus: &SyntaxNode) -> Option<SyntaxElement> {
     }
 }
 
-fn record_focus(binds: &mut Binds, src: &SyntaxElement) {
+thread_local! {
+    /// Positions already reported for the match [`focus_solutions`] is
+    /// re-running, so a reading that would put the `^` on one of them is
+    /// rejected and the search backtracks to the next. Kept out of the
+    /// bindings, which are cloned for every candidate tried, and empty
+    /// except during a re-run. Per thread, and each file is matched on one.
+    static FOCUS_SEEN: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn focus_offset(src: &SyntaxElement) -> Option<u32> {
     let start = match src {
         NodeOrToken::Token(t) => Some(t.text_range().start()),
         NodeOrToken::Node(n) => apex_syntax::significant_range(n).map(|r| r.start()),
     };
-    if let Some(start) = start {
-        binds.insert(FOCUS_KEY.to_string(), u32::from(start).to_string());
+    start.map(u32::from)
+}
+
+fn focus_seen(src: &SyntaxElement) -> bool {
+    FOCUS_SEEN.with(|seen| {
+        let seen = seen.borrow();
+        !seen.is_empty() && focus_offset(src).is_some_and(|o| seen.contains(&o))
+    })
+}
+
+/// Record where the `^` landed, or refuse a position already reported.
+fn record_focus(binds: &mut Binds, src: &SyntaxElement) -> bool {
+    let Some(offset) = focus_offset(src) else {
+        return true;
+    };
+    if focus_seen(src) {
+        return false;
     }
+    binds.insert(FOCUS_KEY.to_string(), offset.to_string());
+    true
+}
+
+/// Every reading of `node` that puts the `^` somewhere new, starting from
+/// the first one found.
+///
+/// A `^` says what is being looked for, so each place it can land is a
+/// hit of its own: a method holding two queries is two hits for
+/// `void $_(...) { ... ^[SELECT ...] ... }`. Found by re-matching with the
+/// positions so far ruled out, which backtracks to the next -- one extra
+/// match of an already-matched node per position, and nothing at all for a
+/// pattern without a `^`. Each reading keeps its own captures, so
+/// conditions are checked per position rather than for the first only.
+fn focus_solutions(pattern: &SyntaxNode, node: &SyntaxNode, first: Binds) -> Vec<Binds> {
+    let mut solutions = vec![first];
+    while let Some(offset) = solutions
+        .last()
+        .and_then(|b| b.get(FOCUS_KEY))
+        .and_then(|o| o.parse().ok())
+    {
+        FOCUS_SEEN.with(|seen| seen.borrow_mut().push(offset));
+        let mut next = Binds::new();
+        if !match_node(pattern, node, &mut next) {
+            break;
+        }
+        solutions.push(next);
+    }
+    FOCUS_SEEN.with(|seen| seen.borrow_mut().clear());
+    solutions
 }
 
 fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
@@ -1012,11 +1066,7 @@ fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) ->
             let Some(inner) = focus_inner(focus) else {
                 return false;
             };
-            if !match_element(&inner, src, binds) {
-                return false;
-            }
-            record_focus(binds, src);
-            return true;
+            return match_element(&inner, src, binds) && record_focus(binds, src);
         }
     }
     match hole_of(pat) {
@@ -1264,15 +1314,16 @@ fn match_in_document_order(
     };
     let unwrapped = inner.as_ref().and_then(expression_inside);
     for (i, candidate) in candidates.iter().enumerate() {
+        // A position already reported is refused before the comparison,
+        // not after it: re-matching for the next `^` walks the same
+        // candidates again, and comparing each one would go quadratic.
+        if focused && focus_seen(candidate) {
+            continue;
+        }
         for probe in [Some(head), unwrapped.as_ref()].into_iter().flatten() {
             let mut attempt = binds.clone();
             if match_element(probe, candidate, &mut attempt)
-                && {
-                    if focused {
-                        record_focus(&mut attempt, candidate);
-                    }
-                    true
-                }
+                && (!focused || record_focus(&mut attempt, candidate))
                 && match_in_document_order(&fixed[1..], &candidates[i + 1..], &mut attempt)
             {
                 *binds = attempt;
@@ -1443,15 +1494,36 @@ fn matches_in_file_filtered(
             .collect();
     }
 
+    // With a `^`, each place it lands is a hit, and a place is reported
+    // once: `{ ... ^X ... }` matches a block and the blocks nested in it,
+    // and they would all name the same X.
+    let focus_pattern = match pattern {
+        Pattern::Tree(green) => Some(SyntaxNode::new_root(green.clone())).filter(|p| {
+            p.descendants()
+                .any(|n| n.kind() == SyntaxKind::PatternFocus)
+        }),
+        _ => None,
+    };
+    let mut reported = std::collections::HashSet::new();
     pattern
         .matches_with_binds(&root)
         .into_iter()
+        .flat_map(|(node, binds)| {
+            let readings = match &focus_pattern {
+                Some(p) => focus_solutions(p, &node, binds),
+                None => vec![binds],
+            };
+            readings.into_iter().map(move |b| (node.clone(), b))
+        })
         .filter(|(node, binds)| passes(node, binds, ands, nots))
         .filter_map(|(node, binds)| {
             let mut site = site_for(display_path, src, &index, &node)?;
             // Report at the `^` if the pattern has one; the text stays the
             // whole match, so the line still shows its context.
             if let Some(offset) = binds.get(FOCUS_KEY).and_then(|o| o.parse().ok()) {
+                if !reported.insert(offset) {
+                    return None;
+                }
                 (site.line, site.col) = index.line_col(src, offset);
             }
             Some(site)
@@ -2944,6 +3016,26 @@ mod tests {
             ["5:9"],
             "on the whole: the default"
         );
+    }
+
+    /// Each place a `^` can land is a hit of its own, and conditions are
+    /// checked for each rather than for the first reading only.
+    #[test]
+    fn a_caret_reports_every_place_it_lands() {
+        let src = "public class T {\n    void go() {\n        List<Account> a = [SELECT Id FROM Account];\n        if (x) {\n            List<Contact> c = [SELECT Id FROM Contact];\n        }\n        a();\n        b();\n    }\n}\n";
+        assert_eq!(
+            positions("void $_(...) { ... ^[SELECT ... FROM $o ...] ... }", src),
+            ["3:27", "5:31"],
+            "both queries, the nested one too"
+        );
+        assert_eq!(
+            positions("{ ... ^[SELECT ... FROM $o ...] ... }", src),
+            ["3:27", "5:31"],
+            "each once, though the inner block matches as well"
+        );
+        let calls = filtered_hits("void $_() { ... ^$f(); ... }", &["$f ~ b*"], &[], src);
+        assert_eq!(calls.len(), 1, "b() passes though a() is the first reading");
+        assert_eq!((calls[0].line, calls[0].col), (8, 9));
     }
 
     /// `^` between two operands is still XOR, and a pattern takes one.

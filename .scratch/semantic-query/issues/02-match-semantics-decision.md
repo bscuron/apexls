@@ -408,3 +408,15 @@ marker, since an ellipsis on the left is a statement run. One `^` per pattern; a
 two queries is one hit, at its first. On NPSP the query above gives 810 hits with or without the
 `^`, and no measurable time. Guarded by `a_caret_moves_the_reported_position` and
 `a_caret_between_operands_is_xor`.
+
+**26. With a `^`, each place it lands is a hit** -- superseding item 25's "one hit per match".
+The user's call: `^` names what is being looked for, so a method holding two queries is two hits
+for `void $_(...) { ... ^[SELECT ...] ... }`. Found by re-matching the already-matched node with
+the positions reported so far ruled out, which backtracks to the next; each position keeps its
+own captures, so conditions are checked per position, which fixes item 24's first-binding
+limitation for any pattern that has a `^`. A position is reported once, since `{ ... ^X ... }`
+also matches the blocks nested around X. The seen positions live in a per-thread set rather than
+the bindings, which are cloned for every candidate, and a seen candidate is refused before it is
+compared; together that took the NPSP run from 801 ms to about 315 ms, against 210 ms without the
+`^`, for 1,703 hits instead of 810. Patterns without a `^` are untouched. Guarded by
+`a_caret_reports_every_place_it_lands`.
