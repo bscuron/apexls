@@ -18,6 +18,12 @@ use crate::parser::{CompletedMarker, Parser};
 use apex_syntax::SyntaxKind;
 
 pub(crate) fn statement(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+    if p.at_focus() {
+        let m = p.start();
+        p.bump(); // ^
+        statement(p);
+        return Some(m.complete(p, SyntaxKind::PatternFocus));
+    }
     let s = match p.current() {
         SyntaxKind::LBrace => block(p),
         SyntaxKind::If => if_stmt(p),

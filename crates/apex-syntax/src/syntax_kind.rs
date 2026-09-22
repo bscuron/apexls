@@ -178,6 +178,8 @@ syntax_kind! {
         ClassBody, InterfaceBody, TypeRefList,
         Modifier, Annotation, AnnotationArgList, AnnotationArg,
         MethodDecl, ConstructorDecl, FieldDecl, PropertyDecl, StaticInitializer,
+        // `^X` in a pattern: X is where a match is reported. Never in real source.
+        PatternFocus,
         PropertyAccessor, FormalParamList, FormalParam,
 
         // ---- SOQL (Phase 4) ----

@@ -201,6 +201,14 @@ fn class_body(p: &mut Parser<'_>) {
 
 /// `classBodyDeclaration: ';' | STATIC? block | modifier* memberDeclaration`.
 pub(crate) fn class_body_decl(p: &mut Parser<'_>) {
+    // `^` before a member -- annotations included -- focuses the member.
+    if p.at_focus() {
+        let m = p.start();
+        p.bump(); // ^
+        class_body_decl(p);
+        m.complete(p, SyntaxKind::PatternFocus);
+        return;
+    }
     // A bare `...` stands in for whole members, which is what lets a class
     // body be written `class $C { ... }`. Only the *ellipsis*: a capture
     // here is naming a return type, so reading any hole as a member
@@ -284,8 +292,18 @@ fn member_decl_rest(p: &mut Parser<'_>) -> SyntaxKind {
         return SyntaxKind::ConstructorDecl;
     }
 
+    // `^` before a method's or property's name focuses the name.
+    let focus = p.at_focus().then(|| {
+        let m = p.start();
+        p.bump(); // ^
+        m
+    });
+
     if !super::ids::at_id(p) {
         p.error(format!("expected a member name, found {:?}", p.current()));
+        if let Some(focus) = focus {
+            focus.complete(p, SyntaxKind::PatternFocus);
+        }
         return SyntaxKind::ErrorNode;
     }
 
@@ -294,6 +312,9 @@ fn member_decl_rest(p: &mut Parser<'_>) -> SyntaxKind {
             let name = p.start();
             p.bump(); // method name
             name.complete(p, SyntaxKind::DeclName);
+            if let Some(focus) = focus {
+                focus.complete(p, SyntaxKind::PatternFocus);
+            }
             formal_parameters(p);
             method_body_or_semi(p);
             SyntaxKind::MethodDecl
@@ -302,11 +323,17 @@ fn member_decl_rest(p: &mut Parser<'_>) -> SyntaxKind {
             let name = p.start();
             p.bump(); // property name
             name.complete(p, SyntaxKind::DeclName);
+            if let Some(focus) = focus {
+                focus.complete(p, SyntaxKind::PatternFocus);
+            }
             property_body(p);
             SyntaxKind::PropertyDecl
         }
         _ => {
             super::statements::var_declarators(p);
+            if let Some(focus) = focus {
+                focus.complete(p, SyntaxKind::PatternFocus);
+            }
             p.expect(SyntaxKind::Semi);
             SyntaxKind::FieldDecl
         }

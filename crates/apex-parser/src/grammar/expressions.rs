@@ -153,7 +153,11 @@ macro_rules! left_assoc_level {
             // ellipsis, operated on by $X" -- swallowing the statement that
             // follows. Operator position stays out of reach; every other
             // hole is a requirement, which is unambiguous.
-            while $at_op(p.current()) || at_operator_capture(p) {
+            // A `^` straight after a bare `...` is a focus marker on what
+            // follows, not XOR: an ellipsis on the left is a statement run.
+            while ($at_op(p.current()) && !(p.at_focus() && p.prev_was_ellipsis()))
+                || at_operator_capture(p)
+            {
                 let m = lhs.precede(p);
                 p.bump();
                 $next(p);
@@ -196,6 +200,12 @@ left_assoc_level!(expr_multiplicative, expr_unary, |k: SyntaxKind| matches!(
 /// tier: chains like `-!x` or `--++x` are built by repeated self-calls,
 /// not by stepping through separate levels one at a time.
 fn expr_unary(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+    if p.at_focus() {
+        let m = p.start();
+        p.bump(); // ^
+        expr_unary(p);
+        return Some(m.complete(p, SyntaxKind::PatternFocus));
+    }
     if matches!(
         p.current(),
         SyntaxKind::Bang

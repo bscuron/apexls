@@ -395,3 +395,16 @@ through one `outln!` that exits 0 on a broken pipe instead of panicking. Known l
 here: when `...` lets a pattern match more than one way, the matcher keeps the *first* binding,
 and conditions test only that one -- in `switch on $o { ... when $T $v { ... } ... }`, `$T` is
 the first typed arm, so `--and '$T ~ Contact'` misses a `Contact` arm that is not first.
+
+**25. `^` marks where a match is reported.** `void $_(...) { ... ^[SELECT ... FROM $o ...] ... }`
+reports each method at its query's `[`, so `vim -q <(apexls query ...)` lands on the query
+rather than the method. The printed text stays the whole match. `^` was chosen over `@` (which
+clashes with annotations, so it could not sit before one) and `$` (the capture sigil, and a legal
+Apex identifier): XOR is binary-only, so wherever a construct *starts* -- a statement, a prefix
+expression, a member, a declared name -- `^` cannot be an operator, and between two operands it
+still is (`$a ^ ^$b` focuses XOR's right operand). A `^` straight after a bare `...` is the
+marker, since an ellipsis on the left is a statement run. One `^` per pattern; a `^` in an
+`--and`/`--not` pattern is ignored. Like conditions, it follows the first binding: a method with
+two queries is one hit, at its first. On NPSP the query above gives 810 hits with or without the
+`^`, and no measurable time. Guarded by `a_caret_moves_the_reported_position` and
+`a_caret_between_operands_is_xor`.

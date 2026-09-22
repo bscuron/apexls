@@ -64,6 +64,14 @@ pub(crate) fn expect_any_id(p: &mut Parser<'_>) -> bool {
 /// (`QualifiedName`, SOQL field names, the trigger's `ON <object>`) --
 /// those aren't declaring anything.
 pub(crate) fn expect_name(p: &mut Parser<'_>) -> bool {
+    // `^` focuses the declared name: `void ^$m(...)`, `class ^$C`.
+    if p.at_focus() {
+        let m = p.start();
+        p.bump(); // ^
+        let ok = expect_name(p);
+        m.complete(p, SyntaxKind::PatternFocus);
+        return ok;
+    }
     // A hole stands in for the declared name.
     if p.at_hole() {
         let m = p.start();

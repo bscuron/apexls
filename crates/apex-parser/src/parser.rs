@@ -80,6 +80,15 @@ impl<'t> Parser<'t> {
             )
     }
 
+    /// Is the parser on a `^` focus marker, as in `{ ... ^[SELECT ...] ... }`?
+    ///
+    /// Only asked where a construct *starts* -- a statement, a prefix
+    /// expression, a member, a declared name -- where `^` cannot be XOR,
+    /// since XOR is binary-only. Between two operands it stays XOR.
+    pub(crate) fn at_focus(&self) -> bool {
+        self.pattern_mode && self.at(SyntaxKind::Caret)
+    }
+
     /// Is the parser on a bare `...`, as opposed to any hole?
     ///
     /// The distinction runs through the whole grammar: a check standing in

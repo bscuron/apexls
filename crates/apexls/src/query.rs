@@ -640,6 +640,24 @@ impl Pattern {
             // shows up as *extra children beside* the real node.
             let root = parse.syntax();
             if let [NodeOrToken::Node(node)] = significant_children(&root).as_slice() {
+                let focuses = node
+                    .descendants()
+                    .filter(|n| n.kind() == SyntaxKind::PatternFocus)
+                    .count();
+                if focuses > 1 {
+                    return Err(ArgError(
+                        "error: a pattern can have only one `^`\nnote: `^` marks where each match is reported".to_string(),
+                        2,
+                    ));
+                }
+                // A `^` on the whole pattern is the default report position.
+                let node = match node.kind() {
+                    SyntaxKind::PatternFocus => match focus_inner(node) {
+                        Some(NodeOrToken::Node(inner)) => inner,
+                        _ => node.clone(),
+                    },
+                    _ => node.clone(),
+                };
                 return Ok(Pattern::Tree(node.green().to_owned()));
             }
         }
@@ -812,6 +830,28 @@ fn is_string_literal(element: &SyntaxElement) -> bool {
 
 type Binds = HashMap<String, String>;
 
+/// Where a `^` focus landed, kept in the bindings so it backtracks with
+/// them. Stored as a byte offset; no capture can be named `^`.
+const FOCUS_KEY: &str = "^";
+
+/// The construct a `^` marks -- `None` unless it is exactly one.
+fn focus_inner(focus: &SyntaxNode) -> Option<SyntaxElement> {
+    match significant_children(focus).as_slice() {
+        [caret, inner] if caret.kind() == SyntaxKind::Caret => Some(inner.clone()),
+        _ => None,
+    }
+}
+
+fn record_focus(binds: &mut Binds, src: &SyntaxElement) {
+    let start = match src {
+        NodeOrToken::Token(t) => Some(t.text_range().start()),
+        NodeOrToken::Node(n) => apex_syntax::significant_range(n).map(|r| r.start()),
+    };
+    if let Some(start) = start {
+        binds.insert(FOCUS_KEY.to_string(), u32::from(start).to_string());
+    }
+}
+
 fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
     if !kinds_compatible(pat, src) {
         return false;
@@ -966,6 +1006,19 @@ fn kinds_compatible(pat: &SyntaxNode, src: &SyntaxNode) -> bool {
 }
 
 fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) -> bool {
+    // `^X` matches whatever X matches, and remembers where.
+    if let NodeOrToken::Node(focus) = pat {
+        if focus.kind() == SyntaxKind::PatternFocus {
+            let Some(inner) = focus_inner(focus) else {
+                return false;
+            };
+            if !match_element(&inner, src, binds) {
+                return false;
+            }
+            record_focus(binds, src);
+            return true;
+        }
+    }
     match hole_of(pat) {
         Some(Hole::Ellipsis) | Some(Hole::Anonymous) => return true,
         // A sequence capture reached here is standing where a single
@@ -1203,11 +1256,23 @@ fn match_in_document_order(
     // expression too. `{ ... [SELECT ...] ... }` means "a block containing
     // this query somewhere", and the query turns up inside a declaration or
     // an argument, not as a statement of its own.
-    let unwrapped = expression_inside(head);
+    // A `^` on the element survives the unwrapping: the focus is recorded
+    // on whichever candidate the element matched.
+    let (inner, focused) = match head {
+        NodeOrToken::Node(n) if n.kind() == SyntaxKind::PatternFocus => (focus_inner(n), true),
+        _ => (Some(head.clone()), false),
+    };
+    let unwrapped = inner.as_ref().and_then(expression_inside);
     for (i, candidate) in candidates.iter().enumerate() {
         for probe in [Some(head), unwrapped.as_ref()].into_iter().flatten() {
             let mut attempt = binds.clone();
             if match_element(probe, candidate, &mut attempt)
+                && {
+                    if focused {
+                        record_focus(&mut attempt, candidate);
+                    }
+                    true
+                }
                 && match_in_document_order(&fixed[1..], &candidates[i + 1..], &mut attempt)
             {
                 *binds = attempt;
@@ -1382,7 +1447,15 @@ fn matches_in_file_filtered(
         .matches_with_binds(&root)
         .into_iter()
         .filter(|(node, binds)| passes(node, binds, ands, nots))
-        .filter_map(|(node, _)| site_for(display_path, src, &index, &node))
+        .filter_map(|(node, binds)| {
+            let mut site = site_for(display_path, src, &index, &node)?;
+            // Report at the `^` if the pattern has one; the text stays the
+            // whole match, so the line still shows its context.
+            if let Some(offset) = binds.get(FOCUS_KEY).and_then(|o| o.parse().ok()) {
+                (site.line, site.col) = index.line_col(src, offset);
+            }
+            Some(site)
+        })
         .collect()
 }
 
@@ -2821,6 +2894,73 @@ mod tests {
             1,
             "a statement run after the try, not its clauses"
         );
+    }
+
+    /// Where each hit is reported, as `line:col`.
+    fn positions(pattern: &str, src: &str) -> Vec<String> {
+        hits(pattern, src)
+            .into_iter()
+            .map(|h| h.splitn(3, ':').take(2).collect::<Vec<_>>().join(":"))
+            .collect()
+    }
+
+    /// `^` marks where a match is reported: the start of the construct
+    /// after it, at a statement, an expression, a member or a name.
+    #[test]
+    fn a_caret_moves_the_reported_position() {
+        let src = "public class T {\n    @isTest static void go() {\n        a();\n        List<Account> x = [SELECT Id FROM Account];\n        System.assertEquals(1, x.size());\n    }\n}\n";
+        assert_eq!(
+            positions("void $_(...) { ... }", src),
+            ["2:5"],
+            "no caret: the match start"
+        );
+        assert_eq!(
+            positions("void $_(...) { ... ^[SELECT ... FROM $o ...] ... }", src),
+            ["4:27"],
+            "the query, found deep inside a declaration"
+        );
+        assert_eq!(
+            positions("System.assertEquals($a, ^$b)", src),
+            ["5:32"],
+            "an argument"
+        );
+        assert_eq!(
+            positions("void ^$m() { ... }", src),
+            ["2:25"],
+            "a method name"
+        );
+        assert_eq!(
+            positions("{ ... ^a(); ... }", src),
+            ["3:9"],
+            "a statement after an ellipsis"
+        );
+        assert_eq!(
+            positions("class $C { ... ^@isTest $_ $m() { ... } ... }", src),
+            ["2:5"],
+            "a member, at its annotation"
+        );
+        assert_eq!(
+            positions("^System.assertEquals(...)", src),
+            ["5:9"],
+            "on the whole: the default"
+        );
+    }
+
+    /// `^` between two operands is still XOR, and a pattern takes one.
+    #[test]
+    fn a_caret_between_operands_is_xor() {
+        let src = wrap("        Integer n = a ^ b;");
+        assert_eq!(hits("$a ^ $b", &src).len(), 1);
+        assert_eq!(
+            positions("$a ^ ^$b", &src),
+            ["3:25"],
+            "focus on XOR's right operand"
+        );
+        let err = Pattern::compile("f(^$a, ^$b)")
+            .err()
+            .map(|e| e.0)
+            .unwrap_or_default();
+        assert!(err.contains("only one `^`"), "{err}");
     }
 
     #[test]
