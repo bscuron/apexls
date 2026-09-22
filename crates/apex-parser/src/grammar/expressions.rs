@@ -206,6 +206,13 @@ fn expr_unary(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         expr_unary(p);
         return Some(m.complete(p, SyntaxKind::PatternFocus));
     }
+    if p.at_group() {
+        let m = p.start();
+        p.bump(); // ${
+        expr(p);
+        p.expect(SyntaxKind::RBrace);
+        return Some(m.complete(p, SyntaxKind::PatternGroup));
+    }
     if matches!(
         p.current(),
         SyntaxKind::Bang

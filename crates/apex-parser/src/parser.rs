@@ -89,6 +89,14 @@ impl<'t> Parser<'t> {
         self.pattern_mode && self.at(SyntaxKind::Caret)
     }
 
+    /// Is the parser on a `${` opening a capture group?
+    ///
+    /// Asked at the same places as [`Self::at_focus`], where a construct
+    /// starts; the group holds exactly that one construct and a `}`.
+    pub(crate) fn at_group(&self) -> bool {
+        self.pattern_mode && self.at(SyntaxKind::PatternGroupOpen)
+    }
+
     /// Is the parser on a bare `...`, as opposed to any hole?
     ///
     /// The distinction runs through the whole grammar: a check standing in

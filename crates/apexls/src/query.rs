@@ -134,6 +134,18 @@
 //! rewrite: `Database.query($...ARGS)` -> `Database.queryWithBinds($...ARGS, ...)`
 //! keeps a call's arguments whatever their number.
 //!
+//! **`${...}` numbers a capture group**: `${[SELECT ... FROM $o ...]}` is
+//! `$1`, the next `${` is `$2`, counted from the left. A group is a capture
+//! with a shape -- its text is `$1` in templates and conditions -- and the
+//! unit a rewrite can target: `-r '$1 => TEMPLATE'` replaces only that
+//! group's span, one `-r` per group, while `-r TEMPLATE` still replaces the
+//! whole match. Like a `^`, a group is found everywhere it can land, so
+//! `void $_(...) { ... ${[SELECT ...]} ... }` rewrites every query in each
+//! void method and keeps the methods. Numbers therefore cannot name holes.
+//! `=>` rather than sed's `s/.../.../`, whose `/` Apex writes constantly;
+//! only the first `=>` separates and at most one space either side of it is
+//! dropped, so a template keeps its own whitespace and map literals.
+//!
 //! **Modifiers match as a subset**, everywhere Apex lets one be written:
 //! a type or member declaration, a local variable, a method or catch
 //! parameter, a property accessor. Every modifier the pattern names must be
@@ -280,6 +292,68 @@ impl Replacement {
     fn is_deletion(&self) -> bool {
         self.parts.is_empty()
     }
+}
+
+/// What `--replace` rewrites: the whole match, or some of its `${...}`
+/// groups, each with its own template.
+enum Rewrite {
+    Whole(Replacement),
+    Groups(Vec<(usize, Replacement)>),
+}
+
+impl Rewrite {
+    /// Each `-r` is either `TEMPLATE` for the whole match or `$N =>
+    /// TEMPLATE` for group N. Not sed's `s/.../.../`: its delimiter is `/`,
+    /// which Apex writes constantly -- division, comments, URLs in strings.
+    fn compile(
+        srcs: &[String],
+        bound: &std::collections::HashSet<String>,
+        groups: usize,
+    ) -> Result<Option<Rewrite>, ArgError> {
+        let err = |message: String| ArgError(message, 2);
+        let mut whole = Vec::new();
+        let mut by_group: Vec<(usize, Replacement)> = Vec::new();
+        for src in srcs {
+            match split_group_template(src) {
+                Some((number, template)) => {
+                    if number == 0 || number > groups {
+                        return Err(err(format!(
+                            "error: the pattern has no group ${number}\nnote: it has {groups}; `${{...}}` marks one, numbered from the left"
+                        )));
+                    }
+                    if by_group.iter().any(|(n, _)| *n == number) {
+                        return Err(err(format!("error: group ${number} is rewritten twice")));
+                    }
+                    by_group.push((number, Replacement::compile(template, bound)?));
+                }
+                None => whole.push(Replacement::compile(src, bound)?),
+            }
+        }
+        match (whole.len(), by_group.is_empty()) {
+            (0, true) => Ok(None),
+            (1, true) => Ok(whole.pop().map(Rewrite::Whole)),
+            (0, false) => Ok(Some(Rewrite::Groups(by_group))),
+            (_, true) => Err(err(
+                "error: only one --replace can rewrite the whole match\nnote: to rewrite parts of it, mark them `${...}` and write `-r '$1 => TEMPLATE'`".to_string(),
+            )),
+            (_, false) => Err(err(
+                "error: a whole-match --replace cannot be combined with `$N => ...`\nnote: the whole match already contains every group".to_string(),
+            )),
+        }
+    }
+}
+
+/// `$N => TEMPLATE` -> `(N, TEMPLATE)`, or `None` for a whole-match
+/// template. Only the first `=>` separates, so a template can hold a map
+/// literal, and at most one space either side of it is dropped: the rest
+/// of the template is kept exactly, leading spaces and newlines included.
+fn split_group_template(src: &str) -> Option<(usize, &str)> {
+    let rest = src.trim_start().strip_prefix(HOLE_CAPTURE_SIGIL)?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let number = rest[..digits].parse().ok()?;
+    let rest = &rest[digits..];
+    let rest = rest.strip_prefix(' ').unwrap_or(rest).strip_prefix("=>")?;
+    Some((number, rest.strip_prefix(' ').unwrap_or(rest)))
 }
 
 /// One rewrite: what to replace, and with what.
@@ -657,7 +731,7 @@ fn case_insensitive(re: &str) -> Result<regex::Regex, ArgError> {
 
 pub fn run(
     pattern_src: &str,
-    replacement_src: Option<&str>,
+    replacement_srcs: &[String],
     and_srcs: &[String],
     not_srcs: &[String],
     paths: &[PathBuf],
@@ -683,15 +757,12 @@ pub fn run(
         }
     };
 
-    let replacement = match replacement_src {
-        Some(text) => match Replacement::compile(text, &bound) {
-            Ok(r) => Some(r),
-            Err(ArgError(message, code)) => {
-                eprintln!("{message}");
-                return ExitCode::from(code);
-            }
-        },
-        None => None,
+    let replacement = match Rewrite::compile(replacement_srcs, &bound, pattern.group_count()) {
+        Ok(r) => r,
+        Err(ArgError(message, code)) => {
+            eprintln!("{message}");
+            return ExitCode::from(code);
+        }
     };
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -803,6 +874,34 @@ impl Pattern {
                         2,
                     ));
                 }
+                if let Some(numbered) = node
+                    .descendants_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .filter(|t| {
+                        matches!(
+                            t.kind(),
+                            SyntaxKind::PatternCapture | SyntaxKind::PatternSeqCapture
+                        )
+                    })
+                    .find(|t| {
+                        let name = t.text().trim_start_matches('$').trim_start_matches("...");
+                        !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
+                    })
+                {
+                    return Err(ArgError(
+                        format!(
+                            "error: `{}` cannot name a hole: `$1`, `$2`, ... are the pattern's `${{...}}` groups\nnote: give the hole a name, or wrap the construct in `${{...}}` to number it",
+                            numbered.text()
+                        ),
+                        2,
+                    ));
+                }
+                if node.kind() == SyntaxKind::PatternGroup {
+                    return Err(ArgError(
+                        "error: a group around the whole pattern is just the whole match\nnote: `-r TEMPLATE` replaces the whole match; `${...}` marks a part of it".to_string(),
+                        2,
+                    ));
+                }
                 // A `^` on the whole pattern is the default report position.
                 let node = match node.kind() {
                     SyntaxKind::PatternFocus => match focus_inner(node) {
@@ -897,7 +996,19 @@ impl Pattern {
                 };
                 (name != "_").then_some(name)
             })
+            .chain((1..=self.group_count()).map(|n| n.to_string()))
             .collect()
+    }
+
+    /// How many `${...}` groups the pattern has; they are `$1` to `$N`.
+    fn group_count(&self) -> usize {
+        let Pattern::Tree(green) = self else {
+            return 0;
+        };
+        SyntaxNode::new_root(green.clone())
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::PatternGroup)
+            .count()
     }
 }
 
@@ -987,6 +1098,102 @@ type Binds = HashMap<String, String>;
 /// them. Stored as a byte offset; no capture can be named `^`.
 const FOCUS_KEY: &str = "^";
 
+/// Where group `$1` landed, when the pattern has no `^`: what tells one
+/// reading of a match from the next, so every place the group can land is
+/// found (see [`focus_solutions`]), and rewritten.
+const ANCHOR_KEY: &str = "^1";
+
+/// The construct a `${...}` group holds -- `None` unless exactly one.
+fn group_inner(group: &SyntaxNode) -> Option<SyntaxElement> {
+    match significant_children(group).as_slice() {
+        [open, inner, close]
+            if open.kind() == SyntaxKind::PatternGroupOpen
+                && close.kind() == SyntaxKind::RBrace =>
+        {
+            Some(inner.clone())
+        }
+        _ => None,
+    }
+}
+
+/// A group's number, counting `${` from the start of the pattern, and
+/// whether it is the one that tells readings apart (`$1`, with no `^`).
+fn group_number(group: &SyntaxNode) -> (usize, bool) {
+    let root = group.ancestors().last().unwrap_or_else(|| group.clone());
+    let number = 1 + root
+        .descendants()
+        .take_while(|n| n != group)
+        .filter(|n| n.kind() == SyntaxKind::PatternGroup)
+        .count();
+    let anchor = number == 1
+        && !root
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::PatternFocus);
+    (number, anchor)
+}
+
+/// Record what a group matched: its text as the capture `$N`, where it is
+/// for a `:` test, and its exact span for a rewrite. Refuses, as a `^`
+/// does, a position already reported when this group tells readings apart.
+fn record_group(binds: &mut Binds, group: &SyntaxNode, src: &SyntaxElement) -> bool {
+    let (number, anchor) = group_number(group);
+    if anchor {
+        if focus_seen(src) {
+            return false;
+        }
+        if let Some(offset) = focus_offset(src) {
+            binds.insert(ANCHOR_KEY.to_string(), offset.to_string());
+        }
+    }
+    let (text, span) = match src {
+        NodeOrToken::Token(t) => (t.text().to_string(), Some(t.text_range())),
+        NodeOrToken::Node(n) => (significant_text(n), apex_syntax::significant_range(n)),
+    };
+    let name = number.to_string();
+    binds.insert(name.clone(), text);
+    record_capture_range(binds, &name, src);
+    if let Some(span) = span {
+        binds.insert(
+            format!("#{number}"),
+            format!("{}:{}", u32::from(span.start()), u32::from(span.end())),
+        );
+    }
+    true
+}
+
+/// Where group `$N` matched in the source, as a byte span.
+fn group_span(binds: &Binds, number: usize) -> Option<(usize, usize)> {
+    let (start, end) = binds.get(&format!("#{number}"))?.split_once(':')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
+}
+
+/// The construct a `^` or `${...}` marks, and how to record a match of it.
+fn marker_inner(node: &SyntaxNode) -> Option<SyntaxElement> {
+    match node.kind() {
+        SyntaxKind::PatternFocus => focus_inner(node),
+        SyntaxKind::PatternGroup => group_inner(node),
+        _ => None,
+    }
+}
+
+fn record_marker(marker: &SyntaxNode, binds: &mut Binds, src: &SyntaxElement) -> bool {
+    match marker.kind() {
+        SyntaxKind::PatternFocus => record_focus(binds, src),
+        SyntaxKind::PatternGroup => record_group(binds, marker, src),
+        _ => true,
+    }
+}
+
+/// Whether this marker is the one that tells readings apart, so a position
+/// already reported can be refused before it is even compared.
+fn marker_tells_readings_apart(marker: &SyntaxNode) -> bool {
+    match marker.kind() {
+        SyntaxKind::PatternFocus => true,
+        SyntaxKind::PatternGroup => group_number(marker).1,
+        _ => false,
+    }
+}
+
 /// The construct a `^` marks -- `None` unless it is exactly one.
 fn focus_inner(focus: &SyntaxNode) -> Option<SyntaxElement> {
     match significant_children(focus).as_slice() {
@@ -1045,7 +1252,7 @@ fn focus_solutions(pattern: &SyntaxNode, node: &SyntaxNode, first: Binds) -> Vec
     let mut solutions = vec![first];
     while let Some(offset) = solutions
         .last()
-        .and_then(|b| b.get(FOCUS_KEY))
+        .and_then(|b| b.get(FOCUS_KEY).or_else(|| b.get(ANCHOR_KEY)))
         .and_then(|o| o.parse().ok())
     {
         FOCUS_SEEN.with(|seen| seen.borrow_mut().push(offset));
@@ -1213,13 +1420,16 @@ fn kinds_compatible(pat: &SyntaxNode, src: &SyntaxNode) -> bool {
 }
 
 fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) -> bool {
-    // `^X` matches whatever X matches, and remembers where.
-    if let NodeOrToken::Node(focus) = pat {
-        if focus.kind() == SyntaxKind::PatternFocus {
-            let Some(inner) = focus_inner(focus) else {
+    // `^X` and `${X}` match whatever X matches, and remember where.
+    if let NodeOrToken::Node(marker) = pat {
+        if matches!(
+            marker.kind(),
+            SyntaxKind::PatternFocus | SyntaxKind::PatternGroup
+        ) {
+            let Some(inner) = marker_inner(marker) else {
                 return false;
             };
-            return match_element(&inner, src, binds) && record_focus(binds, src);
+            return match_element(&inner, src, binds) && record_marker(marker, binds, src);
         }
     }
     match hole_of(pat) {
@@ -1469,22 +1679,37 @@ fn match_in_document_order(
     // an argument, not as a statement of its own.
     // A `^` on the element survives the unwrapping: the focus is recorded
     // on whichever candidate the element matched.
-    let (inner, focused) = match head {
-        NodeOrToken::Node(n) if n.kind() == SyntaxKind::PatternFocus => (focus_inner(n), true),
-        _ => (Some(head.clone()), false),
+    // A `${...}` group keeps what it matched the same way.
+    let marker = match head {
+        NodeOrToken::Node(n)
+            if matches!(
+                n.kind(),
+                SyntaxKind::PatternFocus | SyntaxKind::PatternGroup
+            ) =>
+        {
+            Some(n.clone())
+        }
+        _ => None,
     };
+    let inner = match &marker {
+        Some(m) => marker_inner(m),
+        None => Some(head.clone()),
+    };
+    let tells_apart = marker.as_ref().is_some_and(marker_tells_readings_apart);
     let unwrapped = inner.as_ref().and_then(expression_inside);
     for (i, candidate) in candidates.iter().enumerate() {
         // A position already reported is refused before the comparison,
         // not after it: re-matching for the next `^` walks the same
         // candidates again, and comparing each one would go quadratic.
-        if focused && focus_seen(candidate) {
+        if tells_apart && focus_seen(candidate) {
             continue;
         }
         for probe in [Some(head), unwrapped.as_ref()].into_iter().flatten() {
             let mut attempt = binds.clone();
             if match_element(probe, candidate, &mut attempt)
-                && (!focused || record_focus(&mut attempt, candidate))
+                && marker
+                    .as_ref()
+                    .is_none_or(|m| record_marker(m, &mut attempt, candidate))
                 && match_in_document_order(&fixed[1..], &candidates[i + 1..], &mut attempt)
             {
                 *binds = attempt;
@@ -1659,10 +1884,17 @@ fn matches_in_file_filtered(
     // With a `^`, each place it lands is a hit, and a place is reported
     // once: `{ ... ^X ... }` matches a block and the blocks nested in it,
     // and they would all name the same X.
+    // A `${...}` group enumerates the same way, so a condition on it is
+    // checked for every place it lands; without a `^`, each match is still
+    // reported once, at its start.
     let focus_pattern = match pattern {
         Pattern::Tree(green) => Some(SyntaxNode::new_root(green.clone())).filter(|p| {
-            p.descendants()
-                .any(|n| n.kind() == SyntaxKind::PatternFocus)
+            p.descendants().any(|n| {
+                matches!(
+                    n.kind(),
+                    SyntaxKind::PatternFocus | SyntaxKind::PatternGroup
+                )
+            })
         }),
         _ => None,
     };
@@ -1688,6 +1920,10 @@ fn matches_in_file_filtered(
                     return None;
                 }
                 (site.line, site.col) = index.line_col(src, offset);
+            } else if focus_pattern.is_some()
+                && !reported.insert(u32::from(node.text_range().start()))
+            {
+                return None;
             }
             Some(site)
         })
@@ -1702,7 +1938,7 @@ fn matches_in_file_filtered(
 /// the VCS already does.
 fn run_replace(
     pattern: &Pattern,
-    replacement: &Replacement,
+    replacement: &Rewrite,
     ands: &[Condition],
     nots: &[Condition],
     types: Option<&TypeContext>,
@@ -1731,7 +1967,7 @@ fn run_replace(
 /// the write has to go through the real path either way.
 fn rewrite_file(
     pattern: &Pattern,
-    replacement: &Replacement,
+    replacement: &Rewrite,
     ands: &[Condition],
     nots: &[Condition],
     types: Option<&TypeContext>,
@@ -1743,18 +1979,55 @@ fn rewrite_file(
     let index = LineIndex::new(src);
     let root = parse.syntax();
 
-    let matches: Vec<_> = pattern
-        .matches_with_binds(&root)
-        .into_iter()
-        .filter(|(node, binds)| {
-            let file_types = types.and_then(|t| t.for_file(display_path));
-            passes(node, binds, ands, nots, file_types.as_ref())
-        })
-        .collect();
+    let file_types = types.and_then(|t| t.for_file(display_path));
+    let (edits, sites) = match replacement {
+        Rewrite::Whole(replacement) => {
+            let matches: Vec<_> = pattern
+                .matches_with_binds(&root)
+                .into_iter()
+                .filter(|(node, binds)| passes(node, binds, ands, nots, file_types.as_ref()))
+                .collect();
+            whole_match_edits(
+                outermost_only(matches),
+                replacement,
+                display_path,
+                src,
+                &index,
+            )
+        }
+        Rewrite::Groups(groups) => {
+            let Pattern::Tree(green) = pattern else {
+                return Vec::new();
+            };
+            let pattern_root = SyntaxNode::new_root(green.clone());
+            let readings: Vec<_> = pattern
+                .matches_with_binds(&root)
+                .into_iter()
+                .flat_map(|(node, binds)| {
+                    focus_solutions(&pattern_root, &node, binds)
+                        .into_iter()
+                        .map(move |b| (node.clone(), b))
+                })
+                .filter(|(node, binds)| passes(node, binds, ands, nots, file_types.as_ref()))
+                .map(|(_, binds)| binds)
+                .collect();
+            group_edits(&readings, groups, display_path, src, &index)
+        }
+    };
+    apply_edits(edits, sites, &parse, display_path, src, refused)
+}
 
+/// The edits a whole-match template makes: one per outermost match.
+fn whole_match_edits(
+    matches: Vec<(SyntaxNode, Binds)>,
+    replacement: &Replacement,
+    display_path: &Path,
+    src: &str,
+    index: &LineIndex,
+) -> (Vec<Edit>, Vec<Site>) {
     let mut edits = Vec::new();
     let mut sites = Vec::new();
-    for (node, binds) in outermost_only(matches) {
+    for (node, binds) in matches {
         let Some(range) = apex_syntax::significant_range(&node) else {
             continue;
         };
@@ -1764,7 +2037,7 @@ fn rewrite_file(
         } else {
             (start, end)
         };
-        let Some(mut site) = site_for(display_path, src, &index, &node) else {
+        let Some(mut site) = site_for(display_path, src, index, &node) else {
             continue;
         };
         let new_text = replacement.render(&binds);
@@ -1783,6 +2056,68 @@ fn rewrite_file(
         });
         sites.push(site);
     }
+    (edits, sites)
+}
+
+/// The edits group templates make: each group's own span, in every
+/// reading of every match, and nothing outside the groups. A span two
+/// readings or two nested matches both name is rewritten once.
+fn group_edits(
+    readings: &[Binds],
+    groups: &[(usize, Replacement)],
+    display_path: &Path,
+    src: &str,
+    index: &LineIndex,
+) -> (Vec<Edit>, Vec<Site>) {
+    let mut done = std::collections::HashSet::new();
+    let mut edits = Vec::new();
+    let mut sites = Vec::new();
+    for binds in readings {
+        for (number, replacement) in groups {
+            let Some((start, end)) = group_span(binds, *number) else {
+                continue;
+            };
+            let new_text = replacement.render(binds);
+            if !done.insert((start, end, new_text.clone())) {
+                continue;
+            }
+            let old = crate::project::collapse(&src[start..end]);
+            let (line, col) = index.line_col(src, start as u32);
+            let (start, end) = if replacement.is_deletion() {
+                widen_deletion_to_line(src, start, end)
+            } else {
+                (start, end)
+            };
+            sites.push(Site {
+                path: display_path.to_path_buf(),
+                line,
+                col,
+                text: if replacement.is_deletion() {
+                    format!("{old} -> (deleted)")
+                } else {
+                    format!("{old} -> {}", crate::project::collapse(&new_text))
+                },
+            });
+            edits.push(Edit {
+                start,
+                end,
+                text: new_text,
+            });
+        }
+    }
+    (edits, sites)
+}
+
+/// Check, apply and write a file's edits: refused whole if any two cross,
+/// or if the result would not parse.
+fn apply_edits(
+    mut edits: Vec<Edit>,
+    sites: Vec<Site>,
+    parse: &apex_parser::Parse,
+    display_path: &Path,
+    src: &str,
+    refused: &std::sync::atomic::AtomicBool,
+) -> Vec<Site> {
     if edits.is_empty() {
         return Vec::new();
     }
@@ -1790,7 +2125,8 @@ fn rewrite_file(
     // Crossing overlaps are genuinely ambiguous -- either rewrite changes
     // text the other was computed against -- so both are skipped and named
     // rather than one being picked silently. Nested matches never reach
-    // here; `outermost_only` has already resolved those.
+    // here; `outermost_only` has already resolved those, and groups that
+    // two readings share are rewritten once.
     edits.sort_by_key(|e| e.start);
     if let Some(pair) = edits.windows(2).find(|w| w[1].start < w[0].end) {
         eprintln!("error: overlapping rewrites in {}", display_path.display());
@@ -3379,6 +3715,125 @@ mod tests {
         assert!(
             filtered_hits("f($a)", &["$a : Integer"], &[], &src).is_empty(),
             "no project bound"
+        );
+    }
+
+    /// Rewrite `src` as one file with `-r` values `rewrites`, and return
+    /// the file afterwards (or an error message) plus what was reported.
+    fn rewrite(
+        pattern: &str,
+        rewrites: &[&str],
+        src: &str,
+    ) -> Result<(String, Vec<String>), String> {
+        static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "apexls-query-rewrite-{}-{}",
+            std::process::id(),
+            RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("T.cls");
+        std::fs::write(&file, src).unwrap();
+        let pattern = Pattern::compile(pattern).map_err(|e| e.0)?;
+        let srcs: Vec<String> = rewrites.iter().map(|s| s.to_string()).collect();
+        let plan = Rewrite::compile(&srcs, &pattern.capture_names(), pattern.group_count())
+            .map_err(|e| e.0)?
+            .ok_or("no rewrite")?;
+        let refused = std::sync::atomic::AtomicBool::new(false);
+        let sites = rewrite_file(&pattern, &plan, &[], &[], None, &file, src, &refused);
+        let after = std::fs::read_to_string(&file).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        Ok((after, sites.into_iter().map(|s| s.text).collect()))
+    }
+
+    /// `${...}` numbers a group from the left; `$1 => TEMPLATE` rewrites
+    /// only that group's span, and each group can have its own template.
+    #[test]
+    fn a_group_rewrite_touches_only_the_group() {
+        let src = wrap("        f(a, b);");
+        let (after, sites) =
+            rewrite("f(${$x}, ${$y})", &["$1 => g($1)", "$2 => $x"], &src).unwrap();
+        assert!(after.contains("f(g(a), a);"), "{after}");
+        assert_eq!(sites, ["a -> g(a)", "b -> a"]);
+    }
+
+    /// Inside a deep pattern, a group is rewritten everywhere it lands and
+    /// the surrounding match is left alone -- the method survives.
+    #[test]
+    fn a_group_in_a_deep_pattern_rewrites_every_place_it_lands() {
+        let src = "public class T {\n    void go() {\n        a = [SELECT Id FROM Account];\n        if (x) { c = [SELECT Id FROM Contact]; }\n    }\n    Integer keep() { return [SELECT COUNT() FROM Lead]; }\n}\n";
+        let (after, sites) = rewrite(
+            "void $_() { ... ${[SELECT ... FROM $o ...]} ... }",
+            &["$1 => Data.of($o)"],
+            src,
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        assert!(after.contains("a = Data.of(Account);"), "{after}");
+        assert!(after.contains("c = Data.of(Contact);"), "{after}");
+        assert!(after.contains("void go() {"), "the method itself is kept");
+        assert!(
+            after.contains("[SELECT COUNT() FROM Lead]"),
+            "only void methods"
+        );
+    }
+
+    /// Only the first `=>` separates, at most one space either side of it
+    /// is dropped, and an empty template deletes the group -- its line too
+    /// when it stands alone.
+    #[test]
+    fn a_group_template_keeps_its_whitespace() {
+        let src = wrap("        f(a);");
+        let (after, _) = rewrite(
+            "f(${$x})",
+            &["$1 =>  new Map<String, Object>{'k' => $x}"],
+            &src,
+        )
+        .unwrap();
+        assert!(
+            after.contains("f( new Map<String, Object>{'k' => a});"),
+            "{after}"
+        );
+        let src = wrap("        a();\n        b();");
+        let (after, sites) = rewrite("{ ... ${b();} ... }", &["$1 =>"], &src).unwrap();
+        assert!(
+            !after.contains("b();") && after.contains("        a();\n    }"),
+            "{after}"
+        );
+        assert_eq!(sites, ["b(); -> (deleted)"]);
+    }
+
+    /// Groups are numbered holes' only source: a numbered hole, a missing
+    /// or doubled group, and a whole-match template beside group ones are
+    /// all refused.
+    #[test]
+    fn group_rewrites_are_checked() {
+        let src = wrap("        f(a);");
+        let err = |p: &str, r: &[&str]| rewrite(p, r, &src).err().unwrap_or_default();
+        assert!(err("f($1)", &["x"]).contains("cannot name a hole"));
+        assert!(err("f(${$x})", &["$2 => y"]).contains("has no group $2"));
+        assert!(err("f(${$x})", &["$1 => y", "$1 => z"]).contains("rewritten twice"));
+        assert!(err("f(${$x})", &["whole", "$1 => y"]).contains("cannot be combined"));
+        assert!(err("f(${$x})", &["one", "two"]).contains("only one --replace"));
+        assert!(err("${f($x)}", &["x"]).contains("whole pattern"));
+        let (after, _) = rewrite("f(${$x})", &["$1.trim()"], &src).unwrap();
+        assert!(
+            after.contains("a.trim()") && !after.contains("f("),
+            "no `=>`: a whole-match template: {after}"
+        );
+    }
+
+    /// A group is a capture like any other: `$1` in a condition, and in
+    /// search a match is still reported once, at its start.
+    #[test]
+    fn a_group_works_in_conditions_and_search() {
+        let src = wrap("        f(abc);\n        f(xyz);");
+        assert_eq!(filtered_hits("f(${$x})", &["$1 ~ a*"], &[], &src).len(), 1);
+        let src = "public class T {\n    void go() {\n        a = [SELECT Id FROM Account];\n        c = [SELECT Id FROM Contact];\n    }\n}\n";
+        assert_eq!(
+            positions("void $_() { ... ${[SELECT ... FROM $o ...]} ... }", src),
+            ["2:5"],
+            "once per match"
         );
     }
 

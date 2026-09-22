@@ -69,13 +69,15 @@ enum Command {
     /// case-sensitive unless flagged: `/re/i`, also `x`, `s` and `m`.
     Query {
         pattern: String,
-        /// Rewrite every match with this template, in place.
+        /// Rewrite matches in place: `TEMPLATE` replaces the whole match,
+        /// `$N => TEMPLATE` replaces only the pattern's Nth `${...}` group.
         ///
-        /// Only named captures from PATTERN may appear in it; an empty
-        /// template deletes the match. Repositories are under version
-        /// control, so there is no dry run -- omit this to search.
+        /// Repeatable for groups, one per group. Templates may use any
+        /// named capture and `$1`, `$2`, ... for the groups' text; an empty
+        /// template deletes. Repositories are under version control, so
+        /// there is no dry run -- omit this to search.
         #[arg(long = "replace", short = 'r', value_name = "TEMPLATE")]
-        replace: Option<String>,
+        replace: Vec<String>,
         /// Keep only matches for which this condition holds. Repeatable;
         /// every one must hold.
         #[arg(long = "and", value_name = "COND")]
@@ -148,6 +150,6 @@ fn run_command() -> ExitCode {
             and,
             not,
             paths,
-        } => query::run(&pattern, replace.as_deref(), &and, &not, &paths),
+        } => query::run(&pattern, &replace, &and, &not, &paths),
     }
 }

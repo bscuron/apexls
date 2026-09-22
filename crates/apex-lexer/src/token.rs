@@ -337,6 +337,11 @@ pub enum TokenKind {
     /// `f($...ARGS)` carry a call's arguments across a replacement
     /// whatever their number.
     PatternSeqCapture,
+    /// `${` -- opens a numbered capture group in a structural-search
+    /// pattern, closed by an ordinary `}`: `${[SELECT ... FROM $o ...]}` is
+    /// group `$1`. Never produced by `tokenize`; folded from an adjacent `$`
+    /// and `{`, which no real Apex writes.
+    PatternGroupOpen,
     Eof,
 }
 

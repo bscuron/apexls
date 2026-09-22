@@ -209,6 +209,14 @@ pub(crate) fn class_body_decl(p: &mut Parser<'_>) {
         m.complete(p, SyntaxKind::PatternFocus);
         return;
     }
+    if p.at_group() {
+        let m = p.start();
+        p.bump(); // ${
+        class_body_decl(p);
+        p.expect(SyntaxKind::RBrace);
+        m.complete(p, SyntaxKind::PatternGroup);
+        return;
+    }
     // A bare `...` stands in for whole members, which is what lets a class
     // body be written `class $C { ... }`. Only the *ellipsis*: a capture
     // here is naming a return type, so reading any hole as a member

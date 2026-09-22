@@ -24,6 +24,13 @@ pub(crate) fn statement(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         statement(p);
         return Some(m.complete(p, SyntaxKind::PatternFocus));
     }
+    if p.at_group() {
+        let m = p.start();
+        p.bump(); // ${
+        statement(p);
+        p.expect(SyntaxKind::RBrace);
+        return Some(m.complete(p, SyntaxKind::PatternGroup));
+    }
     let s = match p.current() {
         SyntaxKind::LBrace => block(p),
         SyntaxKind::If => if_stmt(p),

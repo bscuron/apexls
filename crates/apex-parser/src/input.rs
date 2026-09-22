@@ -70,6 +70,23 @@ impl Input {
                 i += 5;
                 continue;
             }
+            // `${` opens a capture group. Before the `$NAME` rule, which
+            // would otherwise take the lone `$` for a capture.
+            let group = t.kind == TokenKind::Identifier
+                && t.len == 1
+                && src[t.start as usize..].starts_with('$')
+                && raw
+                    .get(i + 1)
+                    .is_some_and(|b| b.kind == TokenKind::LBrace && b.start == t.start + 1);
+            if group {
+                folded.push(Token {
+                    kind: TokenKind::PatternGroupOpen,
+                    start: t.start,
+                    len: 2,
+                });
+                i += 2;
+                continue;
+            }
             // `$` is a legal Apex identifier start character, so `$NAME`
             // lexes as one ordinary `Identifier` -- there is no `$` token to
             // look for. A pattern therefore reserves leading-`$`

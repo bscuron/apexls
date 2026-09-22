@@ -136,7 +136,7 @@ syntax_kind! {
 
         // ---- Structural search ----
         // Never produced by the lexer; see `apex_lexer::TokenKind::PatternHole`.
-        PatternHole, PatternCapture, PatternSeqCapture,
+        PatternHole, PatternCapture, PatternSeqCapture, PatternGroupOpen,
     }
     nodes {
         // ---- Roots (fragment-parse entry points) / recovery ----
@@ -180,6 +180,8 @@ syntax_kind! {
         MethodDecl, ConstructorDecl, FieldDecl, PropertyDecl, StaticInitializer,
         // `^X` in a pattern: X is where a match is reported. Never in real source.
         PatternFocus,
+        // `${X}` in a pattern: X is numbered capture group `$1`, `$2`, ...
+        PatternGroup,
         PropertyAccessor, FormalParamList, FormalParam,
 
         // ---- SOQL (Phase 4) ----

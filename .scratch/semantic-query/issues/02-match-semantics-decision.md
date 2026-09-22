@@ -449,3 +449,19 @@ On NPSP, 759 of 795 `private static` field initializers are typed (none were rea
 and all 26 trigger bodies' receivers. `check` is unchanged in time and output. Still not typed:
 static and instance initializer blocks (`static { ... }`), which the binder does not bind at all.
 Guarded by `a_type_condition_reaches_initializers_accessors_and_triggers`.
+
+**29. `${...}` groups, and `$N => TEMPLATE` rewrites.** The user's design: `${X}` marks a
+numbered capture group (`$1`, `$2`, ... from the left), `^` stays report-position only, numbers can
+no longer name holes, and a rewrite can target groups -- `-r '$1 => fix($1)' -r '$2 => other'`,
+one per group, beside the unchanged whole-match `-r TEMPLATE` (the two cannot be mixed). `=>` was
+chosen over the user's first suggestion of `s/$1/.../` because Apex writes `/` constantly; only the
+first `=>` separates and at most one space either side is dropped, so templates keep their
+whitespace and map literals. A group's text is the capture `$N` (usable in templates, `~` and `:`),
+and it records its exact span for the rewrite. Without a `^`, group `$1` tells readings apart, so
+a group is rewritten everywhere it can land: on NPSP, `void $_(...) { ... ${[SELECT ... FROM $o
+...]} ... } -r '$1 => Data.query($o)'` rewrote all 13 queries in `ALLO_Allocations_TEST.cls` with
+the methods kept and zero parse errors. Search with a group still reports each match once (810,
+unchanged). A group around the whole pattern is refused as meaningless. Guarded by
+`a_group_rewrite_touches_only_the_group`, `a_group_in_a_deep_pattern_rewrites_every_place_it_lands`,
+`a_group_template_keeps_its_whitespace`, `group_rewrites_are_checked` and
+`a_group_works_in_conditions_and_search`.
