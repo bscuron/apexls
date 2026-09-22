@@ -385,3 +385,13 @@ and `x`, `s`, `m`. That also brings `~` into line with `regex:` and `comment:`, 
 case-sensitive all along. Globs stay case-insensitive: they are the Apex-aware form, and Apex
 names are case-insensitive. Guarded by `a_regex_condition_is_unanchored_and_takes_flags` and
 `a_regex_condition_rejects_bad_flags`.
+
+**24. Typed `when` arms, catch-clause runs, and quiet broken pipes.** `when $T $v { ... }`
+takes captures as a typed arm's type and variable. In a `try`, a `...` right before a `catch`, a
+`finally` or the pattern's end stands for any catch clauses, so `try { ... } ... finally { ... }`
+is "a try with a finally, whatever it catches" (5 on NPSP), and `try { ... } ...` finds all 785.
+After the last clause, a `...` still belongs to the enclosing block. Every subcommand now prints
+through one `outln!` that exits 0 on a broken pipe instead of panicking. Known limitation, seen
+here: when `...` lets a pattern match more than one way, the matcher keeps the *first* binding,
+and conditions test only that one -- in `switch on $o { ... when $T $v { ... } ... }`, `$T` is
+the first typed arm, so `--and '$T ~ Contact'` misses a `Contact` arm that is not first.

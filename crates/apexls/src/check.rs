@@ -44,7 +44,7 @@ pub fn run(paths: &[PathBuf]) -> ExitCode {
     };
 
     for f in &findings {
-        println!(
+        outln!(
             "{}:{}:{}: {}: {}",
             f.path.display(),
             f.line,

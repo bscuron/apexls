@@ -148,9 +148,12 @@ fn when_control(p: &mut Parser<'_>) -> CompletedMarker {
 /// corruption.
 fn when_value(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
+    // A capture can be the type or the variable of a type arm: `when $T $v`.
+    let at_type = super::types::at_type_start(p) || p.at(SyntaxKind::PatternCapture) && p.at_hole();
+    let then_name = super::ids::is_id_kind(p.nth(1)) || p.nth(1) == SyntaxKind::PatternCapture;
     if p.at(SyntaxKind::Else) {
         p.bump();
-    } else if super::types::at_type_start(p) && super::ids::is_id_kind(p.nth(1)) {
+    } else if at_type && then_name {
         super::types::type_ref(p);
         super::ids::expect_name(p);
     } else {
@@ -337,9 +340,24 @@ fn try_stmt(p: &mut Parser<'_>) -> CompletedMarker {
     p.bump(); // try
     block(p);
     let mut has_catch = false;
-    while p.at(SyntaxKind::Catch) {
+    loop {
+        if p.at(SyntaxKind::Catch) {
+            catch_clause(p);
+        } else if p.at_ellipsis()
+            && matches!(
+                p.nth(1),
+                SyntaxKind::Catch | SyntaxKind::Finally | SyntaxKind::Eof
+            )
+        {
+            // Any number of catch clauses: `try { ... } ... finally { ... }`.
+            // Only right before a `catch`, a `finally` or the pattern's end,
+            // so `{ ... try { } catch (...) { } ... }` keeps its last `...`
+            // for the enclosing block's statements.
+            p.bump_hole();
+        } else {
+            break;
+        }
         has_catch = true;
-        catch_clause(p);
     }
     if p.at(SyntaxKind::Finally) {
         finally_block(p);

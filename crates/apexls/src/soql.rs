@@ -90,7 +90,7 @@ pub fn run(paths: &[PathBuf]) -> ExitCode {
     // whitespace-collapsed (see `collapse`), since real inline SOQL is
     // routinely written across half a dozen lines.
     for q in &queries {
-        println!("{q}");
+        outln!("{q}");
     }
 
     ExitCode::SUCCESS

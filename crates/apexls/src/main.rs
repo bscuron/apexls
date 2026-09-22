@@ -6,6 +6,17 @@
 //! `apexls-server` directly by name, over stdio, need zero changes; see
 //! `apexls_server::run_server`'s own doc comment).
 
+/// `println!`, except that a closed stdout ends the program quietly.
+///
+/// `apexls query ... | head` closes the pipe after ten lines, and that is
+/// the reader being done, not an error -- `println!` panicked there instead.
+/// Defined before the `mod` declarations so every subcommand sees it.
+macro_rules! outln {
+    ($($arg:tt)*) => {
+        $crate::write_stdout_line(format_args!($($arg)*))
+    };
+}
+
 mod ast;
 mod check;
 mod fix;
@@ -72,6 +83,19 @@ enum Command {
         not: Vec<String>,
         paths: Vec<PathBuf>,
     },
+}
+
+/// Write one line to stdout for [`outln!`]. A broken pipe exits 0, since
+/// the reader has everything it asked for; any other failure exits 1.
+pub(crate) fn write_stdout_line(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    if let Err(e) = writeln!(std::io::stdout().lock(), "{args}") {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("error: writing output: {e}");
+        std::process::exit(1);
+    }
 }
 
 fn main() -> ExitCode {

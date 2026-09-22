@@ -55,7 +55,7 @@ pub fn run(paths: &[PathBuf]) -> ExitCode {
     let mut any_conflicts = false;
     for outcome in &outcomes {
         for f in &outcome.applied {
-            println!(
+            outln!(
                 "{}:{}:{}: fixed: {}",
                 outcome.display_path.display(),
                 f.line,
@@ -64,7 +64,7 @@ pub fn run(paths: &[PathBuf]) -> ExitCode {
             );
         }
         for f in &outcome.conflicts {
-            println!(
+            outln!(
                 "{}:{}:{}: skipped (conflicts with another fix): {}",
                 outcome.display_path.display(),
                 f.line,

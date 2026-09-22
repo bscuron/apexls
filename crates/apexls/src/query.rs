@@ -578,7 +578,7 @@ pub fn run(
     };
 
     for m in &matches {
-        println!("{m}");
+        outln!("{m}");
     }
 
     // A refused file is an error even though the others were rewritten:
@@ -2772,6 +2772,54 @@ mod tests {
             filtered_hits("$F(...) { ... }", &["$F ~ c*"], &[], src).len(),
             1,
             "the name binds for conditions"
+        );
+    }
+
+    /// A capture can be a typed `when` arm's type or variable.
+    #[test]
+    fn a_typed_when_arm_takes_captures() {
+        let src = wrap("        switch on o {\n            when Account a { f(a); }\n            when Contact c { g(c); }\n            when else { h(); }\n        }");
+        assert_eq!(
+            hits("switch on $o { ... when $T $v { ... } ... }", &src).len(),
+            1
+        );
+        let arms = filtered_hits(
+            "switch on $o { ... when $T $v { ... } ... }",
+            &["$T ~ Account"],
+            &[],
+            &src,
+        );
+        assert_eq!(arms.len(), 1, "the type binds for conditions");
+    }
+
+    /// `...` before a `finally` or a `catch` stands for any catch clauses,
+    /// and after the last clause it still belongs to the enclosing block.
+    #[test]
+    fn an_ellipsis_stands_for_catch_clauses() {
+        let src = wrap("        try { a(); } catch (DmlException e) { b(); } finally { c(); }\n        try { a(); } finally { c(); }\n        try { a(); } catch (Exception e) { b(); }\n        d();");
+        assert_eq!(
+            hits("try { ... } ... finally { ... }", &src).len(),
+            2,
+            "any catches, even none"
+        );
+        assert_eq!(
+            hits("try { ... } finally { ... }", &src).len(),
+            1,
+            "exactly none"
+        );
+        assert_eq!(
+            hits("try { ... } ... catch (Exception $e) { ... }", &src).len(),
+            1
+        );
+        assert_eq!(
+            hits("try { ... } ...", &src).len(),
+            3,
+            "a trailing ellipsis: any clauses"
+        );
+        assert_eq!(
+            hits("{ ... try { ... } catch ($E $e) { ... } ... }", &src).len(),
+            1,
+            "a statement run after the try, not its clauses"
         );
     }
 

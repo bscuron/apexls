@@ -37,17 +37,17 @@ fn run_on_worker_thread(path: &Path) -> ExitCode {
     };
 
     let parse = apex_parser::parse_compilation_unit(&src);
-    println!("{:#?}", parse.syntax());
+    outln!("{:#?}", parse.syntax());
 
     let rendered = apex_printer::render(&parse.syntax());
     let round_trips = rendered == src;
 
-    println!("---");
-    println!("{} error(s)", parse.errors.len());
+    outln!("---");
+    outln!("{} error(s)", parse.errors.len());
     for e in &parse.errors {
-        println!("  {} (byte offset {})", e.message, e.offset);
+        outln!("  {} (byte offset {})", e.message, e.offset);
     }
-    println!("round-trips exactly: {round_trips}");
+    outln!("round-trips exactly: {round_trips}");
 
     if round_trips {
         ExitCode::SUCCESS
