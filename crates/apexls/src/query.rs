@@ -294,6 +294,11 @@ impl Replacement {
     }
 }
 
+/// The usual cause of a `$NAME` that vanished before apexls saw it.
+const SHELL_QUOTES_NOTE: &str =
+    "note: a shell expands `$1` and `$v` inside double quotes, usually to nothing; \
+     quote patterns, conditions and templates with single quotes, e.g. -r '$1 => x'";
+
 /// What `--replace` rewrites: the whole match, or some of its `${...}`
 /// groups, each with its own template.
 enum Rewrite {
@@ -325,6 +330,14 @@ impl Rewrite {
                         return Err(err(format!("error: group ${number} is rewritten twice")));
                     }
                     by_group.push((number, Replacement::compile(template, bound)?));
+                }
+                // No template starts with `=>`, so one that does lost its
+                // `$N` on the way in -- almost always a shell expanding `$1`
+                // inside double quotes, to nothing.
+                None if src.trim_start().starts_with("=>") => {
+                    return Err(err(format!(
+                        "error: --replace `{src}` starts with `=>`, so the `$N` before it is missing\n{SHELL_QUOTES_NOTE}"
+                    )));
                 }
                 None => whole.push(Replacement::compile(src, bound)?),
             }
@@ -439,6 +452,13 @@ enum GlobPart {
 
 impl Condition {
     fn compile(src: &str, bound: &std::collections::HashSet<String>) -> Result<Self, ArgError> {
+        // Likewise a condition starting `~` or `:` lost its `$NAME`.
+        if matches!(src.trim_start().chars().next(), Some('~' | ':')) {
+            return Err(ArgError(
+                format!("error: condition `{src}` has no capture before its operator\n{SHELL_QUOTES_NOTE}"),
+                2,
+            ));
+        }
         let Some((name, of_type, rhs)) = split_text_condition(src) else {
             return Pattern::compile(src).map(Condition::Contains);
         };
@@ -914,11 +934,18 @@ impl Pattern {
             }
         }
 
+        // `@{` is the one near miss worth naming: it looks like a group and
+        // is what the group syntax was first sketched as.
+        let group_hint = if pattern_src.contains("@{") {
+            "\nnote: a capture group is written `${...}`, not `@{...}`"
+        } else {
+            ""
+        };
         Err(ArgError(
             format!(
                 "error: could not parse pattern as Apex: {pattern_src}\n\
                  note: a pattern must be one complete expression, statement, block, catch clause or class member\n\
-                 note: a method needs its body -- `void $m(...) {{ ... }}` -- or a `;` if it has none"
+                 note: a method needs its body -- `void $m(...) {{ ... }}` -- or a `;` if it has none{group_hint}"
             ),
             2,
         ))
@@ -3422,6 +3449,11 @@ mod tests {
         assert!(err("$M ~ {a,b").contains("unclosed"));
         assert!(err("$M ~ /(/").contains("invalid regex"));
         assert!(
+            err(" ~ a*").contains("no capture before its operator"),
+            "a shell ate `$M`"
+        );
+        assert!(err(" : String").contains("single quotes"));
+        assert!(
             Condition::compile("$M.foo()", &bound).is_ok(),
             "no `~`, so a pattern"
         );
@@ -3816,6 +3848,12 @@ mod tests {
         assert!(err("f(${$x})", &["whole", "$1 => y"]).contains("cannot be combined"));
         assert!(err("f(${$x})", &["one", "two"]).contains("only one --replace"));
         assert!(err("${f($x)}", &["x"]).contains("whole pattern"));
+        let lost = err("f(${$x})", &[" => ''"]);
+        assert!(
+            lost.contains("the `$N` before it is missing") && lost.contains("single quotes"),
+            "{lost}"
+        );
+        assert!(err("f(@{$x})", &["x"]).contains("written `${...}`"));
         let (after, _) = rewrite("f(${$x})", &["$1.trim()"], &src).unwrap();
         assert!(
             after.contains("a.trim()") && !after.contains("f("),
