@@ -6,10 +6,13 @@
 //! `apexls-server` directly by name, over stdio, need zero changes; see
 //! `apexls_server::run_server`'s own doc comment).
 
-/// `println!`, except that a closed stdout ends the program quietly.
+/// `println!`, but buffered, and a closed stdout ends the program quietly.
 ///
-/// `apexls query ... | head` closes the pipe after ten lines, and that is
-/// the reader being done, not an error -- `println!` panicked there instead.
+/// Buffered because `println!` writes and flushes each line on its own:
+/// 11,000 hits written to a file cost ~250 ms that way, more than the search
+/// that found them. `main` flushes once on the way out. And quiet on a
+/// broken pipe because `apexls query ... | head` closes it after ten lines,
+/// which is the reader being done, not an error -- `println!` panicked.
 /// Defined before the `mod` declarations so every subcommand sees it.
 macro_rules! outln {
     ($($arg:tt)*) => {
@@ -85,20 +88,47 @@ enum Command {
     },
 }
 
-/// Write one line to stdout for [`outln!`]. A broken pipe exits 0, since
-/// the reader has everything it asked for; any other failure exits 1.
+/// The buffer behind [`outln!`], created on first use.
+static STDOUT: std::sync::Mutex<Option<std::io::BufWriter<std::io::Stdout>>> =
+    std::sync::Mutex::new(None);
+
+/// Write one line for [`outln!`] into the buffer.
 pub(crate) fn write_stdout_line(args: std::fmt::Arguments<'_>) {
     use std::io::Write;
-    if let Err(e) = writeln!(std::io::stdout().lock(), "{args}") {
-        if e.kind() == std::io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
-        }
-        eprintln!("error: writing output: {e}");
-        std::process::exit(1);
+    let mut out = STDOUT.lock().unwrap_or_else(|e| e.into_inner());
+    let out =
+        out.get_or_insert_with(|| std::io::BufWriter::with_capacity(64 * 1024, std::io::stdout()));
+    if let Err(e) = writeln!(out, "{args}") {
+        output_failed(e);
     }
 }
 
+/// Write out whatever [`outln!`] buffered. Called once, as `main` returns.
+fn flush_stdout() {
+    use std::io::Write;
+    let mut out = STDOUT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Err(e)) = out.as_mut().map(|o| o.flush()) {
+        output_failed(e);
+    }
+}
+
+/// A broken pipe exits 0, since the reader has everything it asked for;
+/// any other write failure exits 1.
+fn output_failed(e: std::io::Error) -> ! {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    eprintln!("error: writing output: {e}");
+    std::process::exit(1);
+}
+
 fn main() -> ExitCode {
+    let code = run_command();
+    flush_stdout();
+    code
+}
+
+fn run_command() -> ExitCode {
     match Cli::parse().command {
         Command::Server => {
             tokio::runtime::Builder::new_current_thread()
