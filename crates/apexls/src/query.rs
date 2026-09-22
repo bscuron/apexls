@@ -110,8 +110,16 @@
 //!   quietly match lowercase, and `~` would disagree with `regex:` and
 //!   `comment:`, which were always case-sensitive.
 //!
-//! The two cannot be confused: `~` is only ever a prefix operator in Apex,
-//! so `$X ~` never starts a pattern. There is no `--or` -- alternation
+//! - **`$X : TYPE`** -- the capture's *type* matches, as the binder infers
+//!   it: `$v : String`, `$l : List<*>`. The same glob, but over the type's
+//!   text, and a `$V` inside it is V's *type*, so `--not '$a : $b'` says two
+//!   expressions differ in type where `--not '$a ~ $b'` says they differ in
+//!   spelling. A capture the binder could not type fails every `:` test,
+//!   so `--not` keeps it. Only a `:` condition binds the project, costing
+//!   a whole-project bind; every other query stays parse-only.
+//!
+//! The forms cannot be confused: `~` is only ever a prefix operator in
+//! Apex, and no Apex construct starts `$X :`, so neither starts a pattern. There is no `--or` -- alternation
 //! inside a glob or regex covers the common case, `$M ~ {add,remove}*` --
 //! and no boolean operators inside a condition, which keeps each one
 //! readable on its own.
@@ -331,7 +339,13 @@ enum Pattern {
 /// be confused.
 enum Condition {
     Contains(Pattern),
-    Text { name: String, test: TextTest },
+    /// `$X ~ ...` when `of_type` is false, `$X : ...` when it is true: the
+    /// same test, over the capture's text or over its inferred type.
+    Text {
+        name: String,
+        test: TextTest,
+        of_type: bool,
+    },
 }
 
 /// How a capture's text is tested.
@@ -351,7 +365,7 @@ enum GlobPart {
 
 impl Condition {
     fn compile(src: &str, bound: &std::collections::HashSet<String>) -> Result<Self, ArgError> {
-        let Some((name, rhs)) = split_text_condition(src) else {
+        let Some((name, of_type, rhs)) = split_text_condition(src) else {
             return Pattern::compile(src).map(Condition::Contains);
         };
         let require_bound = |name: &str| {
@@ -383,25 +397,48 @@ impl Condition {
                 if refers {
                     TextTest::Template(parts)
                 } else {
-                    TextTest::Regex(case_insensitive(&anchored(&parts, &Binds::new()))?)
+                    let re = anchored(&parts, |_| None).unwrap_or_default();
+                    TextTest::Regex(case_insensitive(&re)?)
                 }
             }
         };
-        Ok(Condition::Text { name, test })
+        Ok(Condition::Text {
+            name,
+            test,
+            of_type,
+        })
     }
 
-    fn holds(&self, node: &SyntaxNode, binds: &Binds) -> bool {
+    fn needs_types(&self) -> bool {
+        matches!(self, Condition::Text { of_type: true, .. })
+    }
+
+    fn holds(&self, node: &SyntaxNode, binds: &Binds, types: Option<&Types<'_>>) -> bool {
         match self {
             Condition::Contains(pattern) => !pattern.matches_in(node).is_empty(),
-            Condition::Text { name, test } => {
-                let Some(text) = binds.get(name) else {
+            Condition::Text {
+                name,
+                test,
+                of_type,
+            } => {
+                // What a capture is tested on: its text, or its type --
+                // `None` for a type the binder could not infer, which
+                // fails the test either way.
+                let subject = |name: &str| -> Option<String> {
+                    if *of_type {
+                        types?.of_capture(name, binds)
+                    } else {
+                        Some(binds.get(name).cloned().unwrap_or_default())
+                    }
+                };
+                let Some(value) = binds.contains_key(name).then(|| subject(name)).flatten() else {
                     return false;
                 };
                 match test {
-                    TextTest::Regex(re) => re.is_match(text),
-                    TextTest::Template(parts) => {
-                        case_insensitive(&anchored(parts, binds)).is_ok_and(|re| re.is_match(text))
-                    }
+                    TextTest::Regex(re) => re.is_match(&value),
+                    TextTest::Template(parts) => anchored(parts, subject)
+                        .and_then(|re| case_insensitive(&re).ok())
+                        .is_some_and(|re| re.is_match(&value)),
                 }
             }
         }
@@ -409,18 +446,116 @@ impl Condition {
 }
 
 /// Every `--and` holds and no `--not` does.
-fn passes(node: &SyntaxNode, binds: &Binds, ands: &[Condition], nots: &[Condition]) -> bool {
-    ands.iter().all(|c| c.holds(node, binds)) && !nots.iter().any(|c| c.holds(node, binds))
+fn passes(
+    node: &SyntaxNode,
+    binds: &Binds,
+    ands: &[Condition],
+    nots: &[Condition],
+    types: Option<&Types<'_>>,
+) -> bool {
+    ands.iter().all(|c| c.holds(node, binds, types))
+        && !nots.iter().any(|c| c.holds(node, binds, types))
 }
 
-/// `$X ~ rest` -> `("X", " rest")`, or `None` for a pattern condition.
-/// `$...X ~` names a sequence capture, whose bound text is its whole run.
-fn split_text_condition(src: &str) -> Option<(String, &str)> {
+/// `$X ~ rest` -> `("X", false, " rest")` and `$X : rest` -> `("X", true,
+/// " rest")`, or `None` for a pattern condition. `$...X` names a sequence
+/// capture, whose bound text is its whole run.
+fn split_text_condition(src: &str) -> Option<(String, bool, &str)> {
     let rest = src.trim_start().strip_prefix(HOLE_CAPTURE_SIGIL)?;
     let rest = rest.strip_prefix("...").unwrap_or(rest);
     let (name, after) = rest.split_at(name_len(rest));
-    let rhs = after.trim_start().strip_prefix('~')?;
-    (!name.is_empty()).then(|| (name.to_string(), rhs))
+    let after = after.trim_start();
+    let (of_type, rhs) = match after.strip_prefix('~') {
+        Some(rhs) => (false, rhs),
+        None => (true, after.strip_prefix(':')?),
+    };
+    (!name.is_empty()).then(|| (name.to_string(), of_type, rhs))
+}
+
+/// Set once a `:` condition is compiled: captures then also record where
+/// they matched, so their inferred type can be looked up. Off otherwise,
+/// so no other query pays for positions it never reads.
+static CAPTURE_RANGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Where a capture matched, kept in the bindings under `@NAME` so it
+/// backtracks with them -- no capture can be named `@NAME`. `T` marks a
+/// captured type reference, whose type is its own text.
+fn record_capture_range(binds: &mut Binds, name: &str, src: &SyntaxElement) {
+    let range = src.text_range();
+    let is_type = src.kind() == SyntaxKind::Type;
+    binds.insert(
+        format!("@{name}"),
+        format!(
+            "{}:{}{}",
+            u32::from(range.start()),
+            u32::from(range.end()),
+            if is_type { ":T" } else { "" }
+        ),
+    );
+}
+
+/// What `:` conditions read: the bound project, and where each searched
+/// file sits in it.
+struct TypeContext {
+    program: apex_binder::BoundProgram,
+    file_ids: HashMap<PathBuf, apex_binder::FileId>,
+}
+
+impl TypeContext {
+    fn new(root: &Path, cwd: &Path) -> Self {
+        let program = apex_binder::BoundProgram::from_files(root);
+        let file_ids = program
+            .files()
+            .map(|file| {
+                let path = program.file_path(file);
+                (path.strip_prefix(cwd).unwrap_or(path).to_path_buf(), file)
+            })
+            .collect();
+        TypeContext { program, file_ids }
+    }
+
+    fn for_file(&self, display_path: &Path) -> Option<Types<'_>> {
+        Some(Types {
+            program: &self.program,
+            file: *self.file_ids.get(display_path)?,
+            bodies: std::cell::RefCell::default(),
+        })
+    }
+}
+
+/// One file's type lookups, re-binding each method body at most once.
+struct Types<'a> {
+    program: &'a apex_binder::BoundProgram,
+    file: apex_binder::FileId,
+    #[allow(clippy::type_complexity)]
+    bodies: std::cell::RefCell<
+        HashMap<apex_binder::SymbolId, Vec<(apex_syntax::TextRange, SyntaxKind, String)>>,
+    >,
+}
+
+impl Types<'_> {
+    /// The capture's inferred type, if the binder has one. A captured type
+    /// reference (`$T` in `List<$T>`) is its own text: it names a type
+    /// rather than having one.
+    fn of_capture(&self, name: &str, binds: &Binds) -> Option<String> {
+        let at = binds.get(&format!("@{name}"))?;
+        let mut fields = at.split(':');
+        let start: u32 = fields.next()?.parse().ok()?;
+        let end: u32 = fields.next()?.parse().ok()?;
+        if fields.next() == Some("T") {
+            return binds.get(name).cloned();
+        }
+        let range = apex_syntax::TextRange::new(start.into(), end.into());
+        let callable = self.program.enclosing_callable(self.file, range.start())?;
+        let mut bodies = self.bodies.borrow_mut();
+        let types = bodies
+            .entry(callable)
+            .or_insert_with(|| self.program.expr_types_in(callable));
+        types
+            .iter()
+            .find(|(r, _, _)| *r == range)
+            .map(|(_, _, ty)| ty.clone())
+    }
 }
 
 fn name_len(s: &str) -> usize {
@@ -468,19 +603,19 @@ fn glob_parts(glob: &str) -> Result<Vec<GlobPart>, ArgError> {
     Ok(parts)
 }
 
-/// A glob's parts as one anchored regex, other captures' text as literals.
-fn anchored(parts: &[GlobPart], binds: &Binds) -> String {
+/// A glob's parts as one anchored regex, each other capture spliced in as
+/// a literal from `lookup` -- its text, or its type. `None` if a capture it
+/// names has nothing to splice (an untyped expression).
+fn anchored(parts: &[GlobPart], lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
     let mut re = String::from("^(?:");
     for part in parts {
         match part {
             GlobPart::Regex(s) => re.push_str(s),
-            GlobPart::Capture(name) => {
-                re.push_str(&regex::escape(binds.get(name).map_or("", String::as_str)))
-            }
+            GlobPart::Capture(name) => re.push_str(&regex::escape(&lookup(name)?)),
         }
     }
     re.push_str(")$");
-    re
+    Some(re)
 }
 
 /// `re/flags` (the part after the opening `/`) as a regex. Flags follow
@@ -560,13 +695,31 @@ pub fn run(
     };
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Only a `:` condition binds the project: a whole-project bind costs
+    // several times what a search does, and nothing else needs it.
+    let types = ands
+        .iter()
+        .chain(&nots)
+        .any(Condition::needs_types)
+        .then(|| {
+            CAPTURE_RANGES.store(true, std::sync::atomic::Ordering::Relaxed);
+            TypeContext::new(&crate::project::find_project_root(&cwd), &cwd)
+        });
+    let types = types.as_ref();
     let refused = std::sync::atomic::AtomicBool::new(false);
     let found = match &replacement {
-        Some(replacement) => {
-            run_replace(&pattern, replacement, &ands, &nots, paths, &cwd, &refused)
-        }
+        Some(replacement) => run_replace(
+            &pattern,
+            replacement,
+            &ands,
+            &nots,
+            types,
+            paths,
+            &cwd,
+            &refused,
+        ),
         None => walk_project(paths, &cwd, |path, src| {
-            matches_in_file_filtered(&pattern, &ands, &nots, path, src)
+            matches_in_file_filtered(&pattern, &ands, &nots, types, path, src)
         }),
     };
     let matches = match found {
@@ -1083,12 +1236,20 @@ fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) ->
             return true;
         }
         Some(Hole::AnyString) => return is_string_literal(src),
-        Some(Hole::Capture(_)) => {
+        Some(Hole::Capture(name)) => {
             let text = match src {
                 NodeOrToken::Token(t) => t.text().to_string(),
                 NodeOrToken::Node(n) => significant_text(n),
             };
-            return bind_capture(pat, &text, binds);
+            let record = CAPTURE_RANGES.load(std::sync::atomic::Ordering::Relaxed)
+                && !binds.contains_key(&name);
+            if !bind_capture(pat, &text, binds) {
+                return false;
+            }
+            if record {
+                record_capture_range(binds, &name, src);
+            }
+            return true;
         }
         None => {}
     }
@@ -1466,6 +1627,7 @@ fn matches_in_file_filtered(
     pattern: &Pattern,
     ands: &[Condition],
     nots: &[Condition],
+    types: Option<&TypeContext>,
     display_path: &Path,
     src: &str,
 ) -> Vec<Site> {
@@ -1505,6 +1667,7 @@ fn matches_in_file_filtered(
         _ => None,
     };
     let mut reported = std::collections::HashSet::new();
+    let file_types = types.and_then(|t| t.for_file(display_path));
     pattern
         .matches_with_binds(&root)
         .into_iter()
@@ -1515,7 +1678,7 @@ fn matches_in_file_filtered(
             };
             readings.into_iter().map(move |b| (node.clone(), b))
         })
-        .filter(|(node, binds)| passes(node, binds, ands, nots))
+        .filter(|(node, binds)| passes(node, binds, ands, nots, file_types.as_ref()))
         .filter_map(|(node, binds)| {
             let mut site = site_for(display_path, src, &index, &node)?;
             // Report at the `^` if the pattern has one; the text stays the
@@ -1542,12 +1705,22 @@ fn run_replace(
     replacement: &Replacement,
     ands: &[Condition],
     nots: &[Condition],
+    types: Option<&TypeContext>,
     paths: &[PathBuf],
     cwd: &Path,
     refused: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<Site>, ArgError> {
     walk_project(paths, cwd, |display_path, src| {
-        rewrite_file(pattern, replacement, ands, nots, display_path, src, refused)
+        rewrite_file(
+            pattern,
+            replacement,
+            ands,
+            nots,
+            types,
+            display_path,
+            src,
+            refused,
+        )
     })
 }
 
@@ -1561,6 +1734,7 @@ fn rewrite_file(
     replacement: &Replacement,
     ands: &[Condition],
     nots: &[Condition],
+    types: Option<&TypeContext>,
     display_path: &Path,
     src: &str,
     refused: &std::sync::atomic::AtomicBool,
@@ -1572,7 +1746,10 @@ fn rewrite_file(
     let matches: Vec<_> = pattern
         .matches_with_binds(&root)
         .into_iter()
-        .filter(|(node, binds)| passes(node, binds, ands, nots))
+        .filter(|(node, binds)| {
+            let file_types = types.and_then(|t| t.for_file(display_path));
+            passes(node, binds, ands, nots, file_types.as_ref())
+        })
         .collect();
 
     let mut edits = Vec::new();
@@ -1698,7 +1875,7 @@ fn widen_deletion_to_line(src: &str, start: usize, end: usize) -> (usize, usize)
 
 #[cfg(test)]
 fn matches_in_file(pattern: &Pattern, display_path: &Path, src: &str) -> Vec<Site> {
-    matches_in_file_filtered(pattern, &[], &[], display_path, src)
+    matches_in_file_filtered(pattern, &[], &[], None, display_path, src)
 }
 
 #[cfg(test)]
@@ -1728,9 +1905,42 @@ mod tests {
             &pattern,
             &compile(and),
             &compile(not),
+            None,
             Path::new("T.cls"),
             src,
         )
+    }
+
+    /// Like [`filtered_hits`], with `src` bound as a one-file project so
+    /// `:` conditions have types to read.
+    fn typed_hits(pattern: &str, and: &[&str], not: &[&str], src: &str) -> Vec<String> {
+        static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "apexls-query-types-{}-{}",
+            std::process::id(),
+            RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("T.cls"), src).unwrap();
+        CAPTURE_RANGES.store(true, std::sync::atomic::Ordering::Relaxed);
+        let types = TypeContext::new(&dir, &dir);
+        let pattern = Pattern::compile(pattern).expect("pattern should compile");
+        let bound = pattern.capture_names();
+        let compile = |srcs: &[&str]| -> Vec<Condition> {
+            srcs.iter()
+                .map(|s| Condition::compile(s, &bound).unwrap_or_else(|e| panic!("{}", e.0)))
+                .collect()
+        };
+        let sites = matches_in_file_filtered(
+            &pattern,
+            &compile(and),
+            &compile(not),
+            Some(&types),
+            Path::new("T.cls"),
+            src,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        sites.into_iter().map(|s| s.text).collect()
     }
 
     fn wrap(body: &str) -> String {
@@ -3053,6 +3263,84 @@ mod tests {
             .map(|e| e.0)
             .unwrap_or_default();
         assert!(err.contains("only one `^`"), "{err}");
+    }
+
+    /// `$x : TYPE` tests the type the binder infers -- of a local, a
+    /// literal, a call's return, a query -- as a glob over its text.
+    #[test]
+    fn a_type_condition_tests_the_inferred_type() {
+        let src = "public class T {\n    void go(Integer n, List<Account> accs) {\n        String s = 'a';\n        System.debug(s);\n        System.debug(n);\n        System.debug('lit');\n        System.debug(accs);\n        System.debug(s.length());\n        System.debug([SELECT Id FROM Contact]);\n    }\n}\n";
+        let debug = |ty: &str| typed_hits("System.debug($v)", &[&format!("$v : {ty}")], &[], src);
+        assert_eq!(
+            debug("String"),
+            ["System.debug(s)", "System.debug('lit')"],
+            "a local and a literal"
+        );
+        assert_eq!(
+            debug("integer"),
+            ["System.debug(n)", "System.debug(s.length())"],
+            "a parameter and a return, any case"
+        );
+        assert_eq!(
+            debug("List<*>"),
+            [
+                "System.debug(accs)",
+                "System.debug([SELECT Id FROM Contact])"
+            ],
+            "a glob"
+        );
+        assert_eq!(
+            debug("List<Contact>"),
+            ["System.debug([SELECT Id FROM Contact])"],
+            "a query's rows"
+        );
+    }
+
+    /// Inside `:`, `$b` is b's *type*, so `$a : $b` compares types where
+    /// `$a ~ $b` compares spelling; an untyped capture fails either way.
+    #[test]
+    fn a_type_condition_compares_two_captures() {
+        let src = "public class T {\n    void go(Integer i, Integer j, String s, Object o) {\n        f(i, j);\n        f(i, s);\n        f(i, undeclared);\n    }\n}\n";
+        assert_eq!(
+            typed_hits("f($a, $b)", &["$a : $b"], &[], src),
+            ["f(i, j)"],
+            "same type, different spelling"
+        );
+        assert_eq!(
+            typed_hits("f($a, $b)", &[], &["$a : $b"], src),
+            ["f(i, s)", "f(i, undeclared)"],
+            "--not keeps the untyped"
+        );
+        assert_eq!(
+            typed_hits("f($a, $b)", &["$b : *"], &[], src),
+            ["f(i, j)", "f(i, s)"],
+            "`*` means typed at all"
+        );
+    }
+
+    /// A type condition only reads a capture the pattern binds, and without
+    /// a bound project it can never hold.
+    #[test]
+    fn a_type_condition_needs_a_bound_capture() {
+        let bound = Pattern::compile("f($a)").unwrap().capture_names();
+        let err = |c: &str| {
+            Condition::compile(c, &bound)
+                .err()
+                .map(|e| e.0)
+                .unwrap_or_default()
+        };
+        assert!(err("$x : String").contains("not a capture"));
+        assert!(Condition::compile("$a : String", &bound)
+            .unwrap()
+            .needs_types());
+        assert!(!Condition::compile("$a ~ String", &bound)
+            .unwrap()
+            .needs_types());
+        let src = wrap("        f(1);");
+        assert!(
+            filtered_hits("f($a)", &["$a : Integer"], &[], &src).is_empty(),
+            "no project bound"
+        );
     }
 
     #[test]

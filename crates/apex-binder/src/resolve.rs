@@ -825,6 +825,12 @@ pub(crate) struct BodyBinder<'a> {
     pub(crate) scopes: ScopeTree,
     pending_locals: Vec<Symbol>,
     type_mismatches: Vec<TypeMismatch>,
+    /// Every expression's inferred type, rendered as text, when a caller
+    /// asked for them ([`body_expr_types`]); `None` for every normal bind,
+    /// which then pays one never-taken branch per expression and nothing
+    /// else. Rendered on the spot rather than kept as `Ty`, since a
+    /// project type's id needs no remapping once it is text.
+    expr_types: Option<Vec<(SyntaxPtr, SmolStr)>>,
     pub(crate) file: FileId,
     /// The enclosing type, for `this`/`super`/unqualified member lookup
     /// fallthrough once local-scope lookup misses. `None` when binding a
@@ -867,6 +873,7 @@ pub(crate) fn bind_body(
         scopes,
         pending_locals: Vec::new(),
         type_mismatches: Vec::new(),
+        expr_types: None,
         file,
         enclosing_type,
         enclosing_member,
@@ -877,6 +884,78 @@ pub(crate) fn bind_body(
     }
     binder.bind_block_stmts(root_scope, block);
     binder.into_bound_body()
+}
+
+/// What an inline query evaluates to: `Integer` for a bare `COUNT()`,
+/// `List<AggregateResult>` for any other aggregate or a `GROUP BY`, and
+/// otherwise a list of the queried object -- which Apex also lets a
+/// one-row query assign to a single record, a conversion, not the type.
+fn soql_result_type(sq: &apex_syntax::ast::soql::SoqlExpr) -> Option<SmolStr> {
+    let object = sq.from_list()?.entries().next()?.text();
+    let entries: Vec<_> = sq.select_list()?.entries().collect();
+    let function_named = |f: &apex_syntax::ast::soql::SoqlFunction, names: &[&str]| {
+        f.name_token()
+            .is_some_and(|t| names.iter().any(|n| t.text().eq_ignore_ascii_case(n)))
+    };
+    if let [only] = entries.as_slice() {
+        if let Some(f) = only.function() {
+            if function_named(&f, &["COUNT"]) && f.field_name().is_none() && f.nested_function().is_none() {
+                return Some(SmolStr::new_static("Integer"));
+            }
+        }
+    }
+    let aggregate = ["COUNT", "COUNT_DISTINCT", "SUM", "AVG", "MIN", "MAX"];
+    if sq.group_by().is_some()
+        || entries
+            .iter()
+            .any(|e| e.function().is_some_and(|f| function_named(&f, &aggregate)))
+    {
+        return Some(SmolStr::new_static("List<AggregateResult>"));
+    }
+    Some(SmolStr::from(format!("List<{object}>")))
+}
+
+/// Re-binds one method/constructor/accessor body exactly as [`bind_body`]
+/// does, but keeping every expression's inferred type -- what
+/// `crate::BoundProgram::expr_types_in` hands to a caller asking "what type
+/// is this expression" (`apexls query ... --and '$v : String'`). A
+/// separate re-bind of just the one body rather than a table filled during
+/// the normal bind, so no other caller pays for types it never asks about.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn body_expr_types(
+    table: &SymbolTable,
+    schema: &SchemaIndex,
+    stdlib: &StdlibIndex,
+    labels: &LabelIndex,
+    pages: &PageIndex,
+    file: FileId,
+    enclosing_type: Option<SymbolId>,
+    enclosing_member: Option<SymbolId>,
+    params: &[SymbolId],
+    block: &Block,
+) -> Vec<(SyntaxPtr, SmolStr)> {
+    let (scopes, root_scope) = ScopeTree::new_root(ScopeKind::Body, block.syntax().text_range());
+    let mut binder = BodyBinder {
+        table,
+        schema,
+        stdlib,
+        labels,
+        pages,
+        refs: ReferenceTable::default(),
+        scopes,
+        pending_locals: Vec::new(),
+        type_mismatches: Vec::new(),
+        expr_types: Some(Vec::new()),
+        file,
+        enclosing_type,
+        enclosing_member,
+    };
+    for &p in params {
+        let name = binder.table.get(p).name.clone();
+        binder.scopes.bind(root_scope, name, p);
+    }
+    binder.bind_block_stmts(root_scope, block);
+    binder.expr_types.unwrap_or_default()
 }
 
 /// Binds a `TriggerBlock`'s bare top-level statements -- the trigger's
@@ -907,6 +986,7 @@ pub(crate) fn bind_trigger_body(
         scopes,
         pending_locals: Vec::new(),
         type_mismatches: Vec::new(),
+        expr_types: None,
         file,
         enclosing_type,
         enclosing_member: None,
@@ -945,6 +1025,7 @@ pub(crate) fn bind_initializer(
         scopes,
         pending_locals: Vec::new(),
         type_mismatches: Vec::new(),
+        expr_types: None,
         file,
         enclosing_type,
         enclosing_member: None,
@@ -991,6 +1072,7 @@ pub(crate) fn body_binder_for_completion<'a>(
         scopes,
         pending_locals: Vec::new(),
         type_mismatches: Vec::new(),
+        expr_types: None,
         file,
         enclosing_type,
         enclosing_member,
@@ -2285,6 +2367,56 @@ impl<'a> BodyBinder<'a> {
     /// available when overload resolution narrowed to exactly one
     /// candidate).
     pub(crate) fn bind_expr(&mut self, scope: ScopeId, expr: &Expr) -> Option<Ty> {
+        let ty = self.bind_expr_untracked(scope, expr);
+        if self.expr_types.is_some() {
+            let text = ty
+                .as_ref()
+                .and_then(|ty| self.render_ty(ty))
+                .or_else(|| self.recorded_only_type(expr));
+            if let Some(text) = text {
+                let ptr = SyntaxPtr::new(self.file, expr.syntax());
+                if let Some(types) = &mut self.expr_types {
+                    types.push((ptr, text));
+                }
+            }
+        }
+        ty
+    }
+
+    /// A type worth reporting that the walker itself does not chain: an
+    /// inline query's result.
+    ///
+    /// Recorded only, never returned from `bind_expr`, because the rest of
+    /// Pass 2 reads those return values -- the type-mismatch checks among
+    /// them -- and a query typed `List<Account>` would start flagging
+    /// `Account a = [SELECT ...]`, which Apex accepts for a one-row query.
+    fn recorded_only_type(&self, expr: &Expr) -> Option<SmolStr> {
+        match expr {
+            Expr::Soql(sq) => soql_result_type(sq),
+            _ => None,
+        }
+    }
+
+    /// A type as Apex spells it -- `String`, `List<Account>`, a project
+    /// class's own name -- with `?` for a type argument nothing more is
+    /// known about. `None` for a still-sentinel project id, which a type
+    /// never is (only locals are declared inside a body).
+    fn render_ty(&self, ty: &Ty) -> Option<SmolStr> {
+        match ty {
+            Ty::Project(id) if id.local >= LOCAL_SENTINEL_BASE => None,
+            Ty::Project(id) => Some(self.table.get(*id).name.clone()),
+            Ty::System { name, args } if args.is_empty() => Some(name.clone()),
+            Ty::System { name, args } => {
+                let args: Vec<SmolStr> = args
+                    .iter()
+                    .map(|a| self.render_ty(a).unwrap_or(SmolStr::new_static("?")))
+                    .collect();
+                Some(SmolStr::from(format!("{name}<{}>", args.join(", "))))
+            }
+        }
+    }
+
+    fn bind_expr_untracked(&mut self, scope: ScopeId, expr: &Expr) -> Option<Ty> {
         match expr {
             Expr::Literal(lit) => lit.token().and_then(|t| Ty::for_literal(t.kind())),
             Expr::Name(n) => self.bind_name_expr(scope, n),

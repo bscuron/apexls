@@ -1342,6 +1342,48 @@ impl BoundProgram {
             .map(|(local, _)| SymbolId::new(file, local as u32))
     }
 
+    /// Every expression type the binder infers inside `callable`'s body --
+    /// a method or constructor -- as `(range, kind, type)`, the type
+    /// spelled as Apex does (`String`, `List<Account>`). An expression the
+    /// binder could not type is simply absent.
+    ///
+    /// Re-binds that one body on demand rather than reading a table from
+    /// the normal bind, which keeps no types at all: only a caller that
+    /// asks pays, and only for the bodies it asks about. The range and kind
+    /// identify the expression in any tree parsed from the same text.
+    pub fn expr_types_in(
+        &self,
+        callable: SymbolId,
+    ) -> Vec<(rowan::TextRange, apex_syntax::SyntaxKind, String)> {
+        let symbol = self.symbols.get(callable);
+        let root = self.syntax(symbol.file);
+        let node = symbol.ptr.to_node(&root);
+        let body = match symbol.kind {
+            SymbolKind::Method => node.and_then(MethodDecl::cast).and_then(|m| m.body()),
+            SymbolKind::Constructor => node.and_then(ConstructorDecl::cast).and_then(|c| c.body()),
+            _ => None,
+        };
+        let Some(body) = body else {
+            return Vec::new();
+        };
+        let params = self.symbols.params(callable);
+        resolve::body_expr_types(
+            &self.symbols,
+            &self.schema,
+            &self.stdlib,
+            &self.labels,
+            &self.pages,
+            symbol.file,
+            symbol.container,
+            Some(callable),
+            &params,
+            &body,
+        )
+        .into_iter()
+        .map(|(ptr, text)| (ptr.range(), ptr.kind(), text.to_string()))
+        .collect()
+    }
+
     /// Whether `file` currently has Pass 2 (body/reference) data bound in
     /// this snapshot -- `false` for a declaration-only file outside the
     /// Pass 2 working set (ticket 04, `.scratch/apex-memory/`), or for a

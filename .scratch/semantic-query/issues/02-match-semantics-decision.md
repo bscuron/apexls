@@ -420,3 +420,21 @@ the bindings, which are cloned for every candidate, and a seen candidate is refu
 compared; together that took the NPSP run from 801 ms to about 315 ms, against 210 ms without the
 `^`, for 1,703 hits instead of 810. Patterns without a `^` are untouched. Guarded by
 `a_caret_reports_every_place_it_lands`.
+
+**27. `$X : TYPE` tests a capture's inferred type.** The same glob as `~`, over the type's text as
+the binder spells it (`String`, `List<Account>`), case-insensitive; inside it `$V` is V's *type*,
+so `$a : $b` compares types where `$a ~ $b` compares spelling. An untyped capture fails every `:`
+test, so `--not` keeps it; `$v : *` means "typed at all". Only a `:` condition binds the project
+(~0.35 s on NPSP); everything else stays parse-only, confirmed by timing. The binder keeps no
+types during a normal bind: `BoundProgram::expr_types_in(callable)` re-binds one method or
+constructor body with a recorder switched on, so the server and `check` pay one never-taken branch
+per expression -- `check` on NPSP timed 488 vs 490 ms, with identical output. Types are rendered to
+text as they are recorded, so no symbol id needs remapping. Inline SOQL is typed on the recording
+path only (`List<Object__c>`, `Integer` for a bare `COUNT()`, `List<AggregateResult>` for
+aggregates), never returned into Pass 2, where it would start flagging `Account a = [SELECT ...]`.
+Coverage measured on NPSP before building the condition: 88% of 437,259 expressions in 12,348
+bodies typed, 100% of the 35 single-argument `System.debug($v)` calls; the largest remaining gap is
+SObject field types. Known limits: only method and constructor bodies, and a captured type
+reference (`$T` in `List<$T>`) is compared by its text, not resolved. Guarded by
+`a_type_condition_tests_the_inferred_type`, `a_type_condition_compares_two_captures` and
+`a_type_condition_needs_a_bound_capture`.
