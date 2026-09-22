@@ -136,7 +136,7 @@ syntax_kind! {
 
         // ---- Structural search ----
         // Never produced by the lexer; see `apex_lexer::TokenKind::PatternHole`.
-        PatternHole, PatternCapture, PatternSeqCapture, PatternGlob,
+        PatternHole, PatternCapture, PatternSeqCapture,
     }
     nodes {
         // ---- Roots (fragment-parse entry points) / recovery ----

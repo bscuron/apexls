@@ -337,13 +337,6 @@ pub enum TokenKind {
     /// `f($...ARGS)` carry a call's arguments across a replacement
     /// whatever their number.
     PatternSeqCapture,
-    /// A structural-search identifier glob (`addChild*`, `*Test`, `get?`).
-    ///
-    /// Never produced by `tokenize`. Folded from an adjacent run of
-    /// identifier and `*`/`?` tokens, so `addChild*` is one glob while
-    /// `a * b` stays a multiplication -- adjacency is what tells them
-    /// apart, since the lexer has no notion of either.
-    PatternGlob,
     Eof,
 }
 

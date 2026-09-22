@@ -90,23 +90,37 @@
 //! rather than an identifier, and a hardcoded Salesforce Id is a string of
 //! a particular length and alphabet that no tree shape distinguishes.
 //!
-//! **`--not` and `--containing`** filter a match by what it holds, which is
-//! how a question about *absence* gets asked at all. "Contains" includes
-//! the match itself, not only its descendants, so a negation can narrow a
-//! pattern rather than only exclude what is nested inside it:
-//! `kind:SoqlExpr --not kind:SoqlWhereClause --not kind:SoqlLimit` is
-//! "a query with neither clause", and all three name the same node.
+//! **`--and COND` and `--not COND`** keep a match when every `--and` holds
+//! and no `--not` does. The division of labour is the whole design: the
+//! pattern says the *structure*, `~` says the *text*, and the two flags say
+//! yes or no. A condition takes one of two forms:
+//!
+//! - **A pattern** -- the match *contains* it. "Contains" includes the
+//!   match itself, not only its descendants, so a negation can narrow a
+//!   pattern rather than only exclude what is nested inside it:
+//!   `kind:SoqlExpr --not kind:SoqlWhereClause` is "a query with no WHERE
+//!   clause", and both name the same node.
+//! - **`$X ~ GLOB`** or **`$X ~ /REGEX/`** -- the capture's text matches.
+//!   A glob is shell-style and anchored: `*` any run, `?` one character,
+//!   `{add,remove}` alternatives, and `$V` another capture's text, so
+//!   `--not '$T ~ $V'` says two captures differ. A regex is unanchored.
+//!   Both are case-insensitive, as Apex is; `(?-i)` opts a regex out.
+//!
+//! The two cannot be confused: `~` is only ever a prefix operator in Apex,
+//! so `$X ~` never starts a pattern. There is no `--or` -- alternation
+//! inside a glob or regex covers the common case, `$M ~ {add,remove}*` --
+//! and no boolean operators inside a condition, which keeps each one
+//! readable on its own.
+//!
+//! Globs live only here, never inline in a pattern. Inline, `add*` was
+//! told from `a * b` by whitespace alone and `get?` read as a ternary; a
+//! condition names its capture, so a matched name can also be carried into
+//! a replacement.
 //!
 //! **`$...NAME`** captures a *run* of elements rather than one, and binds
 //! its source text, which is what lets a variable-length run survive a
 //! rewrite: `Database.query($...ARGS)` -> `Database.queryWithBinds($...ARGS, ...)`
-//! keeps a call'''s arguments whatever their number.
-//!
-//! **Globs match identifiers shell-style.** `addChild*`, `*_success`,
-//! `get?` -- `*` is any run of characters and `?` exactly one,
-//! case-insensitively. A glob must contain a name part as well as a
-//! wildcard, which is what keeps a lone `*` the multiplication operator;
-//! `a*b` in a pattern is therefore a glob and `a * b` is arithmetic.
+//! keeps a call's arguments whatever their number.
 //!
 //! **Modifiers match as a subset**, everywhere Apex lets one be written:
 //! a type or member declaration, a local variable, a method or catch
@@ -167,12 +181,6 @@ enum Hole {
     /// `g($...ARGS)` keeps a call's arguments whatever their number, which
     /// a one-construct capture cannot do.
     SeqCapture(String),
-    /// `addChild*` -- matches one construct whose text fits the glob.
-    ///
-    /// Shell-shaped: `*` stands for any run of characters and `?` for
-    /// exactly one. Case-insensitive, like every other comparison here,
-    /// because Apex is.
-    Glob(String),
     /// `$_` -- matches one construct and binds nothing.
     ///
     /// Distinct from `Capture("_")` because a name that unifies makes
@@ -220,14 +228,6 @@ impl Replacement {
                 apex_parser::TokenKind::PatternSeqCapture => 4,
                 _ => 0,
             };
-            if kind == apex_parser::TokenKind::PatternGlob {
-                return Err(ArgError(
-                    "error: a glob cannot appear in a replacement\n\
-                     note: a glob matches text but captures nothing; use $NAME in the pattern to carry it across"
-                        .to_string(),
-                    2,
-                ));
-            }
             if name_at == 0 {
                 return Err(ArgError(
                     "error: `...` cannot appear in a replacement\n\
@@ -319,11 +319,178 @@ enum Pattern {
     Comment(regex::Regex),
 }
 
+/// One `--and` / `--not` condition, tested against a match and its captures.
+///
+/// Told apart by shape: `$X ~ ...` tests a capture's *text*, and anything
+/// else is a pattern the match must *contain*. `~` is only ever a prefix
+/// operator in Apex, so `$X ~` never starts a pattern and the two cannot
+/// be confused.
+enum Condition {
+    Contains(Pattern),
+    Text { name: String, test: TextTest },
+}
+
+/// How a capture's text is tested.
+enum TextTest {
+    /// Compiled once: a `/regex/`, or a glob that names no other capture.
+    Regex(regex::Regex),
+    /// A glob naming other captures (`$T ~ $V`). Their text is only known
+    /// per match, so it is regex source spliced and compiled per match --
+    /// only for matches that survived the pattern, so rarely.
+    Template(Vec<GlobPart>),
+}
+
+enum GlobPart {
+    Regex(String),
+    Capture(String),
+}
+
+impl Condition {
+    fn compile(src: &str, bound: &std::collections::HashSet<String>) -> Result<Self, ArgError> {
+        let Some((name, rhs)) = split_text_condition(src) else {
+            return Pattern::compile(src).map(Condition::Contains);
+        };
+        let require_bound = |name: &str| {
+            if bound.contains(name) {
+                Ok(())
+            } else {
+                Err(ArgError(
+                    format!(
+                        "error: `${name}` in `{src}` is not a capture of the pattern\n\
+                         note: a condition can only test a name the pattern binds, and `$_` binds nothing"
+                    ),
+                    2,
+                ))
+            }
+        };
+        require_bound(&name)?;
+        let rhs = rhs.trim();
+        let test = match rhs.strip_prefix('/').and_then(|r| r.strip_suffix('/')) {
+            Some(re) => TextTest::Regex(case_insensitive(re)?),
+            None => {
+                let parts = glob_parts(rhs)?;
+                let mut refers = false;
+                for part in &parts {
+                    if let GlobPart::Capture(other) = part {
+                        require_bound(other)?;
+                        refers = true;
+                    }
+                }
+                if refers {
+                    TextTest::Template(parts)
+                } else {
+                    TextTest::Regex(case_insensitive(&anchored(&parts, &Binds::new()))?)
+                }
+            }
+        };
+        Ok(Condition::Text { name, test })
+    }
+
+    fn holds(&self, node: &SyntaxNode, binds: &Binds) -> bool {
+        match self {
+            Condition::Contains(pattern) => !pattern.matches_in(node).is_empty(),
+            Condition::Text { name, test } => {
+                let Some(text) = binds.get(name) else {
+                    return false;
+                };
+                match test {
+                    TextTest::Regex(re) => re.is_match(text),
+                    TextTest::Template(parts) => {
+                        case_insensitive(&anchored(parts, binds)).is_ok_and(|re| re.is_match(text))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Every `--and` holds and no `--not` does.
+fn passes(node: &SyntaxNode, binds: &Binds, ands: &[Condition], nots: &[Condition]) -> bool {
+    ands.iter().all(|c| c.holds(node, binds)) && !nots.iter().any(|c| c.holds(node, binds))
+}
+
+/// `$X ~ rest` -> `("X", " rest")`, or `None` for a pattern condition.
+/// `$...X ~` names a sequence capture, whose bound text is its whole run.
+fn split_text_condition(src: &str) -> Option<(String, &str)> {
+    let rest = src.trim_start().strip_prefix(HOLE_CAPTURE_SIGIL)?;
+    let rest = rest.strip_prefix("...").unwrap_or(rest);
+    let (name, after) = rest.split_at(name_len(rest));
+    let rhs = after.trim_start().strip_prefix('~')?;
+    (!name.is_empty()).then(|| (name.to_string(), rhs))
+}
+
+fn name_len(s: &str) -> usize {
+    s.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(s.len())
+}
+
+/// A shell-style glob as regex source: `*` any run, `?` one character,
+/// `{a,b}` alternatives, `$V` another capture's text, anything else
+/// literal.
+fn glob_parts(glob: &str) -> Result<Vec<GlobPart>, ArgError> {
+    let mut parts = Vec::new();
+    let mut re = String::new();
+    let mut depth = 0usize;
+    let mut chars = glob.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            '{' => {
+                depth += 1;
+                re.push_str("(?:");
+            }
+            ',' if depth > 0 => re.push('|'),
+            '}' if depth > 0 => {
+                depth -= 1;
+                re.push(')');
+            }
+            '$' if name_len(&glob[i + 1..]) > 0 => {
+                let len = name_len(&glob[i + 1..]);
+                parts.push(GlobPart::Regex(std::mem::take(&mut re)));
+                parts.push(GlobPart::Capture(glob[i + 1..i + 1 + len].to_string()));
+                chars.nth(len - 1);
+            }
+            c => re.push_str(&regex::escape(c.encode_utf8(&mut [0; 4]))),
+        }
+    }
+    if depth > 0 {
+        return Err(ArgError(
+            format!("error: unclosed `{{` in glob `{glob}`"),
+            2,
+        ));
+    }
+    parts.push(GlobPart::Regex(re));
+    Ok(parts)
+}
+
+/// A glob's parts as one anchored regex, other captures' text as literals.
+fn anchored(parts: &[GlobPart], binds: &Binds) -> String {
+    let mut re = String::from("^(?:");
+    for part in parts {
+        match part {
+            GlobPart::Regex(s) => re.push_str(s),
+            GlobPart::Capture(name) => {
+                re.push_str(&regex::escape(binds.get(name).map_or("", String::as_str)))
+            }
+        }
+    }
+    re.push_str(")$");
+    re
+}
+
+fn case_insensitive(re: &str) -> Result<regex::Regex, ArgError> {
+    regex::RegexBuilder::new(re)
+        .case_insensitive(true)
+        .build()
+        .map_err(|e| ArgError(format!("error: invalid regex: {e}"), 2))
+}
+
 pub fn run(
     pattern_src: &str,
     replacement_src: Option<&str>,
+    and_srcs: &[String],
     not_srcs: &[String],
-    containing_srcs: &[String],
     paths: &[PathBuf],
 ) -> ExitCode {
     let pattern = match Pattern::compile(pattern_src) {
@@ -333,29 +500,22 @@ pub fn run(
             return ExitCode::from(code);
         }
     };
-    let mut excluded = Vec::with_capacity(not_srcs.len());
-    for src in not_srcs {
-        match Pattern::compile(src) {
-            Ok(p) => excluded.push(p),
-            Err(ArgError(message, code)) => {
-                eprintln!("{message}");
-                return ExitCode::from(code);
-            }
+    let bound = pattern.capture_names();
+    let compile_all = |srcs: &[String]| {
+        srcs.iter()
+            .map(|src| Condition::compile(src, &bound))
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let (ands, nots) = match (compile_all(and_srcs), compile_all(not_srcs)) {
+        (Ok(ands), Ok(nots)) => (ands, nots),
+        (Err(ArgError(message, code)), _) | (_, Err(ArgError(message, code))) => {
+            eprintln!("{message}");
+            return ExitCode::from(code);
         }
-    }
-    let mut required = Vec::with_capacity(containing_srcs.len());
-    for src in containing_srcs {
-        match Pattern::compile(src) {
-            Ok(p) => required.push(p),
-            Err(ArgError(message, code)) => {
-                eprintln!("{message}");
-                return ExitCode::from(code);
-            }
-        }
-    }
+    };
 
     let replacement = match replacement_src {
-        Some(text) => match Replacement::compile(text, &pattern.capture_names()) {
+        Some(text) => match Replacement::compile(text, &bound) {
             Ok(r) => Some(r),
             Err(ArgError(message, code)) => {
                 eprintln!("{message}");
@@ -368,17 +528,11 @@ pub fn run(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let refused = std::sync::atomic::AtomicBool::new(false);
     let found = match &replacement {
-        Some(replacement) => run_replace(
-            &pattern,
-            replacement,
-            &excluded,
-            &required,
-            paths,
-            &cwd,
-            &refused,
-        ),
+        Some(replacement) => {
+            run_replace(&pattern, replacement, &ands, &nots, paths, &cwd, &refused)
+        }
         None => walk_project(paths, &cwd, |path, src| {
-            matches_in_file_filtered(&pattern, &excluded, &required, path, src)
+            matches_in_file_filtered(&pattern, &ands, &nots, path, src)
         }),
     };
     let matches = match found {
@@ -502,9 +656,9 @@ impl Pattern {
                 .map(|c| (c, Binds::new()))
                 .collect(),
             // Comments are tokens rather than nodes, so they are collected
-            // directly by `matches_in_file_filtered`; as a *filter* inside
-            // `--not`/`--containing` a comment pattern asks "does this match
-            // contain such a comment", answered by the enclosing node.
+            // directly by `matches_in_file_filtered`; as an `--and`/`--not`
+            // condition a comment pattern asks "does this match contain
+            // such a comment", answered by the enclosing node.
             Pattern::Comment(re) => root
                 .descendants_with_tokens()
                 .filter_map(|e| e.into_token())
@@ -564,7 +718,6 @@ fn hole_of(element: &SyntaxElement) -> Option<Hole> {
     };
     match only.kind() {
         SyntaxKind::PatternHole => return Some(Hole::Ellipsis),
-        SyntaxKind::PatternGlob => return Some(Hole::Glob(only.text().to_string())),
         SyntaxKind::PatternSeqCapture => {
             // `$...NAME` -- strip the sigil and the three dots.
             let name = only.text().get(4..).unwrap_or_default().to_string();
@@ -654,6 +807,9 @@ fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
         if !every_named_modifier_present {
             return false;
         }
+        if pat.kind() == SyntaxKind::ConstructorDecl && src.kind() == SyntaxKind::MethodDecl {
+            return match_without_return_type(&pat_rest, &src_rest, binds);
+        }
         return match_seq(&pat_rest, &src_rest, binds);
     }
 
@@ -699,6 +855,37 @@ fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
     deep && match_block_deep(&pat_items, &src_items, binds)
 }
 
+/// Match a member pattern with no return type against a method, skipping
+/// the method's return type -- `$F(String $_) { ... }` finds methods of
+/// every return type as well as constructors.
+///
+/// The pattern parsed as a constructor, so its name is a `Type` where the
+/// method's is a `DeclName`; the two are compared as a name, by hole or by
+/// text, and everything after the name as usual.
+fn match_without_return_type(
+    pat: &[SyntaxElement],
+    src: &[SyntaxElement],
+    binds: &mut Binds,
+) -> bool {
+    let [pat_name, pat_rest @ ..] = pat else {
+        return false;
+    };
+    let Some(at) = src.iter().position(|e| e.kind() == SyntaxKind::DeclName) else {
+        return false;
+    };
+    let src_name = &src[at];
+    let name_matches = if hole_of(pat_name).is_some() {
+        match_element(pat_name, src_name, binds)
+    } else {
+        let text = |e: &SyntaxElement| match e {
+            NodeOrToken::Token(t) => t.text().to_string(),
+            NodeOrToken::Node(n) => significant_text(n),
+        };
+        text(pat_name).eq_ignore_ascii_case(&text(src_name))
+    };
+    name_matches && match_seq(pat_rest, &src[at + 1..], binds)
+}
+
 /// Do these two nodes name the same construct?
 ///
 /// Identical kinds, plus one equivalence: Apex's two loop productions,
@@ -709,6 +896,12 @@ fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
 /// a search tool is worse than failing outright.
 fn kinds_compatible(pat: &SyntaxNode, src: &SyntaxNode) -> bool {
     if pat.kind() == src.kind() {
+        return true;
+    }
+    // A member written with no return type parses as a constructor, but it
+    // means "any return type": the return type is optional, as modifiers
+    // are, so it matches methods too. See `match_without_return_type`.
+    if pat.kind() == SyntaxKind::ConstructorDecl && src.kind() == SyntaxKind::MethodDecl {
         return true;
     }
     let both_loops = matches!(pat.kind(), SyntaxKind::ForEachStmt | SyntaxKind::ForStmt)
@@ -741,13 +934,6 @@ fn kinds_compatible(pat: &SyntaxNode, src: &SyntaxNode) -> bool {
 fn match_element(pat: &SyntaxElement, src: &SyntaxElement, binds: &mut Binds) -> bool {
     match hole_of(pat) {
         Some(Hole::Ellipsis) | Some(Hole::Anonymous) => return true,
-        Some(Hole::Glob(glob)) => {
-            let text = match src {
-                NodeOrToken::Token(t) => t.text().to_string(),
-                NodeOrToken::Node(n) => significant_text(n),
-            };
-            return glob_matches(&glob, &text);
-        }
         // A sequence capture reached here is standing where a single
         // element is expected rather than in a run, so it binds that one
         // element. Consistent either way: it binds whatever it consumed.
@@ -1046,49 +1232,6 @@ fn run_text(run: &[SyntaxElement]) -> String {
     text.get(from..to).unwrap_or_default().to_string()
 }
 
-/// Shell-style glob match: `*` is any run of characters, `?` exactly one.
-///
-/// Case-insensitive, like every other comparison here. Written out rather
-/// than compiled to a regex because `hole_of` is called for every element
-/// of every candidate, and building a regex there would dominate the walk.
-fn glob_matches(glob: &str, text: &str) -> bool {
-    let (g, t): (Vec<char>, Vec<char>) = (
-        glob.chars().flat_map(char::to_lowercase).collect(),
-        text.chars().flat_map(char::to_lowercase).collect(),
-    );
-    // Classic two-cursor wildcard match: on a mismatch, fall back to the
-    // last `*` and let it swallow one more character. Linear in practice
-    // and needs no allocation beyond the two buffers above.
-    let (mut gi, mut ti) = (0usize, 0usize);
-    let (mut star, mut retry) = (None, 0usize);
-    while ti < t.len() {
-        match g.get(gi) {
-            Some('*') => {
-                star = Some(gi);
-                retry = ti;
-                gi += 1;
-            }
-            Some('?') => {
-                gi += 1;
-                ti += 1;
-            }
-            Some(c) if *c == t[ti] => {
-                gi += 1;
-                ti += 1;
-            }
-            _ => match star {
-                Some(s) => {
-                    gi = s + 1;
-                    retry += 1;
-                    ti = retry;
-                }
-                None => return false,
-            },
-        }
-    }
-    g[gi..].iter().all(|c| *c == '*')
-}
-
 fn is_comment_kind(kind: SyntaxKind) -> bool {
     matches!(
         kind,
@@ -1161,9 +1304,8 @@ fn significant_text(node: &SyntaxNode) -> String {
     })
 }
 
-/// Like [`matches_in_file`], but dropping any match that itself contains a
-/// match of one of `excluded`, and keeping only those containing a match of
-/// every one of `required`.
+/// Like [`matches_in_file`], but keeping only the matches that pass every
+/// `--and` condition and no `--not` condition.
 ///
 /// "Contains" includes the match node itself, not only its descendants,
 /// which is what lets a negation narrow a pattern rather than only exclude
@@ -1172,8 +1314,8 @@ fn significant_text(node: &SyntaxNode) -> String {
 /// the two patterns describe the very same node.
 fn matches_in_file_filtered(
     pattern: &Pattern,
-    excluded: &[Pattern],
-    required: &[Pattern],
+    ands: &[Condition],
+    nots: &[Condition],
     display_path: &Path,
     src: &str,
 ) -> Vec<Site> {
@@ -1203,17 +1345,10 @@ fn matches_in_file_filtered(
     }
 
     pattern
-        .matches_in(&root)
+        .matches_with_binds(&root)
         .into_iter()
-        .filter(|node| {
-            !excluded
-                .iter()
-                .any(|unwanted| !unwanted.matches_in(node).is_empty())
-                && required
-                    .iter()
-                    .all(|wanted| !wanted.matches_in(node).is_empty())
-        })
-        .filter_map(|node| site_for(display_path, src, &index, &node))
+        .filter(|(node, binds)| passes(node, binds, ands, nots))
+        .filter_map(|(node, _)| site_for(display_path, src, &index, &node))
         .collect()
 }
 
@@ -1226,22 +1361,14 @@ fn matches_in_file_filtered(
 fn run_replace(
     pattern: &Pattern,
     replacement: &Replacement,
-    excluded: &[Pattern],
-    required: &[Pattern],
+    ands: &[Condition],
+    nots: &[Condition],
     paths: &[PathBuf],
     cwd: &Path,
     refused: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<Site>, ArgError> {
     walk_project(paths, cwd, |display_path, src| {
-        rewrite_file(
-            pattern,
-            replacement,
-            excluded,
-            required,
-            display_path,
-            src,
-            refused,
-        )
+        rewrite_file(pattern, replacement, ands, nots, display_path, src, refused)
     })
 }
 
@@ -1253,8 +1380,8 @@ fn run_replace(
 fn rewrite_file(
     pattern: &Pattern,
     replacement: &Replacement,
-    excluded: &[Pattern],
-    required: &[Pattern],
+    ands: &[Condition],
+    nots: &[Condition],
     display_path: &Path,
     src: &str,
     refused: &std::sync::atomic::AtomicBool,
@@ -1266,14 +1393,7 @@ fn rewrite_file(
     let matches: Vec<_> = pattern
         .matches_with_binds(&root)
         .into_iter()
-        .filter(|(node, _)| {
-            !excluded
-                .iter()
-                .any(|unwanted| !unwanted.matches_in(node).is_empty())
-                && required
-                    .iter()
-                    .all(|wanted| !wanted.matches_in(node).is_empty())
-        })
+        .filter(|(node, binds)| passes(node, binds, ands, nots))
         .collect();
 
     let mut edits = Vec::new();
@@ -1414,6 +1534,24 @@ mod tests {
             .into_iter()
             .map(|m| format!("{}:{}:{}", m.line, m.col, m.text))
             .collect()
+    }
+
+    /// Search `src` as a class, keeping matches that pass the conditions.
+    fn filtered_hits(pattern: &str, and: &[&str], not: &[&str], src: &str) -> Vec<Site> {
+        let pattern = Pattern::compile(pattern).expect("pattern should compile");
+        let bound = pattern.capture_names();
+        let compile = |srcs: &[&str]| -> Vec<Condition> {
+            srcs.iter()
+                .map(|s| Condition::compile(s, &bound).unwrap_or_else(|e| panic!("{}", e.0)))
+                .collect()
+        };
+        matches_in_file_filtered(
+            &pattern,
+            &compile(and),
+            &compile(not),
+            Path::new("T.cls"),
+            src,
+        )
     }
 
     fn wrap(body: &str) -> String {
@@ -2025,15 +2163,8 @@ mod tests {
             "        List<Account> a = [SELECT Id FROM Account WHERE Name = 'x'];
         List<Contact> c = [SELECT Id FROM Contact];",
         );
-        let filtered = |not: &[&str], containing: &[&str]| {
-            let p = Pattern::compile("kind:SoqlExpr").expect("compiles");
-            let not: Vec<_> = not.iter().map(|s| Pattern::compile(s).unwrap()).collect();
-            let req: Vec<_> = containing
-                .iter()
-                .map(|s| Pattern::compile(s).unwrap())
-                .collect();
-            matches_in_file_filtered(&p, &not, &req, Path::new("T.cls"), &src).len()
-        };
+        let filtered =
+            |not: &[&str], and: &[&str]| filtered_hits("kind:SoqlExpr", and, not, &src).len();
         assert_eq!(filtered(&[], &[]), 2);
         assert_eq!(
             filtered(&["kind:SoqlWhereClause"], &[]),
@@ -2166,29 +2297,10 @@ mod tests {
         assert!(Pattern::compile("{ ... [SELECT ... FROM $O] ... }").is_ok());
     }
 
-    /// A glob matches an identifier shell-style: `*` any run of
-    /// characters, `?` exactly one, case-insensitively like everything
-    /// else here.
+    /// `*` in a pattern is only ever multiplication; globs live in
+    /// conditions.
     #[test]
-    fn a_glob_matches_an_identifier_shell_style() {
-        assert!(glob_matches("addChild*", "addChildQueries_success"));
-        assert!(glob_matches("*_success", "addChildQueries_success"));
-        assert!(glob_matches("addChild*_fail", "addChildQueriesNow_fail"));
-        assert!(glob_matches("get?", "getX"));
-        assert!(!glob_matches("get?", "getXY"));
-        assert!(
-            glob_matches("ADDCHILD*", "addChildQueries"),
-            "case-insensitive"
-        );
-        assert!(!glob_matches("addChild*", "removeChildQueries"));
-        assert!(glob_matches("*", "anything"));
-    }
-
-    /// A glob needs a *name* part as well as a wildcard. Without that rule
-    /// a lone `*` folds into a glob by itself and every multiplication in a
-    /// pattern stops parsing.
-    #[test]
-    fn a_lone_star_is_multiplication_not_a_glob() {
+    fn a_star_in_a_pattern_is_multiplication() {
         let src = wrap("        Integer n = a * b;\n        Integer m = x.size() * 2;");
         assert_eq!(hits("$A * $B", &src).len(), 2);
         assert_eq!(hits("x.size() * 2", &src).len(), 1);
@@ -2200,28 +2312,16 @@ mod tests {
     #[test]
     fn modifiers_narrow_rather_than_pin_the_whole_list() {
         let src = "public class T {\n    @isTest static void goNow() { f(); }\n    public void plain() { }\n}\n";
-        let find = |pattern: &str| {
-            let p = Pattern::compile(pattern).expect("pattern should compile");
-            matches_in_file(&p, Path::new("T.cls"), src).len()
-        };
-        assert_eq!(find("void go*() { ... }"), 1, "no modifiers named at all");
+        let find = |pattern: &str| filtered_hits(pattern, &["$M ~ go*"], &[], src).len();
+        assert_eq!(find("void $M() { ... }"), 1, "no modifiers named at all");
         assert_eq!(
-            find("static void go*() { ... }"),
+            find("static void $M() { ... }"),
             1,
             "a subset still matches"
         );
-        assert_eq!(find("@isTest static void go*() { ... }"), 1, "all of them");
-        assert_eq!(find("@future static void go*() { ... }"), 0, "narrows");
-        assert_eq!(find("public void go*() { ... }"), 0, "wrong modifier");
-    }
-
-    /// A glob matches text but captures nothing, so it cannot be spliced
-    /// back by a rewrite.
-    #[test]
-    fn a_glob_cannot_appear_in_a_replacement() {
-        let names = Pattern::compile("f(a*b);").unwrap().capture_names();
-        let err = Replacement::compile("g(a*b);", &names).expect_err("a glob captures nothing");
-        assert!(err.0.contains("glob cannot appear"), "{}", err.0);
+        assert_eq!(find("@isTest static void $M() { ... }"), 1, "all of them");
+        assert_eq!(find("@future static void $M() { ... }"), 0, "narrows");
+        assert_eq!(find("public void $M() { ... }"), 0, "wrong modifier");
     }
 
     /// Subset matching applies everywhere Apex lets a modifier be written,
@@ -2483,6 +2583,127 @@ mod tests {
             binds,
             [Some("b".to_string())],
             "the comma stays out of the run"
+        );
+    }
+
+    /// A glob tests a capture's text shell-style, anchored and
+    /// case-insensitive, with `{a,b}` alternatives.
+    #[test]
+    fn a_glob_condition_tests_a_captures_text() {
+        let src = wrap("        addChild(1);\n        addChildren(2);\n        removeChild(3);\n        ADDCHILD(4);\n        getX(5);\n        getXY(6);");
+        let n = |glob: &str| filtered_hits("$M(...)", &[&format!("$M ~ {glob}")], &[], &src).len();
+        assert_eq!(n("addChild*"), 3, "prefix, case-insensitively");
+        assert_eq!(
+            n("addChild"),
+            2,
+            "anchored: a glob with no wildcard is equality"
+        );
+        assert_eq!(n("*Child"), 3);
+        assert_eq!(n("{add,remove}Child"), 3, "alternatives");
+        assert_eq!(n("get?"), 1, "one character");
+        assert_eq!(n("*"), 6);
+    }
+
+    /// A regex is unanchored, and case-insensitive unless it opts out.
+    #[test]
+    fn a_regex_condition_is_unanchored() {
+        let src = wrap("        getName(1);\n        setName(2);\n        forget(3);");
+        let n = |re: &str| filtered_hits("$M(...)", &[&format!("$M ~ /{re}/")], &[], &src).len();
+        assert_eq!(n("^(get|set)"), 2);
+        assert_eq!(n("get"), 2, "unanchored: forget too");
+        assert_eq!(n("(?-i)^GET"), 0, "opted out of case-insensitivity");
+    }
+
+    /// `$V` inside a glob is another capture's text, so `--not '$T ~ $V'`
+    /// says two captures differ.
+    #[test]
+    fn a_glob_can_compare_two_captures() {
+        let src = wrap("        List<String> a = new List<String>();\n        List<Object> b = new List<String>();");
+        let pattern = "List<$T> $_ = new List<$V>();";
+        assert_eq!(
+            filtered_hits(pattern, &[], &["$T ~ $V"], &src).len(),
+            1,
+            "they differ"
+        );
+        assert_eq!(
+            filtered_hits(pattern, &["$T ~ $V"], &[], &src).len(),
+            1,
+            "they agree"
+        );
+    }
+
+    /// A condition may only test a capture the pattern binds, and a glob
+    /// must close its braces.
+    #[test]
+    fn a_condition_names_a_bound_capture() {
+        let bound = Pattern::compile("$M(...)").unwrap().capture_names();
+        let err = |c: &str| {
+            Condition::compile(c, &bound)
+                .err()
+                .map(|e| e.0)
+                .unwrap_or_default()
+        };
+        assert!(
+            err("$X ~ a*").contains("not a capture"),
+            "{}",
+            err("$X ~ a*")
+        );
+        assert!(err("$M ~ $Y").contains("not a capture"));
+        assert!(err("$_ ~ a*").contains("not a capture"));
+        assert!(err("$M ~ {a,b").contains("unclosed"));
+        assert!(err("$M ~ /(/").contains("invalid regex"));
+        assert!(
+            Condition::compile("$M.foo()", &bound).is_ok(),
+            "no `~`, so a pattern"
+        );
+    }
+
+    /// A text condition and a pattern condition combine.
+    #[test]
+    fn conditions_combine() {
+        let src = "public class T {\n    void addA() { System.debug(1); }\n    void addB() { }\n    void other() { }\n}\n";
+        let pattern = "void $M() { ... }";
+        assert_eq!(filtered_hits(pattern, &["$M ~ add*"], &[], src).len(), 2);
+        assert_eq!(
+            filtered_hits(pattern, &["$M ~ add*"], &["System.debug(...);"], src).len(),
+            1
+        );
+        assert_eq!(
+            filtered_hits(pattern, &["System.debug(...);"], &[], src).len(),
+            1
+        );
+    }
+
+    /// A member pattern with no return type means any return type, so it
+    /// matches methods as well as constructors -- as with modifiers,
+    /// leaving it out stops pinning it.
+    #[test]
+    fn a_return_type_is_optional() {
+        let src = "public class T {\n    public T(String s) { }\n    public void run(String s) { }\n    Integer count(String s) { return 1; }\n    void other(Integer i) { }\n    abstract void bare(String s);\n}\n";
+        assert_eq!(
+            hits("$F(String $_) { ... }", src).len(),
+            3,
+            "constructor, void and Integer"
+        );
+        assert_eq!(
+            hits("run(String $_) { ... }", src).len(),
+            1,
+            "a literal name"
+        );
+        assert_eq!(
+            hits("public $F(...) { ... }", src).len(),
+            2,
+            "modifiers still narrow"
+        );
+        assert_eq!(
+            hits("void $F(String $_) { ... }", src).len(),
+            1,
+            "a written return type still pins"
+        );
+        assert_eq!(
+            filtered_hits("$F(...) { ... }", &["$F ~ c*"], &[], src).len(),
+            1,
+            "the name binds for conditions"
         );
     }
 

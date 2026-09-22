@@ -77,7 +77,6 @@ impl<'t> Parser<'t> {
                 SyntaxKind::PatternHole
                     | SyntaxKind::PatternCapture
                     | SyntaxKind::PatternSeqCapture
-                    | SyntaxKind::PatternGlob
             )
     }
 
@@ -102,8 +101,7 @@ impl<'t> Parser<'t> {
     pub(crate) fn prev_was_ellipsis(&self) -> bool {
         self.pattern_mode
             && self.pos > 0
-            && SyntaxKind::from_token_kind(self.input.kind(self.pos - 1))
-                == SyntaxKind::PatternHole
+            && SyntaxKind::from_token_kind(self.input.kind(self.pos - 1)) == SyntaxKind::PatternHole
     }
 
     /// Expect the `;` that ends a *statement*, forgivingly in a pattern.

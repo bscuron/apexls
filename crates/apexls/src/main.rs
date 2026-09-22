@@ -47,10 +47,13 @@ enum Command {
     ///
     /// PATTERN is Apex code with holes: `...` matches any code in that
     /// position, `$NAME` matches one construct and captures it.
+    ///
+    /// A COND is either a pattern the match must contain, or `$NAME ~ GLOB`
+    /// / `$NAME ~ /REGEX/` testing a capture's text. Globs are shell-style
+    /// and anchored (`*`, `?`, `{add,remove}`, and `$OTHER` for another
+    /// capture's text); regexes are unanchored. Both are case-insensitive.
     Query {
         pattern: String,
-        /// Exclude any match that itself contains a match of this pattern.
-        /// Repeatable; a match is dropped if any of them hits.
         /// Rewrite every match with this template, in place.
         ///
         /// Only named captures from PATTERN may appear in it; an empty
@@ -58,12 +61,14 @@ enum Command {
         /// control, so there is no dry run -- omit this to search.
         #[arg(long = "replace", short = 'r', value_name = "TEMPLATE")]
         replace: Option<String>,
-        #[arg(long = "not", value_name = "PATTERN")]
+        /// Keep only matches for which this condition holds. Repeatable;
+        /// every one must hold.
+        #[arg(long = "and", value_name = "COND")]
+        and: Vec<String>,
+        /// Drop matches for which this condition holds. Repeatable; any one
+        /// drops the match.
+        #[arg(long = "not", value_name = "COND")]
         not: Vec<String>,
-        /// Keep only matches that themselves contain a match of this
-        /// pattern. Repeatable; every one of them must hit.
-        #[arg(long = "containing", value_name = "PATTERN")]
-        containing: Vec<String>,
         paths: Vec<PathBuf>,
     },
 }
@@ -85,9 +90,9 @@ fn main() -> ExitCode {
         Command::Query {
             pattern,
             replace,
+            and,
             not,
-            containing,
             paths,
-        } => query::run(&pattern, replace.as_deref(), &not, &containing, &paths),
+        } => query::run(&pattern, replace.as_deref(), &and, &not, &paths),
     }
 }

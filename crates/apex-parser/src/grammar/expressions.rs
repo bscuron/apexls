@@ -292,8 +292,8 @@ fn primary(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         let m = p.start();
         p.bump_hole();
         // A call is built here rather than in the postfix chain, so a hole
-        // that names the callee needs the same treatment: `add*(y)` is a
-        // call to whichever method the glob matches.
+        // that names the callee needs the same treatment: `$m(y)` is a
+        // call to whichever method `$m` stands for.
         if p.at(SyntaxKind::LParen) {
             arg_list(p);
             return Some(m.complete(p, SyntaxKind::CallExpr));
@@ -544,10 +544,7 @@ fn at_cast_operand_start(p: &Parser<'_>, n: usize) -> bool {
     // unconditionally, since these kinds only ever arise in a pattern.
     matches!(
         k,
-        SyntaxKind::PatternHole
-            | SyntaxKind::PatternCapture
-            | SyntaxKind::PatternSeqCapture
-            | SyntaxKind::PatternGlob
+        SyntaxKind::PatternHole | SyntaxKind::PatternCapture | SyntaxKind::PatternSeqCapture
     ) || is_literal_kind(k)
         || (super::ids::is_id_kind(k) && k != SyntaxKind::Instanceof)
         || matches!(

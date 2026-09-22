@@ -356,7 +356,10 @@ fn try_stmt(p: &mut Parser<'_>) -> CompletedMarker {
 /// it's rare enough that it never appears anywhere in the NPSP corpus.
 pub(crate) fn catch_clause(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
-    p.bump(); // catch
+    // `expect`, not a bare `bump`: a real `try` has already seen `catch`,
+    // but the catch-clause fragment entry point has not, and bumping blind
+    // made any `$F(...) { ... }` pattern a catch clause of type `$F`.
+    p.expect(SyntaxKind::Catch);
     p.expect(SyntaxKind::LParen);
     if p.at_ellipsis() {
         // The whole `Type name` pair, in one hole.

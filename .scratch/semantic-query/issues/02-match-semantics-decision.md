@@ -351,3 +351,29 @@ halves of one set. Both now return 327. String literal contents stay case-sensit
 there is a difference in value rather than in spelling; capture unification is case-insensitive,
 so `acc` and `Acc` are one capture. Guarded by `matching_is_case_insensitive_like_apex_itself`,
 `string_literal_contents_stay_case_sensitive` and `a_reused_capture_unifies_across_case`.
+
+**21. Conditions replace inline globs and `--containing`.** `apexls query PATTERN [--and COND]...
+[--not COND]...`: a match is kept when every `--and` holds and no `--not` does. A COND is either
+a pattern the match must contain (what `--containing` and `--not` took before), or `$X ~ GLOB` /
+`$X ~ /REGEX/` on a capture's text. Globs are shell-style and anchored, with `{a,b}` alternatives
+and `$V` for another capture's text; regexes are unanchored; both are case-insensitive, and
+`(?-i)` opts a regex out. The two forms cannot be confused, since `~` is only a prefix operator in
+Apex. The user chose this shape over inline constraint syntax and over boolean operators inside
+a condition: the pattern says the structure, `~` the text, the flags yes or no.
+
+Inline globs are gone. They were told from multiplication by whitespace alone (`a*b` versus
+`a * b`), `get?` never compiled because `?` reads as a ternary, and a glob bound nothing, so a
+matched name could not reach a replacement. Every NPSP count carried over exactly --
+`static void $M() { ... } --and '$M ~ addChild*'` is 9, `$_ $M(...) { ... } --and '$M ~ add*'`
+173, `$M(...) --and '$M ~ addChild*'` 4, as the inline forms were -- and the old filters too:
+751, 107 and 11,303. Guarded by `a_glob_condition_tests_a_captures_text`,
+`a_regex_condition_is_unanchored`, `a_glob_can_compare_two_captures`,
+`a_condition_names_a_bound_capture` and `conditions_combine`.
+
+**22. The return type is optional, as modifiers are.** A member pattern with no return type,
+`$F(String $_) { ... }`, parses as a constructor and now also matches methods of any return
+type, the name compared by hole or text. A written return type still pins: `void $F(...)` finds
+only void methods. On NPSP `$F(...) { ... }` finds 12,095 -- every method with a body plus every
+constructor, exactly. Found alongside it: the catch-clause fragment entry point bumped its first
+token without checking it was `catch`, so every `NAME(...) { ... }` pattern without a modifier
+compiled as a catch clause and matched nothing. Guarded by `a_return_type_is_optional`.
