@@ -848,6 +848,18 @@ fn match_seq(pat: &[SyntaxElement], src: &[SyntaxElement], binds: &mut Binds) ->
     };
     if let Some(name) = sequence {
         let rest = &pat[1..];
+        // `..., $X` must still match a list whose only item is X: an
+        // ellipsis that consumes nothing takes its separator with it.
+        if rest.first().is_some_and(is_comma) {
+            let mut attempt = binds.clone();
+            if let Some(name) = &name {
+                attempt.insert(name.clone(), String::new());
+            }
+            if match_seq(&rest[1..], src, &mut attempt) {
+                *binds = attempt;
+                return true;
+            }
+        }
         for split in 0..=src.len() {
             let mut attempt = binds.clone();
             if let Some(name) = &name {
@@ -870,10 +882,31 @@ fn match_seq(pat: &[SyntaxElement], src: &[SyntaxElement], binds: &mut Binds) ->
         return false;
     }
 
+    // The mirror image: `$X, ...` matches a list ending at X. Only where
+    // the source has no comma here -- where it has one, matching it keeps
+    // it out of a sequence capture's run, so `f($X, $...REST)` binds `b`
+    // from `f(a, b)` rather than `, b`.
+    if is_comma(head)
+        && !src.first().is_some_and(is_comma)
+        && pat
+            .get(1)
+            .is_some_and(|e| matches!(hole_of(e), Some(Hole::Ellipsis | Hole::SeqCapture(_))))
+    {
+        let mut attempt = binds.clone();
+        if match_seq(&pat[1..], src, &mut attempt) {
+            *binds = attempt;
+            return true;
+        }
+    }
+
     let Some(first) = src.first() else {
         return false;
     };
     match_element(head, first, binds) && match_seq(&pat[1..], &src[1..], binds)
+}
+
+fn is_comma(element: &SyntaxElement) -> bool {
+    element.kind() == SyntaxKind::Comma
 }
 
 /// The fixed elements of a block pattern shaped `... P ... Q ... `, in
@@ -2338,10 +2371,7 @@ mod tests {
     #[test]
     fn a_type_hole_covers_generic_and_qualified_array_types() {
         let src = wrap(
-            "        String[] a;
-        Map<Id, Account>[] b;
-        Schema.SObjectField[] c;
-        List<String> d;",
+            "        String[] a;\n        Map<Id, Account>[] b;\n        Schema.SObjectField[] c;\n        List<String> d;",
         );
         assert_eq!(hits("$T[] $v;", &src).len(), 3);
         assert_eq!(
@@ -2355,8 +2385,7 @@ mod tests {
             "the bracket count must agree"
         );
         let src = wrap(
-            "        Map<Id, X>[] a = new Map<Id, X>[]{};
-        String[] b = new Integer[]{};",
+            "        Map<Id, X>[] a = new Map<Id, X>[]{};\n        String[] b = new Integer[]{};",
         );
         assert_eq!(
             hits("$T[] $v = new $T[]{ ... };", &src).len(),
@@ -2378,6 +2407,83 @@ mod tests {
             assert_eq!(hits(pattern, &src).len(), 1, "{pattern}");
         }
         assert_eq!(hits("[FIND $q IN ALL FIELDS ...]", &src).len(), 0);
+    }
+
+    /// A subquery takes clause holes like a top-level query, in the select
+    /// list and in a semi-join.
+    #[test]
+    fn a_subquery_takes_clause_holes() {
+        let src = wrap(
+            "        a = [SELECT Id, (SELECT Id FROM Contacts WHERE x = 1) FROM Account];\n        b = [SELECT Id FROM Contact WHERE AccountId IN (SELECT Id FROM Account WHERE y = 2)];",
+        );
+        assert_eq!(
+            hits(
+                "[SELECT ..., (SELECT ... FROM $r ...), ... FROM $o ...]",
+                &src
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            hits(
+                "[SELECT ... FROM $o WHERE $f IN (SELECT ... FROM $p ...) ...]",
+                &src
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// A hole can be a whole WHERE condition, so a chain can be named
+    /// without spelling out each comparison.
+    #[test]
+    fn a_hole_can_be_a_whole_soql_condition() {
+        let src = wrap(
+            "        a = [SELECT Id FROM Account WHERE x = 1 AND y = 2];\n        b = [SELECT Id FROM Account WHERE x = 1 OR y = 2];\n        c = [SELECT Id FROM Account WHERE x = 1];",
+        );
+        assert_eq!(hits("[SELECT ... FROM $o WHERE $a AND $b]", &src).len(), 1);
+        assert_eq!(
+            hits("[SELECT ... FROM $o WHERE ... AND ...]", &src).len(),
+            1
+        );
+        assert_eq!(
+            hits("[SELECT ... FROM $o WHERE ... AND y = 2]", &src).len(),
+            1
+        );
+        assert_eq!(
+            hits("[SELECT ... FROM $o WHERE ...]", &src).len(),
+            3,
+            "a bare hole is still the whole clause"
+        );
+        assert_eq!(
+            hits("[SELECT ... FROM $o WHERE $f = $v]", &src).len(),
+            1,
+            "a hole before `=` is still a field"
+        );
+    }
+
+    /// An ellipsis that consumes nothing takes its comma with it, so
+    /// `f(..., $X, ...)` still finds a call whose only argument is X.
+    #[test]
+    fn an_empty_ellipsis_takes_its_comma_with_it() {
+        let src = wrap("        f(a);\n        f(a, b);\n        f(b, a, c);");
+        assert_eq!(hits("f(..., a, ...)", &src).len(), 3);
+        assert_eq!(hits("f(a, ...)", &src).len(), 2);
+        assert_eq!(hits("f(..., a)", &src).len(), 1);
+
+        let p = Pattern::compile("f($X, $...REST)").expect("compiles");
+        let binds: Vec<_> = p
+            .matches_with_binds(
+                &parse_apex_file(Path::new("T.cls"), &wrap("        f(a, b);")).syntax(),
+            )
+            .into_iter()
+            .map(|(_, b)| b.get("REST").cloned())
+            .collect();
+        assert_eq!(
+            binds,
+            [Some("b".to_string())],
+            "the comma stays out of the run"
+        );
     }
 
     #[test]

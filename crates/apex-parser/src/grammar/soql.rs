@@ -187,15 +187,21 @@ fn sub_query(p: &mut Parser<'_>) -> CompletedMarker {
     select_list(p);
     p.expect(SyntaxKind::From);
     from_list(p);
+    // Clause holes as in a top-level query, so a subquery can be written
+    // `(SELECT ... FROM $r ...)` -- in the select list or a semi-join.
+    trailing_clause_hole(p);
     if p.at(SyntaxKind::Where) {
         where_clause(p);
     }
+    trailing_clause_hole(p);
     if p.at(SyntaxKind::Order) {
         order_by(p);
     }
+    trailing_clause_hole(p);
     if p.at(SyntaxKind::Limit) {
         limit_clause(p);
     }
+    trailing_clause_hole(p);
     for_clauses(p);
     if p.at(SyntaxKind::Update) {
         p.bump();
@@ -274,7 +280,9 @@ fn using_scope(p: &mut Parser<'_>) -> CompletedMarker {
 fn where_clause(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // WHERE
-    if p.at_ellipsis() {
+              // A bare `...` is the whole condition -- unless AND/OR follows, when
+              // it is one condition in a chain: `WHERE ... AND $f = $v`.
+    if p.at_ellipsis() && !matches!(p.nth(1), SyntaxKind::SoqlAnd | SyntaxKind::SoqlOr) {
         p.bump_hole();
         return m.complete(p, SyntaxKind::SoqlWhereClause);
     }
@@ -308,6 +316,12 @@ fn logical_expr(p: &mut Parser<'_>) -> CompletedMarker {
 /// tokens become direct children of the enclosing `SoqlLogicalExpr`/
 /// `SoqlComparison`.
 fn conditional_expr(p: &mut Parser<'_>) {
+    // A hole not followed by a comparison operator is a whole condition,
+    // `WHERE $a AND $b`; followed by one, it is the field, `WHERE $f = $v`.
+    if p.at_hole() && !at_comparison_operator(p, 1) {
+        p.bump_hole();
+        return;
+    }
     if p.at(SyntaxKind::LParen) {
         p.bump();
         logical_expr(p);
@@ -336,6 +350,22 @@ fn field_expression(p: &mut Parser<'_>) -> CompletedMarker {
 /// `<=`/`>=` are two lexer tokens (the lexer never merges them, matching
 /// `grammar::expressions`' own relational-operator handling), so `Lt`/`Gt`
 /// speculatively swallow a following `Assign`.
+fn at_comparison_operator(p: &Parser<'_>, n: usize) -> bool {
+    match p.nth(n) {
+        SyntaxKind::Assign
+        | SyntaxKind::NotEqual
+        | SyntaxKind::LessAndGreater
+        | SyntaxKind::Like
+        | SyntaxKind::Includes
+        | SyntaxKind::Excludes
+        | SyntaxKind::In
+        | SyntaxKind::Lt
+        | SyntaxKind::Gt => true,
+        SyntaxKind::Not => p.nth(n + 1) == SyntaxKind::In,
+        _ => false,
+    }
+}
+
 fn comparison_operator(p: &mut Parser<'_>) {
     match p.current() {
         SyntaxKind::Assign
