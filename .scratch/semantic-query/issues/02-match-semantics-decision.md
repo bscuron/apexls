@@ -438,3 +438,14 @@ SObject field types. Known limits: only method and constructor bodies, and a cap
 reference (`$T` in `List<$T>`) is compared by its text, not resolved. Guarded by
 `a_type_condition_tests_the_inferred_type`, `a_type_condition_compares_two_captures` and
 `a_type_condition_needs_a_bound_capture`.
+
+**28. Types reach every body the binder walks.** `$X : TYPE` now works in field initializers,
+property accessors and trigger bodies, not only methods and constructors. The separate re-bind
+function is gone: Pass 2's three body entry points take a `record_types` flag, and
+`BoundProgram::expr_types_in(unit)` re-binds any declaration through the same dispatcher Pass 2
+uses, so the two cannot drift. A cheap `type_unit_at(file, offset)` finds the innermost owning
+declaration from the file's symbols, which lets a query cache per unit without binding to look.
+On NPSP, 759 of 795 `private static` field initializers are typed (none were reachable before),
+and all 26 trigger bodies' receivers. `check` is unchanged in time and output. Still not typed:
+static and instance initializer blocks (`static { ... }`), which the binder does not bind at all.
+Guarded by `a_type_condition_reaches_initializers_accessors_and_triggers`.

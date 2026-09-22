@@ -749,6 +749,10 @@ pub(crate) struct BoundBody {
     pub(crate) pending_locals: Vec<Symbol>,
     pub(crate) refs: ReferenceTable,
     pub(crate) type_mismatches: Vec<TypeMismatch>,
+    /// Every expression's inferred type, rendered as text -- empty unless
+    /// the bind was asked to record them (`record_types`), which only
+    /// `crate::BoundProgram::expr_types_in` ever does.
+    pub(crate) expr_types: Vec<(SyntaxPtr, SmolStr)>,
 }
 
 /// A provable, `ERROR`-severity type-checking defect found inline during
@@ -826,7 +830,7 @@ pub(crate) struct BodyBinder<'a> {
     pending_locals: Vec<Symbol>,
     type_mismatches: Vec<TypeMismatch>,
     /// Every expression's inferred type, rendered as text, when a caller
-    /// asked for them ([`body_expr_types`]); `None` for every normal bind,
+    /// asked for them (`record_types`); `None` for every normal bind,
     /// which then pays one never-taken branch per expression and nothing
     /// else. Rendered on the spot rather than kept as `Ty`, since a
     /// project type's id needs no remapping once it is text.
@@ -861,6 +865,7 @@ pub(crate) fn bind_body(
     enclosing_member: Option<SymbolId>,
     params: &[SymbolId],
     block: &Block,
+    record_types: bool,
 ) -> BoundBody {
     let (scopes, root_scope) = ScopeTree::new_root(ScopeKind::Body, block.syntax().text_range());
     let mut binder = BodyBinder {
@@ -873,7 +878,7 @@ pub(crate) fn bind_body(
         scopes,
         pending_locals: Vec::new(),
         type_mismatches: Vec::new(),
-        expr_types: None,
+        expr_types: record_types.then(Vec::new),
         file,
         enclosing_type,
         enclosing_member,
@@ -899,7 +904,10 @@ fn soql_result_type(sq: &apex_syntax::ast::soql::SoqlExpr) -> Option<SmolStr> {
     };
     if let [only] = entries.as_slice() {
         if let Some(f) = only.function() {
-            if function_named(&f, &["COUNT"]) && f.field_name().is_none() && f.nested_function().is_none() {
+            if function_named(&f, &["COUNT"])
+                && f.field_name().is_none()
+                && f.nested_function().is_none()
+            {
                 return Some(SmolStr::new_static("Integer"));
             }
         }
@@ -913,49 +921,6 @@ fn soql_result_type(sq: &apex_syntax::ast::soql::SoqlExpr) -> Option<SmolStr> {
         return Some(SmolStr::new_static("List<AggregateResult>"));
     }
     Some(SmolStr::from(format!("List<{object}>")))
-}
-
-/// Re-binds one method/constructor/accessor body exactly as [`bind_body`]
-/// does, but keeping every expression's inferred type -- what
-/// `crate::BoundProgram::expr_types_in` hands to a caller asking "what type
-/// is this expression" (`apexls query ... --and '$v : String'`). A
-/// separate re-bind of just the one body rather than a table filled during
-/// the normal bind, so no other caller pays for types it never asks about.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn body_expr_types(
-    table: &SymbolTable,
-    schema: &SchemaIndex,
-    stdlib: &StdlibIndex,
-    labels: &LabelIndex,
-    pages: &PageIndex,
-    file: FileId,
-    enclosing_type: Option<SymbolId>,
-    enclosing_member: Option<SymbolId>,
-    params: &[SymbolId],
-    block: &Block,
-) -> Vec<(SyntaxPtr, SmolStr)> {
-    let (scopes, root_scope) = ScopeTree::new_root(ScopeKind::Body, block.syntax().text_range());
-    let mut binder = BodyBinder {
-        table,
-        schema,
-        stdlib,
-        labels,
-        pages,
-        refs: ReferenceTable::default(),
-        scopes,
-        pending_locals: Vec::new(),
-        type_mismatches: Vec::new(),
-        expr_types: Some(Vec::new()),
-        file,
-        enclosing_type,
-        enclosing_member,
-    };
-    for &p in params {
-        let name = binder.table.get(p).name.clone();
-        binder.scopes.bind(root_scope, name, p);
-    }
-    binder.bind_block_stmts(root_scope, block);
-    binder.expr_types.unwrap_or_default()
 }
 
 /// Binds a `TriggerBlock`'s bare top-level statements -- the trigger's
@@ -974,6 +939,7 @@ pub(crate) fn bind_trigger_body(
     file: FileId,
     enclosing_type: Option<SymbolId>,
     block: &TriggerBlock,
+    record_types: bool,
 ) -> BoundBody {
     let (scopes, root_scope) = ScopeTree::new_root(ScopeKind::Body, block.syntax().text_range());
     let mut binder = BodyBinder {
@@ -986,7 +952,7 @@ pub(crate) fn bind_trigger_body(
         scopes,
         pending_locals: Vec::new(),
         type_mismatches: Vec::new(),
-        expr_types: None,
+        expr_types: record_types.then(Vec::new),
         file,
         enclosing_type,
         enclosing_member: None,
@@ -1013,6 +979,7 @@ pub(crate) fn bind_initializer(
     file: FileId,
     enclosing_type: Option<SymbolId>,
     expr: &Expr,
+    record_types: bool,
 ) -> BoundBody {
     let (scopes, root_scope) = ScopeTree::new_root(ScopeKind::Body, expr.syntax().text_range());
     let mut binder = BodyBinder {
@@ -1025,7 +992,7 @@ pub(crate) fn bind_initializer(
         scopes,
         pending_locals: Vec::new(),
         type_mismatches: Vec::new(),
-        expr_types: None,
+        expr_types: record_types.then(Vec::new),
         file,
         enclosing_type,
         enclosing_member: None,
@@ -1094,6 +1061,7 @@ pub(crate) fn bind_object_ref(schema: &SchemaIndex, ptr: SyntaxPtr, name: &str) 
         pending_locals: Vec::new(),
         refs,
         type_mismatches: Vec::new(),
+        expr_types: Vec::new(),
     }
 }
 
@@ -1488,6 +1456,7 @@ pub(crate) fn bind_type_ref(
         pending_locals: Vec::new(),
         refs,
         type_mismatches: Vec::new(),
+        expr_types: Vec::new(),
     }
 }
 
@@ -1498,6 +1467,7 @@ impl<'a> BodyBinder<'a> {
             pending_locals: self.pending_locals,
             refs: self.refs,
             type_mismatches: self.type_mismatches,
+            expr_types: self.expr_types.unwrap_or_default(),
         }
     }
 

@@ -523,7 +523,7 @@ impl TypeContext {
     }
 }
 
-/// One file's type lookups, re-binding each method body at most once.
+/// One file's type lookups, re-binding each declaration at most once.
 struct Types<'a> {
     program: &'a apex_binder::BoundProgram,
     file: apex_binder::FileId,
@@ -546,11 +546,11 @@ impl Types<'_> {
             return binds.get(name).cloned();
         }
         let range = apex_syntax::TextRange::new(start.into(), end.into());
-        let callable = self.program.enclosing_callable(self.file, range.start())?;
+        let unit = self.program.type_unit_at(self.file, range.start())?;
         let mut bodies = self.bodies.borrow_mut();
         let types = bodies
-            .entry(callable)
-            .or_insert_with(|| self.program.expr_types_in(callable));
+            .entry(unit)
+            .or_insert_with(|| self.program.expr_types_in(unit));
         types
             .iter()
             .find(|(r, _, _)| *r == range)
@@ -1914,6 +1914,16 @@ mod tests {
     /// Like [`filtered_hits`], with `src` bound as a one-file project so
     /// `:` conditions have types to read.
     fn typed_hits(pattern: &str, and: &[&str], not: &[&str], src: &str) -> Vec<String> {
+        typed_hits_in("T.cls", pattern, and, not, src)
+    }
+
+    fn typed_hits_in(
+        file: &str,
+        pattern: &str,
+        and: &[&str],
+        not: &[&str],
+        src: &str,
+    ) -> Vec<String> {
         static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "apexls-query-types-{}-{}",
@@ -1921,7 +1931,7 @@ mod tests {
             RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("T.cls"), src).unwrap();
+        std::fs::write(dir.join(file), src).unwrap();
         CAPTURE_RANGES.store(true, std::sync::atomic::Ordering::Relaxed);
         let types = TypeContext::new(&dir, &dir);
         let pattern = Pattern::compile(pattern).expect("pattern should compile");
@@ -1936,7 +1946,7 @@ mod tests {
             &compile(and),
             &compile(not),
             Some(&types),
-            Path::new("T.cls"),
+            Path::new(file),
             src,
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -3293,6 +3303,35 @@ mod tests {
             debug("List<Contact>"),
             ["System.debug([SELECT Id FROM Contact])"],
             "a query's rows"
+        );
+    }
+
+    /// Types come from every body the binder walks, not only methods: a
+    /// field initializer, a property accessor, a trigger.
+    #[test]
+    fn a_type_condition_reaches_initializers_accessors_and_triggers() {
+        let class = "public class T {\n    static String name = 'n';\n    static String greeting = 'hi ' + name;\n    List<String> items;\n    public Integer size { get { return items.size(); } }\n}\n";
+        assert_eq!(
+            typed_hits("'hi ' + $x", &["$x : String"], &[], class),
+            ["'hi ' + name"],
+            "a field initializer"
+        );
+        assert_eq!(
+            typed_hits("return $e;", &["$e : Integer"], &[], class),
+            ["return items.size();"],
+            "a property accessor"
+        );
+        let trigger = "trigger T on Account (before insert) {\n    String s = 'x';\n    System.debug(s);\n    System.debug(1);\n}\n";
+        assert_eq!(
+            typed_hits_in(
+                "T.trigger",
+                "System.debug($v)",
+                &["$v : String"],
+                &[],
+                trigger
+            ),
+            ["System.debug(s)"],
+            "a trigger body"
         );
     }
 

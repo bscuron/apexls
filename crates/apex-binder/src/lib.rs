@@ -750,6 +750,7 @@ impl BoundProgram {
                             &root_node,
                             *id,
                             symbol,
+                            false,
                         )
                             .into_iter()
                             .map(move |(key, body)| (*file, key, body))
@@ -1342,44 +1343,59 @@ impl BoundProgram {
             .map(|(local, _)| SymbolId::new(file, local as u32))
     }
 
-    /// Every expression type the binder infers inside `callable`'s body --
-    /// a method or constructor -- as `(range, kind, type)`, the type
-    /// spelled as Apex does (`String`, `List<Account>`). An expression the
-    /// binder could not type is simply absent.
+    /// The declaration whose body holds `offset` -- a method, constructor,
+    /// property, field or trigger, the innermost if they nest -- which is
+    /// what [`Self::expr_types_in`] binds. Cheap: a scan of the file's own
+    /// symbols, so a caller can cache per unit without binding to find out.
+    pub fn type_unit_at(&self, file: FileId, offset: rowan::TextSize) -> Option<SymbolId> {
+        self.symbols
+            .symbols_of_file(file)
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                matches!(
+                    s.kind,
+                    SymbolKind::Method
+                        | SymbolKind::Constructor
+                        | SymbolKind::Property
+                        | SymbolKind::Field
+                        | SymbolKind::Trigger
+                ) && s.ptr.range().contains(offset)
+            })
+            .min_by_key(|(_, s)| s.ptr.range().len())
+            .map(|(local, _)| SymbolId::new(file, local as u32))
+    }
+
+    /// Every expression type the binder infers inside `unit` -- a method,
+    /// constructor, property accessor, field initializer or trigger body
+    /// -- as `(range, kind, type)`, the type spelled as Apex does
+    /// (`String`, `List<Account>`). An expression the binder could not
+    /// type is simply absent.
     ///
-    /// Re-binds that one body on demand rather than reading a table from
-    /// the normal bind, which keeps no types at all: only a caller that
-    /// asks pays, and only for the bodies it asks about. The range and kind
-    /// identify the expression in any tree parsed from the same text.
+    /// Re-binds that one declaration on demand, exactly as Pass 2 does but
+    /// recording types, rather than reading a table from the normal bind,
+    /// which keeps none: only a caller that asks pays, and only for the
+    /// declarations it asks about. The range and kind identify the
+    /// expression in any tree parsed from the same text.
     pub fn expr_types_in(
         &self,
-        callable: SymbolId,
+        unit: SymbolId,
     ) -> Vec<(rowan::TextRange, apex_syntax::SyntaxKind, String)> {
-        let symbol = self.symbols.get(callable);
+        let symbol = self.symbols.get(unit);
         let root = self.syntax(symbol.file);
-        let node = symbol.ptr.to_node(&root);
-        let body = match symbol.kind {
-            SymbolKind::Method => node.and_then(MethodDecl::cast).and_then(|m| m.body()),
-            SymbolKind::Constructor => node.and_then(ConstructorDecl::cast).and_then(|c| c.body()),
-            _ => None,
-        };
-        let Some(body) = body else {
-            return Vec::new();
-        };
-        let params = self.symbols.params(callable);
-        resolve::body_expr_types(
+        bind_symbol_body(
             &self.symbols,
             &self.schema,
             &self.stdlib,
             &self.labels,
             &self.pages,
-            symbol.file,
-            symbol.container,
-            Some(callable),
-            &params,
-            &body,
+            &root,
+            unit,
+            symbol,
+            true,
         )
         .into_iter()
+        .flat_map(|(_, body)| body.expr_types)
         .map(|(ptr, text)| (ptr.range(), ptr.kind(), text.to_string()))
         .collect()
     }
@@ -1523,7 +1539,7 @@ impl BindCache {
         let mut bound: Vec<(Option<SyntaxPtr>, resolve::BoundBody)> = to_bind
             .iter()
             .flat_map(|(id, symbol)| {
-                bind_symbol_body(&self.table, schema, stdlib, labels, pages, &root, *id, symbol)
+                bind_symbol_body(&self.table, schema, stdlib, labels, pages, &root, *id, symbol, false)
             })
             .collect();
         for (owner, ptr) in self.supertype_ptrs.get(&file).into_iter().flatten() {
@@ -1645,6 +1661,7 @@ fn bind_symbol_body(
     root: &SyntaxNode,
     id: SymbolId,
     symbol: &Symbol,
+    record_types: bool,
 ) -> Vec<(Option<SyntaxPtr>, resolve::BoundBody)> {
     // A field/property/parameter's own type, or a method's return type
     // -- shared by several arms below, so factored out once. `None` for
@@ -1686,6 +1703,7 @@ fn bind_symbol_body(
                     Some(id),
                     &params,
                     &body,
+                    record_types,
                 );
                 out.push((Some(key), bound));
             }
@@ -1711,6 +1729,7 @@ fn bind_symbol_body(
                 Some(id),
                 &params,
                 &body,
+                record_types,
             );
             vec![(Some(key), bound)]
         }
@@ -1741,6 +1760,7 @@ fn bind_symbol_body(
                         None,
                         params,
                         &body,
+                        record_types,
                     );
                     Some((Some(key), bound))
                 }));
@@ -1765,6 +1785,7 @@ fn bind_symbol_body(
                     symbol.file,
                     symbol.container,
                     &init,
+                    record_types,
                 );
                 out.push((None, bound));
             }
@@ -1797,6 +1818,7 @@ fn bind_symbol_body(
                     symbol.file,
                     Some(id),
                     &block,
+                    record_types,
                 );
                 out.push((Some(key), bound));
             }
