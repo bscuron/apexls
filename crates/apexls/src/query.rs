@@ -103,8 +103,12 @@
 //! - **`$X ~ GLOB`** or **`$X ~ /REGEX/`** -- the capture's text matches.
 //!   A glob is shell-style and anchored: `*` any run, `?` one character,
 //!   `{add,remove}` alternatives, and `$V` another capture's text, so
-//!   `--not '$T ~ $V'` says two captures differ. A regex is unanchored.
-//!   Both are case-insensitive, as Apex is; `(?-i)` opts a regex out.
+//!   `--not '$T ~ $V'` says two captures differ. A glob is
+//!   case-insensitive, because Apex names are. A regex is unanchored and
+//!   means exactly what it says, as in Perl: case-sensitive unless flagged
+//!   `/re/i`, with `x`, `s` and `m` also accepted. Otherwise `[A-Z]` would
+//!   quietly match lowercase, and `~` would disagree with `regex:` and
+//!   `comment:`, which were always case-sensitive.
 //!
 //! The two cannot be confused: `~` is only ever a prefix operator in Apex,
 //! so `$X ~` never starts a pattern. There is no `--or` -- alternation
@@ -365,8 +369,8 @@ impl Condition {
         };
         require_bound(&name)?;
         let rhs = rhs.trim();
-        let test = match rhs.strip_prefix('/').and_then(|r| r.strip_suffix('/')) {
-            Some(re) => TextTest::Regex(case_insensitive(re)?),
+        let test = match rhs.strip_prefix('/') {
+            Some(body) => TextTest::Regex(flagged_regex(body, src)?),
             None => {
                 let parts = glob_parts(rhs)?;
                 let mut refers = false;
@@ -477,6 +481,36 @@ fn anchored(parts: &[GlobPart], binds: &Binds) -> String {
     }
     re.push_str(")$");
     re
+}
+
+/// `re/flags` (the part after the opening `/`) as a regex. Flags follow
+/// the closing `/`, Perl-style: `i` case-insensitive, `x` whitespace and
+/// `#` comments ignored, `s` `.` matches a newline, `m` `^`/`$` per line.
+fn flagged_regex(body: &str, src: &str) -> Result<regex::Regex, ArgError> {
+    let Some((re, flags)) = body.rsplit_once('/') else {
+        return Err(ArgError(
+            format!("error: unclosed regex in `{src}`\nnote: write it `/REGEX/`, flags after the closing slash"),
+            2,
+        ));
+    };
+    let mut builder = regex::RegexBuilder::new(re);
+    for flag in flags.chars() {
+        match flag {
+            'i' => builder.case_insensitive(true),
+            'x' => builder.ignore_whitespace(true),
+            's' => builder.dot_matches_new_line(true),
+            'm' => builder.multi_line(true),
+            _ => {
+                return Err(ArgError(
+                    format!("error: unknown regex flag `{flag}` in `{src}`\nnote: the flags are i, x, s and m"),
+                    2,
+                ))
+            }
+        };
+    }
+    builder
+        .build()
+        .map_err(|e| ArgError(format!("error: invalid regex: {e}"), 2))
 }
 
 fn case_insensitive(re: &str) -> Result<regex::Regex, ArgError> {
@@ -2604,14 +2638,48 @@ mod tests {
         assert_eq!(n("*"), 6);
     }
 
-    /// A regex is unanchored, and case-insensitive unless it opts out.
+    /// A regex is unanchored and case-sensitive, Perl-style, unless
+    /// flagged: `/re/i`, and `x`, `s`, `m`.
     #[test]
-    fn a_regex_condition_is_unanchored() {
-        let src = wrap("        getName(1);\n        setName(2);\n        forget(3);");
-        let n = |re: &str| filtered_hits("$M(...)", &[&format!("$M ~ /{re}/")], &[], &src).len();
-        assert_eq!(n("^(get|set)"), 2);
-        assert_eq!(n("get"), 2, "unanchored: forget too");
-        assert_eq!(n("(?-i)^GET"), 0, "opted out of case-insensitivity");
+    fn a_regex_condition_is_unanchored_and_takes_flags() {
+        let src = wrap("        getName(1);\n        setName(2);\n        forget(3);\n        GetAll(4);\n        getter(5);");
+        let n = |re: &str| filtered_hits("$M(...)", &[&format!("$M ~ {re}")], &[], &src).len();
+        assert_eq!(n("/^(get|set)/"), 3, "case-sensitive: not GetAll");
+        assert_eq!(n("/get/"), 3, "unanchored: forget too, but not GetAll");
+        assert_eq!(n("/^get/i"), 3, "flagged: GetAll too");
+        assert_eq!(
+            n("/^(get|set)[A-Z]/"),
+            2,
+            "[A-Z] means uppercase: not getter"
+        );
+        assert_eq!(
+            n("/^ g e t  # a comment\n/x"),
+            2,
+            "x ignores whitespace and comments"
+        );
+        assert_eq!(n("/^GET/ix"), 3, "flags combine");
+    }
+
+    /// A regex must close, and only known flags are accepted.
+    #[test]
+    fn a_regex_condition_rejects_bad_flags() {
+        let bound = Pattern::compile("$M(...)").unwrap().capture_names();
+        let err = |c: &str| {
+            Condition::compile(c, &bound)
+                .err()
+                .map(|e| e.0)
+                .unwrap_or_default()
+        };
+        assert!(
+            err("$M ~ /get").contains("unclosed regex"),
+            "{}",
+            err("$M ~ /get")
+        );
+        assert!(err("$M ~ /get/g").contains("unknown regex flag `g`"));
+        assert!(
+            Condition::compile("$M ~ /a/b/i", &bound).is_ok(),
+            "the last slash closes it"
+        );
     }
 
     /// `$V` inside a glob is another capture's text, so `--not '$T ~ $V'`

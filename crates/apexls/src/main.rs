@@ -51,7 +51,8 @@ enum Command {
     /// A COND is either a pattern the match must contain, or `$NAME ~ GLOB`
     /// / `$NAME ~ /REGEX/` testing a capture's text. Globs are shell-style
     /// and anchored (`*`, `?`, `{add,remove}`, and `$OTHER` for another
-    /// capture's text); regexes are unanchored. Both are case-insensitive.
+    /// capture's text) and case-insensitive. Regexes are unanchored and
+    /// case-sensitive unless flagged: `/re/i`, also `x`, `s` and `m`.
     Query {
         pattern: String,
         /// Rewrite every match with this template, in place.

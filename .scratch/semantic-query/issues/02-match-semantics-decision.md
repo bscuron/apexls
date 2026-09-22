@@ -356,8 +356,8 @@ so `acc` and `Acc` are one capture. Guarded by `matching_is_case_insensitive_lik
 [--not COND]...`: a match is kept when every `--and` holds and no `--not` does. A COND is either
 a pattern the match must contain (what `--containing` and `--not` took before), or `$X ~ GLOB` /
 `$X ~ /REGEX/` on a capture's text. Globs are shell-style and anchored, with `{a,b}` alternatives
-and `$V` for another capture's text; regexes are unanchored; both are case-insensitive, and
-`(?-i)` opts a regex out. The two forms cannot be confused, since `~` is only a prefix operator in
+and `$V` for another capture's text, and case-insensitive; regexes are unanchored and
+case-sensitive, Perl-style, unless flagged `/re/i` (also `x`, `s`, `m`). The two forms cannot be confused, since `~` is only a prefix operator in
 Apex. The user chose this shape over inline constraint syntax and over boolean operators inside
 a condition: the pattern says the structure, `~` the text, the flags yes or no.
 
@@ -367,7 +367,7 @@ matched name could not reach a replacement. Every NPSP count carried over exactl
 `static void $M() { ... } --and '$M ~ addChild*'` is 9, `$_ $M(...) { ... } --and '$M ~ add*'`
 173, `$M(...) --and '$M ~ addChild*'` 4, as the inline forms were -- and the old filters too:
 751, 107 and 11,303. Guarded by `a_glob_condition_tests_a_captures_text`,
-`a_regex_condition_is_unanchored`, `a_glob_can_compare_two_captures`,
+`a_regex_condition_is_unanchored_and_takes_flags`, `a_glob_can_compare_two_captures`,
 `a_condition_names_a_bound_capture` and `conditions_combine`.
 
 **22. The return type is optional, as modifiers are.** A member pattern with no return type,
@@ -377,3 +377,11 @@ only void methods. On NPSP `$F(...) { ... }` finds 12,095 -- every method with a
 constructor, exactly. Found alongside it: the catch-clause fragment entry point bumped its first
 token without checking it was `catch`, so every `NAME(...) { ... }` pattern without a modifier
 compiled as a catch clause and matched nothing. Guarded by `a_return_type_is_optional`.
+
+**23. A regex is case-sensitive unless flagged.** `/re/` began case-insensitive like everything
+else, and `/^(get|set)[A-Z]/` then found 2,137 on NPSP, `getter` included, because `[A-Z]`
+matched lowercase. A regex now means exactly what it says, with Perl's trailing flags: `/re/i`,
+and `x`, `s`, `m`. That also brings `~` into line with `regex:` and `comment:`, which were
+case-sensitive all along. Globs stay case-insensitive: they are the Apex-aware form, and Apex
+names are case-insensitive. Guarded by `a_regex_condition_is_unanchored_and_takes_flags` and
+`a_regex_condition_rejects_bad_flags`.
