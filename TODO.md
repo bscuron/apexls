@@ -31,20 +31,18 @@ apexls query 'delete $x;'    -r 'DML.doDelete($x, true);'    #   119
 apexls query 'upsert $x $f;' -r 'DML.doUpsert($x, $f, true);'#     1
 ```
 
-## 1. DML forms the four patterns above miss
+## 1. Done: the rest of the DML
 
-Each is a pattern plus a template, no new machinery -- but each needs its
-own Moxygen call shape decided first.
-
-| Form | NPSP | Note |
+| Form | NPSP | Command |
 | --- | --- | --- |
-| `upsert $x;` | 71 | no external id: which `doUpsert` overload? |
-| `undelete $x;` | 14 | |
-| `merge $a $b;` | 17 | Moxygen may have no wrapper; check |
-| `insert as user $x;` | 0 here | access-level forms exist in the language |
-| `Database.insert(...)` | 46 | already a call; different rewrite |
-| `Database.update(...)` | 39 | |
-| `Database.query(...)` | 327 | already a string: the easy query case |
+| `undelete $x;` | 14 | `-r 'DML.doUndelete($x, true);'` |
+| `Database.insert($x, $b);` | 9 | `-r 'DML.doInsert($x, $b);'` |
+| `Database.update($x, $b);` | 9 | `-r 'DML.doUpdate($x, $b);'` |
+| `upsert $x;` (no field) | 71 | one run per type: `--and '$x : Level__c' -r 'DML.doUpsert($x, Level__c.Id, true);'` |
+| `merge $a $b;` | 17 | Moxygen has no `doMerge`; left alone |
+
+`doUpsert` always takes an external-id field, which is why a bare `upsert`
+needs the type. Every command is in `docs/moxygen-migration.md`.
 
 ## 2-5. Done: `--let`, transforms, groups in SOQL, template strings
 
@@ -87,12 +85,13 @@ elsewhere in the file, coordinated edits across sites, state carried
 between matches (numbering, deduplication), and anything needing a
 computation the two transforms do not cover.
 
-## 6. Cast and result shape
+## 6. Done: casts and call shapes
 
-`Selector.queryWithBinds` returns `List<SObject>`, so a rewrite needs the
-cast (`(List<Account>)`) and must know the queried object -- `$o` from the
-pattern's `FROM` gives that. Single-row uses (`Account a = [SELECT ...]`)
-need `[0]` or a different call, so they are a separate pattern from the
-list case. Worth splitting the migration into: list-assigned queries,
-single-row-assigned queries, `for (X x : [SELECT ...])` loops, and queries
-used as a bare argument.
+Ten recipes, one per place a query's result can go -- list and
+single-record declarations, for-each loops, assignments, returns and
+arguments, plus `COUNT()` -- in `docs/moxygen-migration.md`. Together they
+convert 1,896 of NPSP's 2,132 inline queries (89%) across 313 files with no
+parse failures.
+
+The 236 left are queries inside larger expressions (`[SELECT ...][0].Name`),
+in conditions, or aggregates, which change the surrounding code too.
