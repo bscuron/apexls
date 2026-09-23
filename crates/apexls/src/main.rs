@@ -78,6 +78,13 @@ enum Command {
         /// there is no dry run -- omit this to search.
         #[arg(long = "replace", short = 'r', value_name = "TEMPLATE")]
         replace: Vec<String>,
+        /// Name the result of applying a pattern to a capture:
+        /// `NAME = $SRC ~ PATTERN => TEMPLATE` rewrites every match inside
+        /// $SRC and keeps the rest; `NAME = $SRC * PATTERN => TEMPLATE |
+        /// SEP` renders each match and joins them. NAME is then usable
+        /// like any capture. Repeatable, evaluated in order.
+        #[arg(long = "let", value_name = "SPEC")]
+        lets: Vec<String>,
         /// Keep only matches for which this condition holds. Repeatable;
         /// every one must hold.
         #[arg(long = "and", value_name = "COND")]
@@ -147,9 +154,10 @@ fn run_command() -> ExitCode {
         Command::Query {
             pattern,
             replace,
+            lets,
             and,
             not,
             paths,
-        } => query::run(&pattern, &replace, &and, &not, &paths),
+        } => query::run(&pattern, &replace, &lets, &and, &not, &paths),
     }
 }

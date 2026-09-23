@@ -146,6 +146,36 @@
 //! only the first `=>` separates and at most one space either side of it is
 //! dropped, so a template keeps its own whitespace and map literals.
 //!
+//! **`--let NAME = $SRC ~ PATTERN => TEMPLATE`** names the result of
+//! applying this tool to one capture: `~` rewrites every match inside
+//! `$SRC` and keeps the rest, `*` renders each match and joins them
+//! (`... | SEP`). The inner pattern and template are the same language as
+//! the outer ones, which is what makes the flag general rather than a
+//! feature per use case. Repeating a name adds a rule instead of replacing
+//! it, so one value can be two rewrites at once. `NAME` is then an
+//! ordinary capture: usable in `-r`, in conditions, and with transforms.
+//!
+//! **`$X:quote` and `$X:id`** are the two transforms, both plain text
+//! functions: `:quote` escapes `'` and `\\` and flattens whitespace so text
+//! fits in a string literal, `:id` turns an expression into a name
+//! (`a.Id` -> `aId`), the same name every time from the same text. Between
+//! them, "extract these scattered sub-expressions, rename them in place,
+//! and list them over there" is expressible -- an inline SOQL query
+//! becoming a dynamic one with its binds in a map:
+//!
+//! ```text
+//! apexls query '$_ $v = ${[${SELECT ... FROM $o ...}]};' \
+//!   --let 'q = $2 ~ :$e => :$e:id' \
+//!   --let 'q = $2 ~ kind:SoqlWithClause => ' \
+//!   --let "m = \$2 * :\$e => '\$e:id' => \$e |, " \
+//!   -r "\$1 => (List<\$o>) Selector.queryWithBinds('\$q:quote', new Map<String, Object>{\$m}, AccessLevel.USER_MODE)"
+//! ```
+//!
+//! Nothing in the tool knows what a SOQL bind is; the inner pattern `:$e`
+//! does. The boundary is one match in, one span out: edits elsewhere in
+//! the file, coordinated edits across sites, and state carried between
+//! matches all stay outside it.
+//!
 //! **Modifiers match as a subset**, everywhere Apex lets one be written:
 //! a type or member declaration, a local variable, a method or catch
 //! parameter, a property accessor. Every modifier the pattern names must be
@@ -230,7 +260,79 @@ struct Replacement {
 #[derive(Debug, Clone)]
 enum ReplacementPart {
     Text(String),
-    Capture(String),
+    Capture {
+        name: String,
+        transform: Option<Transform>,
+    },
+}
+
+/// What `$X:name` does to a capture's text on the way into a template.
+/// Both are plain text functions -- nothing here knows Apex.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Transform {
+    /// `:quote` -- escape `\` and `'` and flatten every run of
+    /// whitespace to one space, so the text can sit inside an Apex string
+    /// literal. A literal cannot span lines, and 269 of NPSP's query sites
+    /// do.
+    Quote,
+    /// `:id` -- a legal identifier derived from the text (`a.Id` ->
+    /// `aId`), so a captured expression can *name* something: a map key, a
+    /// variable. Deterministic, so two templates deriving a key from the
+    /// same expression agree.
+    Id,
+}
+
+impl Transform {
+    fn parse(name: &str) -> Option<Transform> {
+        match name {
+            "quote" => Some(Transform::Quote),
+            "id" => Some(Transform::Id),
+            _ => None,
+        }
+    }
+
+    fn apply(self, text: &str) -> String {
+        match self {
+            Transform::Quote => {
+                let escaped: String = text
+                    .chars()
+                    .map(|c| match c {
+                        '\\' => "\\\\".to_string(),
+                        '\'' => "\\'".to_string(),
+                        c => c.to_string(),
+                    })
+                    .collect();
+                crate::project::collapse(&escaped)
+            }
+            Transform::Id => {
+                // Each run of identifier characters becomes one word, and
+                // the words join camelCase: `a.Id` -> `aId`, `crel[0].id`
+                // -> `crel0Id`. A leading digit gets a `k` so the result is
+                // always a legal name.
+                let mut out = String::new();
+                for word in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                    if word.is_empty() {
+                        continue;
+                    }
+                    if out.is_empty() {
+                        out.push_str(word);
+                    } else {
+                        let mut chars = word.chars();
+                        if let Some(first) = chars.next() {
+                            out.extend(first.to_uppercase());
+                            out.push_str(chars.as_str());
+                        }
+                    }
+                }
+                if out.is_empty() {
+                    out.push('x');
+                } else if out.starts_with(|c: char| c.is_ascii_digit()) {
+                    out.insert(0, 'k');
+                }
+                out
+            }
+        }
+    }
 }
 
 impl Replacement {
@@ -242,17 +344,27 @@ impl Replacement {
     /// of each side is how Coccinelle does it and is easy to get wrong;
     /// requiring a name makes the template total -- every hole in it has
     /// exactly one binding.
+    /// Only *named* captures may appear, and only ones the pattern binds.
+    ///
+    /// A bare `...` is rejected rather than given a meaning: on the match
+    /// side it stands for code nobody named, so on the output side it has
+    /// nothing to refer to. Positional correspondence between the nth `...`
+    /// of each side is how Coccinelle does it and is easy to get wrong;
+    /// requiring a name makes the template total -- every hole in it has
+    /// exactly one binding.
+    ///
+    /// Scanned as plain text rather than through the pattern lexer, so a
+    /// capture *inside a string literal* is substituted too --
+    /// `Selector.query('$1')` is the whole point of a rewrite that turns
+    /// code into a string. The pattern side keeps a literal's insides
+    /// opaque, which is right there and wrong here.
     fn compile(text: &str, bound: &std::collections::HashSet<String>) -> Result<Self, ArgError> {
         let mut parts = Vec::new();
-        let mut cursor = 0usize;
-        for (start, len, kind) in apex_parser::hole_spans(text) {
-            let (start, len) = (start as usize, len as usize);
-            let name_at = match kind {
-                apex_parser::TokenKind::PatternCapture => 1,
-                apex_parser::TokenKind::PatternSeqCapture => 4,
-                _ => 0,
-            };
-            if name_at == 0 {
+        let mut literal = String::new();
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        while i < text.len() {
+            if text[i..].starts_with("...") {
                 return Err(ArgError(
                     "error: `...` cannot appear in a replacement\n\
                      note: an unnamed hole has nothing to refer to; name it in the pattern and use the name here"
@@ -260,21 +372,56 @@ impl Replacement {
                     2,
                 ));
             }
-            let name = text[start + name_at..start + len].to_string();
+            if bytes[i] != b'$' {
+                literal.push_str(&text[i..=i]);
+                i += 1;
+                continue;
+            }
+            // `$...NAME` and `$NAME` name the same binding; `$1` names a
+            // group. A `$` naming nothing is just a `$`.
+            let after_sigil = i + 1;
+            let name_start = if text[after_sigil..].starts_with("...") {
+                after_sigil + 3
+            } else {
+                after_sigil
+            };
+            let len = name_len(&text[name_start..]);
+            if len == 0 {
+                literal.push('$');
+                i += 1;
+                continue;
+            }
+            let name = text[name_start..name_start + len].to_string();
             if !bound.contains(&name) {
                 return Err(ArgError(
                     format!("error: replacement uses ${name}, which the pattern never binds"),
                     2,
                 ));
             }
-            if start > cursor {
-                parts.push(ReplacementPart::Text(text[cursor..start].to_string()));
+            i = name_start + len;
+            // `:name` right after the capture is a transform; `$x : y`
+            // (spaced, a ternary) is not.
+            let mut transform = None;
+            if text[i..].starts_with(':') {
+                let transform_len = name_len(&text[i + 1..]);
+                if transform_len > 0 {
+                    let named = &text[i + 1..i + 1 + transform_len];
+                    transform = Some(Transform::parse(named).ok_or_else(|| {
+                        ArgError(
+                            format!("error: unknown transform `:{named}` in a replacement\nnote: the transforms are :quote (for a string literal) and :id (a name)"),
+                            2,
+                        )
+                    })?);
+                    i += 1 + transform_len;
+                }
             }
-            parts.push(ReplacementPart::Capture(name));
-            cursor = start + len;
+            if !literal.is_empty() {
+                parts.push(ReplacementPart::Text(std::mem::take(&mut literal)));
+            }
+            parts.push(ReplacementPart::Capture { name, transform });
         }
-        if cursor < text.len() {
-            parts.push(ReplacementPart::Text(text[cursor..].to_string()));
+        if !literal.is_empty() {
+            parts.push(ReplacementPart::Text(literal));
         }
         Ok(Replacement { parts })
     }
@@ -283,8 +430,14 @@ impl Replacement {
         self.parts
             .iter()
             .map(|part| match part {
-                ReplacementPart::Text(t) => t.as_str(),
-                ReplacementPart::Capture(name) => binds.get(name).map_or("", String::as_str),
+                ReplacementPart::Text(t) => t.clone(),
+                ReplacementPart::Capture { name, transform } => {
+                    let text = binds.get(name).map_or("", String::as_str);
+                    match transform {
+                        Some(transform) => transform.apply(text),
+                        None => text.to_string(),
+                    }
+                }
             })
             .collect()
     }
@@ -298,6 +451,198 @@ impl Replacement {
 const SHELL_QUOTES_NOTE: &str =
     "note: a shell expands `$1` and `$v` inside double quotes, usually to nothing; \
      quote patterns, conditions and templates with single quotes, e.g. -r '$1 => x'";
+
+/// A `--let`: the tool applied to one capture, naming the result.
+///
+/// Two forms, which differ only in what they keep:
+///
+/// ```text
+/// --let 'NAME = $SRC ~ PATTERN => TEMPLATE'         rewrite every match inside $SRC, keep the rest
+/// --let 'NAME = $SRC * PATTERN => TEMPLATE | SEP'   render each match, join them with SEP
+/// ```
+///
+/// `NAME` is then an ordinary capture: usable in `-r`, in conditions, and
+/// with transforms. The inner pattern and template are the same language
+/// as the outer ones, which is what makes this general rather than a
+/// feature per use case -- "for each of a variable number of scattered
+/// sub-expressions, rename it here and list it there" is the shape every
+/// bind-extraction rewrite needs:
+///
+/// ```text
+/// --let 'q = $1 ~ :$e => :$e:id'          the query, binds renamed to their keys
+/// --let 'm = $1 * :$e => '$e:id' => $e | , '   the map pairs for those keys
+/// ```
+///
+/// Both derive the key with `:id` from the same expression text, so the
+/// string and the map agree without either knowing about the other.
+struct Let {
+    name: String,
+    source: String,
+    collect: bool,
+    /// One per `--let` that names this binding. Repeating the name adds a
+    /// rule rather than replacing it, which is how one value can be the
+    /// product of two rewrites -- a query with its binds renamed *and* its
+    /// `WITH USER_MODE` removed, since a dynamic query may not state an
+    /// access level twice (confirmed against a real org: "Cannot use the
+    /// WITH AccessLevel clause in dynamic queries that also specify an
+    /// access level"). The rules match the same source independently, and
+    /// their edits are applied together.
+    rules: Vec<(Pattern, Replacement)>,
+    separator: String,
+}
+
+impl Let {
+    fn compile(spec: &str, bound: &std::collections::HashSet<String>) -> Result<Let, ArgError> {
+        let err = |message: String| ArgError(message, 2);
+        let shape = "note: write it `NAME = $SRC ~ PATTERN => TEMPLATE` (rewrite in place) or `NAME = $SRC * PATTERN => TEMPLATE | SEP` (collect and join)";
+        // The first `=` that is not the `=>` further along: a spec with
+        // no name at all must say so, rather than splitting mid-arrow.
+        let assign = spec
+            .char_indices()
+            .find(|&(i, c)| c == '=' && !spec[i..].starts_with("=>"))
+            .map(|(i, _)| i)
+            .ok_or_else(|| {
+                err(format!(
+                    "error: --let `{spec}` has no `=`
+{shape}"
+                ))
+            })?;
+        let (name, rest) = (&spec[..assign], &spec[assign + 1..]);
+        let name = name.trim().to_string();
+        if name.is_empty() || name_len(&name) != name.len() {
+            return Err(err(format!(
+                "error: --let `{spec}` does not start with a name\n{shape}"
+            )));
+        }
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix(HOLE_CAPTURE_SIGIL).ok_or_else(|| {
+            err(format!(
+                "error: --let `{spec}` does not name a capture to work on\n{shape}"
+            ))
+        })?;
+        let source_len = name_len(rest);
+        if source_len == 0 {
+            return Err(err(format!(
+                "error: --let `{spec}` does not name a capture to work on\n{shape}"
+            )));
+        }
+        let source = rest[..source_len].to_string();
+        if !bound.contains(&source) {
+            return Err(err(format!(
+                "error: --let `{spec}` works on ${source}, which the pattern never binds"
+            )));
+        }
+        let rest = rest[source_len..].trim_start();
+        let (collect, rest) = match rest.chars().next() {
+            Some('~') => (false, &rest[1..]),
+            Some('*') => (true, &rest[1..]),
+            _ => {
+                return Err(err(format!(
+                    "error: --let `{spec}` has no `~` or `*` after the capture\n{shape}"
+                )))
+            }
+        };
+        let (pattern, template) = rest
+            .split_once("=>")
+            .ok_or_else(|| err(format!("error: --let `{spec}` has no `=>`\n{shape}")))?;
+        // A separator is the tail after the last `|`, so a template can
+        // hold `=>` and `||` and still be read correctly.
+        let (template, separator) = match (collect, template.rsplit_once('|')) {
+            (true, Some((template, separator))) => (template, separator.to_string()),
+            _ => (template, String::new()),
+        };
+        let pattern = Pattern::compile(pattern.trim())?;
+        let mut inner_bound = bound.clone();
+        inner_bound.extend(pattern.capture_names());
+        let template = template.trim();
+        let template = Replacement::compile(template, &inner_bound)?;
+        Ok(Let {
+            name,
+            source,
+            collect,
+            rules: vec![(pattern, template)],
+            separator,
+        })
+    }
+
+    /// Fold another `--let` for the same name into this one, or say why it
+    /// cannot be: two rules only compose when they read the same capture
+    /// the same way.
+    fn merge(&mut self, other: Let) -> Result<(), ArgError> {
+        if self.source != other.source || self.collect != other.collect {
+            return Err(ArgError(
+                format!(
+                    "error: --let `{}` is already defined over ${} -- repeating a name adds a rule, so both must read the same capture the same way",
+                    self.name, self.source
+                ),
+                2,
+            ));
+        }
+        self.rules.extend(other.rules);
+        Ok(())
+    }
+
+    /// Run this `--let` against one match's bindings, adding its result.
+    fn eval(&self, root: &SyntaxNode, src: &str, binds: &mut Binds) {
+        let Some((start, end)) = capture_span(binds, &self.source) else {
+            return;
+        };
+        // Every rule's matches inside the source, in source order, each
+        // already rendered with that rule's own template.
+        let mut inside: Vec<(SyntaxNode, String)> = Vec::new();
+        for (pattern, template) in &self.rules {
+            for (node, inner) in pattern.matches_with_binds(root) {
+                let range = node.text_range();
+                if usize::from(range.start()) < start || usize::from(range.end()) > end {
+                    continue;
+                }
+                let mut merged = binds.clone();
+                merged.extend(inner);
+                inside.push((node, template.render(&merged)));
+            }
+        }
+        inside.sort_by_key(|(node, _)| node.text_range().start());
+        let value = if self.collect {
+            inside
+                .iter()
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>()
+                .join(&self.separator)
+        } else {
+            // Highest offset first, so earlier edits keep their offsets --
+            // the same idiom the file rewrite uses. A rule whose match
+            // overlaps one already applied is skipped rather than
+            // corrupting it.
+            let mut text = src[start..end].to_string();
+            let mut last_start = end;
+            for (node, rendered) in inside.iter().rev() {
+                let Some(range) = apex_syntax::significant_range(node) else {
+                    continue;
+                };
+                let (from, to) = (usize::from(range.start()), usize::from(range.end()));
+                if from < start || to > end || to > last_start {
+                    continue;
+                }
+                text.replace_range(from - start..to - start, rendered);
+                last_start = from;
+            }
+            text
+        };
+        binds.insert(self.name.clone(), value);
+    }
+}
+
+/// Where a capture matched, as a byte span: `#N` for a group (its exact
+/// span, what a rewrite targets) or `@NAME` for an ordinary capture.
+fn capture_span(binds: &Binds, name: &str) -> Option<(usize, usize)> {
+    let recorded = binds
+        .get(&format!("#{name}"))
+        .or_else(|| binds.get(&format!("@{name}")))?;
+    let mut fields = recorded.split(':');
+    let start = fields.next()?.parse().ok()?;
+    let end = fields.next()?.parse().ok()?;
+    Some((start, end))
+}
 
 /// What `--replace` rewrites: the whole match, or some of its `${...}`
 /// groups, each with its own template.
@@ -752,6 +1097,7 @@ fn case_insensitive(re: &str) -> Result<regex::Regex, ArgError> {
 pub fn run(
     pattern_src: &str,
     replacement_srcs: &[String],
+    let_srcs: &[String],
     and_srcs: &[String],
     not_srcs: &[String],
     paths: &[PathBuf],
@@ -763,7 +1109,30 @@ pub fn run(
             return ExitCode::from(code);
         }
     };
-    let bound = pattern.capture_names();
+    let mut bound = pattern.capture_names();
+    // Each `--let` may work on what an earlier one produced only through
+    // its *span*, so a name becomes available as soon as it is compiled.
+    let mut lets = Vec::with_capacity(let_srcs.len());
+    for spec in let_srcs {
+        match Let::compile(spec, &bound) {
+            Ok(binding) => {
+                bound.insert(binding.name.clone());
+                match lets.iter_mut().find(|l: &&mut Let| l.name == binding.name) {
+                    Some(existing) => {
+                        if let Err(ArgError(message, code)) = existing.merge(binding) {
+                            eprintln!("{message}");
+                            return ExitCode::from(code);
+                        }
+                    }
+                    None => lets.push(binding),
+                }
+            }
+            Err(ArgError(message, code)) => {
+                eprintln!("{message}");
+                return ExitCode::from(code);
+            }
+        }
+    }
     let compile_all = |srcs: &[String]| {
         srcs.iter()
             .map(|src| Condition::compile(src, &bound))
@@ -788,6 +1157,11 @@ pub fn run(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // Only a `:` condition binds the project: a whole-project bind costs
     // several times what a search does, and nothing else needs it.
+    // A `--let` works on where its source matched, so captures must
+    // record their spans for it, exactly as a `:` condition needs.
+    if !lets.is_empty() {
+        CAPTURE_RANGES.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let types = ands
         .iter()
         .chain(&nots)
@@ -802,6 +1176,7 @@ pub fn run(
         Some(replacement) => run_replace(
             &pattern,
             replacement,
+            &lets,
             &ands,
             &nots,
             types,
@@ -810,7 +1185,7 @@ pub fn run(
             &refused,
         ),
         None => walk_project(paths, &cwd, |path, src| {
-            matches_in_file_filtered(&pattern, &ands, &nots, types, path, src)
+            matches_in_file_filtered(&pattern, &lets, &ands, &nots, types, path, src)
         }),
     };
     let matches = match found {
@@ -873,6 +1248,7 @@ impl Pattern {
             Fragment::CatchClause,
             Fragment::ClassMember,
             Fragment::TriggerUnit,
+            Fragment::SoqlBind,
         ] {
             let parse = apex_parser::parse_pattern(pattern_src, fragment);
             if !parse.errors.is_empty() {
@@ -1188,6 +1564,45 @@ fn record_group(binds: &mut Binds, group: &SyntaxNode, src: &SyntaxElement) -> b
     true
 }
 
+/// Record a group that wraps a *run* rather than one construct: the
+/// query inside `[${SELECT ...}]`, whose parts are children of the SOQL
+/// expression itself, with no node of their own to stand for them.
+fn record_group_run(binds: &mut Binds, group: &SyntaxNode, run: &[SyntaxElement]) -> bool {
+    let (Some(first), Some(last)) = (run.first(), run.last()) else {
+        return false;
+    };
+    let span = match (element_range(first), element_range(last)) {
+        (Some(first), Some(last)) => Some((first.start(), last.end())),
+        _ => None,
+    };
+    let (number, anchor) = group_number(group);
+    if anchor {
+        if let Some((start, _)) = span {
+            let offset = u32::from(start);
+            if FOCUS_SEEN.with(|seen| seen.borrow().contains(&offset)) {
+                return false;
+            }
+            binds.insert(ANCHOR_KEY.to_string(), offset.to_string());
+        }
+    }
+    let name = number.to_string();
+    binds.insert(name.clone(), run_text(run));
+    if let Some((start, end)) = span {
+        let span = format!("{}:{}", u32::from(start), u32::from(end));
+        binds.insert(format!("#{number}"), span.clone());
+        binds.insert(format!("@{name}"), span);
+    }
+    true
+}
+
+/// A node's significant range, or a token's own.
+fn element_range(element: &SyntaxElement) -> Option<apex_syntax::TextRange> {
+    match element {
+        NodeOrToken::Token(t) => Some(t.text_range()),
+        NodeOrToken::Node(n) => apex_syntax::significant_range(n),
+    }
+}
+
 /// Where group `$N` matched in the source, as a byte span.
 fn group_span(binds: &Binds, number: usize) -> Option<(usize, usize)> {
     let (start, end) = binds.get(&format!("#{number}"))?.split_once(':')?;
@@ -1326,6 +1741,31 @@ fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
             return match_without_return_type(&pat_rest, &src_rest, binds);
         }
         return match_seq(&pat_rest, &src_rest, binds);
+    }
+
+    // `[${SELECT ... FROM $o ...}]`: the group stands for everything
+    // between the brackets, which in the source is a run of children, so
+    // it is matched as that run and recorded with the run's own span.
+    if matches!(pat.kind(), SyntaxKind::SoqlExpr | SyntaxKind::SoslExpr) {
+        let pat_children = significant_children(pat);
+        if let [open, NodeOrToken::Node(group), close] = pat_children.as_slice() {
+            if group.kind() == SyntaxKind::PatternGroup {
+                let src_children = significant_children(src);
+                let [src_open, src_rest @ .., src_close] = src_children.as_slice() else {
+                    return false;
+                };
+                let inner: Vec<SyntaxElement> = significant_children(group)
+                    .into_iter()
+                    .filter(|e| {
+                        !matches!(e.kind(), SyntaxKind::PatternGroupOpen | SyntaxKind::RBrace)
+                    })
+                    .collect();
+                return match_element(open, src_open, binds)
+                    && match_element(close, src_close, binds)
+                    && match_seq(&inner, src_rest, binds)
+                    && record_group_run(binds, group, src_rest);
+            }
+        }
     }
 
     // An array type is flat -- `Map<Id, X>[]` is `Map`, a `TypeArgList`,
@@ -1877,6 +2317,7 @@ fn significant_text(node: &SyntaxNode) -> String {
 /// the two patterns describe the very same node.
 fn matches_in_file_filtered(
     pattern: &Pattern,
+    lets: &[Let],
     ands: &[Condition],
     nots: &[Condition],
     types: Option<&TypeContext>,
@@ -1937,6 +2378,12 @@ fn matches_in_file_filtered(
             };
             readings.into_iter().map(move |b| (node.clone(), b))
         })
+        .map(|(node, mut binds)| {
+            for binding in lets {
+                binding.eval(&root, src, &mut binds);
+            }
+            (node, binds)
+        })
         .filter(|(node, binds)| passes(node, binds, ands, nots, file_types.as_ref()))
         .filter_map(|(node, binds)| {
             let mut site = site_for(display_path, src, &index, &node)?;
@@ -1966,6 +2413,7 @@ fn matches_in_file_filtered(
 fn run_replace(
     pattern: &Pattern,
     replacement: &Rewrite,
+    lets: &[Let],
     ands: &[Condition],
     nots: &[Condition],
     types: Option<&TypeContext>,
@@ -1977,6 +2425,7 @@ fn run_replace(
         rewrite_file(
             pattern,
             replacement,
+            lets,
             ands,
             nots,
             types,
@@ -1995,6 +2444,7 @@ fn run_replace(
 fn rewrite_file(
     pattern: &Pattern,
     replacement: &Rewrite,
+    lets: &[Let],
     ands: &[Condition],
     nots: &[Condition],
     types: Option<&TypeContext>,
@@ -2012,6 +2462,12 @@ fn rewrite_file(
             let matches: Vec<_> = pattern
                 .matches_with_binds(&root)
                 .into_iter()
+                .map(|(node, mut binds)| {
+                    for binding in lets {
+                        binding.eval(&root, src, &mut binds);
+                    }
+                    (node, binds)
+                })
                 .filter(|(node, binds)| passes(node, binds, ands, nots, file_types.as_ref()))
                 .collect();
             whole_match_edits(
@@ -2034,6 +2490,12 @@ fn rewrite_file(
                     focus_solutions(&pattern_root, &node, binds)
                         .into_iter()
                         .map(move |b| (node.clone(), b))
+                })
+                .map(|(node, mut binds)| {
+                    for binding in lets {
+                        binding.eval(&root, src, &mut binds);
+                    }
+                    (node, binds)
                 })
                 .filter(|(node, binds)| passes(node, binds, ands, nots, file_types.as_ref()))
                 .map(|(_, binds)| binds)
@@ -2238,7 +2700,7 @@ fn widen_deletion_to_line(src: &str, start: usize, end: usize) -> (usize, usize)
 
 #[cfg(test)]
 fn matches_in_file(pattern: &Pattern, display_path: &Path, src: &str) -> Vec<Site> {
-    matches_in_file_filtered(pattern, &[], &[], None, display_path, src)
+    matches_in_file_filtered(pattern, &[], &[], &[], None, display_path, src)
 }
 
 #[cfg(test)]
@@ -2266,6 +2728,7 @@ mod tests {
         };
         matches_in_file_filtered(
             &pattern,
+            &[],
             &compile(and),
             &compile(not),
             None,
@@ -2306,6 +2769,7 @@ mod tests {
         };
         let sites = matches_in_file_filtered(
             &pattern,
+            &[],
             &compile(and),
             &compile(not),
             Some(&types),
@@ -3757,6 +4221,15 @@ mod tests {
         rewrites: &[&str],
         src: &str,
     ) -> Result<(String, Vec<String>), String> {
+        rewrite_with(pattern, &[], rewrites, src)
+    }
+
+    fn rewrite_with(
+        pattern: &str,
+        lets: &[&str],
+        rewrites: &[&str],
+        src: &str,
+    ) -> Result<(String, Vec<String>), String> {
         static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "apexls-query-rewrite-{}-{}",
@@ -3768,11 +4241,35 @@ mod tests {
         std::fs::write(&file, src).unwrap();
         let pattern = Pattern::compile(pattern).map_err(|e| e.0)?;
         let srcs: Vec<String> = rewrites.iter().map(|s| s.to_string()).collect();
-        let plan = Rewrite::compile(&srcs, &pattern.capture_names(), pattern.group_count())
+        let mut bound = pattern.capture_names();
+        let mut compiled = Vec::new();
+        for spec in lets {
+            let binding = Let::compile(spec, &bound).map_err(|e| e.0)?;
+            bound.insert(binding.name.clone());
+            match compiled
+                .iter_mut()
+                .find(|l: &&mut Let| l.name == binding.name)
+            {
+                Some(existing) => existing.merge(binding).map_err(|e| e.0)?,
+                None => compiled.push(binding),
+            }
+        }
+        let plan = Rewrite::compile(&srcs, &bound, pattern.group_count())
             .map_err(|e| e.0)?
             .ok_or("no rewrite")?;
+        CAPTURE_RANGES.store(true, std::sync::atomic::Ordering::Relaxed);
         let refused = std::sync::atomic::AtomicBool::new(false);
-        let sites = rewrite_file(&pattern, &plan, &[], &[], None, &file, src, &refused);
+        let sites = rewrite_file(
+            &pattern,
+            &plan,
+            &compiled,
+            &[],
+            &[],
+            None,
+            &file,
+            src,
+            &refused,
+        );
         let after = std::fs::read_to_string(&file).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         Ok((after, sites.into_iter().map(|s| s.text).collect()))
@@ -3873,6 +4370,103 @@ mod tests {
             ["2:5"],
             "once per match"
         );
+    }
+
+    /// The whole point of `--let`: extract scattered sub-expressions,
+    /// rename them in place, and list them somewhere else -- an inline
+    /// query becoming a dynamic one with its binds in a map. Nothing in
+    /// the tool knows about SOQL binds; the inner pattern does.
+    #[test]
+    fn lets_turn_a_query_into_a_string_and_a_bind_map() {
+        let src = "public class T {\n    void go(Account a, Set<Id> ids) {\n        List<Opportunity> o = [SELECT Id FROM Opportunity WHERE AccountId = :a.Id AND Id IN :ids];\n        List<Contact> c = [SELECT Id FROM Contact];\n    }\n}\n";
+        let (after, sites) = rewrite_with(
+            "$_ $v = ${[${SELECT ... FROM $o ...}]};",
+            &["q = $2 ~ :$e => :$e:id", "m = $2 * :$e => '$e:id' => $e |, "],
+            &["$1 => (List<$o>) Selector.queryWithBinds('$q:quote', new Map<String, Object>{$m}, AccessLevel.USER_MODE)"],
+            src,
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 2);
+        assert!(
+            after.contains("Selector.queryWithBinds('SELECT Id FROM Opportunity WHERE AccountId = :aId AND Id IN :ids', new Map<String, Object>{'aId' => a.Id, 'ids' => ids}, AccessLevel.USER_MODE)"),
+            "{after}"
+        );
+        assert!(
+            after.contains("queryWithBinds('SELECT Id FROM Contact', new Map<String, Object>{}"),
+            "a query with no binds gets an empty map: {after}"
+        );
+    }
+
+    /// Repeating a `--let` name adds a rule rather than replacing it, so
+    /// one value can be two rewrites at once: a query with its binds
+    /// renamed *and* its `WITH USER_MODE` removed. A dynamic query may not
+    /// state an access level twice -- confirmed against a real org, which
+    /// answers "Cannot use the WITH AccessLevel clause in dynamic queries\n    /// that also specify an access level".
+    #[test]
+    fn a_repeated_let_name_adds_a_rule() {
+        let src = "public class T {\n    void go(Account a) {\n        List<Account> u = [SELECT Id FROM Account WHERE Id = :a.Id WITH USER_MODE];\n    }\n}\n";
+        let (after, _) = rewrite_with(
+            "$_ $v = ${[${SELECT ... FROM $o ...}]};",
+            &["q = $2 ~ :$e => :$e:id", "q = $2 ~ kind:SoqlWithClause => "],
+            &["$1 => Selector.queryWithBinds('$q:quote', AccessLevel.USER_MODE)"],
+            src,
+        )
+        .unwrap();
+        assert!(
+            after.contains(
+                "queryWithBinds('SELECT Id FROM Account WHERE Id = :aId', AccessLevel.USER_MODE)"
+            ),
+            "{after}"
+        );
+        // Two rules only compose when they read the same capture the same way.
+        let clash = rewrite_with(
+            "$_ $v = ${[${SELECT ... FROM $o ...}]};",
+            &["q = $2 ~ :$e => :$e:id", "q = $1 ~ :$e => :$e:id"],
+            &["$1 => $q"],
+            src,
+        )
+        .err()
+        .unwrap_or_default();
+        assert!(clash.contains("already defined"), "{clash}");
+    }
+
+    /// `:quote` makes text safe for a string literal; `:id` makes a name
+    /// out of an expression, the same name from the same text every time.
+    #[test]
+    fn transforms_quote_and_name() {
+        assert_eq!(Transform::Quote.apply("a 'b'\nc"), "a \\'b\\' c");
+        assert_eq!(Transform::Quote.apply("back\\slash"), "back\\\\slash");
+        assert_eq!(Transform::Id.apply("a.Id"), "aId");
+        assert_eq!(Transform::Id.apply("crel[0].id"), "crel0Id");
+        assert_eq!(Transform::Id.apply("ids"), "ids");
+        assert_eq!(Transform::Id.apply("0abc"), "k0abc");
+        assert_eq!(Transform::Id.apply("!!"), "x");
+    }
+
+    /// A capture inside a template's string literal is substituted -- the
+    /// pattern side keeps literals opaque, a template must not.
+    #[test]
+    fn a_template_substitutes_inside_a_string_literal() {
+        let src = wrap("        f(a);");
+        let (after, _) = rewrite("f(${$x})", &["$1 => log('$1', $x)"], &src).unwrap();
+        assert!(after.contains("f(log('a', a));"), "{after}");
+    }
+
+    /// `--let` is checked when it is compiled, not when it misfires.
+    #[test]
+    fn lets_are_checked() {
+        let src = wrap("        f(a);");
+        let err = |spec: &str| {
+            rewrite_with("f(${$x})", &[spec], &["$1 => $1"], &src)
+                .err()
+                .unwrap_or_default()
+        };
+        assert!(err("q $1 ~ a => b").contains("has no `=`"));
+        assert!(err("q = $9 ~ a => b").contains("never binds"));
+        assert!(err("q = $1 a => b").contains("no `~` or `*`"));
+        assert!(err("q = $1 ~ a").contains("has no `=>`"));
+        assert!(err("q = $1 ~ a => $nope").contains("never binds"));
+        assert!(err("q = $1 ~ a => $x:nope").contains("unknown transform"));
     }
 
     #[test]

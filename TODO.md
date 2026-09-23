@@ -46,73 +46,46 @@ own Moxygen call shape decided first.
 | `Database.update(...)` | 39 | |
 | `Database.query(...)` | 327 | already a string: the easy query case |
 
-## 2. Substitute captures inside a template's string literal
+## 2-5. Done: `--let`, transforms, groups in SOQL, template strings
 
-**Blocker.** `-r "Selector.query('\$1')"` writes the literal text `'$1'`
-into the file: the replacement scanner treats string contents as opaque,
-as the pattern side deliberately does. Every query rewrite needs the
-captured text *inside* a string, so nothing else in this list matters
-until this works.
-
-Where: `Replacement::compile` (`crates/apexls/src/query.rs`) scans with
-`apex_parser::hole_spans`, which folds holes but never looks inside a
-literal. It needs a template-only pass that also substitutes within
-literals, leaving the pattern side untouched.
-
-## 3. Let a group sit inside a SOQL expression
-
-**Blocker.** `${...}` attaches where a construct starts -- statement,
-prefix expression, member, declared name -- so the smallest capturable
-thing is the whole `[SELECT ...]`, brackets included. The string needs the
-*inner* query text, so a group has to be allowed inside the brackets:
+All four blockers are built, and the query half of the migration now runs
+as one command. Nothing in the tool knows what a SOQL bind is:
 
 ```sh
-apexls query '[${SELECT ... FROM $o ...}]' -r "\$1 => ..."
+apexls query '$_ $v = ${[${SELECT ... FROM $o ...}]};'   --and '$2 ~ *WITH USER_MODE*'   --let 'q = $2 ~ :$e => :$e:id'   --let 'q = $2 ~ kind:SoqlWithClause => '   --let "m = \$2 * :\$e => '\$e:id' => \$e |, "   -r "\$1 => (List<\$o>) Selector.queryWithBinds('\$q:quote', new Map<String, Object>{\$m}, AccessLevel.USER_MODE)"
 ```
 
-Where: the group hooks in `crates/apex-parser/src/grammar/` (statement,
-expression, declaration) plus one in `soql.rs` around the query body.
+- **`--let NAME = $SRC ~ PATTERN => TEMPLATE`** rewrites every match inside
+  a capture and keeps the rest; `*` renders each match and joins them with
+  `| SEP`. The inner pattern and template are the same language as the
+  outer ones. Repeating a name adds a rule, so one value can be two
+  rewrites at once.
+- **`:quote` and `:id`** are the only built-ins, both plain text functions.
+- **`${...}` inside `[...]`** captures a query without its brackets, so
+  nesting the groups gives both the replacement target and the string.
+- **Captures inside a template's string literals** are substituted.
 
-## 4. Template transforms, starting with quoting
+Measured on a copy of NPSP: 1,052 queries across 201 files in 1.3s, no
+refusals, and every rewritten file parses.
 
-**Blocker.** Pasted text goes in verbatim, but a string literal cannot
-hold a raw `'` or a newline:
+**Access levels, confirmed against a real org rather than assumed.** A
+dynamic query may not state an access level twice -- "Cannot use the WITH
+AccessLevel clause in dynamic queries that also specify an access level" --
+and `WITH SECURITY_ENFORCED` is rejected outright: "no longer supported,
+use WITH USER_MODE instead". So the clause is always stripped (the second
+`--let` above) and the level moves into the argument, one run per case:
 
-- 32 NPSP queries contain a string literal, so pasting them into
-  `'...'` produces broken Apex.
-- 269 query sites span more than one line; Apex string literals do not.
+| Query has | `--and` / `--not` | AccessLevel |
+| --- | --- | --- |
+| `WITH USER_MODE` | `--and '$2 ~ *WITH USER_MODE*'` | `USER_MODE` |
+| `WITH SECURITY_ENFORCED` | `--and '$2 ~ *SECURITY_ENFORCED*'` | `USER_MODE` |
+| `WITH SYSTEM_MODE` | `--and '$2 ~ *WITH SYSTEM_MODE*'` | `SYSTEM_MODE` |
+| no clause | `--not` each of the above | `SYSTEM_MODE` |
 
-So a template needs something like `$1:quote` -- escape `'` and `\`,
-collapse newlines and runs of whitespace to single spaces. Useful well
-beyond this migration.
-
-Where: `ReplacementPart::Capture` gains a transform; parse `:name` after
-the capture in `Replacement::compile`.
-
-## 5. Bind extraction
-
-**The real work, and not a template job.** 1,387 of NPSP's 2,132 queries
-contain at least one bind. Moxygen keeps `:name` inside the string and
-expects a matching map entry, so a migration has to, for every query:
-
-1. find each bind expression (`:opp.Id`, `:new Set<Id>(ids)`),
-2. invent a unique, legal map key per bind,
-3. rewrite the string to use that key,
-4. build `new Map<String, Object>{ 'key' => expr, ... }`.
-
-A capture-and-template language cannot express "for each of a variable
-number of scattered sub-expressions, rename it and accumulate a map".
-Two ways to get it:
-
-- **A dedicated pass** (a small Rust codemod over the parsed tree, reusing
-  the matcher to find query sites). Most direct; one job, one tool.
-- **Or a general escape hatch**: let a replacement call out to a script
-  with the match's captures as JSON and splice back what it prints. Much
-  bigger decision -- it makes replacements arbitrary code -- but it would
-  cover every future migration of this shape, not just this one.
-
-The pass is the smaller, more honest first step; the escape hatch deserves
-its own design discussion.
+**Still not expressible, by design.** One match in, one span out: edits
+elsewhere in the file, coordinated edits across sites, state carried
+between matches (numbering, deduplication), and anything needing a
+computation the two transforms do not cover.
 
 ## 6. Cast and result shape
 
@@ -123,19 +96,3 @@ need `[0]` or a different call, so they are a separate pattern from the
 list case. Worth splitting the migration into: list-assigned queries,
 single-row-assigned queries, `for (X x : [SELECT ...])` loops, and queries
 used as a bare argument.
-
-## 7. Safety rail (independent of Moxygen)
-
-`apexls query --replace` run from a directory with no `sfdx-project.json`
-above it treats the whole tree as the project. Run from this repo's root,
-that swept in `tests/corpus/npsp` and rewrote 493 files. Refuse `--replace`
-when no project root is found unless explicit paths are given.
-
-## Suggested order
-
-1. Item 7 (safety), then item 1 (the rest of the DML) -- both small, and
-   item 1 is already usable value.
-2. Items 2, 3, 4 -- together they make `Database.query(...)`-style
-   conversions and every no-bind query expressible with templates alone.
-3. Item 5 -- decide pass versus escape hatch, then build it.
-4. Item 6 falls out as patterns written against the above.

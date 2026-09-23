@@ -18,7 +18,17 @@ use crate::parser::{CompletedMarker, Parser};
 use apex_syntax::SyntaxKind;
 
 pub(crate) fn at_soql_start(p: &Parser<'_>) -> bool {
-    p.at(SyntaxKind::LBrack) && p.nth(1) == SyntaxKind::Select
+    if !p.at(SyntaxKind::LBrack) {
+        return false;
+    }
+    // `[${SELECT ...}]` -- a group between the bracket and the query, so
+    // a rewrite can capture the query without its brackets.
+    let query_at = if p.nth(1) == SyntaxKind::PatternGroupOpen {
+        2
+    } else {
+        1
+    };
+    p.nth(query_at) == SyntaxKind::Select
 }
 
 pub(crate) fn at_sosl_start(p: &Parser<'_>) -> bool {
@@ -32,7 +42,18 @@ pub(crate) fn at_sosl_start(p: &Parser<'_>) -> bool {
 pub(crate) fn soql_expr(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(); // [
-    query(p);
+    // `[${SELECT ... FROM $o ...}]` groups the query *without* its
+    // brackets, which is what a rewrite into a string literal needs: the
+    // brackets are Apex, the rest is the query text.
+    if p.at_group() {
+        let group = p.start();
+        p.bump(); // ${
+        query(p);
+        p.expect(SyntaxKind::RBrace);
+        group.complete(p, SyntaxKind::PatternGroup);
+    } else {
+        query(p);
+    }
     p.expect(SyntaxKind::RBrack);
     m.complete(p, SyntaxKind::SoqlExpr)
 }
@@ -483,7 +504,7 @@ fn value(p: &mut Parser<'_>) -> CompletedMarker {
     m.complete(p, SyntaxKind::SoqlValue)
 }
 
-fn bound_expr(p: &mut Parser<'_>) -> CompletedMarker {
+pub(crate) fn bound_expr(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.expect(SyntaxKind::Colon);
     super::expressions::expr(p);

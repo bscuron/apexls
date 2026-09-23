@@ -154,6 +154,10 @@ pub enum Fragment {
     CatchClause,
     ClassMember,
     TriggerUnit,
+    /// `:$e` -- a SOQL bind, which only ever appears inside a query, so
+    /// nothing else parses it standalone. Its own entry point so a *sub*
+    /// pattern can name the binds of a captured query (`--let`).
+    SoqlBind,
 }
 
 /// Parse `src` as a structural-search *pattern*: Apex with holes in it.
@@ -196,6 +200,10 @@ pub fn parse_pattern(src: &str, fragment: Fragment) -> Parse {
         Fragment::ClassMember => {
             grammar::declarations::class_body_decl(&mut p);
             apex_syntax::SyntaxKind::MemberRoot
+        }
+        Fragment::SoqlBind => {
+            grammar::soql::bound_expr(&mut p);
+            apex_syntax::SyntaxKind::BindRoot
         }
         Fragment::TriggerUnit => {
             grammar::declarations::trigger_unit(&mut p);
