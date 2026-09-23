@@ -75,6 +75,9 @@ fn to_sobject_schema(raw: RawObject) -> SObjectSchema {
 
 fn to_field_schema(raw: RawField) -> FieldSchema {
     FieldSchema {
+        // The scraped standard-object reference carries no relationship
+        // names -- checked in the raw JSON, not inferred from this struct.
+        relationship_name: None,
         api_name: SmolStr::new(&raw.name),
         field_type: raw.field_type.map(|t| SmolStr::new(&t)),
         reference_to: raw.reference_to.iter().map(SmolStr::new).collect(),

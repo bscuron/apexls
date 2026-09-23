@@ -3062,6 +3062,29 @@ impl<'a> BodyBinder<'a> {
                 // stdlib-property fallback to reach for either. This is
                 // the one narrow, language-level exception, not a general
                 // "SObject has every field" relaxation.
+                // `opportunity.npe01__OppPayment__r` is the *children*
+                // pointing back, a list -- not a field of the parent at
+                // all, so it is looked up by the relationship name the
+                // child's lookup declares, before the field miss below
+                // would give up. Only local metadata names relationships;
+                // a standard one (`account.Contacts`) stays unknown.
+                if field_schema.is_none() {
+                    if let Some(child) = self.schema.child_relationship(&object, name) {
+                        let child = SmolStr::new(child);
+                        self.refs.set_with_highlight(
+                            ptr,
+                            highlight,
+                            Resolution::SchemaObject(Box::new(SchemaObjectRef {
+                                object: child.clone(),
+                                field: None,
+                            })),
+                        );
+                        return Some(Ty::system_with_args(
+                            "List",
+                            vec![Ty::system_owned(child, Vec::new())],
+                        ));
+                    }
+                }
                 let is_universal_id = object.eq_ignore_ascii_case("SObject")
                     && real_field_name.eq_ignore_ascii_case("Id");
                 if field_schema.is_some()

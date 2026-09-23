@@ -465,3 +465,19 @@ unchanged). A group around the whole pattern is refused as meaningless. Guarded 
 `a_group_rewrite_touches_only_the_group`, `a_group_in_a_deep_pattern_rewrites_every_place_it_lands`,
 `a_group_template_keeps_its_whitespace`, `group_rewrites_are_checked` and
 `a_group_works_in_conditions_and_search`.
+
+**30. A child relationship is a `List` of the child.** `opportunity.Payments__r` used to have no
+type, so anything called on it (`.isEmpty()`, `.size()`) dead-ended. The child's own lookup field
+declares `<relationshipName>`, which nothing parsed: `apex-metadata` now keeps it, `SchemaIndex`
+indexes `(parent, relationship) -> child object`, and a field-access miss consults that before
+giving up. On NPSP this removes one real `check` error (`Households.cls:145`, `.isEmpty()` on
+`accountRecord.Opportunities`), the only line that changed. The gain is narrow there because only
+77 NPSP fields name a relationship and most uses are *standard* relationships (`account.Contacts`):
+the scraped `standard_objects.json` carries no relationship names at all -- checked in the raw
+JSON, per the standing rule about not inferring stdlib data from a struct's shape -- so closing
+that needs the scraper to capture them. Guarded by `a_child_relationship_is_a_list_of_the_child_object`.
+
+Two items listed as open turned out to be done already: SOSL clauses take a hole at every boundary
+(item 21's counterpart, verified: `[FIND $q ... RETURNING ... ...]` and `[FIND $q IN $g FIELDS ...]`
+both compile and match), and SObject *field* types have worked since the binder's `Ty` layer --
+502 of 675 NPSP declarations initialised from a field access are typed.

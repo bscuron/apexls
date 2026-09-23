@@ -27,6 +27,7 @@ pub(crate) fn parse_field_meta(xml: &str, source_path: PathBuf) -> Option<FieldS
         api_name,
         field_type,
         reference_to,
+        relationship_name: child_text(root, "relationshipName").map(SmolStr::new),
         source_path: Some(source_path),
     })
 }
@@ -60,6 +61,7 @@ pub(crate) fn parse_object_meta_name_field(xml: &str, source_path: PathBuf) -> O
         api_name: SmolStr::new_static("Name"),
         field_type,
         reference_to: Vec::new(),
+        relationship_name: None,
         source_path: Some(source_path),
     })
 }

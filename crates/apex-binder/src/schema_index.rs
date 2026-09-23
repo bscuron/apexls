@@ -19,6 +19,13 @@ use std::sync::OnceLock;
 #[derive(Debug, PartialEq)]
 pub struct SchemaIndex {
     objects: CiMap<ObjectEntry>,
+    /// `(parent object, relationship name)` -> the child object holding
+    /// the lookup, so `opportunity.npe01__OppPayment__r` can be typed
+    /// `List<npe01__OppPayment__c>`. Built once from every field's
+    /// `<relationshipName>`, which only project-local metadata has: the
+    /// bundled standard schema names none, so a standard child
+    /// relationship (`account.Contacts`) stays unknown.
+    child_relationships: CiMap<SmolStr>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -59,6 +66,24 @@ impl SchemaIndex {
     }
 
     fn from_cow_sobjects(sobjects: Vec<Cow<'static, SObjectSchema>>) -> Self {
+        // Every lookup that names its relationship, keyed by the parent it
+        // points at: what turns `opportunity.npe01__OppPayment__r` into
+        // `List<npe01__OppPayment__c>`.
+        let child_relationships = sobjects
+            .iter()
+            .flat_map(|schema| {
+                schema.fields.iter().flat_map(move |field| {
+                    let relationship = field.relationship_name.clone();
+                    field.reference_to.iter().filter_map(move |parent| {
+                        let relationship = relationship.as_ref()?;
+                        Some((
+                            CiKey::from(format!("{parent}.{relationship}").as_str()),
+                            schema.api_name.clone(),
+                        ))
+                    })
+                })
+            })
+            .collect();
         let objects = sobjects
             .into_iter()
             .map(|schema| {
@@ -74,11 +99,23 @@ impl SchemaIndex {
                 )
             })
             .collect();
-        SchemaIndex { objects }
+        SchemaIndex {
+            objects,
+            child_relationships,
+        }
     }
 
     pub fn object(&self, api_name: &str) -> Option<&SObjectSchema> {
         self.objects.get(&CiQuery(api_name)).map(|e| e.schema.as_ref())
+    }
+
+    /// The object a parent's child-relationship collection holds, if
+    /// local metadata names that relationship.
+    pub fn child_relationship(&self, parent_api_name: &str, relationship: &str) -> Option<&str> {
+        let key = format!("{parent_api_name}.{relationship}");
+        self.child_relationships
+            .get(&CiQuery(&key))
+            .map(SmolStr::as_str)
     }
 
     pub fn field(&self, object_api_name: &str, field_api_name: &str) -> Option<&FieldSchema> {
@@ -215,6 +252,7 @@ fn universal_field(field_api_name: &str) -> Option<&'static FieldSchema> {
     static FIELDS: OnceLock<Vec<FieldSchema>> = OnceLock::new();
     fn field(api_name: &'static str, field_type: &'static str, reference_to: &[&'static str]) -> FieldSchema {
         FieldSchema {
+            relationship_name: None,
             api_name: SmolStr::new_static(api_name),
             field_type: Some(SmolStr::new_static(field_type)),
             reference_to: reference_to.iter().map(|&s| SmolStr::new_static(s)).collect(),

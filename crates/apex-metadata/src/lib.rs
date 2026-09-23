@@ -79,6 +79,12 @@ pub struct FieldSchema {
     /// `Task.WhoId` instead comes from `apex_stdlib`'s bundled schema,
     /// not this crate's own file-based discovery).
     pub reference_to: Vec<SmolStr>,
+    /// A lookup/master-detail field's `<relationshipName>`: what the
+    /// *parent* calls the collection of children pointing at it, the `__r`
+    /// in `opportunity.npe01__OppPayment__r`. `None` for a field that
+    /// names none, and for every field from the bundled standard-schema
+    /// snapshot, whose scraped source has no relationship names at all.
+    pub relationship_name: Option<SmolStr>,
     /// The path to this field's own `.field-meta.xml`, when parsed from
     /// a real local file (every `FieldSchema` this crate itself
     /// constructs has one). `None` for a field that came from a bundled
