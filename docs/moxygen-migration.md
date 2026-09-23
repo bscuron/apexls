@@ -65,17 +65,17 @@ Run these in order. Counts are from NPSP, which has 2,132 inline queries.
 | # | Shape | Pattern and filters | Replacement | Rewrote |
 | --- | --- | --- | --- | --- |
 | 1 | `COUNT()` into a variable | `'$T $v = $Q;' --and '$2 ~ *COUNT()*'` | `'$1 => Selector.countQueryWithBinds(...)'` | 35 |
-| 2 | list declaration | `'$T $v = $Q;' --and '$T ~ List<*>'` | `'$1 => (List<$o>) $CALL'` | 542 |
+| 2 | list declaration | `'$T $v = $Q;' --and '$T ~ List<*>'` | `'$1 => ($T) $CALL'` | 542 |
 | 3 | one-record declaration | `'$T $v = $Q;' --not '$T ~ List<*>'` | `'$1 => ($T) $CALL[0]'` | 475 |
-| 4 | for-each loop | `'for ($T $v : $Q) { ... }'` | `'$1 => (List<$o>) $CALL'` | 114 |
-| 5 | assignment, list variable | `'$v = $Q;' --and '$v : List<*>'` | `'$1 => (List<$o>) $CALL'` | 208 |
-| 6 | assignment, record variable | `'$v = $Q;' --not '$v : List<*>' --and '$v : *'` | `'$1 => ($o) $CALL[0]'` | 151 |
-| 7 | return, list method | `'$T $m(...) { ... return $Q; ... }' --and '$T ~ List<*>'` | `'$1 => (List<$o>) $CALL'` | 138 |
+| 4 | for-each loop | `'for ($T $v : $Q) { ... }'` | `'$1 => (List<$T>) $CALL'` | 114 |
+| 5 | assignment, list variable | `'$v = $Q;' --and '$v : List<*>' --not '$o ~ * *'` | `'$1 => (List<$o>) $CALL'` | 209 |
+| 6 | assignment, record variable | `'$v = $Q;' --not '$v : List<*>' --and '$v : *' --not '$o ~ * *'` | `'$1 => ($o) $CALL[0]'` | 151 |
+| 7 | return, list method | `'$T $m(...) { ... return $Q; ... }' --and '$T ~ List<*>'` | `'$1 => ($T) $CALL'` | 139 |
 | 8 | return, record method | `'$T $m(...) { ... return $Q; ... }' --not '$T ~ List<*>'` | `'$1 => ($T) $CALL[0]'` | 51 |
 | 9 | `COUNT()` as an argument | `'$r.$f(..., $Q, ...)' --and '$2 ~ *COUNT()*'` | `'$1 => Selector.countQueryWithBinds(...)'` | 159 |
-| 10 | query as an argument | `'$r.$f(..., $Q, ...)' --not '$2 ~ *COUNT()*'` | `'$1 => (List<$o>) $CALL'` | 23 |
+| 10 | query as an argument | `'$r.$f(..., $Q, ...)' --not '$2 ~ *COUNT()*' --not '$o ~ * *'` | `'$1 => (List<$o>) $CALL'` | 23 |
 
-Together: **1,896 of 2,132 (89%)** across 313 files, with **no parse
+Together: **1,898 of 2,132 (89%)** across 314 files, with **no refusals and no parse
 failures** afterwards.
 
 Order matters in two places: `COUNT()` before the declaration shapes (a
@@ -83,12 +83,30 @@ count goes into an `Integer`, not a list), and the declaration shapes
 before the assignment ones.
 
 Cases 5 and 6 read the *variable's* type, so they bind the project and are
-slower (about half a second extra on NPSP). Cases 2, 3, 7 and 8 read the
-declared type as text and stay parse-only.
+slower (about half a second extra on NPSP). Everything else stays
+parse-only.
 
-### What the 236 left over are
+### Casting: prefer `$T`, and mind the FROM alias
 
-Queries in positions with no recipe here: inside a larger expression
+`$o` is the query's whole **FROM list**, not just the object name, so a
+query written `FROM AsyncApexJob a` binds `AsyncApexJob a` and a cast built
+from it comes out as `(List<AsyncApexJob a>)` -- which does not parse. Two
+consequences:
+
+- Where the code states a type, cast with that (`$T`) instead of `$o`:
+  cases 2, 3, 4, 7 and 8 above. It is both safer and more faithful, since
+  it keeps the type the code already declared.
+- Where there is no declared type (cases 5, 6, 10), exclude aliased FROM
+  lists with `--not '$o ~ * *'` -- a glob for "contains a space".
+
+NPSP has two such queries; convert those by hand. The refusal is not
+dangerous either way: a rewrite that would not parse is reported and the
+file is left alone, but a refusal discards *every* edit in that file, so
+it is worth filtering rather than ignoring.
+
+### What the 234 left over are
+
+Two aliased FROM lists (above), plus queries in positions with no recipe here: inside a larger expression
 (`[SELECT ...][0].Name`, `[SELECT ...].Id`), in an `if` condition or
 ternary, or as part of a bigger call chain. They need either a pattern per
 shape or a hand edit; the reparse check means a wrong one is refused, not
