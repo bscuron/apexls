@@ -43,49 +43,46 @@ is what made the first probe misleading):
   is rejected from **v67.0**: "no longer supported, use WITH USER_MODE
   instead". A class runs at its own `apiVersion`, so what matters is the
   class being rewritten -- NPSP's are 53.0.
-- **It cannot be combined with an access level**: passing
-  `AccessLevel.USER_MODE` alongside it fails with "Cannot use the WITH
-  SECURITY_ENFORCED clause in queries using USER_MODE access level".
+- **It cannot be combined with `USER_MODE`**: that fails with "Cannot use
+  the WITH SECURITY_ENFORCED clause in queries using USER_MODE access
+  level". With `SYSTEM_MODE` it is fine, which is what the recipes use.
 - **`WITH USER_MODE` / `WITH SYSTEM_MODE` cannot be combined with one
   either**: "Cannot use the WITH AccessLevel clause in dynamic queries that
   also specify an access level". Those two are stripped, and the level moves
   into the argument.
 
-So `SECURITY_ENFORCED` is *kept* and the call takes no access level, which
-also preserves its meaning exactly: field and object permissions enforced,
-sharing left to the class's own `with`/`without sharing`. Swapping it for
+So `SECURITY_ENFORCED` is *kept*, which preserves its meaning exactly:
+field and object permissions enforced, sharing left to the class's own
+`with`/`without sharing`. Swapping it for
 `USER_MODE` would additionally apply sharing and can return fewer rows.
 
-| Query has | Clause | Call |
+| Query has | Clause | Access level in the call |
 | --- | --- | --- |
-| `WITH SECURITY_ENFORCED`, no binds | keep | `Selector.query('...')`, no access level |
-| `WITH SECURITY_ENFORCED`, with binds | keep | none fits -- see below |
-| `WITH USER_MODE` | strip | `...WithBinds(..., AccessLevel.USER_MODE)` |
-| `WITH SYSTEM_MODE` | strip | `...WithBinds(..., AccessLevel.SYSTEM_MODE)` |
-| no clause | -- | `...WithBinds(..., AccessLevel.SYSTEM_MODE)` |
+| `WITH SECURITY_ENFORCED` | **keep** | `SYSTEM_MODE`, or omit it entirely with `Selector.query(...)` |
+| `WITH USER_MODE` | strip | `USER_MODE` |
+| `WITH SYSTEM_MODE` | strip | `SYSTEM_MODE` |
+| no clause | -- | `SYSTEM_MODE` |
 
 Inline SOQL runs in system mode unless it says otherwise, which is why the
 no-clause case is `SYSTEM_MODE`.
 
-### `SECURITY_ENFORCED` with binds
-
-Moxygen's only bind-aware method is
-`queryWithBinds(String, Map<String, Object>, AccessLevel)`, and an access
-level is required, so a bind query cannot keep the clause: `USER_MODE` is
-rejected outright with it, and `SYSTEM_MODE` alongside it is untested
-(anonymous Apex refuses `SYSTEM_MODE`, so it needs a real class to check).
-Leave those inline until that is settled. NPSP has exactly one.
+`SECURITY_ENFORCED` with binds works too -- `queryWithBinds(q, binds,
+AccessLevel.SYSTEM_MODE)` with the clause in the string was confirmed by
+deploying a class at API 66 to a real org and calling it, because anonymous
+Apex refuses `SYSTEM_MODE` and cannot test it.
 
 ### Keeping the clause
 
-Select them first, before the recipes below, and exclude them from the rest
-with `--not '$2 ~ *SECURITY_ENFORCED*'`:
+Run these before the recipes below, and exclude their queries from the rest
+with `--not '$2 ~ *SECURITY_ENFORCED*'`. They are the ordinary recipes
+minus the clause-stripping `--let`:
 
 ```sh
-apexls query '$T $v = $Q;' --and '$2 ~ *SECURITY_ENFORCED*' --not '$2 ~ *:*'   --let 'q = $2 ~ :$e => :$e:id'   -r "\$1 => (\$T) Selector.query('\$q:quote')"
+apexls query '$T $v = $Q;' --and '$2 ~ *SECURITY_ENFORCED*' \
+  --let 'q = $2 ~ :$e => :$e:id' \
+  --let "m = \$2 * :\$e => '\$e:id' => \$e |, " \
+  -r "\$1 => (\$T) Selector.queryWithBinds('\$q:quote', new Map<String, Object>{\$m}, AccessLevel.SYSTEM_MODE)"
 ```
-
-`--not '$2 ~ *:*'` is "no binds in the query text".
 
 ## Queries, by where the result goes
 
