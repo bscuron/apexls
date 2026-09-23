@@ -20,11 +20,13 @@ use std::sync::OnceLock;
 pub struct SchemaIndex {
     objects: CiMap<ObjectEntry>,
     /// `(parent object, relationship name)` -> the child object holding
-    /// the lookup, so `opportunity.npe01__OppPayment__r` can be typed
-    /// `List<npe01__OppPayment__c>`. Built once from every field's
-    /// `<relationshipName>`, which only project-local metadata has: the
-    /// bundled standard schema names none, so a standard child
-    /// relationship (`account.Contacts`) stays unknown.
+    /// the lookup, so `opportunity.npe01__OppPayment__r` is typed
+    /// `List<npe01__OppPayment__c>` and `account.Contacts` is
+    /// `List<Contact>`. Two sources, because they have two shapes: a
+    /// project's own lookups name their relationship in metadata
+    /// (`<relationshipName>`), while standard ones come from
+    /// `apex_stdlib::standard_child_relationships`, describe-derived
+    /// because the scraped object reference never names them.
     child_relationships: CiMap<SmolStr>,
 }
 
@@ -69,7 +71,17 @@ impl SchemaIndex {
         // Every lookup that names its relationship, keyed by the parent it
         // points at: what turns `opportunity.npe01__OppPayment__r` into
         // `List<npe01__OppPayment__c>`.
-        let child_relationships = sobjects
+        // Standard relationships first, so a project's own metadata wins
+        // where both name the same one on the same parent.
+        let child_relationships = apex_stdlib::standard_child_relationships()
+            .iter()
+            .map(|(parent, relationship, child)| {
+                (
+                    CiKey::from(format!("{parent}.{relationship}").as_str()),
+                    child.clone(),
+                )
+            })
+            .chain(sobjects
             .iter()
             .flat_map(|schema| {
                 schema.fields.iter().flat_map(move |field| {
@@ -82,7 +94,7 @@ impl SchemaIndex {
                         ))
                     })
                 })
-            })
+            }))
             .collect();
         let objects = sobjects
             .into_iter()

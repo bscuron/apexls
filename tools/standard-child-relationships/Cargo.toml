@@ -1,0 +1,13 @@
+[package]
+name = "standard-child-relationships"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "standard-child-relationships"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1.0.95"

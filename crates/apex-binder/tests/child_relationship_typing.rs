@@ -89,3 +89,29 @@ fn a_child_relationship_is_a_list_of_the_child_object() {
         "expected a stdlib List member, got {isempty:?}"
     );
 }
+
+/// A *standard* relationship needs no local metadata at all: it comes
+/// from the bundled describe-derived data (`account.Contacts`).
+#[test]
+fn a_standard_child_relationship_is_a_list_of_the_child_object() {
+    let dir = write_fixture_dir(
+        "standard-child-relationship",
+        &[(
+            "classes/Standard.cls",
+            "public class Standard {
+    void go(Account acc) {
+        Boolean none = acc.Contacts.isEmpty();
+    }
+}
+",
+        )],
+    );
+    let program = BoundProgram::from_files(&dir);
+    let isempty = call_resolution(&program, "isEmpty");
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        matches!(isempty, Some(Resolution::StdlibMember(_))),
+        "expected a stdlib List member, got {isempty:?}"
+    );
+}

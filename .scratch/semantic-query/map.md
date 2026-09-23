@@ -207,8 +207,7 @@ Replace: **(R1)** `x.size() == 0` -> `x.isEmpty()`, `x.size() > 0` -> `!x.isEmpt
   ([match semantics](issues/02-match-semantics-decision.md), item 27). The substrate note above
   predates it: Pass 2 now infers `Ty` for most expressions, and `BoundProgram::expr_types_in`
   re-binds one declaration on demand to report them, for every body the binder walks. Still
-  open: *standard* child relationships (`account.Contacts`), which need relationship names the
-  scraped standard-object data does not carry; static and instance initializer blocks (never
+  open: static and instance initializer blocks (never
   bound); and resolving a captured type reference rather than using its text. What else can eventually go in it is bounded by the substrate note above: resolution and stdlib-membership
   yes, expression types no. Revisit once search exists and the corpus has shown which queries are
   false-positive-prone for lack of resolution (corpus item 3 is the obvious candidate -- a

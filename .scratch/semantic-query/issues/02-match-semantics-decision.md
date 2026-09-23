@@ -474,10 +474,21 @@ giving up. On NPSP this removes one real `check` error (`Households.cls:145`, `.
 `accountRecord.Opportunities`), the only line that changed. The gain is narrow there because only
 77 NPSP fields name a relationship and most uses are *standard* relationships (`account.Contacts`):
 the scraped `standard_objects.json` carries no relationship names at all -- checked in the raw
-JSON, per the standing rule about not inferring stdlib data from a struct's shape -- so closing
-that needs the scraper to capture them. Guarded by `a_child_relationship_is_a_list_of_the_child_object`.
+JSON, per the standing rule about not inferring stdlib data from a struct's shape. Guarded by `a_child_relationship_is_a_list_of_the_child_object`.
 
 Two items listed as open turned out to be done already: SOSL clauses take a hole at every boundary
 (item 21's counterpart, verified: `[FIND $q ... RETURNING ... ...]` and `[FIND $q IN $g FIELDS ...]`
 both compile and match), and SObject *field* types have worked since the binder's `Ty` layer --
 502 of 675 NPSP declarations initialised from a field access are typed.
+
+**31. Standard child relationships are bundled from a describe.** The doc scrape cannot supply
+them, and pluralizing the child's name is wrong too often to use: of `Account`'s 85 child
+relationships, measured against a real org, 23 are not the child's plural (`ChildAccounts`,
+`Shares`, `ProvidedAssets`) and six child objects reach `Account` through more than one
+relationship. So `tools/standard-child-relationships` asks the org itself and bundles the answer
+as `crates/apex-stdlib/data/standard_child_relationships.json` -- 4,678 relationships on 580
+parents, 221 KB, with anything containing `__` dropped on both sides so the file is identical
+whatever org generates it. `SchemaIndex` seeds its relationship index with these and lets a
+project's own metadata win on a clash. On NPSP this removes 28 further `check` errors (`.size()`
+and `.isEmpty()` on child collections) and adds no new diagnostic. Guarded by
+`a_standard_child_relationship_is_a_list_of_the_child_object`.

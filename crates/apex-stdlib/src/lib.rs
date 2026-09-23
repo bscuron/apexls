@@ -50,6 +50,39 @@ struct RawField {
 
 const STANDARD_OBJECTS_JSON: &str = include_str!("../data/standard_objects.json");
 
+const STANDARD_CHILD_RELATIONSHIPS_JSON: &str =
+    include_str!("../data/standard_child_relationships.json");
+
+/// Every standard object's child relationships, as `(parent,
+/// relationship name, child object)` -- `("Account", "Contacts",
+/// "Contact")`.
+///
+/// Separate from [`standard_sobjects`] because it has a different source:
+/// Salesforce's object reference pages, which that snapshot is scraped
+/// from, list an object's fields but never name the child relationships a
+/// parent exposes. These come from a describe instead, via
+/// `tools/standard-child-relationships`, filtered to standard names on
+/// both sides so nothing org-specific rides along.
+pub fn standard_child_relationships() -> &'static [(SmolStr, SmolStr, SmolStr)] {
+    static RELATIONSHIPS: OnceLock<Vec<(SmolStr, SmolStr, SmolStr)>> = OnceLock::new();
+    RELATIONSHIPS.get_or_init(|| {
+        let raw: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+            serde_json::from_str(STANDARD_CHILD_RELATIONSHIPS_JSON)
+                .expect("bundled data/standard_child_relationships.json failed to parse");
+        raw.into_iter()
+            .flat_map(|(parent, relationships)| {
+                relationships.into_iter().map(move |(name, child)| {
+                    (
+                        SmolStr::new(&parent),
+                        SmolStr::new(name),
+                        SmolStr::new(child),
+                    )
+                })
+            })
+            .collect()
+    })
+}
+
 /// Every standard SObject's bundled schema, parsed once on first use.
 /// Panics on first access if the embedded JSON is missing/malformed --
 /// a build-time-detectable failure (the data is `include_str!`'d, so a

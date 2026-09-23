@@ -12,6 +12,7 @@ members = [
     "crates/apexls",
     "crates/apexls-server",
     "tools/salesforce-doc-scraper",
+    "tools/standard-child-relationships",
 ]
 
 [workspace.package]
