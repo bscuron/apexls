@@ -5,18 +5,22 @@ to [Moxygen](https://github.com/ZackFra/Salesforce-Moxygen). Every command
 here was run against a copy of the NPSP corpus; the counts are what it
 actually rewrote, and every rewritten file still parsed.
 
+It converts **every** inline query: 2,132 of 2,132, with nothing left for
+`apexls query 'kind:SoqlExpr'` to find. What it took to get there, and
+what still does not fit, is in [`GAPS.md`](../GAPS.md).
+
 Run them from the project root, on a clean git tree — rewrites happen in
 place, and `git diff` is the preview.
 
 ## Shared pieces
 
-Every query command uses the same three `--let`s and the same call, so they
+Every query command uses the same `--let`s and the same call, so they
 are given once here and referred to as `$LETS` and `$CALL`:
 
 ```sh
 LETS_Q="--let 'q = \$2 ~ :\$e => :\$e:id' --let 'q = \$2 ~ kind:SoqlWithClause => '"
 LETS_M="--let \"m = \\\$2 * :\\\$e => '\\\$e:id' => \\\$e |, \""
-CALL="Selector.queryWithBinds('\$q:quote', new Map<String, Object>{\$m}, AccessLevel.SYSTEM_MODE)"
+CALL="Selector.queryWithBinds('\$q:quote', new Map<String, Object>{\$m}, System.AccessLevel.SYSTEM_MODE)"
 ```
 
 - `q` is the query text with every bind `:a.Id` renamed to `:aId`, and with
@@ -24,6 +28,9 @@ CALL="Selector.queryWithBinds('\$q:quote', new Map<String, Object>{\$m}, AccessL
 - `m` is the bind map, `'aId' => a.Id`, joined with `, `.
 - Both derive the key with `:id` from the same expression, so the string
   and the map agree.
+- The recipes that match a query with *no shape around it* -- the `COUNT()`
+  and aggregate catch-alls -- bind it to `$1` rather than `$2`, so they
+  take the same two `--let`s spelled over `$1`.
 
 `$Q` below is the pattern piece that captures a query twice — `$1` is the
 whole `[...]` (what gets replaced), `$2` is the query text without its
@@ -81,75 +88,76 @@ minus the clause-stripping `--let`:
 apexls query '$T $v = $Q;' --and '$2 ~ *SECURITY_ENFORCED*' \
   --let 'q = $2 ~ :$e => :$e:id' \
   --let "m = \$2 * :\$e => '\$e:id' => \$e |, " \
-  -r "\$1 => (\$T) Selector.queryWithBinds('\$q:quote', new Map<String, Object>{\$m}, AccessLevel.SYSTEM_MODE)"
+  -r "\$1 => (\$T) Selector.queryWithBinds('\$q:quote', new Map<String, Object>{\$m}, System.AccessLevel.SYSTEM_MODE)"
 ```
 
 ## Queries, by where the result goes
 
-Run these in order. Counts are from NPSP, which has 2,132 inline queries.
+The whole set is a script: [`run.sh`](../../NPSP/run.sh) in the NPSP
+checkout, which is what these counts come from. Run it from the project
+root on a clean tree.
 
-| # | Shape | Pattern and filters | Replacement | Rewrote |
+Order matters, and only in two places: `COUNT()` runs first, and
+aggregates run before the record shapes. Everything after that is
+independent.
+
+| # | Shape | Pattern | Cast from | NPSP |
 | --- | --- | --- | --- | --- |
-| 1 | `COUNT()` into a variable | `'$T $v = $Q;' --and '$2 ~ *COUNT()*'` | `'$1 => Selector.countQueryWithBinds(...)'` | 35 |
-| 2 | list declaration | `'$T $v = $Q;' --and '$T ~ List<*>'` | `'$1 => ($T) $CALL'` | 542 |
-| 3 | one-record declaration | `'$T $v = $Q;' --not '$T ~ List<*>'` | `'$1 => ($T) $CALL[0]'` | 475 |
-| 4 | for-each loop | `'for ($T $v : $Q) { ... }'` | `'$1 => (List<$T>) $CALL'` | 114 |
-| 5 | assignment, list variable | `'$v = $Q;' --and '$v : List<*>' --not '$o ~ * *'` | `'$1 => (List<$o>) $CALL'` | 209 |
-| 6 | assignment, record variable | `'$v = $Q;' --not '$v : List<*>' --and '$v : *' --not '$o ~ * *'` | `'$1 => ($o) $CALL[0]'` | 151 |
-| 7 | return, list method | `'$T $m(...) { ... return $Q; ... }' --and '$T ~ List<*>'` | `'$1 => ($T) $CALL'` | 139 |
-| 8 | return, record method | `'$T $m(...) { ... return $Q; ... }' --not '$T ~ List<*>'` | `'$1 => ($T) $CALL[0]'` | 51 |
-| 9 | `COUNT()` as an argument | `'$r.$f(..., $Q, ...)' --and '$2 ~ *COUNT()*'` | `'$1 => Selector.countQueryWithBinds(...)'` | 159 |
-| 10 | query as an argument | `'$r.$f(..., $Q, ...)' --not '$2 ~ *COUNT()*' --not '$o ~ * *'` | `'$1 => (List<$o>) $CALL'` | 23 |
+| 1 | `COUNT()`, anywhere | `[${SELECT ...}]` + `--and '$1 ~ *COUNT()*'` | -- (an Integer) | 236 |
+| 2 | aggregate declaration | `$T $v = $Q;` + the aggregate filter | `List<Aggregate>` | 6 |
+| 3 | aggregate loop | `for ($T $v : $Q) $b` | `Aggregate` | 7 |
+| 4 | aggregate, anywhere else | `[${SELECT ...}]` + the aggregate filter | -- | (in 2/3) |
+| 5 | declaration | `$T $v = $Q;` | `$T` | 1,002 |
+| 6 | for-each | `for ($T $v : $Q) ...;` | `List<$T>` | 108 |
+| 7 | property getter | `$T $p { get { ... return $Q; ... } }` | `$T` | 1 |
+| 8 | return | `$T $m(...) { ... return $Q; ... }` | `$T` | 185 |
+| 9 | assignment | `$v = $Q;` + `'$v : List<*>'` | `$o` | 347 |
+| 10 | argument | `$r.$f(..., $Q, ...)`, `$f(..., $Q, ...)` | `$o` | 37 |
+| 11 | constructor argument | `new $T($Q)` | `$o` | 124 |
+| 12 | postfix | `$Q.$f`, `$Q.$f(...)`, `$Q[$i]` | `$o`, parenthesised | 78 |
+| 13 | aliased FROM | the same shapes over `FROM $o $a` | `$o` | 1 |
 
-Together: **1,898 of 2,132 (89%)** across 314 files, with **no refusals and no parse
-failures** afterwards.
+**2,132 of 2,132**, across 412 files, with no refusals and no parse
+failures. `apexls query 'kind:SoqlExpr'` finds nothing afterwards.
 
-Order matters in two places: `COUNT()` before the declaration shapes (a
-count goes into an `Integer`, not a list), and the declaration shapes
-before the assignment ones.
+### Where the cast comes from
 
-Cases 5 and 6 read the *variable's* type, so they bind the project and are
-slower (about half a second extra on NPSP). Everything else stays
-parse-only.
+Two sources, and the choice is not cosmetic.
 
-### Casting: prefer `$T`, and mind the FROM alias
+- **The declared type (`$T`)** wherever the code states one: declarations,
+  loops, properties, returns. It is more faithful -- it keeps the type the
+  code already had -- and it sidesteps the FROM alias entirely.
+- **The FROM object (`$o`)** where there is no declared type: assignments,
+  arguments, constructors, postfix. `$o` binds the whole FROM *list*, so
+  `FROM Account a` would give `(List<Account a>)`; those recipes exclude
+  aliased lists with `--not '$o ~ * *'`, and a separate recipe writes
+  `FROM $o $a`, which binds the object and the alias apart.
 
-`$o` is the query's whole **FROM list**, not just the object name, so a
-query written `FROM AsyncApexJob a` binds `AsyncApexJob a` and a cast built
-from it comes out as `(List<AsyncApexJob a>)` -- which does not parse. Two
-consequences:
+A postfix recipe parenthesises its cast -- `((List<X>) call)[0].Name` --
+so the postfix applies to the call's result and not to the cast's.
 
-- Where the code states a type, cast with that (`$T`) instead of `$o`:
-  cases 2, 3, 4, 7 and 8 above. It is both safer and more faithful, since
-  it keeps the type the code already declared.
-- Where there is no declared type (cases 5, 6, 10), exclude aliased FROM
-  lists with `--not '$o ~ * *'` -- a glob for "contains a space".
+### Two things that will bite
 
-NPSP has two such queries; convert those by hand. The refusal is not
-dangerous either way: a rewrite that would not parse is reported and the
-file is left alone, but a refusal discards *every* edit in that file, so
-it is worth filtering rather than ignoring.
-
-### What the 234 left over are
-
-Two aliased FROM lists (above), plus queries in positions with no recipe here: inside a larger expression
-(`[SELECT ...][0].Name`, `[SELECT ...].Id`), in an `if` condition or
-ternary, or as part of a bigger call chain. They need either a pattern per
-shape or a hand edit; the reparse check means a wrong one is refused, not
-written.
-
-Aggregate queries (`GROUP BY`, `SUM`, `MIN`) want
-`Selector.aggregateQueryWithBinds`, which returns `List<Aggregate>` rather
-than `List<AggregateResult>`, so the surrounding code changes too. NPSP has
-15; they are left for hand conversion.
+- **Qualify types in a replacement.** A replacement is text, not a
+  resolved reference: `AccessLevel.SYSTEM_MODE` binds to a class's own
+  `enum AccessLevel` if it declares one, and NPSP has exactly one such
+  class. The recipes write `System.AccessLevel.SYSTEM_MODE`.
+- **An aggregate changes the element type.** `aggregateQueryWithBinds`
+  returns `List<Aggregate>`, not `List<AggregateResult>`, so anything
+  carrying one along -- a parameter, a field, a return type -- follows.
+  The recipes change the declaration the query sits in; the rest is a
+  rename, and `GAPS.md` says why the tool will not do it.
 
 ## DML
 
-These need no `--let`: the statement's shape is the whole rewrite.
+These need no `--let`: the statement's shape is the whole rewrite. They run
+**first**, before the query recipes: a query used as a DML operand
+(`delete [SELECT ...];`) becomes an ordinary call argument once the
+statement is wrapped, and the argument recipe then converts it.
 
 | Statement | Command | Rewrote |
 | --- | --- | --- |
-| `insert` | `query 'insert $x;' -r 'DML.doInsert($x, true);'` | 2,509 |
+| `insert` | `query 'insert $x;' -r 'DML.doInsert($x, true);'` | 2,506 |
 | `update` | `query 'update $x;' -r 'DML.doUpdate($x, true);'` | 590 |
 | `delete` | `query 'delete $x;' -r 'DML.doDelete($x, true);'` | 119 |
 | `undelete` | `query 'undelete $x;' -r 'DML.doUndelete($x, true);'` | 14 |
@@ -158,7 +166,8 @@ These need no `--let`: the statement's shape is the whole rewrite.
 | `Database.update(x, b)` | `query 'Database.update($x, $b);' -r 'DML.doUpdate($x, $b);'` | 9 |
 
 An access-level form (`insert as user x;`) takes the third argument:
-`-r 'DML.doInsert($x, true, AccessLevel.USER_MODE);'`. NPSP has none.
+`-r 'DML.doInsert($x, true, System.AccessLevel.USER_MODE);'`. NPSP has
+none.
 
 ### `upsert` with no external id
 

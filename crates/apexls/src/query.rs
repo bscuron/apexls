@@ -146,6 +146,26 @@
 //! only the first `=>` separates and at most one space either side of it is
 //! dropped, so a template keeps its own whitespace and map literals.
 //!
+//! A group goes wherever a construct begins, and takes what follows it:
+//! `${[SELECT ... FROM $o ...]}.Id` marks the query and reads a field off
+//! the result, `${List<X>} $v` marks a declaration's type and leaves the
+//! rest of it alone. The one place it cannot go is the first token of a
+//! statement, where `${` already means "group this whole statement".
+//!
+//! In a query's `FROM`, a second hole names the table alias:
+//! `[SELECT ... FROM $o $a ...]` binds `Account` and `a` separately, where
+//! `FROM $o` alone binds the whole list, `Account a`. A cast built from
+//! that would not parse, so the two are worth telling apart. Only a
+//! *named* hole reads as an alias; a `...` there is the trailing clause
+//! hole, which has no other spelling.
+//!
+//! **Redundant parentheses in the source are transparent.** A pattern that
+//! does not write them matches through them -- `f(..., [SELECT ...], ...)`
+//! finds `f(([SELECT ...]), true)` -- and the match is the inner
+//! expression, so a rewrite leaves the parentheses where they were. A match
+//! may not *start* at one, or its span would swallow them, and dropping
+//! parentheses changes what `(a + b) * c` means.
+//!
 //! **`--let NAME = $SRC ~ PATTERN => TEMPLATE`** names the result of
 //! applying this tool to one capture: `~` rewrites every match inside
 //! `$SRC` and keeps the rest, `*` renders each match and joins them
@@ -592,7 +612,14 @@ impl Let {
         let mut inside: Vec<(SyntaxNode, String)> = Vec::new();
         for (pattern, template) in &self.rules {
             for (node, inner) in pattern.matches_with_binds(root) {
-                let range = node.text_range();
+                // Significant range, not the raw one: a node's raw range can
+                // run past its last real token into the whitespace after it,
+                // so the last match inside a multi-line capture would look
+                // like it spilled out and be dropped -- silently losing, say,
+                // the final bind of a query written across lines.
+                let Some(range) = apex_syntax::significant_range(&node) else {
+                    continue;
+                };
                 if usize::from(range.start()) < start || usize::from(range.end()) > end {
                     continue;
                 }
@@ -1087,9 +1114,15 @@ fn flagged_regex(body: &str, src: &str) -> Result<regex::Regex, ArgError> {
         .map_err(|e| ArgError(format!("error: invalid regex: {e}"), 2))
 }
 
+/// A glob's regex: case-insensitive, and `*` spans newlines. A glob is
+/// matched against a whole node's text, which in Apex is routinely several
+/// lines -- a query wrapped across three of them is still "contains
+/// `COUNT()`" to anyone writing `*COUNT()*`, so a `*` that stopped at the
+/// line end would quietly answer "no" instead.
 fn case_insensitive(re: &str) -> Result<regex::Regex, ArgError> {
     regex::RegexBuilder::new(re)
         .case_insensitive(true)
+        .dot_matches_new_line(true)
         .build()
         .map_err(|e| ArgError(format!("error: invalid regex: {e}"), 2))
 }
@@ -1155,6 +1188,21 @@ pub fn run(
     };
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Rewriting with neither a project root nor explicit paths would take
+    // every Apex file below the current directory as its scope, which is
+    // how a stray run from one directory up rewrites a corpus that was
+    // never the target. Searching is harmless there and stays allowed.
+    if !replacement_srcs.is_empty()
+        && paths.is_empty()
+        && crate::project::located_project_root(&cwd).is_none()
+    {
+        eprintln!(
+            "error: no sfdx-project.json here or above {}, so --replace has no project to scope it
+note: run it from inside the project, or name the files and directories to rewrite",
+            cwd.display()
+        );
+        return ExitCode::from(2);
+    }
     // Only a `:` condition binds the project: a whole-project bind costs
     // several times what a search does, and nothing else needs it.
     // A `--let` works on where its source matched, so captures must
@@ -1345,7 +1393,16 @@ impl Pattern {
             // thread-local cursor and cannot be shared across workers.
             Pattern::Tree(green) => {
                 let pattern = SyntaxNode::new_root(green.clone());
+                let parenthesised = |n: &SyntaxNode| {
+                    n.kind() == SyntaxKind::ParenExpr && pattern.kind() != SyntaxKind::ParenExpr
+                };
                 root.descendants()
+                    // Parentheses are transparent *inside* a match, but a
+                    // match may not start at one: the span would then
+                    // swallow them, and a rewrite that drops parentheses
+                    // changes what the expression means (`(a + b) * c`).
+                    // The expression inside is its own candidate anyway.
+                    .filter(|candidate| !parenthesised(candidate))
                     .filter_map(|candidate| {
                         let mut binds = HashMap::new();
                         match_node(&pattern, &candidate, &mut binds).then_some((candidate, binds))
@@ -1709,6 +1766,21 @@ fn focus_solutions(pattern: &SyntaxNode, node: &SyntaxNode, first: Binds) -> Vec
 }
 
 fn match_node(pat: &SyntaxNode, src: &SyntaxNode, binds: &mut Binds) -> bool {
+    // Redundant parentheses in the source are transparent: a pattern that
+    // does not write them still matches through them, so
+    // `f(..., [SELECT ...], ...)` finds `f(([SELECT ...]), true)`. The
+    // match is then the inner expression, so a replacement leaves the
+    // parentheses where the author put them. Without this, every shape
+    // would need a parenthesised twin -- a special case per context,
+    // which is the same rule spelled twice.
+    if src.kind() == SyntaxKind::ParenExpr && pat.kind() != SyntaxKind::ParenExpr {
+        if let Some(inner) = significant_children(src)
+            .iter()
+            .find_map(|e| e.as_node().cloned())
+        {
+            return match_node(pat, &inner, binds);
+        }
+    }
     if !kinds_compatible(pat, src) {
         return false;
     }
@@ -3120,6 +3192,93 @@ mod tests {
         );
     }
 
+    /// A `--let` keeps the matches that sit inside its capture. "Inside"
+    /// has to be judged on real tokens: a node's raw range can run past its
+    /// last token into the whitespace after it, which would drop the final
+    /// match of a capture spanning several lines -- the last bind of a
+    /// wrapped query, leaving the rewrite with a string that names a bind
+    /// its map does not have.
+    #[test]
+    fn a_let_collects_the_last_match_in_a_multi_line_capture() {
+        let src = wrap("        List<Contact> cs = [\n            SELECT Id\n            FROM Contact\n            WHERE AccountId IN :ids\n        ];");
+        let (after, _) = rewrite_with(
+            "$T $v = ${[${SELECT ... FROM $o ...}]};",
+            &["m = $2 * :$e => '$e:id' => $e |, "],
+            &["$1 => q(new Map<String, Object>{$m})"],
+            &src,
+        )
+        .unwrap();
+        assert!(
+            after.contains("'ids' => ids"),
+            "the bind on the last line is collected: {after}"
+        );
+    }
+
+    /// A `${...}` group is a primary like any other, so a postfix belongs
+    /// to it: the query is marked for replacement and the field read stays
+    /// where it is. Without this, `[SELECT ...].Id` had no spelling at all.
+    #[test]
+    fn a_group_can_carry_a_postfix() {
+        let src = wrap("        Id x = [SELECT Id FROM Account LIMIT 1].Id;");
+        let (after, _) = rewrite(
+            "${[${SELECT ... FROM $o ...}]}.$f",
+            &["$1 => q('$2')[0]"],
+            &src,
+        )
+        .unwrap();
+        assert_eq!(
+            after,
+            wrap("        Id x = q('SELECT Id FROM Account LIMIT 1')[0].Id;")
+        );
+    }
+
+    /// `FROM $o $a` names the object and its alias separately. They are one
+    /// token run otherwise, so `$o` alone binds `Account a` -- and a cast
+    /// built from that does not parse.
+    #[test]
+    fn a_from_alias_can_be_captured_apart_from_the_object() {
+        let src = wrap("        List<Account> xs = [SELECT a.Id FROM Account a];");
+        let (after, _) =
+            rewrite("[${SELECT ... FROM $o $a ...}]", &["q('$1', $o, $a)"], &src).unwrap();
+        assert_eq!(
+            after,
+            wrap("        List<Account> xs = q('SELECT a.Id FROM Account a', Account, a);")
+        );
+    }
+
+    /// A group may mark a *type*, which is what a rewrite needs when the
+    /// type is what changes and the declaration around it must stay put.
+    /// The one place it cannot go is the first token of a statement, where
+    /// `${` already means "group this whole statement".
+    #[test]
+    fn a_group_can_mark_a_type() {
+        let src = wrap("        for (AggregateResult r : rows) { use(r); }");
+        let (after, _) = rewrite(
+            "for (${AggregateResult} $v : $x) $b",
+            &["$1 => Aggregate"],
+            &src,
+        )
+        .unwrap();
+        assert_eq!(after, wrap("        for (Aggregate r : rows) { use(r); }"));
+        assert!(Pattern::compile("${AggregateResult} $v = $x;").is_err());
+    }
+
+    /// Redundant parentheses in the source are transparent, so one shape
+    /// covers `f(g(1))` and `f((g(1)))` alike rather than needing a
+    /// parenthesised twin of every pattern. The match is the inner
+    /// expression, so a rewrite leaves the parentheses alone.
+    #[test]
+    fn a_pattern_matches_through_redundant_parentheses() {
+        let src = wrap("        f(g(1));\n        f((g(1)));\n        f(((g(1))));");
+        assert_eq!(hits("f(g(1));", &src).len(), 3);
+        let (after, _) = rewrite("g($X)", &["h($X)"], &src).unwrap();
+        assert_eq!(
+            after,
+            wrap("        f(h(1));\n        f((h(1)));\n        f(((h(1))));"),
+            "the parentheses stay where the author put them",
+        );
+    }
+
     /// Holes inside a string are literal text -- the string is data, not
     /// structure, so `'a...b'` is a three-dot string and `'$x'` is a dollar
     /// sign.
@@ -3828,6 +3987,17 @@ mod tests {
         assert_eq!(n("{add,remove}Child"), 3, "alternatives");
         assert_eq!(n("get?"), 1, "one character");
         assert_eq!(n("*"), 6);
+    }
+
+    /// A glob is matched against a whole node's text, which is routinely
+    /// several lines, so `*` spans newlines. Without this, a filter like
+    /// `$q ~ *COUNT()*` answers "no" for a query wrapped across lines --
+    /// and a wrong "no" here silently routes a match to the wrong rewrite.
+    #[test]
+    fn a_glob_wildcard_spans_newlines() {
+        let src = wrap("        f(g(1,\n            2));\n        f(g(1, 2));");
+        let n = |glob: &str| filtered_hits("f($X)", &[&format!("$X ~ {glob}")], &[], &src).len();
+        assert_eq!(n("g(1,*2)"), 2, "a newline is just another character");
     }
 
     /// A regex is unanchored and case-sensitive, Perl-style, unless

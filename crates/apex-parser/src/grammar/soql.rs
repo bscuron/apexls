@@ -95,12 +95,18 @@ pub(crate) fn sosl_expr(p: &mut Parser<'_>) -> CompletedMarker {
 /// real-world-frequency tradeoff already used for `instanceof` and the
 /// arithmetic cast-operand exclusions in `grammar::expressions`.
 fn maybe_alias(p: &mut Parser<'_>) {
-    // A hole after the object name is the pattern's trailing `...`, meaning
-    // "and whatever clauses follow" -- not a table alias. An alias is
-    // optional, so refusing the hole here costs nothing, whereas taking it
-    // would silently turn `[SELECT ... FROM $o ...]` into "a query with an
-    // alias and no clauses".
+    // `...` after the object name is the pattern's trailing clause hole --
+    // "and whatever clauses follow" -- not a table alias, so it is left
+    // alone: taking it would silently turn `[SELECT ... FROM $o ...]` into
+    // "a query with an alias and no clauses". A *named* hole is
+    // unambiguous, since the clause hole is only ever spelled `...`, so
+    // `FROM $o $a` captures the object and its alias separately -- which is
+    // what a rewrite needs, the two being one token run otherwise.
+    if p.at_ellipsis() {
+        return;
+    }
     if p.at_hole() {
+        p.bump_hole();
         return;
     }
     if super::ids::at_id(p) && !at_soql_clause_keyword(p) {

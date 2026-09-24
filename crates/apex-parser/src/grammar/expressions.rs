@@ -211,7 +211,12 @@ fn expr_unary(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         p.bump(); // ${
         expr(p);
         p.expect(SyntaxKind::RBrace);
-        return Some(m.complete(p, SyntaxKind::PatternGroup));
+        let group = m.complete(p, SyntaxKind::PatternGroup);
+        // A group is a primary like any other, so what follows it belongs
+        // to it: `${[SELECT ...]}.Id` marks the query for replacement and
+        // reads a field off the result. Without this the chain would be
+        // dropped and the pattern would fail to parse.
+        return Some(postfix_chain(p, group));
     }
     if matches!(
         p.current(),
@@ -244,7 +249,15 @@ fn expr_unary(p: &mut Parser<'_>) -> Option<CompletedMarker> {
 /// `methodCall` vs `dotExpression -> dotMethodCall` alternatives -- so
 /// this loop never needs to special-case a bare `(`.
 fn expr_primary_chain(p: &mut Parser<'_>) -> Option<CompletedMarker> {
-    let mut e = primary(p)?;
+    let e = primary(p)?;
+    Some(postfix_chain(p, e))
+}
+
+/// The postfix loop itself, applied to an already-parsed left-hand side so
+/// that anything primary-shaped -- a plain primary or a pattern group --
+/// can carry a chain.
+fn postfix_chain(p: &mut Parser<'_>, start: CompletedMarker) -> CompletedMarker {
+    let mut e = start;
     loop {
         e = match p.current() {
             SyntaxKind::Dot | SyntaxKind::QuestionDot => {
@@ -286,7 +299,7 @@ fn expr_primary_chain(p: &mut Parser<'_>) -> Option<CompletedMarker> {
             _ => break,
         };
     }
-    Some(e)
+    e
 }
 
 fn is_literal_kind(k: SyntaxKind) -> bool {

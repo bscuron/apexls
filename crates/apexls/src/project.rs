@@ -19,15 +19,20 @@ use std::path::{Path, PathBuf};
 /// there's no override flag, matching how `cargo`/`git` locate their own
 /// project roots by upward walk rather than taking one as an argument.
 pub(crate) fn find_project_root(start: &Path) -> PathBuf {
+    located_project_root(start).unwrap_or_else(|| start.to_path_buf())
+}
+
+/// The same walk, but saying whether a marker was actually found. A
+/// command that only reads can fall back to the starting directory; one
+/// that *writes* cannot treat "no project here" as "rewrite everything
+/// below me", so it asks this instead.
+pub(crate) fn located_project_root(start: &Path) -> Option<PathBuf> {
     let mut current = start;
     loop {
         if current.join("sfdx-project.json").is_file() {
-            return current.to_path_buf();
+            return Some(current.to_path_buf());
         }
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => return start.to_path_buf(),
-        }
+        current = current.parent()?;
     }
 }
 

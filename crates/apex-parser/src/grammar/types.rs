@@ -22,7 +22,7 @@ use apex_syntax::SyntaxKind;
 /// cast-vs-paren disambiguation) use this before committing to a
 /// speculative `type_ref` attempt.
 pub(crate) fn at_type_start(p: &Parser<'_>) -> bool {
-    at_type_name_start(p, 0)
+    p.at_group() || at_type_name_start(p, 0)
 }
 
 fn at_type_name_start(p: &Parser<'_>, n: usize) -> bool {
@@ -34,6 +34,18 @@ fn at_type_name_start(p: &Parser<'_>, n: usize) -> bool {
 /// returns `false` otherwise (nothing consumed, so callers can fall back
 /// to a different interpretation without a rollback).
 pub(crate) fn type_ref(p: &mut Parser<'_>) -> bool {
+    // `${Account}` marks the type itself for replacement, which is what a
+    // rewrite needs when the type is what changes and the rest of the
+    // declaration must stay as it is. It is a group like any other, so it
+    // nests: `${List<${Account}>}`.
+    if p.at_group() {
+        let m = p.start();
+        p.bump(); // ${
+        type_ref(p);
+        p.expect(SyntaxKind::RBrace);
+        m.complete(p, SyntaxKind::PatternGroup);
+        return true;
+    }
     // A hole stands in for the type's name -- still followed by any `[]`,
     // so `new $T[]{ ... }` is an array creation like `new Object[]{ ... }`.
     if !p.at_hole() && !at_type_start(p) {
